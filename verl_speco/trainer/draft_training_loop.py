@@ -171,7 +171,7 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait:
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
                 if future is not None:
                     future.add_done_callback(
-                        lambda completed: _rewrite_standalone_block_runtime_config(
+                        lambda completed: _finalize_standalone_checkpoint(
                             trainer,
                             checkpoint_path,
                             completed,
@@ -216,6 +216,7 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait:
     }
 
 
+
 def _load_tensor_from_safetensors(path: str, keys: tuple[str, ...]) -> tuple[str, torch.Tensor] | None:
     try:
         from safetensors import safe_open
@@ -228,6 +229,29 @@ def _load_tensor_from_safetensors(path: str, keys: tuple[str, ...]) -> tuple[str
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to load any of %s from %s: %s", keys, path, exc)
     return None
+
+
+def _finalize_standalone_checkpoint(
+    trainer: DrafterBaseTrainer,
+    checkpoint_path: str,
+    completed_future,
+) -> None:
+    try:
+        completed_future.result()
+    except Exception:
+        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path, completed_future)
+        return
+
+    _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+
+
+def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
+    value = config.get(key)
+    if isinstance(value, dict):
+        return value
+    value = {}
+    config[key] = value
+    return value
 
 
 def _torch_load_cpu(path: str) -> Any:
