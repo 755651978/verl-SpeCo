@@ -8,6 +8,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
@@ -148,6 +149,50 @@ def test_standalone_dspark_checkpoint_preserves_source_runtime_config(tmp_path):
     assert saved_training_config == training_config
 
 
+def test_standalone_dspark_checkpoint_rewrites_generic_qwen3_architecture(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dspark"
+    source_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "architectures": ["DSparkDraftModel"],
+                "markov_head_type": "vanilla",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}), encoding="utf-8")
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "dspark",
+                "architectures": ["DSparkDraftModel"],
+                "markov_head_type": "vanilla",
+            }
+        ),
+        encoding="utf-8",
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir))),
+        ),
+    )
+
+    rewrite_standalone_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    assert runtime_config["model_type"] == "qwen3"
+    assert runtime_config["architectures"] == ["Qwen3DSparkModel"]
+    assert runtime_config["speco_training_model_type"] == "dspark"
+
+
 def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
@@ -180,6 +225,188 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     assert runtime_config["dflash_config"]["target_layer_ids"] == [2, 10, 18]
     assert runtime_config["eagle_aux_hidden_state_layer_ids"] == [3, 11, 19]
     assert saved_training_config == training_config
+
+
+def test_standalone_block_checkpoint_uses_target_model_type_without_source_config(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    missing_source_dir = tmp_path / "missing_source_dspark"
+    (target_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "head_dim": 128,
+                "rope_theta": 1000000.0,
+                "max_position_embeddings": 40960,
+            }
+        ),
+        encoding="utf-8",
+    )
+    training_config = {
+        "model_type": "dspark",
+        "architectures": ["DSparkDraftModel"],
+        "target_layer_ids": [1, 9, 17],
+        "markov_head_type": "vanilla",
+        "head_dim": 80,
+        "rope_theta": 10000.0,
+    }
+    (checkpoint_dir / "config.json").write_text(json.dumps(training_config), encoding="utf-8")
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(missing_source_dir))),
+        ),
+    )
+
+    source_model_path = rewrite_standalone_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    saved_training_config = json.loads((checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8"))
+    assert source_model_path == str(missing_source_dir)
+    assert runtime_config["model_type"] == "qwen3"
+    assert runtime_config["architectures"] == ["Qwen3DSparkModel"]
+    assert runtime_config["draft_model_type"] == "dspark"
+    assert runtime_config["speculative_algorithm"] == "DSPARK"
+    assert runtime_config["speco_training_model_type"] == "dspark"
+    assert runtime_config["head_dim"] == 128
+    assert runtime_config["max_position_embeddings"] == 40960
+    assert runtime_config["dflash_config"]["head_dim"] == 128
+    assert runtime_config["dspark_config"]["head_dim"] == 128
+    assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
+    assert runtime_config["rope_parameters"] == {"rope_theta": 1000000.0, "rope_type": "default"}
+    assert "rope_theta" not in runtime_config
+    assert "rope_theta" not in runtime_config["dflash_config"]
+    assert "rope_theta" not in runtime_config["dspark_config"]
+    assert saved_training_config == training_config
+
+
+def test_standalone_dflash_checkpoint_preserves_source_lm_head(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    source_dir = tmp_path / "source_dflash"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "architectures": ["DFlashForCausalLM"]}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dflash", "architectures": ["DFlashDraftModel"]}),
+        encoding="utf-8",
+    )
+    safetensors_torch.save_file({"lm_head.weight": torch.ones(3, 4)}, str(source_dir / "model.safetensors"))
+    safetensors_torch.save_file({"fc.weight": torch.ones(2, 2)}, str(checkpoint_dir / "model.safetensors"))
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dflash"),
+        config=SimpleNamespace(rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(source_dir)))),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    exported_state = safetensors_torch.load_file(str(checkpoint_dir / "model.safetensors"), device="cpu")
+    assert torch.equal(exported_state["lm_head.weight"], torch.ones(3, 4))
+    assert torch.equal(exported_state["fc.weight"], torch.ones(2, 2))
+
+
+def test_standalone_dflash_checkpoint_does_not_create_lm_head_without_source(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    missing_source_dir = tmp_path / "missing_source_dflash"
+    (target_dir / "config.json").write_text(json.dumps({"model_type": "qwen3"}), encoding="utf-8")
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dflash", "architectures": ["DFlashDraftModel"]}),
+        encoding="utf-8",
+    )
+    safetensors_torch.save_file({"model.embed_tokens.weight": torch.ones(3, 4)}, str(target_dir / "model.safetensors"))
+    safetensors_torch.save_file({"fc.weight": torch.ones(2, 2)}, str(checkpoint_dir / "model.safetensors"))
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dflash"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(missing_source_dir))),
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    exported_state = safetensors_torch.load_file(str(checkpoint_dir / "model.safetensors"), device="cpu")
+    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    assert runtime_config["model_type"] == "qwen3"
+    assert "lm_head.weight" not in exported_state
+    assert torch.equal(exported_state["fc.weight"], torch.ones(2, 2))
+
+
+def test_standalone_dspark_checkpoint_appends_target_tied_embedding(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    missing_source_dir = tmp_path / "missing_source_dspark"
+    (target_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "tie_word_embeddings": True}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dspark", "architectures": ["DSparkDraftModel"]}),
+        encoding="utf-8",
+    )
+    embedding = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    safetensors_torch.save_file({"model.embed_tokens.weight": embedding}, str(target_dir / "model.safetensors"))
+    safetensors_torch.save_file({"fc.weight": torch.ones(2, 2)}, str(checkpoint_dir / "model.safetensors"))
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(missing_source_dir))),
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    exported_state = safetensors_torch.load_file(str(checkpoint_dir / "model.safetensors"), device="cpu")
+    runtime_config = json.loads((checkpoint_dir / "config.json").read_text(encoding="utf-8"))
+    assert runtime_config["model_type"] == "qwen3"
+    assert torch.equal(exported_state["lm_head.weight"], embedding)
+    assert torch.equal(exported_state["fc.weight"], torch.ones(2, 2))
+
+
+def test_standalone_dspark_checkpoint_skips_untied_target_embedding(tmp_path):
+    safetensors_torch = pytest.importorskip("safetensors.torch")
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    missing_source_dir = tmp_path / "missing_source_dspark"
+    (target_dir / "config.json").write_text(
+        json.dumps({"model_type": "qwen3", "tie_word_embeddings": False}),
+        encoding="utf-8",
+    )
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps({"model_type": "dspark", "architectures": ["DSparkDraftModel"]}),
+        encoding="utf-8",
+    )
+    safetensors_torch.save_file({"model.embed_tokens.weight": torch.ones(3, 4)}, str(target_dir / "model.safetensors"))
+    safetensors_torch.save_file({"fc.weight": torch.ones(2, 2)}, str(checkpoint_dir / "model.safetensors"))
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="dspark"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(drafter=SimpleNamespace(model_path=str(missing_source_dir))),
+        ),
+    )
+
+    _rewrite_standalone_block_runtime_config(trainer, str(checkpoint_dir))
+
+    exported_state = safetensors_torch.load_file(str(checkpoint_dir / "model.safetensors"), device="cpu")
+    assert "lm_head.weight" not in exported_state
+    assert torch.equal(exported_state["fc.weight"], torch.ones(2, 2))
 
 
 def test_standalone_block_checkpoint_appends_source_lm_head_weight(tmp_path):

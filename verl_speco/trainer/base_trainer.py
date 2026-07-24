@@ -563,7 +563,7 @@ class DrafterBaseTrainer:
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "domino"}:
+        if model_type in {"dspark", "domino", "eagle3"}:
             return model_type
         return "dflash"
 
@@ -619,7 +619,15 @@ class DrafterBaseTrainer:
         if self.optimizer is not None and self.optimizer.param_groups:
             metrics["drafter/current_lr"] = float(self.optimizer.param_groups[0]["lr"])
 
-        for pos in range(int(self._block_drafter_config_value("block_size", 16))):
+        count_prefix = f"{prefix}/count_per_position/"
+        positions = sorted(
+            int(key.removeprefix(count_prefix))
+            for key in sums
+            if key.startswith(count_prefix) and key.removeprefix(count_prefix).isdigit()
+        )
+        if not positions:
+            positions = list(range(int(self._block_drafter_config_value("block_size", 16))))
+        for pos in positions:
             count_key = f"{prefix}/count_per_position/{pos}"
             count = sums.get(count_key, 0.0)
             if count <= 0:
