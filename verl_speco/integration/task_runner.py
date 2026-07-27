@@ -269,5 +269,12 @@ class SpecoTaskRunner(TaskRunner):
             speco_worker_cls=speco_worker_cls,
         )
 
+        # Bootstrap TransferQueue before spawning Ray actors so worker processes
+        # inherit the TQ environment (mirrors verl main_ppo_sync tq.init). No-op
+        # when transfer_queue.enable=false or the package is not installed.
+        from verl_speco.integration.transferqueue_bridge import init_transfer_queue
+
+        init_transfer_queue(config)
+
         trainer.init_workers()
         trainer.fit()

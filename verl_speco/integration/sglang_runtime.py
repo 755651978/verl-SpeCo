@@ -1635,6 +1635,26 @@ class _SpecoSGLangHttpServerMixin:
                         "global_step": collection_global_steps,
                         "replica_rank": self.replica_rank,
                     }
+                    # P0: offload the dominant hidden_states tensor to
+                    # TransferQueue so it bypasses the RayPPOTrainer driver and
+                    # the Ray object store. The key rides with the sample dict;
+                    # the drafter worker fetches by key. No-op when TQ disabled.
+                    from verl_speco.integration.transferqueue_bridge import (
+                        configure_transfer_queue,
+                        is_transfer_queue_enabled,
+                        make_sample_key,
+                        put_sample,
+                    )
+                    configure_transfer_queue(training_cfg)
+                    if is_transfer_queue_enabled():
+                        tq_key = make_sample_key(collection_global_steps, self.replica_rank, request_id)
+                        put_sample(
+                            tq_key,
+                            {"hidden_states": hidden_states.unsqueeze(0).cpu()},
+                            tag={"global_step": collection_global_steps, "replica_rank": self.replica_rank},
+                        )
+                        drafter_sample["hidden_states_tq_key"] = tq_key
+                        drafter_sample["hidden_states"] = None
             else:
                 self._speco_log_missing_hidden_states_once(
                     collection_global_steps=collection_global_steps,

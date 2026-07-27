@@ -309,6 +309,14 @@ class SpecoWorker(Worker):
         self.publish_interval_steps = int(self.config.rollout.drafter.training.get("publish_interval_steps", 0))
         self.train_steps_per_trigger = int(self.config.rollout.drafter.training.get("step", 100))
 
+        # Configure TransferQueue transport for drafter features. No-op when
+        # disabled or when the transfer_queue package is not installed; the
+        # existing inline Ray path is used otherwise. Cached on the instance so
+        # collect_rollout_features can branch without re-reading config.
+        from verl_speco.integration.transferqueue_bridge import configure_transfer_queue
+
+        self._speco_tq_enabled = configure_transfer_queue(self.config.rollout.drafter.training)
+
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
             initialize_global_process_group_ray(
@@ -703,15 +711,24 @@ class SpecoWorker(Worker):
                     batch[key] = sample[key]
             hidden = sample.get("hidden_states")
             if hidden is None:
-                hidden_chunks = sample.get("hidden_states_ref_chunks")
-                if hidden_chunks:
-                    expected_rows = None
-                    hidden_positions = batch.get("hidden_positions")
-                    if torch.is_tensor(hidden_positions):
-                        expected_rows = int(hidden_positions.numel())
-                    hidden = _resolve_hidden_state_chunks(hidden_chunks, expected_rows=expected_rows)
+                tq_key = sample.get("hidden_states_tq_key")
+                if tq_key is not None and self._speco_tq_enabled:
+                    # P0: hidden states were offloaded to TransferQueue by the
+                    # rollout server; fetch by key (and free the storage).
+                    from verl_speco.integration.transferqueue_bridge import get_sample
+
+                    payload = get_sample(tq_key)
+                    hidden = payload.get("hidden_states")
                 else:
-                    hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
+                    hidden_chunks = sample.get("hidden_states_ref_chunks")
+                    if hidden_chunks:
+                        expected_rows = None
+                        hidden_positions = batch.get("hidden_positions")
+                        if torch.is_tensor(hidden_positions):
+                            expected_rows = int(hidden_positions.numel())
+                        hidden = _resolve_hidden_state_chunks(hidden_chunks, expected_rows=expected_rows)
+                    else:
+                        hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
             target_logprobs = sample.get("target_logprobs")
             if target_logprobs is None:
                 target_logprobs = _resolve_ray_object_ref(sample.get("target_logprobs_ref"))
