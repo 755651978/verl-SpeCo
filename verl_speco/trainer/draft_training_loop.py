@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Standalone torchrun training loop for SPECO draft models."""
 
 from __future__ import annotations
@@ -7,7 +20,7 @@ import json
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -18,7 +31,10 @@ from verl.utils.device import get_device_name, get_torch_device
 from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
 from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer
-from verl_speco.trainer.draft_dataset import DraftFeatureDataLoader, DraftFeatureDataLoaderConfig
+from verl_speco.trainer.draft_dataset import (
+    DraftFeatureDataLoader,
+    DraftFeatureDataLoaderConfig,
+)
 from verl_speco.trainer.feature_store import build_feature_store_from_config
 from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config
 
@@ -37,7 +53,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     training_cfg = drafter_cfg.training
     feature_store_cfg = training_cfg.feature_store
     if not feature_store_cfg.get("path"):
-        raise ValueError("actor_rollout_ref.rollout.drafter.training.feature_store.path is required")
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.feature_store.path is required"
+        )
     _disable_standalone_sequence_parallel(draft_config)
 
     _configure_device(local_rank)
@@ -55,7 +73,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         training_process_group=(
             None
             if training_device_mesh is not None
-            else dist.group.WORLD if dist.is_initialized() and world_size > 1 else None
+            else dist.group.WORLD
+            if dist.is_initialized() and world_size > 1
+            else None
         ),
         data_parallel_process_group=None,
         backend=backend,
@@ -72,7 +92,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     try:
         activated = await trainer.activate_training_model()
         if not activated:
-            raise RuntimeError(f"Failed to activate standalone drafter trainer on rank={rank}")
+            raise RuntimeError(
+                f"Failed to activate standalone drafter trainer on rank={rank}"
+            )
         initial_optimizer_step = int(trainer.optimizer_steps_total)
         optimizer_step = initial_optimizer_step
         last_saved_step = optimizer_step
@@ -94,11 +116,16 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 break
             step_started = time.perf_counter()
             attempted_batches += 1
-            batch = trainer.prepare_training_batch_from_samples(samples, step=optimizer_step)
+            batch = trainer.prepare_training_batch_from_samples(
+                cast(list[Any], samples),
+                step=optimizer_step,
+            )
             has_batch = batch is not None
             if not _all_ranks_true(has_batch, trainer.runtime_device):
                 if rank == 0:
-                    logger.warning("Skipping standalone drafter batch: at least one rank has no valid batch")
+                    logger.warning(
+                        "Skipping standalone drafter batch: at least one rank has no valid batch"
+                    )
                 continue
             if batch is None:
                 continue
@@ -124,7 +151,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 _barrier()
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
-            last_save_result = _save_standalone_checkpoint(trainer, optimizer_step, wait=True)
+            last_save_result = _save_standalone_checkpoint(
+                trainer, optimizer_step, wait=True
+            )
             _barrier()
     finally:
         if store is not None:
@@ -155,10 +184,14 @@ def _build_backend(draft_config):
         from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
 
         return DSparkTrainerBackend(draft_config, draft_config.model)
-    raise ValueError(f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK")
+    raise ValueError(
+        f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK"
+    )
 
 
-def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait: bool = False) -> dict[str, Any]:
+def _save_standalone_checkpoint(
+    trainer: DrafterBaseTrainer, step: int, *, wait: bool = False
+) -> dict[str, Any]:
     save_checkpoint = getattr(trainer, "save_checkpoint", None)
     if callable(save_checkpoint):
         result = save_checkpoint(int(step), wait=wait)
@@ -187,11 +220,19 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait:
     pending_full_checkpoint = getattr(trainer, "_pending_full_checkpoint_future", None)
     pending_done = getattr(pending_full_checkpoint, "done", None)
     if callable(pending_done) and not pending_done():
-        return {"saved": False, "path": checkpoint_path, "reason": "previous_save_running"}
+        return {
+            "saved": False,
+            "path": checkpoint_path,
+            "reason": "previous_save_running",
+        }
 
     save_async = getattr(trainer, "_save_checkpoint_async", None)
     if not callable(save_async):
-        return {"saved": False, "path": checkpoint_path, "reason": "unsupported_trainer"}
+        return {
+            "saved": False,
+            "path": checkpoint_path,
+            "reason": "unsupported_trainer",
+        }
     future = save_async(int(step))
     if future is not None and wait:
         future.result()
@@ -211,13 +252,16 @@ def _save_standalone_checkpoint(trainer: DrafterBaseTrainer, step: int, *, wait:
         "reason": (
             "saved"
             if future is not None and wait
-            else "scheduled" if future is not None else "not_checkpoint_leader"
+            else "scheduled"
+            if future is not None
+            else "not_checkpoint_leader"
         ),
     }
 
 
-
-def _load_tensor_from_safetensors(path: str, keys: tuple[str, ...]) -> tuple[str, torch.Tensor] | None:
+def _load_tensor_from_safetensors(
+    path: str, keys: tuple[str, ...]
+) -> tuple[str, torch.Tensor] | None:
     try:
         from safetensors import safe_open
 
@@ -239,19 +283,12 @@ def _finalize_standalone_checkpoint(
     try:
         completed_future.result()
     except Exception:
-        _rewrite_standalone_block_runtime_config(trainer, checkpoint_path, completed_future)
+        _rewrite_standalone_block_runtime_config(
+            trainer, checkpoint_path, completed_future
+        )
         return
 
     _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
-
-
-def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
-    value = config.get(key)
-    if isinstance(value, dict):
-        return value
-    value = {}
-    config[key] = value
-    return value
 
 
 def _torch_load_cpu(path: str) -> Any:
@@ -261,7 +298,9 @@ def _torch_load_cpu(path: str) -> Any:
         return torch.load(path, map_location="cpu")
 
 
-def _load_tensor_from_torch(path: str, keys: tuple[str, ...]) -> tuple[str, torch.Tensor] | None:
+def _load_tensor_from_torch(
+    path: str, keys: tuple[str, ...]
+) -> tuple[str, torch.Tensor] | None:
     try:
         state = _torch_load_cpu(path)
     except Exception as exc:  # noqa: BLE001
@@ -293,7 +332,11 @@ def _model_ties_word_embeddings(model_path: str | None) -> bool:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Failed to read model config %s for tied embedding check: %s", config_path, exc)
+        logger.warning(
+            "Failed to read model config %s for tied embedding check: %s",
+            config_path,
+            exc,
+        )
         return False
     return bool(isinstance(config, dict) and config.get("tie_word_embeddings") is True)
 
@@ -306,7 +349,11 @@ def _load_lm_head_weight(
     if not model_path:
         return None
 
-    keys = ("lm_head.weight", "model.embed_tokens.weight") if allow_tied_embedding else ("lm_head.weight",)
+    keys = (
+        ("lm_head.weight", "model.embed_tokens.weight")
+        if allow_tied_embedding
+        else ("lm_head.weight",)
+    )
     for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
         index_path = os.path.join(model_path, index_name)
         if not os.path.exists(index_path):
@@ -344,7 +391,9 @@ def _load_lm_head_weight(
     return None
 
 
-def _append_lm_head_to_safetensors_index(checkpoint_path: str, lm_head_weight: torch.Tensor) -> bool:
+def _append_lm_head_to_safetensors_index(
+    checkpoint_path: str, lm_head_weight: torch.Tensor
+) -> bool:
     index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
     if not os.path.exists(index_path):
         return False
@@ -355,13 +404,19 @@ def _append_lm_head_to_safetensors_index(checkpoint_path: str, lm_head_weight: t
             index_data = json.load(f)
         weight_map = index_data.setdefault("weight_map", {})
         if not isinstance(weight_map, dict):
-            logger.warning("Cannot append lm_head.weight to %s: expected weight_map object", index_path)
+            logger.warning(
+                "Cannot append lm_head.weight to %s: expected weight_map object",
+                index_path,
+            )
             return True
         if "lm_head.weight" in weight_map:
             return True
 
         shard_name = "model-lm-head.safetensors"
-        save_file({"lm_head.weight": lm_head_weight}, os.path.join(checkpoint_path, shard_name))
+        save_file(
+            {"lm_head.weight": lm_head_weight},
+            os.path.join(checkpoint_path, shard_name),
+        )
         weight_map["lm_head.weight"] = shard_name
         metadata = index_data.setdefault("metadata", {})
         if isinstance(metadata, dict) and "total_size" in metadata:
@@ -371,13 +426,21 @@ def _append_lm_head_to_safetensors_index(checkpoint_path: str, lm_head_weight: t
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2, sort_keys=True)
             f.write("\n")
-        logger.info("Added lm_head.weight to standalone sharded checkpoint %s", index_path)
+        logger.info(
+            "Added lm_head.weight to standalone sharded checkpoint %s", index_path
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to append lm_head.weight to sharded checkpoint %s: %s", index_path, exc)
+        logger.warning(
+            "Failed to append lm_head.weight to sharded checkpoint %s: %s",
+            index_path,
+            exc,
+        )
     return True
 
 
-def _append_lm_head_to_torch_index(checkpoint_path: str, lm_head_weight: torch.Tensor) -> bool:
+def _append_lm_head_to_torch_index(
+    checkpoint_path: str, lm_head_weight: torch.Tensor
+) -> bool:
     index_path = os.path.join(checkpoint_path, "pytorch_model.bin.index.json")
     if not os.path.exists(index_path):
         return False
@@ -386,13 +449,19 @@ def _append_lm_head_to_torch_index(checkpoint_path: str, lm_head_weight: torch.T
             index_data = json.load(f)
         weight_map = index_data.setdefault("weight_map", {})
         if not isinstance(weight_map, dict):
-            logger.warning("Cannot append lm_head.weight to %s: expected weight_map object", index_path)
+            logger.warning(
+                "Cannot append lm_head.weight to %s: expected weight_map object",
+                index_path,
+            )
             return True
         if "lm_head.weight" in weight_map:
             return True
 
         shard_name = "pytorch_model-lm-head.bin"
-        torch.save({"lm_head.weight": lm_head_weight}, os.path.join(checkpoint_path, shard_name))
+        torch.save(
+            {"lm_head.weight": lm_head_weight},
+            os.path.join(checkpoint_path, shard_name),
+        )
         weight_map["lm_head.weight"] = shard_name
         metadata = index_data.setdefault("metadata", {})
         if isinstance(metadata, dict) and "total_size" in metadata:
@@ -402,9 +471,15 @@ def _append_lm_head_to_torch_index(checkpoint_path: str, lm_head_weight: torch.T
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2, sort_keys=True)
             f.write("\n")
-        logger.info("Added lm_head.weight to standalone sharded checkpoint %s", index_path)
+        logger.info(
+            "Added lm_head.weight to standalone sharded checkpoint %s", index_path
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to append lm_head.weight to sharded checkpoint %s: %s", index_path, exc)
+        logger.warning(
+            "Failed to append lm_head.weight to sharded checkpoint %s: %s",
+            index_path,
+            exc,
+        )
     return True
 
 
@@ -433,7 +508,11 @@ def _append_lm_head_weight_if_missing(
         return
     loaded_key, lm_head_weight = loaded
     lm_head_weight = lm_head_weight.detach().cpu()
-    logger.info("Using %s from %s as standalone drafter lm_head.weight", loaded_key, source_label)
+    logger.info(
+        "Using %s from %s as standalone drafter lm_head.weight",
+        loaded_key,
+        source_label,
+    )
 
     if _append_lm_head_to_safetensors_index(checkpoint_path, lm_head_weight):
         return
@@ -450,9 +529,13 @@ def _append_lm_head_weight_if_missing(
                 return
             state["lm_head.weight"] = lm_head_weight
             save_file(state, safetensors_path)
-            logger.info("Added lm_head.weight to standalone checkpoint %s", safetensors_path)
+            logger.info(
+                "Added lm_head.weight to standalone checkpoint %s", safetensors_path
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to append lm_head.weight to %s: %s", safetensors_path, exc)
+            logger.warning(
+                "Failed to append lm_head.weight to %s: %s", safetensors_path, exc
+            )
         return
 
     torch_path = os.path.join(checkpoint_path, "pytorch_model.bin")
@@ -460,7 +543,10 @@ def _append_lm_head_weight_if_missing(
         try:
             state = _torch_load_cpu(torch_path)
             if not isinstance(state, dict):
-                logger.warning("Cannot append lm_head.weight to %s: expected dict state", torch_path)
+                logger.warning(
+                    "Cannot append lm_head.weight to %s: expected dict state",
+                    torch_path,
+                )
                 return
             if "lm_head.weight" in state:
                 return
@@ -482,7 +568,9 @@ def _rewrite_standalone_block_runtime_config(
     checkpoint_path: str,
     completed_future=None,
 ) -> None:
-    source_model_path = rewrite_standalone_runtime_config(trainer, checkpoint_path, completed_future)
+    source_model_path = rewrite_standalone_runtime_config(
+        trainer, checkpoint_path, completed_future
+    )
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
     if backend_type == "dspark":
         _append_lm_head_weight_if_missing(
@@ -517,7 +605,9 @@ def _disable_standalone_sequence_parallel(draft_config) -> None:
 def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | None:
     if world_size <= 1 or not dist.is_initialized():
         return None
-    strategy = str(draft_config.actor.get("strategy", "") if hasattr(draft_config, "actor") else "").lower()
+    strategy = str(
+        draft_config.actor.get("strategy", "") if hasattr(draft_config, "actor") else ""
+    ).lower()
     if strategy != "fsdp2":
         return None
     return DeviceMesh(
@@ -525,7 +615,6 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
         mesh=torch.arange(world_size, dtype=torch.int64).reshape(1, world_size),
         mesh_dim_names=("dp", "sp"),
     )
-
 
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
@@ -543,7 +632,9 @@ def _current_learning_rate(trainer: DrafterBaseTrainer) -> float:
     return float(param_groups[0].get("lr", 0.0))
 
 
-def _position_metric_series(metrics: dict[str, float], prefix: str, name: str) -> list[float]:
+def _position_metric_series(
+    metrics: dict[str, float], prefix: str, name: str
+) -> list[float]:
     values: list[float] = []
     pos = 0
     while True:
@@ -561,7 +652,10 @@ def _weighted_average(values: list[float], counts: list[float]) -> float | None:
     total_count = sum(counts[: len(values)])
     if total_count <= 0:
         return None
-    return sum(value * count for value, count in zip(values, counts, strict=False)) / total_count
+    return (
+        sum(value * count for value, count in zip(values, counts, strict=False))
+        / total_count
+    )
 
 
 def _simulated_accept_length(accuracies: list[float]) -> float:
@@ -581,12 +675,16 @@ def _standalone_step_metrics(
     step_elapsed_sec: float,
 ) -> dict[str, float]:
     raw_metrics = trainer.get_training_metrics()
-    metrics: dict[str, float] = {key: float(value) for key, value in raw_metrics.items()}
+    metrics: dict[str, float] = {
+        key: float(value) for key, value in raw_metrics.items()
+    }
     prefix = _block_metric_prefix(trainer)
     if prefix is not None:
         anchor_offset = 1 if prefix == "dflash" else 0
         losses = _position_metric_series(raw_metrics, prefix, "loss_per_position")
-        accuracies = _position_metric_series(raw_metrics, prefix, "accuracy_per_position")
+        accuracies = _position_metric_series(
+            raw_metrics, prefix, "accuracy_per_position"
+        )
         counts = _position_metric_series(raw_metrics, prefix, "count_per_position")
         pred_losses = losses[anchor_offset:]
         pred_accuracies = accuracies[anchor_offset:]
@@ -599,7 +697,9 @@ def _standalone_step_metrics(
         if avg_acc is not None:
             metrics["train/avg_acc"] = avg_acc
         if pred_accuracies:
-            metrics["train/simulated_acc_len"] = _simulated_accept_length(pred_accuracies)
+            metrics["train/simulated_acc_len"] = _simulated_accept_length(
+                pred_accuracies
+            )
         if f"{prefix}/top1_acc" in raw_metrics:
             metrics["train/top1_acc"] = float(raw_metrics[f"{prefix}/top1_acc"])
         if f"{prefix}/top5_acc" in raw_metrics:
@@ -609,7 +709,9 @@ def _standalone_step_metrics(
         for idx, value in enumerate(pred_accuracies):
             metrics[f"train/acc_{idx}"] = float(value)
     metrics["train/step"] = float(successful_steps)
-    metrics["train/global_step"] = float(getattr(trainer, "training_steps", successful_steps))
+    metrics["train/global_step"] = float(
+        getattr(trainer, "training_steps", successful_steps)
+    )
     metrics["train/lr"] = _current_learning_rate(trainer)
     metrics["drafter/train_successful_steps"] = float(successful_steps)
     metrics["drafter/train_attempted_batches"] = float(attempted_batches)
@@ -641,6 +743,7 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
             fields.append(f"{label}={value:.4f}")
     logger.warning("[standalone drafter metrics] %s", " ".join(fields))
 
+
 def _init_distributed() -> tuple[int, int, int]:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -655,7 +758,9 @@ def _init_distributed() -> tuple[int, int, int]:
         elif device_name == "cpu":
             backend = "gloo"
         else:
-            raise ValueError(f"Unsupported standalone drafter device_name={device_name!r}")
+            raise ValueError(
+                f"Unsupported standalone drafter device_name={device_name!r}"
+            )
         dist.init_process_group(backend=backend)
     return rank, local_rank, world_size
 
@@ -695,4 +800,7 @@ def _sync_any_rank_saved_checkpoint(saved: Any) -> bool:
 def log_resolved_config(config) -> None:
     rank = int(os.environ.get("RANK", "0"))
     if rank == 0:
-        logger.warning("Resolved SPECO standalone draft trainer config:\n%s", OmegaConf.to_yaml(config))
+        logger.warning(
+            "Resolved SPECO standalone draft trainer config:\n%s",
+            OmegaConf.to_yaml(config),
+        )
