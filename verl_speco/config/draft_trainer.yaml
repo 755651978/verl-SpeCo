@@ -44,3 +44,16 @@ actor_rollout_ref:
         master_addr: ${speco.draft_training.master_addr}
         master_port: ${speco.draft_training.master_port}
         standalone: ${speco.draft_training.standalone}
+        # Standalone/offline-only reconstruction for compact token_replay stores.
+        # The frozen target model is loaded lazily after the draft trainer starts.
+        target_feature_replay:
+          model_path: null
+          target_revision: null
+          dtype: bfloat16
+          trust_remote_code: false
+          strict_target_model_path: false
+          logits_chunk_rows: 32
+          cache:
+            enabled: false
+            path: null
+            max_size_gb: 0

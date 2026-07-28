@@ -42,7 +42,13 @@ from verl.utils.distributed import (
     initialize_global_process_group_ray,
     set_numa_affinity,
 )
-from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
+from verl_speco.trainer.feature_store import (
+    DraftFeatureSample,
+    DraftReplaySample,
+    TokenReplayFeatureStore,
+    TorchShardFeatureStore,
+    build_feature_store_from_config,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -323,6 +329,7 @@ class SpecoWorker(Worker):
         self.trainer: Any = None
         self.feature_writer: Optional[TorchShardFeatureStore] = None
         self.feature_writer_path: Optional[str] = None
+        self.feature_writer_type: Optional[str] = None
         self.last_global_step: Optional[int] = None
         self.last_trained_step: Optional[int] = None
         self.training_process_group = None
@@ -498,7 +505,7 @@ class SpecoWorker(Worker):
     def _store_rollout_sample(
         self,
         batch: dict,
-        hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
         target_logprobs: Optional[torch.Tensor] = None,
     ):
         if (
@@ -510,6 +517,10 @@ class SpecoWorker(Worker):
         if self._drafter_training_mode() == "collect_only":
             self._write_rollout_feature_sample(batch, hidden_states, target_logprobs)
             return
+        if hidden_states is None:
+            raise RuntimeError(
+                "Online drafter training requires collected hidden states"
+            )
         self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
 
     def _drafter_training_mode(self) -> str:
@@ -528,32 +539,53 @@ class SpecoWorker(Worker):
         path = _config_str(feature_store_cfg.get("path", None))
         if not path:
             return None
-        if self.feature_writer is not None and self.feature_writer_path == path:
+        store_type = str(
+            feature_store_cfg.get("type", "torch_shard") or "torch_shard"
+        ).lower()
+        if (
+            self.feature_writer is not None
+            and self.feature_writer_path == path
+            and self.feature_writer_type == store_type
+        ):
             return self.feature_writer
+        if self.feature_writer is not None:
+            self.feature_writer.close()
         model_cfg = self.config.get("model", None)
         target_model_path = (
             _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
         )
-        self.feature_writer = TorchShardFeatureStore(
-            path,
-            max_samples_per_shard=int(
-                feature_store_cfg.get("max_samples_per_shard", 1024)
+        self.feature_writer = cast(
+            TorchShardFeatureStore,
+            build_feature_store_from_config(
+                feature_store_cfg,
+                read_only=False,
+                metadata={
+                    "algorithm": str(
+                        self.config.rollout.drafter.speculative_algorithm
+                    ).upper(),
+                    "target_model_path": target_model_path,
+                    "drafter_model_path": _config_str(
+                        self.config.rollout.drafter.get("model_path", None)
+                    ),
+                    "source": "rl_collect_only",
+                },
+                shard_prefix=f"rank{int(self.rank):05d}_pid{int(os.getpid())}",
             ),
-            strict_schema=bool(feature_store_cfg.get("strict_schema", True)),
-            metadata={
-                "algorithm": str(
-                    self.config.rollout.drafter.speculative_algorithm
-                ).upper(),
-                "target_model_path": target_model_path,
-                "drafter_model_path": _config_str(
-                    self.config.rollout.drafter.get("model_path", None)
-                ),
-                "source": "rl_collect_only",
-            },
-            shard_prefix=f"rank{int(self.rank):05d}_pid{int(os.getpid())}",
         )
         self.feature_writer_path = path
+        self.feature_writer_type = store_type
         return self.feature_writer
+
+    def _uses_token_replay_store(self) -> bool:
+        feature_store_cfg = self.config.rollout.drafter.training.get(
+            "feature_store", {}
+        )
+        return (
+            str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
+            .strip()
+            .lower()
+            == "token_replay"
+        )
 
     def _build_rollout_loss_mask(
         self, batch: dict, input_ids: torch.Tensor
@@ -591,7 +623,7 @@ class SpecoWorker(Worker):
     def _write_rollout_feature_sample(
         self,
         batch: dict,
-        hidden_states: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
         target_logprobs: Optional[torch.Tensor],
     ) -> None:
         writer = self._get_feature_writer()
@@ -603,18 +635,25 @@ class SpecoWorker(Worker):
             return
         full_input_ids = batch["input_ids"].detach().cpu().reshape(-1)
         full_loss_mask = self._build_rollout_loss_mask(batch, full_input_ids)
-        hidden_states = hidden_states.detach().cpu()
-        hidden_rows = int(
-            hidden_states.size(1)
-            if hidden_states.dim() == 3 and hidden_states.size(0) == 1
-            else hidden_states.size(0)
-        )
         hidden_positions = batch.get("hidden_positions")
         if torch.is_tensor(hidden_positions):
             hidden_positions = cast(torch.Tensor, hidden_positions)
             hidden_positions = hidden_positions.detach().cpu().long().reshape(-1)
         else:
             hidden_positions = None
+        if hidden_states is not None:
+            hidden_states = hidden_states.detach().cpu()
+            hidden_rows = int(
+                hidden_states.size(1)
+                if hidden_states.dim() == 3 and hidden_states.size(0) == 1
+                else hidden_states.size(0)
+            )
+        elif isinstance(writer, TokenReplayFeatureStore):
+            hidden_rows = self._token_replay_hidden_rows(batch, hidden_positions)
+        else:
+            raise RuntimeError(
+                "torch_shard feature collection requires collected hidden states"
+            )
         feature_start, feature_end, position_ids = self._resolve_rollout_feature_window(
             full_input_ids,
             hidden_rows,
@@ -687,16 +726,98 @@ class SpecoWorker(Worker):
         ):
             if key in batch:
                 metadata[key] = batch[key]
-        sample = DraftFeatureSample(
-            algorithm=str(self.config.rollout.drafter.speculative_algorithm).upper(),
-            input_ids=input_ids,
-            loss_mask=loss_mask,
-            hidden_states=hidden_states,
-            target_logprobs=target_logprobs,
-            position_ids=position_ids,
-            metadata=metadata,
-        )
-        writer.write_many([sample])
+        if isinstance(writer, TokenReplayFeatureStore):
+            full_attention_mask = self._replay_sequence_tensor(
+                batch.get("attention_mask"),
+                full_input_ids,
+                name="attention_mask",
+                default=torch.ones_like(full_input_ids, dtype=torch.bool),
+            ).bool()
+            default_position_ids = (
+                full_attention_mask.long().cumsum(dim=0).sub(1).clamp_min(0)
+            )
+            full_position_ids = self._replay_sequence_tensor(
+                batch.get("position_ids"),
+                full_input_ids,
+                name="position_ids",
+                default=default_position_ids,
+            ).long()
+            replay_metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key
+                not in {
+                    "hidden_positions",
+                    "hidden_last_hidden_logprob_check",
+                    "hidden_raw_topk_logprob_check",
+                    "hidden_last_hidden_filter",
+                    "hidden_last_hidden_select",
+                    "target_logprobs_position_start",
+                    "target_logprobs_position_end",
+                }
+            }
+            replay_metadata["source"] = "token_replay"
+            replay_sample = DraftReplaySample(
+                algorithm=algorithm,
+                input_ids=full_input_ids,
+                loss_mask=full_loss_mask,
+                attention_mask=full_attention_mask,
+                position_ids=full_position_ids,
+                feature_positions=position_ids - 1,
+                draft_position_ids=position_ids,
+                metadata=replay_metadata,
+            )
+            writer.write_many([replay_sample])
+        else:
+            assert hidden_states is not None
+            feature_sample = DraftFeatureSample(
+                algorithm=algorithm,
+                input_ids=input_ids,
+                loss_mask=loss_mask,
+                hidden_states=hidden_states,
+                target_logprobs=target_logprobs,
+                position_ids=position_ids,
+                metadata=metadata,
+            )
+            writer.write_many([feature_sample])
+
+    @staticmethod
+    def _token_replay_hidden_rows(
+        batch: dict, hidden_positions: Optional[torch.Tensor]
+    ) -> int:
+        if hidden_positions is not None and int(hidden_positions.numel()) > 0:
+            return int(hidden_positions.numel())
+        try:
+            start = int(batch["hidden_position_start"])
+            end = int(batch["hidden_position_end"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "token_replay collection without a hidden tensor requires "
+                "hidden_positions or hidden_position_start/hidden_position_end"
+            ) from exc
+        if end <= start:
+            raise ValueError(
+                f"Invalid token_replay hidden window: start={start} end={end}"
+            )
+        return end - start
+
+    @staticmethod
+    def _replay_sequence_tensor(
+        value: Any,
+        input_ids: torch.Tensor,
+        *,
+        name: str,
+        default: torch.Tensor,
+    ) -> torch.Tensor:
+        if not torch.is_tensor(value):
+            return default
+        tensor = cast(torch.Tensor, value).detach().cpu().reshape(-1)
+        if int(tensor.numel()) != int(input_ids.numel()):
+            raise ValueError(
+                f"token_replay {name} cannot be normalized to one value per token: "
+                f"numel={int(tensor.numel())} tokens={int(input_ids.numel())}"
+            )
+        return tensor
 
     @staticmethod
     def _align_rollout_target_logprobs(
@@ -805,6 +926,8 @@ class SpecoWorker(Worker):
                 "responses": sample["responses"],
             }
             for key in (
+                "attention_mask",
+                "position_ids",
                 "hidden_position_start",
                 "hidden_position_end",
                 "hidden_positions",
@@ -828,8 +951,9 @@ class SpecoWorker(Worker):
             ):
                 if key in sample:
                     batch[key] = sample[key]
-            hidden = sample.get("hidden_states")
-            if hidden is None:
+            skip_hidden_payload = self._uses_token_replay_store()
+            hidden = None if skip_hidden_payload else sample.get("hidden_states")
+            if hidden is None and not skip_hidden_payload:
                 hidden_chunks = sample.get("hidden_states_ref_chunks")
                 if hidden_chunks:
                     expected_rows = None
@@ -842,12 +966,14 @@ class SpecoWorker(Worker):
                     )
                 else:
                     hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
-            target_logprobs = sample.get("target_logprobs")
-            if target_logprobs is None:
+            target_logprobs = (
+                None if skip_hidden_payload else sample.get("target_logprobs")
+            )
+            if target_logprobs is None and not skip_hidden_payload:
                 target_logprobs = _resolve_ray_object_ref(
                     sample.get("target_logprobs_ref")
                 )
-            if hidden is None:
+            if hidden is None and not skip_hidden_payload:
                 continue
             self._store_rollout_sample(
                 batch=batch,

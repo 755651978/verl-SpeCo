@@ -202,12 +202,132 @@ class DraftFeatureSample:
         return item
 
 
+@dataclass
+class DraftReplaySample:
+    """Compact token sample used to reconstruct target features offline."""
+
+    input_ids: torch.Tensor
+    loss_mask: torch.Tensor
+    attention_mask: torch.Tensor
+    position_ids: torch.Tensor
+    feature_positions: torch.Tensor
+    draft_position_ids: torch.Tensor
+    algorithm: str = "EAGLE3"
+    schema_version: int = SCHEMA_VERSION
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(
+        cls, payload: dict[str, Any], *, strict: bool = True
+    ) -> "DraftReplaySample":
+        sample = cls(
+            schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
+            algorithm=str(
+                payload.get(
+                    "algorithm", payload.get("metadata", {}).get("algorithm", "EAGLE3")
+                )
+            ),
+            input_ids=payload["input_ids"],
+            loss_mask=payload["loss_mask"],
+            attention_mask=payload["attention_mask"],
+            position_ids=payload["position_ids"],
+            feature_positions=payload["feature_positions"],
+            draft_position_ids=payload["draft_position_ids"],
+            metadata=dict(payload.get("metadata") or {}),
+        )
+        sample.validate(strict=strict)
+        return sample
+
+    def validate(self, *, strict: bool = True) -> None:
+        if self.schema_version != SCHEMA_VERSION and strict:
+            raise ValueError(
+                f"Unsupported DraftReplaySample schema_version={self.schema_version}"
+            )
+        tensor_fields = (
+            "input_ids",
+            "loss_mask",
+            "attention_mask",
+            "position_ids",
+            "feature_positions",
+            "draft_position_ids",
+        )
+        for name in tensor_fields:
+            value = getattr(self, name)
+            if not torch.is_tensor(value):
+                raise TypeError(f"DraftReplaySample.{name} must be a torch.Tensor")
+            if value.dim() > 1:
+                setattr(self, name, value.reshape(-1))
+
+        sequence_length = int(self.input_ids.numel())
+        for name in ("loss_mask", "attention_mask", "position_ids"):
+            value = cast(torch.Tensor, getattr(self, name))
+            if strict and int(value.numel()) != sequence_length:
+                raise ValueError(
+                    f"DraftReplaySample input_ids/{name} length mismatch: "
+                    f"{sequence_length} vs {int(value.numel())}"
+                )
+        if strict and int(self.feature_positions.numel()) <= 0:
+            raise ValueError("DraftReplaySample.feature_positions must not be empty")
+        if strict and int(self.draft_position_ids.numel()) != int(
+            self.feature_positions.numel()
+        ):
+            raise ValueError(
+                "DraftReplaySample feature_positions/draft_position_ids length mismatch: "
+                f"{int(self.feature_positions.numel())} vs "
+                f"{int(self.draft_position_ids.numel())}"
+            )
+        if int(self.feature_positions.numel()) > 0:
+            positions = self.feature_positions.detach().cpu().long()
+            if strict and (
+                int(positions.min().item()) < 0
+                or int(positions.max().item()) >= sequence_length
+            ):
+                raise ValueError(
+                    "DraftReplaySample.feature_positions are outside input_ids: "
+                    f"min={int(positions.min().item())} "
+                    f"max={int(positions.max().item())} sequence_length={sequence_length}"
+                )
+            if strict and int(positions.numel()) > 1:
+                deltas = positions[1:] - positions[:-1]
+                if not bool((deltas == 1).all().item()):
+                    raise ValueError(
+                        "DraftReplaySample.feature_positions must be contiguous and increasing"
+                    )
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate(strict=False)
+        return {
+            "schema_version": self.schema_version,
+            "sample_type": "token_replay",
+            "algorithm": self.algorithm,
+            "input_ids": self.input_ids.detach().cpu().to(torch.int32).contiguous(),
+            "loss_mask": self.loss_mask.detach().cpu().to(torch.float16).contiguous(),
+            "attention_mask": self.attention_mask.detach().cpu().bool().contiguous(),
+            "position_ids": self.position_ids.detach()
+            .cpu()
+            .to(torch.int32)
+            .contiguous(),
+            "feature_positions": self.feature_positions.detach()
+            .cpu()
+            .to(torch.int32)
+            .contiguous(),
+            "draft_position_ids": self.draft_position_ids.detach()
+            .cpu()
+            .to(torch.int32)
+            .contiguous(),
+            "metadata": dict(self.metadata),
+        }
+
+
+DraftStoredSample = DraftFeatureSample | DraftReplaySample
+
+
 class DraftFeatureStore(Protocol):
     def write_many(
-        self, samples: list[DraftFeatureSample | dict[str, Any]]
+        self, samples: list[DraftStoredSample | dict[str, Any]]
     ) -> list[str]: ...
 
-    def read(self, key: str) -> DraftFeatureSample: ...
+    def read(self, key: str) -> DraftStoredSample: ...
 
     def iter_keys(self, *, shuffle: bool = False, seed: int = 0) -> Iterator[str]: ...
 
@@ -291,7 +411,7 @@ class TorchShardFeatureStore:
             self._write_metadata()
 
     def write_many(
-        self, samples: list[DraftFeatureSample | dict[str, Any]]
+        self, samples: list[DraftStoredSample | dict[str, Any]]
     ) -> list[str]:
         if self.read_only:
             raise RuntimeError("Cannot write to a read-only TorchShardFeatureStore")
@@ -342,7 +462,7 @@ class TorchShardFeatureStore:
             return []
         return self.flush()
 
-    def read(self, key: str) -> DraftFeatureSample:
+    def read(self, key: str) -> DraftStoredSample:
         shard_name, sample_index = _parse_key(key)
         shard = self._load_shard(shard_name)
         samples = shard.get("samples") or []
@@ -432,22 +552,83 @@ class TorchShardFeatureStore:
             return torch.load(path, map_location="cpu")
 
 
+class TokenReplayFeatureStore(TorchShardFeatureStore):
+    """Compact shard store containing tokens and replay alignment metadata."""
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        max_samples_per_shard: int = 1024,
+        metadata: dict[str, Any] | None = None,
+        strict_schema: bool = True,
+        read_only: bool = False,
+        shard_prefix: str = "shard",
+    ):
+        replay_metadata = dict(metadata or {})
+        replay_metadata["format"] = "token_replay"
+        super().__init__(
+            path,
+            max_samples_per_shard=max_samples_per_shard,
+            metadata=replay_metadata,
+            strict_schema=strict_schema,
+            read_only=read_only,
+            shard_prefix=shard_prefix,
+        )
+
+    def write_many(
+        self, samples: list[DraftStoredSample | dict[str, Any]]
+    ) -> list[str]:
+        if self.read_only:
+            raise RuntimeError("Cannot write to a read-only TokenReplayFeatureStore")
+        keys: list[str] = []
+        for sample_like in samples:
+            sample = _coerce_replay_sample(sample_like, strict=self.strict_schema)
+            self._pending.append(sample.to_dict())
+            keys.append(f"pending:{len(self._pending) - 1}")
+            if len(self._pending) >= self.max_samples_per_shard:
+                self.flush()
+        return keys
+
+    def read(self, key: str) -> DraftReplaySample:
+        shard_name, sample_index = _parse_key(key)
+        shard = self._load_shard(shard_name)
+        samples = shard.get("samples") or []
+        sample = samples[int(sample_index)]
+        return DraftReplaySample.from_dict(sample, strict=self.strict_schema)
+
+
 def build_feature_store_from_config(
-    feature_store_cfg, *, read_only: bool = False
-) -> TorchShardFeatureStore:
-    store_type = str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
-    if store_type != "torch_shard":
+    feature_store_cfg,
+    *,
+    read_only: bool = False,
+    metadata: dict[str, Any] | None = None,
+    shard_prefix: str = "shard",
+) -> DraftFeatureStore:
+    store_type = (
+        str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
+        .strip()
+        .lower()
+    )
+    store_cls: type[TorchShardFeatureStore]
+    if store_type == "torch_shard":
+        store_cls = TorchShardFeatureStore
+    elif store_type == "token_replay":
+        store_cls = TokenReplayFeatureStore
+    else:
         raise NotImplementedError(f"Unsupported draft feature store type: {store_type}")
-    return TorchShardFeatureStore(
+    return store_cls(
         feature_store_cfg.get("path"),
         max_samples_per_shard=int(feature_store_cfg.get("max_samples_per_shard", 1024)),
+        metadata=metadata,
         strict_schema=bool(feature_store_cfg.get("strict_schema", True)),
         read_only=read_only,
+        shard_prefix=shard_prefix,
     )
 
 
 def _coerce_sample(
-    sample_like: DraftFeatureSample | dict[str, Any], *, strict: bool
+    sample_like: DraftStoredSample | dict[str, Any], *, strict: bool
 ) -> DraftFeatureSample:
     if isinstance(sample_like, DraftFeatureSample):
         sample_like.validate(strict=strict)
@@ -455,6 +636,17 @@ def _coerce_sample(
     if isinstance(sample_like, dict):
         return DraftFeatureSample.from_dict(sample_like, strict=strict)
     raise TypeError(f"Unsupported draft feature sample type: {type(sample_like)!r}")
+
+
+def _coerce_replay_sample(
+    sample_like: DraftStoredSample | dict[str, Any], *, strict: bool
+) -> DraftReplaySample:
+    if isinstance(sample_like, DraftReplaySample):
+        sample_like.validate(strict=strict)
+        return sample_like
+    if isinstance(sample_like, dict):
+        return DraftReplaySample.from_dict(sample_like, strict=strict)
+    raise TypeError(f"Unsupported draft replay sample type: {type(sample_like)!r}")
 
 
 def _cpu_tensor_tree(value: Any) -> Any:

@@ -22,6 +22,8 @@ feature_store = importlib.import_module("verl_speco.trainer.feature_store")
 DraftFeatureDataLoader = draft_dataset.DraftFeatureDataLoader
 DraftFeatureDataLoaderConfig = draft_dataset.DraftFeatureDataLoaderConfig
 DraftFeatureSample = feature_store.DraftFeatureSample
+DraftReplaySample = feature_store.DraftReplaySample
+TokenReplayFeatureStore = feature_store.TokenReplayFeatureStore
 TorchShardFeatureStore = feature_store.TorchShardFeatureStore
 
 
@@ -59,6 +61,46 @@ def test_torch_shard_feature_store_roundtrip(tmp_path):
     assert torch.equal(loaded.input_ids, torch.tensor([1, 2, 3, 4]))
     assert loaded.metadata["hidden_states_layout"] == "eagle3_aux_plus_last"
     assert reader.get_metadata()["num_samples"] == 2
+
+
+def test_token_replay_feature_store_roundtrip(tmp_path):
+    sample = DraftReplaySample(
+        algorithm="DSPARK",
+        input_ids=torch.arange(12, dtype=torch.long),
+        loss_mask=torch.ones(12, dtype=torch.float32),
+        attention_mask=torch.ones(12, dtype=torch.bool),
+        position_ids=torch.arange(12, dtype=torch.long),
+        feature_positions=torch.arange(4, 10, dtype=torch.long),
+        draft_position_ids=torch.arange(5, 11, dtype=torch.long),
+        metadata={"target_model_path": "/target", "global_step": 3},
+    )
+    store = TokenReplayFeatureStore(tmp_path, max_samples_per_shard=1)
+    store.write_many([sample])
+    store.close()
+
+    reader = TokenReplayFeatureStore(tmp_path, read_only=True)
+    loaded = reader.read(next(reader.iter_keys()))
+
+    assert loaded.algorithm == "DSPARK"
+    assert loaded.input_ids.dtype == torch.int32
+    assert loaded.attention_mask.dtype == torch.bool
+    assert torch.equal(loaded.feature_positions, torch.arange(4, 10, dtype=torch.int32))
+    assert "hidden_states" not in loaded.to_dict()
+    assert reader.get_metadata()["format"] == "token_replay"
+
+
+def test_token_replay_rejects_non_contiguous_feature_positions():
+    sample = DraftReplaySample(
+        input_ids=torch.arange(8),
+        loss_mask=torch.ones(8),
+        attention_mask=torch.ones(8, dtype=torch.bool),
+        position_ids=torch.arange(8),
+        feature_positions=torch.tensor([2, 4]),
+        draft_position_ids=torch.tensor([3, 5]),
+    )
+
+    with pytest.raises(ValueError, match="contiguous"):
+        sample.validate(strict=True)
 
 
 def test_feature_sample_normalizes_singleton_position_ids():

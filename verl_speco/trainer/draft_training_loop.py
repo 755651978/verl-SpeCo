@@ -52,9 +52,22 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     drafter_cfg = draft_config.rollout.drafter
     training_cfg = drafter_cfg.training
     feature_store_cfg = training_cfg.feature_store
+    feature_store_type = (
+        str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
+        .strip()
+        .lower()
+    )
+    training_mode = (
+        str(training_cfg.get("mode", "offline") or "offline").strip().lower()
+    )
     if not feature_store_cfg.get("path"):
         raise ValueError(
             "actor_rollout_ref.rollout.drafter.training.feature_store.path is required"
+        )
+    if feature_store_type == "token_replay" and training_mode != "offline":
+        raise ValueError(
+            "feature_store.type=token_replay is supported only by standalone "
+            "training.mode=offline"
         )
     _disable_standalone_sequence_parallel(draft_config)
 
@@ -89,6 +102,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     last_save_result: dict[str, Any] | None = None
     last_saved_step = 0
     store = None
+    feature_replayer = None
     try:
         activated = await trainer.activate_training_model()
         if not activated:
@@ -100,6 +114,20 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         last_saved_step = optimizer_step
 
         store = build_feature_store_from_config(feature_store_cfg, read_only=True)
+        if feature_store_type == "token_replay":
+            # Keep the large target model entirely outside online training imports
+            # and lifetime. The standalone loop materializes ordinary feature
+            # samples before handing them to the shared trainer.
+            from verl_speco.trainer.target_feature_replay import (
+                TargetFeatureReplayer,
+            )
+
+            feature_replayer = TargetFeatureReplayer(
+                config,
+                rank=rank,
+                world_size=world_size,
+                device=trainer.runtime_device,
+            )
         loader = DraftFeatureDataLoader(
             store,
             DraftFeatureDataLoaderConfig(
@@ -116,8 +144,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 break
             step_started = time.perf_counter()
             attempted_batches += 1
+            materialized_samples = (
+                feature_replayer.materialize(samples)
+                if feature_replayer is not None
+                else samples
+            )
             batch = trainer.prepare_training_batch_from_samples(
-                cast(list[Any], samples),
+                cast(list[Any], materialized_samples),
                 step=optimizer_step,
             )
             has_batch = batch is not None
@@ -143,6 +176,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 attempted_batches=attempted_batches,
                 step_elapsed_sec=time.perf_counter() - step_started,
             )
+            if feature_replayer is not None:
+                step_metrics.update(feature_replayer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 last_save_result = _save_standalone_checkpoint(trainer, optimizer_step)
@@ -158,6 +193,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     finally:
         if store is not None:
             store.close()
+        if feature_replayer is not None:
+            feature_replayer.close()
         await trainer.cleanup_training(clear_data=True)
         if dist.is_initialized():
             dist.barrier()
@@ -731,13 +768,15 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("train/simulated_acc_len", "sim_acc_len"),
         ("train/lr", "lr"),
         ("perf/step_time", "step_time"),
+        ("replay/cache_hit_ratio", "cache_hit"),
+        ("replay/target_forward_time_total", "target_forward_total"),
     ):
         if key not in metrics:
             continue
         value = float(metrics[key])
         if key == "train/lr":
             fields.append(f"{label}={value:.3e}")
-        elif key == "perf/step_time":
+        elif key in {"perf/step_time", "replay/target_forward_time_total"}:
             fields.append(f"{label}={value:.3f}s")
         else:
             fields.append(f"{label}={value:.4f}")
