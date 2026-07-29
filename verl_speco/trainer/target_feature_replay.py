@@ -153,6 +153,42 @@ def _load_json_config(path: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
+    if not lock_path.exists():
+        return
+    try:
+        import fcntl
+    except ImportError:
+        deadline = time.monotonic() + float(timeout)
+        while lock_path.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for hidden-states lock: {lock_path}"
+                )
+            time.sleep(0.1)
+        return
+
+    fd = os.open(lock_path, os.O_RDONLY)
+    try:
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Timed out waiting for hidden-states lock: {lock_path}"
+                    ) from None
+                time.sleep(0.1)
+    finally:
+        os.close(fd)
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
 class BoundedReplayCache:
     """Per-rank disk cache with a hard least-recently-used size budget."""
 
@@ -294,6 +330,16 @@ class TargetFeatureReplayer:
         self.drafter_cfg = self.draft_config.rollout.drafter
         self.training_cfg = self.drafter_cfg.training
         self.replay_cfg = self.training_cfg.get("target_feature_replay", {}) or {}
+        self.backend = (
+            str(_config_value(self.replay_cfg, "backend", "torch") or "torch")
+            .strip()
+            .lower()
+        )
+        if self.backend not in {"torch", "vllm_file"}:
+            raise ValueError(
+                f"Unsupported target_feature_replay.backend={self.backend!r}; "
+                "expected 'torch' or 'vllm_file'"
+            )
         configured_model_path = _config_value(self.replay_cfg, "model_path", None)
         model_path = configured_model_path or self.draft_config.model.path
         if not model_path:
@@ -321,6 +367,29 @@ class TargetFeatureReplayer:
         self.logits_topk = int(self.training_cfg.get("logits_topk", 128) or 128)
         self.logits_chunk_rows = max(
             int(_config_value(self.replay_cfg, "logits_chunk_rows", 32) or 32), 1
+        )
+        self.vllm_endpoint = str(
+            _config_value(self.replay_cfg, "vllm_endpoint", "http://localhost:8000/v1")
+            or "http://localhost:8000/v1"
+        )
+        self.vllm_model = _config_value(self.replay_cfg, "vllm_model", None)
+        self.vllm_timeout = float(
+            _config_value(self.replay_cfg, "request_timeout", 120.0) or 120.0
+        )
+        self.vllm_max_retries = max(
+            int(_config_value(self.replay_cfg, "max_retries", 3) or 0), 0
+        )
+        self.vllm_on_generate = (
+            str(_config_value(self.replay_cfg, "on_generate", "delete") or "delete")
+            .strip()
+            .lower()
+        )
+        if self.vllm_on_generate not in {"delete", "keep"}:
+            raise ValueError(
+                "target_feature_replay.on_generate must be 'delete' or 'keep'"
+            )
+        self.vllm_require_arange_positions = bool(
+            _config_value(self.replay_cfg, "require_arange_positions", True)
         )
 
         from transformers import AutoConfig
@@ -388,10 +457,14 @@ class TargetFeatureReplayer:
         self.final_norm: nn.Module | None = None
         self.backbone: nn.Module | None = None
         self.output_embedding: nn.Module | None = None
+        self.vllm_client: Any | None = None
+        self.vllm_resolved_model: str | None = None
         self.cache_hits = 0
         self.cache_misses = 0
         self.materialized_samples = 0
         self.target_forward_seconds = 0.0
+        self.vllm_request_seconds = 0.0
+        self.vllm_requests = 0
 
     def materialize(
         self, samples: Iterable[DraftReplaySample | DraftFeatureSample]
@@ -516,6 +589,11 @@ class TargetFeatureReplayer:
         self.model = model
 
     def _materialize_one(self, sample: DraftReplaySample) -> DraftFeatureSample:
+        if self.backend == "vllm_file":
+            return self._materialize_one_vllm_file(sample)
+        return self._materialize_one_torch(sample)
+
+    def _materialize_one_torch(self, sample: DraftReplaySample) -> DraftFeatureSample:
         self._ensure_model()
         assert self.backbone is not None
         assert self.final_norm is not None
@@ -652,6 +730,204 @@ class TargetFeatureReplayer:
             metadata=metadata,
         )
 
+    def _materialize_one_vllm_file(
+        self, sample: DraftReplaySample
+    ) -> DraftFeatureSample:
+        if self.use_logits:
+            raise NotImplementedError(
+                "target_feature_replay.backend=vllm_file does not yet support "
+                "training.use_logits=true; use backend=torch for EAGLE3 logits."
+            )
+        self._validate_vllm_positions(sample)
+        feature_positions = sample.feature_positions.detach().cpu().long()
+        feature_end = int(feature_positions[-1].item()) + 1
+        prompt_ids = sample.input_ids[:feature_end].detach().cpu().long().tolist()
+        hidden_payload = self._request_vllm_hidden_states(prompt_ids)
+        try:
+            feature = self._feature_from_vllm_payload(
+                sample,
+                hidden_payload,
+                prompt_ids=prompt_ids,
+                source="token_replay_vllm_file",
+            )
+        finally:
+            path = hidden_payload.get("_path")
+            if self.vllm_on_generate == "delete" and path:
+                try:
+                    Path(os.fspath(path)).unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Failed to delete vLLM hidden-states file %s", path)
+        return feature
+
+    def _validate_vllm_positions(self, sample: DraftReplaySample) -> None:
+        if not self.vllm_require_arange_positions:
+            return
+        feature_positions = sample.feature_positions.detach().cpu().long()
+        feature_end = int(feature_positions[-1].item()) + 1
+        expected = torch.arange(feature_end, dtype=torch.long)
+        actual = sample.position_ids[:feature_end].detach().cpu().long()
+        if not torch.equal(actual, expected):
+            raise ValueError(
+                "target_feature_replay.backend=vllm_file currently requires "
+                "position_ids to be contiguous arange positions for the replay prefix"
+            )
+
+    def _ensure_vllm_client(self) -> None:
+        if self.vllm_client is not None:
+            return
+        try:
+            import openai
+        except ImportError as exc:
+            raise RuntimeError(
+                "target_feature_replay.backend=vllm_file requires the openai package"
+            ) from exc
+        self.vllm_client = openai.OpenAI(
+            base_url=self.vllm_endpoint,
+            api_key="EMPTY",
+            max_retries=0,
+        )
+        if self.vllm_model:
+            self.vllm_resolved_model = os.fspath(self.vllm_model)
+        else:
+            models = self.vllm_client.models.list()
+            self.vllm_resolved_model = models.data[0].id
+
+    def _request_vllm_hidden_states(self, prompt_ids: list[int]) -> dict[str, Any]:
+        self._ensure_vllm_client()
+        assert self.vllm_client is not None
+        assert self.vllm_resolved_model is not None
+        last_error: Exception | None = None
+        started = time.perf_counter()
+        for attempt in range(self.vllm_max_retries + 1):
+            try:
+                response = self.vllm_client.completions.create(
+                    model=self.vllm_resolved_model,
+                    prompt=prompt_ids,
+                    max_tokens=1,
+                    extra_body={"return_token_ids": True},
+                    timeout=self.vllm_timeout,
+                )
+                path = self._extract_hidden_states_path(response, prompt_ids)
+                payload = self._load_vllm_hidden_states(path)
+                payload["_path"] = path
+                self.vllm_requests += 1
+                self.vllm_request_seconds += time.perf_counter() - started
+                return payload
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt >= self.vllm_max_retries:
+                    break
+                time.sleep(float(2**attempt))
+        self.vllm_request_seconds += time.perf_counter() - started
+        raise RuntimeError(
+            f"Failed to request vLLM hidden states after "
+            f"{self.vllm_max_retries + 1} attempts: {last_error}"
+        ) from last_error
+
+    def _extract_hidden_states_path(self, response: Any, prompt_ids: list[int]) -> str:
+        choices = getattr(response, "choices", None) or []
+        if choices:
+            prompt_token_ids = getattr(choices[0], "prompt_token_ids", None)
+            if prompt_token_ids is not None and list(prompt_token_ids) != prompt_ids:
+                raise ValueError(
+                    "vLLM prompt_token_ids mismatch while extracting hidden states"
+                )
+        kv_transfer_params = getattr(response, "kv_transfer_params", None)
+        if kv_transfer_params is None:
+            raise ValueError("vLLM response missing kv_transfer_params")
+        path = kv_transfer_params.get("hidden_states_path")
+        if not path:
+            raise ValueError("vLLM response missing hidden_states_path")
+        return os.fspath(path)
+
+    def _load_vllm_hidden_states(self, path: str) -> dict[str, Any]:
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:
+            raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
+        file_path = Path(path)
+        lock_path = Path(f"{path}.lock")
+        if lock_path.exists():
+            _wait_for_lock(lock_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
+        return dict(load_file(str(file_path), device="cpu"))
+
+    def _feature_from_vllm_payload(
+        self,
+        sample: DraftReplaySample,
+        payload: dict[str, Any],
+        *,
+        prompt_ids: list[int],
+        source: str,
+    ) -> DraftFeatureSample:
+        token_ids = payload.get("token_ids")
+        hidden = payload.get("hidden_states")
+        if not torch.is_tensor(token_ids) or not torch.is_tensor(hidden):
+            raise ValueError(
+                "vLLM hidden-states payload must contain token_ids and hidden_states"
+            )
+        if token_ids.detach().cpu().long().tolist() != prompt_ids:
+            raise ValueError("vLLM hidden-states token_ids do not match replay input")
+        if hidden.dim() != 3:
+            raise ValueError(
+                "vLLM hidden_states must have shape [seq, layers, hidden], "
+                f"got {tuple(hidden.shape)}"
+            )
+        feature_positions = sample.feature_positions.detach().cpu().long()
+        expected_layers = len(self.target_layer_ids)
+        include_final = self.hidden_layout in {
+            "eagle3_aux_plus_last",
+            "dflash_aux_plus_last",
+        }
+        required_layers = expected_layers + (1 if include_final else 0)
+        if int(hidden.size(1)) < required_layers:
+            raise ValueError(
+                "vLLM hidden_states layer count is too small: "
+                f"got {int(hidden.size(1))}, need at least {required_layers}. "
+                "Start vLLM with target layer ids plus the final layer when the "
+                "training layout needs last hidden states."
+            )
+        selected = hidden.index_select(0, feature_positions).to(dtype=self.dtype)
+        aux_hidden = selected[:, :expected_layers, :].flatten(1)
+        if include_final:
+            final_hidden = selected[:, required_layers - 1, :]
+            hidden_states = torch.cat([aux_hidden, final_hidden], dim=-1)
+        else:
+            hidden_states = aux_hidden
+        selected_input_ids = sample.input_ids.index_select(0, feature_positions).long()
+        selected_loss_mask = sample.loss_mask.index_select(0, feature_positions).float()
+        metadata = dict(sample.metadata)
+        feature_start = int(feature_positions[0].item())
+        feature_end = int(feature_positions[-1].item()) + 1
+        metadata.update(
+            {
+                "source": source,
+                "target_model_path": self.model_path,
+                "target_revision": self.target_revision,
+                "target_config_fingerprint": self.target_config_fingerprint,
+                "target_layer_ids": list(self.target_layer_ids),
+                "vllm_hidden_layers": int(hidden.size(1)),
+                "hidden_states_layout": self.hidden_layout,
+                "feature_start": feature_start,
+                "feature_end": feature_end,
+                "hidden_position_start": feature_start,
+                "hidden_position_end": feature_end,
+                "hidden_positions": feature_positions,
+                "sequence_length": int(selected_input_ids.numel()),
+                "full_sequence_length": int(sample.input_ids.numel()),
+                "use_logits": self.use_logits,
+            }
+        )
+        return DraftFeatureSample(
+            algorithm=self.algorithm,
+            input_ids=selected_input_ids,
+            loss_mask=selected_loss_mask,
+            hidden_states=hidden_states.cpu().contiguous(),
+            position_ids=sample.draft_position_ids.long(),
+            metadata=metadata,
+        )
+
     def _build_sparse_target_logprobs(
         self, final_hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -684,6 +960,11 @@ class TargetFeatureReplayer:
             "replay/materialized_samples_total": float(self.materialized_samples),
             "replay/target_forward_time_total": float(self.target_forward_seconds),
         }
+        if self.backend == "vllm_file":
+            metrics["replay/vllm_requests_total"] = float(self.vllm_requests)
+            metrics["replay/vllm_request_time_total"] = float(
+                self.vllm_request_seconds
+            )
         total = self.cache_hits + self.cache_misses
         if total > 0:
             metrics["replay/cache_hit_ratio"] = self.cache_hits / float(total)
