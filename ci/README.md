@@ -1,24 +1,26 @@
 # CI layers
 
-The repository uses three workflow layers:
+The repository uses six workflow layers:
 
 - `cpu_unit_tests.yml`: required PR checks without installing this repository or using accelerator runtimes.
-- `gpu_unit_tests.yml`: scheduled/manual vLLM and SGLang example-script runs on GPU.
-- `npu_unit_tests.yml`: trusted PR, scheduled, and manual vLLM/SGLang example-script runs on NPU.
+- `gpu_vllm_unit_tests.yml`: scheduled/manual vLLM example-script runs on GPU.
+- `gpu_sglang_unit_tests.yml`: scheduled/manual SGLang example-script runs on GPU.
+- `gpu_drafter_training_smoke.yml`: scheduled/manual standalone drafter training smoke tests on GPU.
+- `npu_vllm_unit_tests.yml`: PR, push, scheduled, and manual vLLM example-script runs on NPU.
+- `npu_sglang_unit_tests.yml`: PR, push, scheduled, and manual SGLang example-script runs on NPU.
 
 The hardware workflows require self-hosted runner labels:
 
 - GPU: `self-hosted`, `linux`, `x64`, `gpu`
 - NPU: `self-hosted`, `linux-aarch64-a2-8`
 
-The NPU workflow intentionally does not run self-hosted jobs for forked pull
-requests. Pull requests from the same repository run a one-step smoke matrix:
+Pull requests, including pull requests from forks, run this smoke matrix:
 
 - vLLM + DSpark
 - SGLang + EAGLE3
 - SGLang + DFlash
 
-Scheduled and manual NPU runs use the broader matrix:
+Push, scheduled, and manual NPU runs use the broader matrix:
 
 - vLLM + EAGLE3
 - vLLM + DFlash
@@ -44,14 +46,26 @@ bash -n examples/*.sh
 python -m pytest tests/compat tests/config tests/examples tests/integration -q
 ```
 
-The hardware layers call `ci/run_example_test.sh`, which selects one of the
-repository-owned scripts in `examples/` and passes CI variables as Hydra
-overrides. Configure these variables in the `speco-gpu-ci` and `speco-npu-ci`
-GitHub environments, or pass them as manual workflow inputs where available:
+The vLLM and SGLang hardware workflows call `ci/run_example_test.sh`, which
+selects one of the repository-owned scripts in `examples/` and passes CI
+variables as Hydra overrides.
+
+The GPU drafter training workflow directly runs the standalone tests under
+`tests/special_standalone/` for EAGLE-1, EAGLE-2, Domino, and P-EAGLE. Its
+default target model is `/home/runner/models/Qwen/Qwen3-4B`, and it runs three
+optimizer steps per matrix entry. Configure these defaults with
+`SPECO_TRAINING_SMOKE_TARGET_MODEL`, `SPECO_TRAINING_SMOKE_STEPS`, and
+`SPECO_TRAINING_SMOKE_LR`.
+
+Configure CI variables in the `speco-gpu-ci` and `speco-npu-ci` GitHub
+environments, or pass them as manual workflow inputs where available:
 
 - `SPECO_MODEL_ROOT`
 - `SPECO_DATA_ROOT`
 - `SPECO_TARGET_MODEL`
+- `SPECO_TRAINING_SMOKE_TARGET_MODEL`
+- `SPECO_TRAINING_SMOKE_STEPS`
+- `SPECO_TRAINING_SMOKE_LR`
 - `SPECO_EAGLE3_DRAFT_MODEL`
 - `SPECO_DFLASH_DRAFT_MODEL`
 - `SPECO_DSPARK_DRAFT_MODEL`
@@ -95,6 +109,11 @@ The runner image is responsible for providing the matching verl, vLLM/SGLang,
 PyTorch accelerator runtime, and model files. Hardware workflows deliberately
 fail closed when required models or datasets are absent.
 
+Fork pull requests execute repository code on the NPU self-hosted runner.
+Keep the `speco-npu-ci` environment free of privileged secrets, require review
+before first-time contributors can run workflows, and use isolated or
+ephemeral runners where possible.
+
 ## Testing CI locally
 
 Run the CPU layer checks from the repository root:
@@ -127,7 +146,14 @@ SPECO_CKPT_DIR=/tmp/speco \
 bash ci/run_example_test.sh npu vllm dspark
 ```
 
-To test the hardware workflows on GitHub, open Actions, choose
-`gpu_unit_tests` or `npu_unit_tests`, and run the workflow without inputs
-after preparing the default paths above. Fill the manual inputs only when you
-want to override the defaults for one run.
+To test the hardware workflows on GitHub, open Actions and choose one of:
+
+- `gpu_drafter_training_smoke`
+- `gpu_vllm_unit_tests`
+- `gpu_sglang_unit_tests`
+- `npu_vllm_unit_tests`
+- `npu_sglang_unit_tests`
+
+Run the selected workflow without inputs after preparing the default paths
+above. Fill the manual inputs only when you want to override the defaults for
+one run.

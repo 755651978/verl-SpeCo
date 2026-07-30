@@ -10,14 +10,14 @@ training, and hot-update logic through `verl_speco`.
 - **Import-only verl overlay**: composes upstream `verl` PPO/GRPO config and
   runs through `python -m verl_speco.main` without patching the installed `verl`
   tree.
-- **Drafter Co-Training in the RL loop**: collects hidden states during    rollout or
+- **Drafter Co-Training in the RL loop**: collects hidden states during rollout or
   old-logprob computation, trains a drafter periodically, and publishes updated
   drafter weights back to the rollout engine.
-- **Multiple drafter backends**: includes EAGLE3, DFLASH, and DSpark trainer
-  backends under `verl_speco.backends`.
-- **vLLM and SGLang integration**: supports EAGLE3, DFLASH, and DSpark
-  speculative decoding on vLLM, plus EAGLE3 and DFLASH on SGLang, with
-  drafter collection and hot-update logic integrated through the rollout
+- **Multiple drafter backends**: includes EAGLE-1, EAGLE-2, EAGLE3, DFlash,
+  DSpark, Domino, and P-EAGLE trainer backends under `verl_speco.backends`.
+- **vLLM and SGLang integration**: supports EAGLE-1, EAGLE-2, EAGLE3, DFlash,
+  and DSpark speculative decoding on vLLM, plus EAGLE3 and DFlash on SGLang,
+  with drafter collection and hot-update logic integrated through the rollout
   engine.
 - **GPU and NPU examples**: provides example scripts for vLLM, SGLang, and
   vLLM-Ascend style graph settings.
@@ -33,7 +33,7 @@ training, and hot-update logic through `verl_speco`.
 
 The current results focus on EAGLE3 with the vLLM rollout engine, where
 verl-SpeCo supports both GPU and NPU deployments. The figures below show a
-Qwen3-8B EAGLE3 run on vLLM-Ascend/NPU; DFLASH support is available, and DFLASH
+Qwen3-8B EAGLE3 run on vLLM-Ascend/NPU; DFlash support is available, and DFlash
 figures will be added in a later update.
 
 On Qwen3-8B with an EAGLE3 drafter on vLLM-Ascend/NPU, a 100-step run shows
@@ -51,11 +51,32 @@ faster end-to-end training without accuracy regression.
 
 ## Draft Model Support
 
-| Draft model | Rollout engines | Training engines | Status |
+| Draft model | Rollout engines | Training engine | Status |
 | :---: | :---: | :---: | :---: |
-| EAGLE3 | vLLM, SGLang | FSDP | ✅ |
-| DFLASH | vLLM, SGLang | FSDP | ✅ |
-| DSpark | vLLM | FSDP | ✅ |
+| EAGLE-1 | vLLM | FSDP | Available |
+| EAGLE-2 | vLLM | FSDP | Available |
+| EAGLE3 | vLLM, SGLang | FSDP | Available |
+| DFlash | vLLM, SGLang | FSDP | Available |
+| DSpark | vLLM | FSDP | Available |
+| Domino | vLLM, SGLang via DFlash | FSDP | Available |
+| P-EAGLE | Not wired in this overlay | FSDP | Training only |
+
+EAGLE-1 and EAGLE-2 share vLLM's native EAGLE draft method; EAGLE-2 adds the
+dynamic-tree decoding policy over the same draft head.
+
+Standalone GPU training smoke tests for EAGLE-1/EAGLE-2, Domino, and P-EAGLE
+are kept under `tests/special_standalone/`. The scheduled/manual
+`gpu_drafter_training_smoke` workflow runs them with a configurable target
+model, optimizer step count, and learning rate.
+
+Domino is trained with `speculative_algorithm=DOMINO`, but it is served as a
+DFlash projector sub-mode. For rollout, use `speculative_algorithm=DFLASH`
+with a Domino checkpoint on an engine version that supports the Domino
+projector.
+
+P-EAGLE training is available, but its vLLM parallel-drafting rollout runtime
+is not wired into this overlay yet. Keep rollout drafter serving disabled and
+train or serve the checkpoint separately.
 
 ## Runtime Compatibility
 
@@ -65,11 +86,14 @@ drafter backend you use.
 
 | Draft model | vLLM | vLLM-Ascend | SGLang |
 | :---: | :---: | :---: | :---: |
+| EAGLE-1 / EAGLE-2 | Engine version with native EAGLE support | Runtime-specific | - |
 | EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
-| DFLASH | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
+| DFlash | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
 | DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`dc68bd8`](https://github.com/vllm-project/vllm/tree/dc68bd8c4199b00631fe71eb37313f406cc66ac1) | NPU: [`8214d19`](https://github.com/vllm-project/vllm-ascend/tree/8214d19f8b505484b839469444887b404db2e3a8) | - |
+| Domino | DFlash-compatible runtime with Domino projector support | Runtime-specific | Runtime-specific |
+| P-EAGLE | Not wired | Not wired | Not wired |
 
-For vLLM DFLASH, the drafter checkpoint must use the DFlash draft model config
+For vLLM DFlash, the drafter checkpoint must use the DFlash draft model config
 expected by the runtime.
 
 For vLLM DSpark on GPU, use vLLM main. For vLLM DSpark on NPU, follow the
@@ -93,7 +117,7 @@ verl_speco/
   trainer/speco_ray_trainer.py    # RayPPOTrainer adapter
   workers/speco_worker.py         # drafter trainer worker
   integration/                    # vLLM, SGLang, old-logprob, publish adapters
-  backends/                       # EAGLE3/DFLASH/DSpark trainer backends
+  backends/                       # drafter-specific trainer backends
   models/                         # drafter model definitions
 
 examples/                         # end-to-end command examples
@@ -162,7 +186,8 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f Dockerfile.vllm -t verl-speco:vllm023-verl080 .
+docker build -f docker/verl0.8.0/Dockerfile.vllm \
+  -t verl-speco:vllm023-verl080 .
 ```
 
 For GPU SGLang-based examples, use the same layout with the SGLang base image:
@@ -190,7 +215,8 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f Dockerfile.sglang -t verl-speco:sgl0512-verl080 .
+docker build -f docker/verl0.8.0/Dockerfile.sglang \
+  -t verl-speco:sgl0512-verl080 .
 ```
 
 Install the rollout engine and accelerator runtime that match the script you
@@ -277,7 +303,7 @@ Important groups:
 - `drafter.enable_drafter_training`: enables online drafter trainer workers.
 - `drafter.rollout.*`: controls speculative steps, top-k, and verify tokens.
 - `drafter.training.*`: controls hidden-state collection, training interval,
-  publish interval, update mode, and DFLASH/DSpark-specific training options.
+  publish interval, update mode, and DFlash/DSpark-specific training options.
 - `drafter.vllm.*`: contains vLLM-specific drafter overrides.
 
 Shared SPECO and drafter defaults are in

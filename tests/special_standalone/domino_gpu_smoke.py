@@ -14,7 +14,8 @@ The draft is cold-started, so the useful signals are:
   * ``lambda_base`` decaying from 1 -> 0 (curriculum handing over to the head).
 
 Run:
-    python ci/domino_gpu_smoke.py --target /path/to/target-model --steps 120
+    python tests/special_standalone/domino_gpu_smoke.py \
+        --target /path/to/target-model --steps 120
 """
 
 from __future__ import annotations

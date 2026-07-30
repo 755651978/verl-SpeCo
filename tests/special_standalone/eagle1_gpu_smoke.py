@@ -12,7 +12,8 @@ The draft is cold-started (no pretrained checkpoint), so the useful signals are:
   * draft-vs-target top-1 agreement trending up.
 
 Run:
-    python ci/eagle1_gpu_smoke.py --target /path/to/target-model \
+    python tests/special_standalone/eagle1_gpu_smoke.py \
+        --target /path/to/target-model \
         --algorithm EAGLE1 --steps 100
 """
 

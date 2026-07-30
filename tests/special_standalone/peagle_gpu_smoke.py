@@ -12,7 +12,8 @@ The draft is cold-started, so the useful signal is convergence: the KL loss fall
 and draft-vs-target top-1 agreement rises across depths.
 
 Run:
-    python ci/peagle_gpu_smoke.py --target /path/to/target-model --steps 150
+    python tests/special_standalone/peagle_gpu_smoke.py \
+        --target /path/to/target-model --steps 150
 """
 
 from __future__ import annotations
