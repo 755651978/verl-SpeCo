@@ -14,6 +14,10 @@ The hardware workflows require self-hosted runner labels:
 - GPU: `self-hosted`, `linux`, `x64`, `gpu`
 - NPU: `self-hosted`, `linux-aarch64-a2-8`
 
+The NPU vLLM workflow targets an 8-card NPU runner by default and sets
+`SPECO_ACCELERATOR_COUNT=8` unless the GitHub environment variable or manual
+workflow input overrides it.
+
 Pull requests, including pull requests from forks, run this smoke matrix:
 
 - vLLM + DSpark
@@ -29,13 +33,26 @@ Push, scheduled, and manual NPU runs use the broader matrix:
 - SGLang + DFlash
 
 Like verl's CI, the hardware workflows assume the runner image has the runtime
-stack and a small default model/data cache. By default they look under:
+stack and a small default model cache. Most workflows default to:
 
 - `/home/runner/models`
 - `/home/runner/models/hf_data`
 
 The default paths are intentionally tiny-runner friendly and can be overridden
 with GitHub environment variables or manual workflow inputs.
+
+The NPU vLLM workflow follows verl's Ascend CI layout. Its image provides the
+accelerator runtime plus pre-cached model and dataset assets under
+`/root/.cache/models`; the workflow links that cache to `~/models`. It checks
+out the pull-request revision and runs `pip install --no-deps -e .`, then verifies that
+`verl_speco` imports from the current GitHub workspace rather than the image's
+preinstalled copy.
+
+The NPU vLLM workflow does not download models or datasets. Before launching the
+example script it checks that the selected target model directory, selected
+draft model directory, training parquet, and validation parquet exist. Override
+the defaults with GitHub environment variables or manual inputs when the image
+uses different paths.
 
 The CPU layer uses `PYTHONPATH=$PWD` and checks out the upstream verl commit
 from `REQUIRED_VERL.txt`. It runs:
