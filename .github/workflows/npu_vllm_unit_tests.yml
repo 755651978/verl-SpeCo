@@ -101,7 +101,7 @@ env:
 jobs:
   example:
     name: NPU vLLM ${{ matrix.drafter }} example
-    runs-on: [self-hosted, linux-aarch64-a2-8]
+    runs-on: [linux-aarch64-a2-8]
     container:
       image: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_speco:v1
       options: --shm-size 16g
