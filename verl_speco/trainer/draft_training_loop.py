@@ -41,6 +41,10 @@ from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_
 logger = logging.getLogger(__name__)
 
 
+def _should_log_batch_progress(attempted_batches: int) -> bool:
+    return attempted_batches <= 3 or attempted_batches % 100 == 0
+
+
 def run_standalone_draft_training(config) -> dict[str, Any]:
     """Run independent draft training from a feature store."""
     return asyncio.run(_run_standalone_draft_training_async(config))
@@ -48,6 +52,12 @@ def run_standalone_draft_training(config) -> dict[str, Any]:
 
 async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     rank, local_rank, world_size = _init_distributed()
+    logger.info(
+        "[standalone rank=%s] distributed runtime initialized local_rank=%s world_size=%s",
+        rank,
+        local_rank,
+        world_size,
+    )
     draft_config = config.actor_rollout_ref
     drafter_cfg = draft_config.rollout.drafter
     training_cfg = drafter_cfg.training
@@ -103,17 +113,42 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     last_saved_step = 0
     store = None
     feature_replayer = None
+    current_stage = "activate_training_model"
     try:
+        stage_started = time.perf_counter()
+        logger.info(
+            "[standalone rank=%s] activating drafter model algorithm=%s",
+            rank,
+            drafter_cfg.speculative_algorithm,
+        )
         activated = await trainer.activate_training_model()
         if not activated:
             raise RuntimeError(
                 f"Failed to activate standalone drafter trainer on rank={rank}"
             )
+        logger.info(
+            "[standalone rank=%s] drafter model activated elapsed=%.3fs",
+            rank,
+            time.perf_counter() - stage_started,
+        )
         initial_optimizer_step = int(trainer.optimizer_steps_total)
         optimizer_step = initial_optimizer_step
         last_saved_step = optimizer_step
 
+        current_stage = "open_feature_store"
+        stage_started = time.perf_counter()
+        logger.info(
+            "[standalone rank=%s] opening feature store type=%s path=%s",
+            rank,
+            feature_store_type,
+            feature_store_cfg.get("path"),
+        )
         store = build_feature_store_from_config(feature_store_cfg, read_only=True)
+        logger.info(
+            "[standalone rank=%s] feature store opened elapsed=%.3fs",
+            rank,
+            time.perf_counter() - stage_started,
+        )
         if feature_store_type == "token_replay":
             # Keep the large target model entirely outside online training imports
             # and lifetime. The standalone loop materializes ordinary feature
@@ -122,12 +157,26 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 TargetFeatureReplayer,
             )
 
+            current_stage = "initialize_target_feature_replayer"
+            stage_started = time.perf_counter()
+            logger.info(
+                "[standalone rank=%s] initializing target feature replayer",
+                rank,
+            )
             feature_replayer = TargetFeatureReplayer(
                 config,
                 rank=rank,
                 world_size=world_size,
                 device=trainer.runtime_device,
             )
+            logger.info(
+                "[standalone rank=%s] target feature replayer initialized "
+                "backend=%s elapsed=%.3fs",
+                rank,
+                feature_replayer.backend,
+                time.perf_counter() - stage_started,
+            )
+        current_stage = "create_dataloader"
         loader = DraftFeatureDataLoader(
             store,
             DraftFeatureDataLoaderConfig(
@@ -139,21 +188,59 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 seed=int(training_cfg.get("seed", 0) or 0),
             ),
         )
+        logger.info(
+            "[standalone rank=%s] dataloader ready batch_size_per_gpu=%s "
+            "shuffle=%s repeat=%s",
+            rank,
+            int(training_cfg.get("batch_size_per_gpu", 4)),
+            bool(feature_store_cfg.get("shuffle", True)),
+            bool(feature_store_cfg.get("repeat", True)),
+        )
         for samples in loader:
             if max_steps > 0 and successful_steps >= max_steps:
                 break
             step_started = time.perf_counter()
             attempted_batches += 1
-            materialized_samples = (
-                feature_replayer.materialize(samples)
-                if feature_replayer is not None
-                else samples
-            )
+            log_batch_progress = _should_log_batch_progress(attempted_batches)
+            if log_batch_progress:
+                logger.info(
+                    "[standalone rank=%s] batch=%s loaded samples=%s "
+                    "successful_steps=%s",
+                    rank,
+                    attempted_batches,
+                    len(samples),
+                    successful_steps,
+                )
+            current_stage = "materialize_target_features"
+            if feature_replayer is not None:
+                materialize_started = time.perf_counter()
+                if log_batch_progress:
+                    logger.info(
+                        "[standalone rank=%s] batch=%s materializing target features "
+                        "backend=%s",
+                        rank,
+                        attempted_batches,
+                        feature_replayer.backend,
+                    )
+                materialized_samples = feature_replayer.materialize(samples)
+                if log_batch_progress:
+                    logger.info(
+                        "[standalone rank=%s] batch=%s target features materialized "
+                        "samples=%s elapsed=%.3fs",
+                        rank,
+                        attempted_batches,
+                        len(materialized_samples),
+                        time.perf_counter() - materialize_started,
+                    )
+            else:
+                materialized_samples = samples
+            current_stage = "prepare_training_batch"
             batch = trainer.prepare_training_batch_from_samples(
                 cast(list[Any], materialized_samples),
                 step=optimizer_step,
             )
             has_batch = batch is not None
+            current_stage = "synchronize_batch_readiness"
             if not _all_ranks_true(has_batch, trainer.runtime_device):
                 if rank == 0:
                     logger.warning(
@@ -163,7 +250,17 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             if batch is None:
                 continue
             trainer.reset_training_metrics()
+            current_stage = "training_step"
+            if log_batch_progress:
+                logger.info(
+                    "[standalone rank=%s] batch=%s starting drafter training step "
+                    "optimizer_step=%s",
+                    rank,
+                    attempted_batches,
+                    optimizer_step,
+                )
             ok = await trainer.training_step_from_batch(batch, optimizer_step)
+            current_stage = "synchronize_training_step"
             if not _all_ranks_true(ok, trainer.runtime_device):
                 continue
             successful_steps += 1
@@ -180,25 +277,51 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 step_metrics.update(feature_replayer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
             if save_interval > 0 and optimizer_step % save_interval == 0:
+                current_stage = "save_checkpoint"
                 last_save_result = _save_standalone_checkpoint(trainer, optimizer_step)
                 if _sync_any_rank_saved_checkpoint(last_save_result.get("saved")):
                     last_saved_step = optimizer_step
                 _barrier()
+            current_stage = "load_next_batch"
         final_save = bool(training_cfg.get("save_final_checkpoint", True))
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
+            current_stage = "save_final_checkpoint"
             last_save_result = _save_standalone_checkpoint(
                 trainer, optimizer_step, wait=True
             )
             _barrier()
+    except Exception:
+        logger.exception(
+            "[standalone rank=%s] training failed stage=%s attempted_batches=%s "
+            "successful_steps=%s optimizer_step=%s",
+            rank,
+            current_stage,
+            attempted_batches,
+            successful_steps,
+            optimizer_step,
+        )
+        raise
     finally:
+        logger.info(
+            "[standalone rank=%s] cleanup starting stage=%s attempted_batches=%s "
+            "successful_steps=%s",
+            rank,
+            current_stage,
+            attempted_batches,
+            successful_steps,
+        )
         if store is not None:
             store.close()
         if feature_replayer is not None:
             feature_replayer.close()
+        logger.info("[standalone rank=%s] cleaning trainer resources", rank)
         await trainer.cleanup_training(clear_data=True)
         if dist.is_initialized():
+            logger.info("[standalone rank=%s] entering final process-group barrier", rank)
             dist.barrier()
+            logger.info("[standalone rank=%s] final process-group barrier complete", rank)
             dist.destroy_process_group()
+        logger.info("[standalone rank=%s] cleanup complete", rank)
 
     return {
         "rank": rank,

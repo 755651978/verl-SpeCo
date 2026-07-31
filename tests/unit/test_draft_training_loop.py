@@ -25,6 +25,7 @@ from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
+    _should_log_batch_progress,
     _torch_load_cpu,
 )
 
@@ -41,6 +42,22 @@ class _FakeTrainer:
         self.step = step
         self._pending_full_checkpoint_future = self.future
         return self.future
+
+
+@pytest.mark.parametrize(
+    ("attempted_batches", "expected"),
+    [
+        (1, True),
+        (2, True),
+        (3, True),
+        (4, False),
+        (99, False),
+        (100, True),
+        (101, False),
+    ],
+)
+def test_should_log_standalone_batch_progress(attempted_batches, expected):
+    assert _should_log_batch_progress(attempted_batches) is expected
 
 
 def test_standalone_checkpoint_schedules_without_waiting():
