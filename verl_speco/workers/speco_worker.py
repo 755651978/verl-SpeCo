@@ -53,6 +53,32 @@ def _resolve_ray_object_ref(value):
     return value
 
 
+def _densify_tq_tensor(tensor):
+    """Unwrap a tensor returned by TransferQueue into a plain dense tensor.
+
+    TQ stores each ``put_sample`` payload inside a TensorDict and
+    ``kv_batch_get`` returns it with an added batch dimension, as a NestedTensor
+    (jagged on dim 0). The old-logprob chunk resolver slices
+    ``tensor[start:start + length]`` on dim 0, which NestedTensor does not
+    support (``slice(): not supported for NestedTensor on dim=0``). The producer
+    put a dense ``[rows, hidden]`` tensor, so flatten the NestedTensor back to
+    that 2-D form. Mirrors ``_speco_tensor_rows`` which uses ``tensor.unbind()``
+    for the same nested-tensor case.
+    """
+    if not torch.is_tensor(tensor):
+        return tensor
+    if tensor.is_nested:
+        parts = [p for p in tensor.unbind() if p.numel() > 0]
+        if not parts:
+            return None
+        tensor = torch.cat(parts, dim=0)
+    if tensor.dim() == 3:
+        tensor = tensor.squeeze(0)
+    elif tensor.dim() == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor.contiguous()
+
+
 def _resolve_tq_or_ray_ref(ref):
     # P1: old-logprob chunk refs may be TransferQueue keys ("speco:" prefix)
     # instead of Ray ObjectRefs. Fetch the stored chunk via TQ and fall back to
@@ -61,7 +87,7 @@ def _resolve_tq_or_ray_ref(ref):
     if isinstance(ref, str) and ref.startswith("speco:"):
         from verl_speco.integration.transferqueue_bridge import get_sample
 
-        return get_sample(ref).get("hidden")
+        return _densify_tq_tensor(get_sample(ref).get("hidden"))
     return _resolve_ray_object_ref(ref)
 
 
