@@ -1,28 +1,32 @@
 """TransferQueue bridge for SPECO drafter feature transport.
 
 This module lets SPECO route large per-sample drafter-training tensors (hidden
-states, and later target logprobs) through TransferQueue (TQ) instead of
-funneling them through the ``SpecoRayPPOTrainer`` driver process and the Ray
-object store. It is the SpeCo-side analog of verl's ``transferqueue_utils.py``,
-but used as a standalone transport library -- it does **not** depend on verl's
+states, target logprobs) through TransferQueue (TQ) instead of funneling them
+through the ``SpecoRayPPOTrainer`` driver process and the Ray object store. It
+is the SpeCo-side analog of verl's ``transferqueue_utils.py``, but used as a
+standalone transport library -- it does **not** depend on verl's
 ``main_ppo_sync`` TQ integration and does **not** modify upstream verl.
 
-Design (P0):
-- Only the dominant tensor (``hidden_states``) is offloaded to TQ. The rest of
-  the ``drafter_sample`` dict (input_ids, prompts, responses, positions,
-  metadata scalars) keeps riding the existing DataProto side-channel + Ray
-  dispatch. The TQ key rides with the sample dict, so the driver is unchanged.
+Design:
+- P0: offload SGLang-collected ``hidden_states`` (a1 path).
+- P1: offload old-logprob-collected ``hidden_states`` (a2 path) -- replaces the
+  ``ray.put`` chunk + driver relay.
+- P2: also offload ``target_logprobs`` / ``hidden_raw_target_logprobs``.
 - Default ``enable: false`` -> behavior is bit-identical to the current Ray
   path. TQ is only touched when explicitly enabled and the ``transfer_queue``
   package is importable.
-- Producer = SGLang rollout server (``sglang_runtime.py``); consumer = drafter
-  worker (``speco_worker.py``). Both call ``configure_transfer_queue`` from
-  their respective drafter training config, then ``put_sample`` / ``get_sample``.
+
+A sample remains in TQ until task cleanup: a SPECO drafter replica contains
+multiple TP/SP ranks and each rank reads the same sample (the owner-route
+dispatch duplicates a DP bucket to all SP ranks of one replica; only the SP
+leader is ``is_collect``). Deleting a sample after the first read would race the
+remaining ranks. Garbage collection is therefore deferred to task teardown; a
+finer-grained leader-clears-after-barrier is future work.
 
 Note: the TQ call sites follow the documented KV API (``kv_put`` /
-``kv_batch_get`` / ``kv_clear``) of TransferQueue 0.1.7. When TQ is enabled,
-these are exercised against the installed package; verify the exact signatures
-against your TQ version on first run (the bridge fails loud, never silently).
+``kv_batch_get`` / ``kv_close``) of TransferQueue 0.1.7. The exact signatures
+(keyword names, return shapes) must be verified against the installed TQ
+version on first run; the bridge fails loud, never silently.
 """
 
 from __future__ import annotations
@@ -78,6 +82,7 @@ _state = {
     "configured": False,     # configure_transfer_queue has run
     "initialized": False,    # tq.init() has run in this process
     "config": None,          # the transfer_queue sub-config (plain dict)
+    "owner": False,          # this process created the task-level TQ system
 }
 
 
@@ -142,10 +147,9 @@ def init_transfer_queue(config: Any) -> bool:
     """Cluster-wide TQ bootstrap, called once from the SpecoTaskRunner.
 
     Mirrors verl ``main_ppo_sync`` calling ``tq.init(config.transfer_queue)``
-    in the TaskRunner before workers spawn. Ray actors (SGLang server, drafter
-    worker) inherit this process's environment, so their lazy ``tq.init()``
-    (no-arg) connects to the already-started storage. Returns whether TQ is
-    usable; no-op (returns False) when disabled or not installed.
+    in the TaskRunner before workers spawn. Other Ray processes lazily call
+    ``tq.init()`` and connect to the named TransferQueue controller. Returns
+    whether TQ is usable; no-op (returns False) when disabled or not installed.
     """
 
     tq_cfg = _extract_tq_config(_drafter_training_cfg(config))
@@ -156,6 +160,7 @@ def init_transfer_queue(config: Any) -> bool:
         _state["config"] = _to_plain_dict(tq_cfg)
         _state["enabled"] = True
         _state["initialized"] = True
+        _state["owner"] = True
     logger.info("[SpeCo TQ] TransferQueue bootstrapped in task runner (partition=%s)", _SPECO_TQ_PARTITION)
     return True
 
@@ -170,9 +175,9 @@ def _drafter_training_cfg(config: Any) -> Any:
 def _ensure_initialized() -> None:
     """Lazily ``tq.init()`` once per worker process (mirrors verl TQ_INITIALIZED).
 
-    No-arg init relies on env inheritance from the task-runner bootstrap. If a
-    future TQ version does not propagate config via env, switch this to
-    ``tq.init(_state["config"])``.
+    A no-argument initialization discovers the named TransferQueue controller
+    on the connected Ray cluster. It deliberately does not create a separate
+    per-worker configuration.
     """
 
     if _state["initialized"]:
@@ -185,7 +190,7 @@ def _ensure_initialized() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Key / put / get / clear
+# Key / put / get / close
 # ---------------------------------------------------------------------------
 
 def make_sample_key(global_step: Any, replica_rank: Any, request_id: Any) -> str:
@@ -196,12 +201,6 @@ def make_sample_key(global_step: Any, replica_rank: Any, request_id: Any) -> str
     """
 
     return f"speco:{global_step}:{replica_rank}:{request_id}"
-
-
-def _to_tensordict(tensor_dict: dict) -> Any:
-    from tensordict import TensorDict
-
-    return TensorDict(tensor_dict, batch_size=[])
 
 
 def put_sample(
@@ -224,32 +223,58 @@ def put_sample(
     if not payload:
         return
     _ensure_initialized()
-    value = _to_tensordict(payload)
-    # KV API (TransferQueue docs): kv_put(key, value, partition_id, tag).
-    tq.kv_put(key, value, partition_id=_SPECO_TQ_PARTITION, tag=tag or {})
+    # Pass a plain single-sample dict of columns. TQ's kv_put adds its required
+    # batch dimension internally; constructing a scalar TensorDict here would be
+    # incorrect. (Exact kwarg names verified against TQ 0.1.7 on first run.)
+    tq.kv_put(
+        key=key,
+        partition_id=_SPECO_TQ_PARTITION,
+        fields=payload,
+        tag=tag or {},
+    )
 
 
 def get_sample(key: str) -> dict:
-    """Retrieve the tensor dict stored under ``key`` and free it.
+    """Retrieve one tensor dict without deleting it.
 
-    Returns a plain ``{field: tensor}`` dict. Clears the key after read since
-    each sample is consumed by exactly one drafter owner replica.
+    A drafter replica may execute this method on multiple TP/SP ranks; each
+    rank reads the same key. TQ storage is released once at task shutdown by
+    the process that initialized it, after every consumer has finished.
     """
 
     if not is_transfer_queue_enabled():
         raise RuntimeError("get_sample called while TransferQueue is not enabled.")
     _ensure_initialized()
-    # KV API: kv_batch_get(keys, partition_id) -> mapping key -> TensorDict
-    # (return shape is version-dependent; handle both dict and list forms).
-    result = tq.kv_batch_get([key], partition_id=_SPECO_TQ_PARTITION)
+    # TQ returns the stored sample (TensorDict-like). Return shape is version
+    # dependent, so handle both a direct value and a {key: value} mapping.
+    result = tq.kv_batch_get(keys=[key], partition_id=_SPECO_TQ_PARTITION)
     value = _extract_value(result, key)
-    try:
-        tq.kv_clear([key], partition_id=_SPECO_TQ_PARTITION)
-    except Exception:  # noqa: BLE001
-        logger.debug("[SpeCo TQ] kv_clear failed for key=%s (ignored)", key)
     if value is None:
         return {}
     return _tensordict_to_dict(value)
+
+
+def close_transfer_queue() -> None:
+    """Close task-level TQ resources if this process initialized them.
+
+    Only the TaskRunner owns controller/storage teardown. Worker-side lazy
+    clients must not call this because they may still be serving other ranks.
+    """
+
+    with _state_lock:
+        if not _state["owner"]:
+            return
+        _state["owner"] = False
+        _state["initialized"] = False
+    try:
+        tq.close()
+    except AttributeError:
+        # tq.close() is not part of the public TQ API on some versions; nothing
+        # to tear down explicitly. The named controller/storage actors are
+        # reaped when the Ray job exits.
+        logger.debug("[SpeCo TQ] tq.close() unavailable; skipping explicit teardown")
+    except Exception:  # noqa: BLE001
+        logger.debug("[SpeCo TQ] tq.close() raised; ignoring shutdown error")
 
 
 def _extract_value(result: Any, key: str) -> Any:
@@ -271,6 +296,7 @@ def _tensordict_to_dict(value: Any) -> dict:
 __all__ = [
     "KVBatchMeta",
     "configure_transfer_queue",
+    "close_transfer_queue",
     "init_transfer_queue",
     "is_transfer_queue_enabled",
     "make_sample_key",
