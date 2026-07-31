@@ -70,14 +70,15 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     training_mode = (
         str(training_cfg.get("mode", "offline") or "offline").strip().lower()
     )
+    replay_feature_store_types = {"token_replay", "jsonl_token_replay", "jsonl"}
     if not feature_store_cfg.get("path"):
         raise ValueError(
             "actor_rollout_ref.rollout.drafter.training.feature_store.path is required"
         )
-    if feature_store_type == "token_replay" and training_mode != "offline":
+    if feature_store_type in replay_feature_store_types and training_mode != "offline":
         raise ValueError(
-            "feature_store.type=token_replay is supported only by standalone "
-            "training.mode=offline"
+            f"feature_store.type={feature_store_type} is supported only by "
+            "standalone training.mode=offline"
         )
     _disable_standalone_sequence_parallel(draft_config)
 
@@ -149,7 +150,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             rank,
             time.perf_counter() - stage_started,
         )
-        if feature_store_type == "token_replay":
+        if feature_store_type in replay_feature_store_types:
             # Keep the large target model entirely outside online training imports
             # and lifetime. The standalone loop materializes ordinary feature
             # samples before handing them to the shared trainer.
