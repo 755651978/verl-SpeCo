@@ -32,8 +32,7 @@ jobs:
       - name: Install the current repository
         run: |
           pip install pre-commit hydra-core
-          # TODO: uncomment after adding pyproject.toml or setup.py
-          # pip install --no-deps -e .
+          pip install --no-deps -e .
       - name: Set ruff --output-format=github
         run: |
           sed -i 's/--output-format=full/--output-format=github/' .pre-commit-config.yaml
