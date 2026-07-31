@@ -76,18 +76,10 @@ def test_ci_layers_match_required_shape() -> None:
 
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
-    npu_vllm_triggers = _workflow("npu_vllm_unit_tests.yml")["on"]
-    assert set(npu_vllm_triggers) == {
-        "pull_request",
-        "push",
-        "workflow_dispatch",
-    }
-    assert "paths" in npu_vllm_triggers["pull_request"]
-    assert "paths" in npu_vllm_triggers["push"]
 
-    manual_hardware_workflows = (
-        rollout_workflows - {"npu_vllm_unit_tests.yml"}
-    ) | {"gpu_drafter_training_smoke.yml"}
+    manual_hardware_workflows = rollout_workflows | {
+        "gpu_drafter_training_smoke.yml",
+    }
     for workflow_name in manual_hardware_workflows:
         triggers = _workflow(workflow_name)["on"]
         assert set(triggers) == {"workflow_dispatch"}
@@ -163,10 +155,10 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             assert drafter in source
         for job in workflow["jobs"].values():
             labels = set(job["runs-on"])
-            assert "self-hosted" in labels
             if accelerator == "npu":
-                assert labels == {"self-hosted", "linux-aarch64-a2-8"}
+                assert labels == {"linux-aarch64-a2-8"}
             else:
+                assert "self-hosted" in labels
                 assert "gpu" in labels
 
         if accelerator == "npu":
