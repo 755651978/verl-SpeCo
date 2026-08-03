@@ -90,8 +90,8 @@ env:
   SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--AngelSlim--Qwen3-8B_eagle3/snapshots/9629dfce7a4a10564dd48d3e5485c3976095653c' }}
   SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--z-lab--Qwen3-8B-DFlash-b16/snapshots/9b41424b7109f9c5413454f481b09a82b85333f4' }}
   SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/huggingface/hub/models--deepseek-ai--dspark_qwen3_8b_block7/snapshots/03326e5043815da1f81b109078b2889737c26017' }}
-  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || 'BytedTsinghua-SIA/DAPO-Math-17k' }}
-  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || 'BytedTsinghua-SIA/AIME-2024' }}
+  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--DAPO-Math-17k/snapshots/65877096c24ffa7abc4e4fa5edb95cf3413a5674/data/dapo-math-17k.parquet' }}
+  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/root/.cache/huggingface/hub/datasets--BytedTsinghua-SIA--AIME-2024/snapshots/aa49075e24ad594b79fdf0bdcefa735c2181be67/data/aime-2024.parquet' }}
   SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}
   SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
   SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
