@@ -86,12 +86,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '~/.cache/huggingface/Qwen3-8B' }}
-  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '~/.cache/huggingface/angelslim-qwen3-8b-eagle3' }}
-  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '~/.cache/huggingface/Qwen3-8B-Dflash-b16' }}
-  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '~/.cache/huggingface/dspark_qwen3_8b_block7' }}
-  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '~/.cache/huggingface/dapo-math-17k.parquet' }}
-  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '~/.cache/huggingface/aime-2024.parquet' }}
+  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '~/.cache/huggingface/hub/Qwen3-8B' }}
+  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '~/.cache/huggingface/hub/angelslim-qwen3-8b-eagle3' }}
+  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '~/.cache/huggingface/hub/Qwen3-8B-Dflash-b16' }}
+  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '~/.cache/huggingface/hub/dspark_qwen3_8b_block7' }}
+  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '~/.cache/huggingface/hub/dapo-math-17k.parquet' }}
+  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '~/.cache/huggingface/hub/aime-2024.parquet' }}
   SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}
   SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
   SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
