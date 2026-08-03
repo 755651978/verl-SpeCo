@@ -91,10 +91,16 @@ def _resolve_tq_or_ray_ref(ref):
     return _resolve_ray_object_ref(ref)
 
 
-def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
+def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None, cache=None):
     if not chunks:
         return None
-    resolved_cache = {}
+    # Cross-sample cache: callers pass a per-step cache so multiple samples
+    # sharing the same owner chunk (same TQ key / ObjectRef) are fetched only
+    # once. Without this, ~16 samples in one owner each trigger a full TQ
+    # kv_batch_get (or ray.get) on the same ~400MB chunk. ray.get dedups at
+    # the object store; TQ get_sample does NOT, so the cache is essential.
+    if cache is None:
+        cache = {}
     pieces = []
     full_rows = int(expected_rows or 0)
     hidden_size = None
@@ -106,9 +112,9 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         if ref is None:
             continue
         cache_key = ref if isinstance(ref, str) else id(ref)
-        if cache_key not in resolved_cache:
-            resolved_cache[cache_key] = _resolve_tq_or_ray_ref(ref)
-        tensor = resolved_cache[cache_key]
+        if cache_key not in cache:
+            cache[cache_key] = _resolve_tq_or_ray_ref(ref)
+        tensor = cache[cache_key]
         if not torch.is_tensor(tensor):
             continue
         start = int(chunk.get("chunk_start", 0) or 0)
@@ -715,6 +721,10 @@ class SpecoWorker(Worker):
     def collect_rollout_features(self, samples: list[dict]):
         if not samples:
             return
+        # Per-step cross-sample cache for chunk fetches. Reset every collect
+        # call so keys (which carry global_step) never stale and the cache
+        # cannot grow unbounded. Shared across all samples in this step.
+        self._tq_chunk_cache = {}
         for sample in samples:
             if not sample:
                 continue
@@ -783,7 +793,7 @@ class SpecoWorker(Worker):
                     hidden_positions = batch.get("hidden_positions")
                     if torch.is_tensor(hidden_positions):
                         expected_rows = int(hidden_positions.numel())
-                    hidden = _resolve_hidden_state_chunks(hidden_chunks, expected_rows=expected_rows)
+                    hidden = _resolve_hidden_state_chunks(hidden_chunks, expected_rows=expected_rows, cache=self._tq_chunk_cache)
                 else:
                     hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
             target_logprobs = sample.get("target_logprobs")
