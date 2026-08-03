@@ -1,3 +1,16 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import os
@@ -50,16 +63,26 @@ def _runner_script() -> str:
 
 
 def test_ci_layers_match_required_shape() -> None:
-    expected = {
+    rollout_workflows = {
+        "gpu_vllm_unit_tests.yml",
+        "gpu_sglang_unit_tests.yml",
+        "npu_vllm_unit_tests.yml",
+        "npu_sglang_unit_tests.yml",
+    }
+    expected = rollout_workflows | {
         "cpu_unit_tests.yml",
-        "gpu_unit_tests.yml",
-        "npu_unit_tests.yml",
+        "gpu_drafter_training_smoke.yml",
     }
 
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
-    assert "pull_request" not in _workflow("gpu_unit_tests.yml")["on"]
-    assert "pull_request" in _workflow("npu_unit_tests.yml")["on"]
+
+    manual_hardware_workflows = rollout_workflows | {
+        "gpu_drafter_training_smoke.yml",
+    }
+    for workflow_name in manual_hardware_workflows:
+        triggers = _workflow(workflow_name)["on"]
+        assert set(triggers) == {"workflow_dispatch"}
 
 
 def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
@@ -80,55 +103,119 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
 
 
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
-    for workflow_name, label in (
-        ("gpu_unit_tests.yml", "gpu"),
-        ("npu_unit_tests.yml", "npu"),
+    for workflow_name, accelerator, backend, expected_drafters in (
+        ("gpu_vllm_unit_tests.yml", "gpu", "vllm", {"eagle3", "dflash"}),
+        ("gpu_sglang_unit_tests.yml", "gpu", "sglang", {"eagle3", "dflash"}),
+        (
+            "npu_vllm_unit_tests.yml",
+            "npu",
+            "vllm",
+            {"eagle3", "dflash", "dspark"},
+        ),
+        ("npu_sglang_unit_tests.yml", "npu", "sglang", {"eagle3", "dflash"}),
     ):
         source = _workflow_source(workflow_name)
         workflow = _workflow(workflow_name)
         assert "ci/run_example_test.sh" in source
+        assert f"bash ci/run_example_test.sh {accelerator} {backend}" in source
         assert "SPECO_DEFAULT_MODEL_ROOT" in source
         assert "SPECO_DEFAULT_DATA_ROOT" in source
-        assert "/home/runner/models" in source
-        assert "/home/runner/models/hf_data" in source
+        if workflow_name == "npu_vllm_unit_tests.yml":
+            assert "/root/.cache/models" in source
+            assert "/root/.cache/models/hf_data" in source
+        else:
+            assert "/home/runner/models" in source
+            assert "/home/runner/models/hf_data" in source
         assert "SPECO_TARGET_MODEL" in source
         assert "SPECO_EAGLE3_DRAFT_MODEL" in source
         assert "SPECO_DFLASH_DRAFT_MODEL" in source
-        if workflow_name == "npu_unit_tests.yml":
+        if backend == "vllm" and accelerator == "npu":
             assert "SPECO_DSPARK_DRAFT_MODEL" in source
+            assert workflow["jobs"]["example"]["container"]["image"] == (
+                "swr.cn-north-4.myhuaweicloud.com/"
+                "mindspeed/verl0.8.0_speco:v1"
+            )
+            assert (
+                workflow["jobs"]["example"]["container"]["options"]
+                == "--shm-size 16g"
+            )
+            assert "python -m pip install --no-deps -e ." in source
+            assert "verl_speco imported from" in source
+            assert "ln -sfn /root/.cache/models" in source
+            assert "Verify model and dataset paths" in source
+            assert "Missing target model directory" in source
+            assert "Missing training dataset file" in source
+            assert "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}" in source
         assert "SPECO_ACCELERATOR_COUNT" in source
         assert "SPECO_TENSOR_PARALLEL_SIZE" in source
         assert "SPECO_SEQUENCE_PARALLEL_SIZE" in source
         assert "SPECO_ENABLE_TRAINING" in source
         assert "SPECO_EXTRA_HYDRA_ARGS" in source
-        if workflow_name == "npu_unit_tests.yml":
-            assert "github.event.pull_request.head.repo.full_name == github.repository" in source
+        for drafter in expected_drafters:
+            assert drafter in source
+        for job in workflow["jobs"].values():
+            labels = set(job["runs-on"])
+            if accelerator == "npu":
+                assert labels == {"linux-aarch64-a2-8"}
+            else:
+                assert "self-hosted" in labels
+                assert "gpu" in labels
+
+        if accelerator == "npu":
             assert "linux-aarch64-a2-8" in source
             assert "linux-aarch64-a2-4" not in source
-            assert '"backend":"vllm","drafter":"dspark"' in source
-            assert '"backend":"sglang","drafter":"eagle3"' in source
-            assert '"backend":"sglang","drafter":"dflash"' in source
-        else:
-            matrix_entries = {
-                (entry["backend"], entry["drafter"])
-                for entry in workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
-            }
-            assert {
-                ("vllm", "eagle3"),
-                ("vllm", "dflash"),
-                ("sglang", "eagle3"),
-                ("sglang", "dflash"),
-            } <= matrix_entries
-        for job in workflow["jobs"].values():
-            if workflow_name == "npu_unit_tests.yml":
-                assert set(job["runs-on"]) == {"self-hosted", "linux-aarch64-a2-8"}
-            else:
-                assert {"self-hosted", label} <= set(job["runs-on"])
+
+
+def test_gpu_drafter_training_smoke_covers_standalone_backends() -> None:
+    workflow_name = "gpu_drafter_training_smoke.yml"
+    source = _workflow_source(workflow_name)
+    workflow = _workflow(workflow_name)
+    matrix = workflow["jobs"]["smoke"]["strategy"]["matrix"]["include"]
+
+    assert {
+        (entry["name"], entry["script"], entry["algorithm"]) for entry in matrix
+    } == {
+        (
+            "EAGLE-1",
+            "tests/special_standalone/eagle1_gpu_smoke.py",
+            "EAGLE1",
+        ),
+        (
+            "EAGLE-2",
+            "tests/special_standalone/eagle1_gpu_smoke.py",
+            "EAGLE2",
+        ),
+        (
+            "Domino",
+            "tests/special_standalone/domino_gpu_smoke.py",
+            "",
+        ),
+        (
+            "P-EAGLE",
+            "tests/special_standalone/peagle_gpu_smoke.py",
+            "",
+        ),
+    }
+    for entry in matrix:
+        assert (ROOT / entry["script"]).is_file()
+
+    assert set(workflow["jobs"]["smoke"]["runs-on"]) == {
+        "self-hosted",
+        "linux",
+        "x64",
+        "gpu",
+    }
+    assert "SPECO_TRAINING_SMOKE_TARGET_MODEL" in source
+    assert "SPECO_TRAINING_SMOKE_STEPS" in source
+    assert "SPECO_TRAINING_SMOKE_LR" in source
+    assert "python -m pip install --no-deps -e ." in source
 
 
 def test_example_runner_shell_syntax_is_valid() -> None:
     bash = _require_working_bash()
-    subprocess.run([bash, "-n", "-s"], input=_runner_script().encode("utf-8"), check=True)
+    subprocess.run(
+        [bash, "-n", "-s"], input=_runner_script().encode("utf-8"), check=True
+    )
 
 
 def test_example_runner_covers_gpu_and_npu_backend_matrix() -> None:
@@ -191,7 +278,9 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
         "SPECO_CKPT_DIR": "/tmp/speco",
         "SPECO_ACCELERATOR_COUNT": "1",
     }
-    script = "".join(f"export {name}={shlex.quote(value)}\n" for name, value in env.items())
+    script = "".join(
+        f"export {name}={shlex.quote(value)}\n" for name, value in env.items()
+    )
     script += _runner_script()
     result = subprocess.run(
         [bash, "-s", "--", "npu", "vllm", "dspark"],
