@@ -1,0 +1,98 @@
+name: gpu_drafter_training_smoke
+
+run-name: GPU drafter training smoke (${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_model:
+        description: Target model path or HF id; falls back to SPECO_TRAINING_SMOKE_TARGET_MODEL
+        required: false
+        type: string
+      steps:
+        description: Number of optimizer steps per drafter
+        required: true
+        default: "3"
+        type: string
+      learning_rate:
+        description: Drafter learning rate
+        required: true
+        default: "0.0001"
+        type: string
+  # schedule:
+  #   - cron: "13 17 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-drafter-training-smoke-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SPECO_DEFAULT_TRAINING_SMOKE_TARGET_MODEL: ${{ vars.SPECO_TRAINING_SMOKE_TARGET_MODEL || '/home/runner/models/Qwen/Qwen3-4B' }}
+  SPECO_DEFAULT_TRAINING_SMOKE_STEPS: ${{ vars.SPECO_TRAINING_SMOKE_STEPS || '3' }}
+  SPECO_DEFAULT_TRAINING_SMOKE_LR: ${{ vars.SPECO_TRAINING_SMOKE_LR || '0.0001' }}
+
+jobs:
+  smoke:
+    name: GPU ${{ matrix.name }} trainer smoke
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 60
+    environment: speco-gpu-ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: EAGLE-1
+            script: tests/special_standalone/eagle1_gpu_smoke.py
+            algorithm: EAGLE1
+          - name: EAGLE-2
+            script: tests/special_standalone/eagle1_gpu_smoke.py
+            algorithm: EAGLE2
+          - name: Domino
+            script: tests/special_standalone/domino_gpu_smoke.py
+            algorithm: ""
+          - name: P-EAGLE
+            script: tests/special_standalone/peagle_gpu_smoke.py
+            algorithm: ""
+
+    steps:
+      - name: Check out verl-SpeCo
+        uses: actions/checkout@v4
+
+      - name: Verify GPU runtime
+        run: |
+          nvidia-smi
+          python - <<'PY'
+          import torch
+
+          assert torch.cuda.is_available()
+          print("torch.cuda.device_count =", torch.cuda.device_count())
+          PY
+
+      - name: Install current repository
+        run: python -m pip install --no-deps -e .
+
+      - name: Run drafter training smoke
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          TARGET_MODEL: ${{ inputs.target_model || env.SPECO_DEFAULT_TRAINING_SMOKE_TARGET_MODEL }}
+          SMOKE_STEPS: ${{ inputs.steps || env.SPECO_DEFAULT_TRAINING_SMOKE_STEPS }}
+          SMOKE_LR: ${{ inputs.learning_rate || env.SPECO_DEFAULT_TRAINING_SMOKE_LR }}
+          SMOKE_SCRIPT: ${{ matrix.script }}
+          SMOKE_ALGORITHM: ${{ matrix.algorithm }}
+        run: |
+          if ! [[ "${SMOKE_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "steps must be a positive integer, got: ${SMOKE_STEPS}" >&2
+            exit 2
+          fi
+          args=()
+          if [[ -n "${SMOKE_ALGORITHM}" ]]; then
+            args+=(--algorithm "${SMOKE_ALGORITHM}")
+          fi
+          python "${SMOKE_SCRIPT}" \
+            --target "${TARGET_MODEL}" \
+            --steps "${SMOKE_STEPS}" \
+            --lr "${SMOKE_LR}" \
+            "${args[@]}"

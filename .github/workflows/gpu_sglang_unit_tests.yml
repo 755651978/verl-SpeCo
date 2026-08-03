@@ -1,6 +1,6 @@
-name: gpu_unit_tests
+name: gpu_sglang_unit_tests
 
-run-name: GPU example tests (${{ github.ref_name }})
+run-name: GPU SGLang example tests (${{ github.ref_name }})
 
 on:
   workflow_dispatch:
@@ -49,14 +49,14 @@ on:
         description: Optional newline-separated Hydra overrides
         required: false
         type: string
-  schedule:
-    - cron: "41 18 * * *"
+  # schedule:
+  #   - cron: "41 18 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: gpu-example-tests-${{ github.ref }}
+  group: gpu-sglang-example-tests-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -73,22 +73,16 @@ env:
 
 jobs:
   example:
-    name: GPU ${{ matrix.backend }} ${{ matrix.drafter }} example
+    name: GPU SGLang ${{ matrix.drafter }} example
     runs-on: [self-hosted, linux, x64, gpu]
     timeout-minutes: 150
     environment: speco-gpu-ci
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - backend: vllm
-            drafter: eagle3
-          - backend: vllm
-            drafter: dflash
-          - backend: sglang
-            drafter: eagle3
-          - backend: sglang
-            drafter: dflash
+        drafter:
+          - eagle3
+          - dflash
 
     steps:
       - name: Check out verl-SpeCo
@@ -97,11 +91,7 @@ jobs:
       - name: Verify GPU runtime
         run: |
           nvidia-smi
-          if [[ "${{ matrix.backend }}" == "vllm" ]]; then
-            python -c "import vllm; print(vllm.__version__)"
-          else
-            python -c "import sglang; print(sglang.__version__)"
-          fi
+          python -c "import sglang; print(sglang.__version__)"
 
       - name: Run example script
         env:
@@ -117,4 +107,4 @@ jobs:
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
           SPECO_ENABLE_TRAINING: ${{ github.event_name == 'schedule' && 'true' || inputs.run_training }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
-        run: bash ci/run_example_test.sh gpu "${{ matrix.backend }}" "${{ matrix.drafter }}"
+        run: bash ci/run_example_test.sh gpu sglang "${{ matrix.drafter }}"
