@@ -42,17 +42,18 @@ The default paths are intentionally tiny-runner friendly and can be overridden
 with GitHub environment variables or manual workflow inputs.
 
 The NPU vLLM workflow follows verl's Ascend CI layout. Its image provides the
-accelerator runtime plus pre-cached model and dataset assets under
-`/root/.cache/models`; the workflow links that cache to `~/models`. It checks
-out the pull-request revision and runs `pip install --no-deps -e .`, then verifies that
-`verl_speco` imports from the current GitHub workspace rather than the image's
-preinstalled copy.
+accelerator runtime plus pre-cached model assets under
+`/root/.cache/huggingface/hub`. It checks out the pull-request revision and runs
+`pip install --no-deps -e .`, then verifies that `verl_speco` imports from the
+current GitHub workspace rather than the image's preinstalled copy.
 
-The NPU vLLM workflow does not download models or datasets. Before launching the
-example script it checks that the selected target model directory, selected
-draft model directory, training parquet, and validation parquet exist. Override
-the defaults with GitHub environment variables or manual inputs when the image
-uses different paths.
+Before launching the example script, the NPU vLLM workflow checks that the
+selected target model directory and selected draft model directory exist. Its
+default datasets are Hugging Face dataset ids, allowing the datasets library to
+reuse the local cache or download them if needed. The workflow uses
+`HF_ENDPOINT=https://hf-mirror.com` and disables `hf_transfer` for more stable
+downloads on the NPU runner. Override the defaults with GitHub environment
+variables or manual inputs when the image uses different paths or dataset ids.
 
 The CPU layer uses `PYTHONPATH=$PWD` and checks out the upstream verl commit
 from `REQUIRED_VERL.txt`. It runs:

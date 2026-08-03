@@ -122,8 +122,8 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             assert "SPECO_DEFAULT_MODEL_ROOT" not in source
             assert "SPECO_DEFAULT_DATA_ROOT" not in source
             assert "/root/.cache/huggingface/hub" in source
-            assert "dapo-math-17k.parquet" in source
-            assert "aime-2024.parquet" in source
+            assert "BytedTsinghua-SIA/DAPO-Math-17k" in source
+            assert "BytedTsinghua-SIA/AIME-2024" in source
         else:
             assert "SPECO_DEFAULT_MODEL_ROOT" in source
             assert "SPECO_DEFAULT_DATA_ROOT" in source
@@ -150,10 +150,13 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             )
             assert "python -m pip install --no-deps -e ." in source
             assert "verl_speco imported from" in source
+            assert workflow["jobs"]["example"]["env"]["HF_ENDPOINT"] == (
+                "https://hf-mirror.com"
+            )
+            assert workflow["jobs"]["example"]["env"]["HF_HUB_ENABLE_HF_TRANSFER"] == "0"
             assert "find /root/.cache/huggingface/hub" in source
-            assert "Verify model and dataset paths" in source
+            assert "Verify model paths" in source
             assert "Missing target model directory" in source
-            assert "Missing training dataset file" in source
             assert "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}" in source
         assert "SPECO_ACCELERATOR_COUNT" in source
         assert "SPECO_TENSOR_PARALLEL_SIZE" in source
