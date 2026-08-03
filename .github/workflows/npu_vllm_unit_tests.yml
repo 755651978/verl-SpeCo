@@ -101,7 +101,7 @@ jobs:
     name: NPU vLLM ${{ matrix.drafter }} example
     runs-on: [linux-aarch64-a2-8]
     container:
-      image: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_speco:v1
+      image: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_vllm_speco:v1
       options: --shm-size 16g
     timeout-minutes: 180
     environment: speco-npu-ci
