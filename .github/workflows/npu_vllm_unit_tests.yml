@@ -3,28 +3,28 @@ name: npu_vllm_unit_tests
 run-name: NPU vLLM example tests (${{ github.ref_name }})
 
 on:
-  # pull_request:
-  #   branches:
-  #     - main
-  #   paths:
-  #     - ".github/workflows/npu_vllm_unit_tests.yml"
-  #     - "ci/**"
-  #     - "examples/*vllm*.sh"
-  #     - "tests/**"
-  #     - "verl_speco/**"
-  #     - "pyproject.toml"
-  #     - "REQUIRED_VERL.txt"
-  # push:
-  #   branches:
-  #     - main
-  #   paths:
-  #     - ".github/workflows/npu_vllm_unit_tests.yml"
-  #     - "ci/**"
-  #     - "examples/*vllm*.sh"
-  #     - "tests/**"
-  #     - "verl_speco/**"
-  #     - "pyproject.toml"
-  #     - "REQUIRED_VERL.txt"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/npu_vllm_unit_tests.yml"
+      - "ci/**"
+      - "examples/*vllm*.sh"
+      - "tests/**"
+      - "verl_speco/**"
+      - "pyproject.toml"
+      - "REQUIRED_VERL.txt"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/npu_vllm_unit_tests.yml"
+      - "ci/**"
+      - "examples/*vllm*.sh"
+      - "tests/**"
+      - "verl_speco/**"
+      - "pyproject.toml"
+      - "REQUIRED_VERL.txt"
   workflow_dispatch:
     inputs:
       run_training:
@@ -86,14 +86,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SPECO_DEFAULT_MODEL_ROOT: ${{ vars.SPECO_MODEL_ROOT || '/root/.cache/models' }}
-  SPECO_DEFAULT_DATA_ROOT: ${{ vars.SPECO_DATA_ROOT || '/root/.cache/models/hf_data' }}
-  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '/root/.cache/models/Qwen/Qwen2.5-0.5B-Instruct' }}
-  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/root/.cache/models/speco/eagle3-drafter' }}
-  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/root/.cache/models/speco/dflash-drafter' }}
-  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/models/speco/dspark-drafter' }}
-  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/root/.cache/models/hf_data/gsm8k/train.parquet' }}
-  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/root/.cache/models/hf_data/gsm8k/test.parquet' }}
+  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '/root/.cache/huggingface/Qwen3-8B' }}
+  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/root/.cache/huggingface/angelslim-qwen3-8b-eagle3' }}
+  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/root/.cache/huggingface/Qwen3-8B-Dflash-b16' }}
+  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/huggingface/dspark_qwen3_8b_block7' }}
+  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/root/.cache/huggingface/dapo-math-17k.parquet' }}
+  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/root/.cache/huggingface/aime-2024.parquet' }}
   SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}
   SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
   SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
@@ -138,9 +136,9 @@ jobs:
       - name: Prepare model cache
         run: |
           mkdir -p "${HOME}"
-          ln -sfn /root/.cache/models "${HOME}/models"
-          test -d "${SPECO_DEFAULT_MODEL_ROOT}"
-          find "${SPECO_DEFAULT_MODEL_ROOT}" -maxdepth 3 -name config.json -print
+          test -d /root/.cache/huggingface
+          find /root/.cache/huggingface -maxdepth 2 -name config.json -print
+          find /root/.cache/huggingface -maxdepth 1 -name "*.parquet" -print
 
       - name: Verify model and dataset paths
         env:

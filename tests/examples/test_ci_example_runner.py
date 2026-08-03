@@ -118,12 +118,15 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         workflow = _workflow(workflow_name)
         assert "ci/run_example_test.sh" in source
         assert f"bash ci/run_example_test.sh {accelerator} {backend}" in source
-        assert "SPECO_DEFAULT_MODEL_ROOT" in source
-        assert "SPECO_DEFAULT_DATA_ROOT" in source
         if workflow_name == "npu_vllm_unit_tests.yml":
-            assert "/root/.cache/models" in source
-            assert "/root/.cache/models/hf_data" in source
+            assert "SPECO_DEFAULT_MODEL_ROOT" not in source
+            assert "SPECO_DEFAULT_DATA_ROOT" not in source
+            assert "/root/.cache/huggingface" in source
+            assert "dapo-math-17k.parquet" in source
+            assert "aime-2024.parquet" in source
         else:
+            assert "SPECO_DEFAULT_MODEL_ROOT" in source
+            assert "SPECO_DEFAULT_DATA_ROOT" in source
             assert "/home/runner/models" in source
             assert "/home/runner/models/hf_data" in source
         assert "SPECO_TARGET_MODEL" in source
@@ -141,7 +144,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             )
             assert "python -m pip install --no-deps -e ." in source
             assert "verl_speco imported from" in source
-            assert "ln -sfn /root/.cache/models" in source
+            assert "find /root/.cache/huggingface" in source
             assert "Verify model and dataset paths" in source
             assert "Missing target model directory" in source
             assert "Missing training dataset file" in source
