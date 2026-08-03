@@ -121,7 +121,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         if workflow_name == "npu_vllm_unit_tests.yml":
             assert "SPECO_DEFAULT_MODEL_ROOT" not in source
             assert "SPECO_DEFAULT_DATA_ROOT" not in source
-            assert "~/.cache/huggingface" in source
+            assert "/root/.cache/huggingface/hub" in source
             assert "dapo-math-17k.parquet" in source
             assert "aime-2024.parquet" in source
         else:
@@ -134,6 +134,12 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
         assert "SPECO_DFLASH_DRAFT_MODEL" in source
         if backend == "vllm" and accelerator == "npu":
             assert "SPECO_DSPARK_DRAFT_MODEL" in source
+            assert {
+                entry["drafter"]
+                for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
+                    "include"
+                ]
+            } == {"eagle3", "dflash", "dspark"}
             assert workflow["jobs"]["example"]["container"]["image"] == (
                 "swr.cn-north-4.myhuaweicloud.com/"
                 "mindspeed/verl0.8.0_speco:v1"
@@ -144,8 +150,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             )
             assert "python -m pip install --no-deps -e ." in source
             assert "verl_speco imported from" in source
-            assert "find ~/.cache/huggingface" in source
-            assert "expand_path()" in source
+            assert "find /root/.cache/huggingface/hub" in source
             assert "Verify model and dataset paths" in source
             assert "Missing target model directory" in source
             assert "Missing training dataset file" in source
