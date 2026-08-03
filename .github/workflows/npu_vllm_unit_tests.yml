@@ -86,12 +86,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '/root/.cache/huggingface/Qwen3-8B' }}
-  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '/root/.cache/huggingface/angelslim-qwen3-8b-eagle3' }}
-  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '/root/.cache/huggingface/Qwen3-8B-Dflash-b16' }}
-  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '/root/.cache/huggingface/dspark_qwen3_8b_block7' }}
-  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '/root/.cache/huggingface/dapo-math-17k.parquet' }}
-  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '/root/.cache/huggingface/aime-2024.parquet' }}
+  SPECO_DEFAULT_TARGET_MODEL: ${{ vars.SPECO_TARGET_MODEL || '~/.cache/huggingface/Qwen3-8B' }}
+  SPECO_DEFAULT_EAGLE3_DRAFT_MODEL: ${{ vars.SPECO_EAGLE3_DRAFT_MODEL || '~/.cache/huggingface/angelslim-qwen3-8b-eagle3' }}
+  SPECO_DEFAULT_DFLASH_DRAFT_MODEL: ${{ vars.SPECO_DFLASH_DRAFT_MODEL || '~/.cache/huggingface/Qwen3-8B-Dflash-b16' }}
+  SPECO_DEFAULT_DSPARK_DRAFT_MODEL: ${{ vars.SPECO_DSPARK_DRAFT_MODEL || '~/.cache/huggingface/dspark_qwen3_8b_block7' }}
+  SPECO_DEFAULT_TRAIN_FILE: ${{ vars.SPECO_TRAIN_FILE || '~/.cache/huggingface/dapo-math-17k.parquet' }}
+  SPECO_DEFAULT_TEST_FILE: ${{ vars.SPECO_TEST_FILE || '~/.cache/huggingface/aime-2024.parquet' }}
   SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}
   SPECO_DEFAULT_TENSOR_PARALLEL_SIZE: ${{ vars.SPECO_TENSOR_PARALLEL_SIZE || '1' }}
   SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE: ${{ vars.SPECO_SEQUENCE_PARALLEL_SIZE || '1' }}
@@ -135,10 +135,9 @@ jobs:
 
       - name: Prepare model cache
         run: |
-          mkdir -p "${HOME}"
-          test -d /root/.cache/huggingface
-          find /root/.cache/huggingface -maxdepth 2 -name config.json -print
-          find /root/.cache/huggingface -maxdepth 1 -name "*.parquet" -print
+          test -d ~/.cache/huggingface
+          find ~/.cache/huggingface -maxdepth 2 -name config.json -print
+          find ~/.cache/huggingface -maxdepth 1 -name "*.parquet" -print
 
       - name: Verify model and dataset paths
         env:
@@ -149,6 +148,21 @@ jobs:
           SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
           SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
         run: |
+          expand_path() {
+            case "$1" in
+              "~") printf '%s\n' "${HOME}" ;;
+              "~/"*) printf '%s/%s\n' "${HOME}" "${1#"~/"}" ;;
+              *) printf '%s\n' "$1" ;;
+            esac
+          }
+
+          SPECO_TARGET_MODEL="$(expand_path "${SPECO_TARGET_MODEL}")"
+          SPECO_EAGLE3_DRAFT_MODEL="$(expand_path "${SPECO_EAGLE3_DRAFT_MODEL}")"
+          SPECO_DFLASH_DRAFT_MODEL="$(expand_path "${SPECO_DFLASH_DRAFT_MODEL}")"
+          SPECO_DSPARK_DRAFT_MODEL="$(expand_path "${SPECO_DSPARK_DRAFT_MODEL}")"
+          SPECO_TRAIN_FILE="$(expand_path "${SPECO_TRAIN_FILE}")"
+          SPECO_TEST_FILE="$(expand_path "${SPECO_TEST_FILE}")"
+
           case "${{ matrix.drafter }}" in
             eagle3)
               draft_model="${SPECO_EAGLE3_DRAFT_MODEL}"
@@ -208,4 +222,20 @@ jobs:
           SPECO_VAL_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_VAL_MAX_SAMPLES }}
           SPECO_DATALOADER_NUM_WORKERS: ${{ github.event_name == 'pull_request' && '0' || vars.SPECO_DATALOADER_NUM_WORKERS }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
-        run: bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"
+        run: |
+          expand_path() {
+            case "$1" in
+              "~") printf '%s\n' "${HOME}" ;;
+              "~/"*) printf '%s/%s\n' "${HOME}" "${1#"~/"}" ;;
+              *) printf '%s\n' "$1" ;;
+            esac
+          }
+
+          export SPECO_TARGET_MODEL="$(expand_path "${SPECO_TARGET_MODEL}")"
+          export SPECO_EAGLE3_DRAFT_MODEL="$(expand_path "${SPECO_EAGLE3_DRAFT_MODEL}")"
+          export SPECO_DFLASH_DRAFT_MODEL="$(expand_path "${SPECO_DFLASH_DRAFT_MODEL}")"
+          export SPECO_DSPARK_DRAFT_MODEL="$(expand_path "${SPECO_DSPARK_DRAFT_MODEL}")"
+          export SPECO_TRAIN_FILE="$(expand_path "${SPECO_TRAIN_FILE}")"
+          export SPECO_TEST_FILE="$(expand_path "${SPECO_TEST_FILE}")"
+
+          bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"
