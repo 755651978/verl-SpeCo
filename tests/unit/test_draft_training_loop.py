@@ -23,12 +23,14 @@ torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
+    _contains_replay_samples,
     _is_out_of_memory_error,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
     _should_log_batch_progress,
     _torch_load_cpu,
 )
+from verl_speco.trainer.feature_store import DraftReplaySample  # noqa: E402
 
 
 class _FakeTrainer:
@@ -66,6 +68,20 @@ def test_is_out_of_memory_error_matches_npu_oom_message():
 
     assert _is_out_of_memory_error(error)
     assert not _is_out_of_memory_error(RuntimeError("bad batch"))
+
+
+def test_contains_replay_samples_detects_draft_replay_sample():
+    sample = DraftReplaySample(
+        input_ids=torch.arange(4),
+        loss_mask=torch.ones(4),
+        attention_mask=torch.ones(4, dtype=torch.bool),
+        position_ids=torch.arange(4),
+        feature_positions=torch.arange(1, 3),
+        draft_position_ids=torch.arange(2, 4),
+    )
+
+    assert _contains_replay_samples([sample])
+    assert not _contains_replay_samples([{"input_ids": [1, 2]}])
 
 
 def test_standalone_checkpoint_schedules_without_waiting():
