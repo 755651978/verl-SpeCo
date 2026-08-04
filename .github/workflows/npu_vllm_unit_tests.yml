@@ -186,7 +186,7 @@ jobs:
 
       - name: Run example script
         env:
-          PYTHONPATH: ${{ github.workspace }}
+          PYTHONPATH: /usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/cann-9.0.0/python/site-packages:${{ github.workspace }}
           SPECO_TARGET_MODEL: ${{ inputs.target_model || env.SPECO_DEFAULT_TARGET_MODEL }}
           SPECO_EAGLE3_DRAFT_MODEL: ${{ inputs.eagle3_draft_model || env.SPECO_DEFAULT_EAGLE3_DRAFT_MODEL }}
           SPECO_DFLASH_DRAFT_MODEL: ${{ inputs.dflash_draft_model || env.SPECO_DEFAULT_DFLASH_DRAFT_MODEL }}
