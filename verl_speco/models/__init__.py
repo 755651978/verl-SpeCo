@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Modeling layer for EAGLE3 and DFLASH drafters.
+Modeling components and configuration helpers for supported drafter families.
 """
 
 # Import specific implementations for direct access
