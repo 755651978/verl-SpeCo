@@ -122,10 +122,13 @@ PR smoke jobs force lightweight settings through environment variables:
 - `SPECO_TRAIN_BATCH_SIZE=8`
 - `SPECO_TRAIN_MAX_SAMPLES=8`
 - `SPECO_VAL_MAX_SAMPLES=8`
+- `SPECO_PPO_MINI_BATCH_SIZE=8`
 - `SPECO_DATALOADER_NUM_WORKERS=0`
 
 The NPU vLLM PR smoke batch uses eight samples so the generation batch can be
-split evenly across the eight NPU agent-loop workers.
+split evenly across the eight NPU agent-loop workers. The PPO mini-batch also
+uses eight samples so actor updates split evenly across the eight data-parallel
+workers.
 
 The runner image is responsible for providing the matching verl, vLLM/SGLang,
 PyTorch accelerator runtime, and model files. Hardware workflows deliberately
