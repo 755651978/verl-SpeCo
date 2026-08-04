@@ -16,9 +16,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from verl_speco.trainer.feature_store import DraftFeatureSample  # noqa: E402
+from verl_speco.trainer.feature_store import DraftFeatureSample, DraftReplaySample  # noqa: E402
 from verl_speco.trainer.target_feature_replay import (  # noqa: E402
     BoundedReplayCache,
+    TargetFeatureReplayer,
     _hidden_capture_target,
 )
 
@@ -65,3 +66,76 @@ def test_bounded_replay_cache_disables_zero_budget(tmp_path):
 
     assert cache.put("sample", _feature_sample()) is False
     assert cache.get("sample") is None
+
+
+def test_token_replay_algorithm_mismatch_is_warning_not_error(caplog):
+    replayer = TargetFeatureReplayer.__new__(TargetFeatureReplayer)
+    replayer.rank = 0
+    replayer.algorithm = "DFLASH"
+    replayer.target_layer_ids = [1, 3]
+    replayer.hidden_layout = "dflash_aux"
+    replayer.strict_target_model_path = False
+    replayer._warned_replay_algorithm_mismatch = False
+    replayer._warned_replay_layer_mismatch = False
+    replayer._warned_replay_layout_mismatch = False
+    sample = DraftReplaySample(
+        algorithm="DSPARK",
+        input_ids=torch.arange(8),
+        loss_mask=torch.ones(8),
+        attention_mask=torch.ones(8, dtype=torch.bool),
+        position_ids=torch.arange(8),
+        feature_positions=torch.arange(2, 6),
+        draft_position_ids=torch.arange(3, 7),
+        metadata={
+            "target_layer_ids": [2, 4],
+            "hidden_states_layout": "dflash_aux_plus_last",
+        },
+    )
+
+    replayer._validate_target_path(sample)
+
+    assert "token replay algorithm differs" in caplog.text
+    assert "token replay target layers differ" in caplog.text
+    assert "token replay hidden layout differs" in caplog.text
+
+
+def test_vllm_payload_maps_suffix_hidden_rows_to_absolute_positions():
+    replayer = TargetFeatureReplayer.__new__(TargetFeatureReplayer)
+    replayer.rank = 0
+    replayer.target_layer_ids = [1, 3]
+    replayer.hidden_layout = "dflash_aux_plus_last"
+    replayer.dtype = torch.float32
+    replayer.model_path = "/target"
+    replayer.target_revision = None
+    replayer.target_config_fingerprint = "unit"
+    replayer.use_logits = False
+
+    sample = DraftReplaySample(
+        algorithm="DSPARK",
+        input_ids=torch.arange(10, dtype=torch.long),
+        loss_mask=torch.ones(10, dtype=torch.float32),
+        attention_mask=torch.ones(10, dtype=torch.bool),
+        position_ids=torch.arange(10, dtype=torch.long),
+        feature_positions=torch.arange(4, 10, dtype=torch.long),
+        draft_position_ids=torch.arange(5, 11, dtype=torch.long),
+        metadata={"global_step": 1},
+    )
+    hidden = torch.arange(5 * 3 * 4, dtype=torch.float32).reshape(5, 3, 4)
+    payload = {
+        "token_ids": torch.arange(10, dtype=torch.long),
+        "hidden_states": hidden,
+    }
+
+    feature = replayer._feature_from_vllm_payload(
+        sample,
+        payload,
+        prompt_ids=list(range(10)),
+        source="token_replay_vllm_file",
+    )
+
+    assert torch.equal(feature.input_ids, torch.arange(5, 10))
+    assert torch.equal(feature.position_ids, torch.arange(6, 11))
+    assert feature.hidden_states.shape == (5, 12)
+    assert feature.metadata["feature_start"] == 5
+    assert feature.metadata["feature_end"] == 10
+    assert feature.metadata["vllm_hidden_position_offset"] == 5

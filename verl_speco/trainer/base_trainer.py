@@ -4230,10 +4230,12 @@ class DrafterBaseTrainer:
         self, batch: dict[str, torch.Tensor], step: int
     ) -> bool:
         """Execute one optimizer step from a pre-built standalone batch."""
+        self.last_standalone_training_error = None
         try:
             with torch.enable_grad():
                 return await self._training_step_on_batch(batch, step)
         except Exception as e:  # noqa: BLE001
+            self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
             return False
 

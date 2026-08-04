@@ -599,7 +599,12 @@ class TokenReplayFeatureStore(TorchShardFeatureStore):
 
 
 class JsonlTokenReplayFeatureStore:
-    """Read ``input_ids``/``loss_mask`` JSONL rows as token replay samples."""
+    """Read token replay JSONL rows as compact replay samples.
+
+    Supported row formats:
+    - ``{"input_ids": [...], "loss_mask": [...]}``
+    - ``{"conversations": [{"from": "human", "value": "..."}, ...]}``
+    """
 
     def __init__(
         self,
@@ -612,6 +617,9 @@ class JsonlTokenReplayFeatureStore:
         shard_prefix: str = "shard",
         max_seq_len: int = 512,
         window_mode: str = "loss",
+        tokenizer_path: str | os.PathLike[str] | None = None,
+        trust_remote_code: bool = False,
+        train_on: str = "last_assistant",
     ):
         if path is None:
             raise ValueError("JsonlTokenReplayFeatureStore requires a non-empty path")
@@ -632,10 +640,19 @@ class JsonlTokenReplayFeatureStore:
         self.shard_prefix = str(shard_prefix or "shard")
         self.max_seq_len = int(max_seq_len or 0)
         self.window_mode = str(window_mode or "loss").strip().lower()
+        self.tokenizer_path = os.fspath(tokenizer_path) if tokenizer_path else None
+        self.trust_remote_code = bool(trust_remote_code)
+        self.train_on = str(train_on or "last_assistant").strip().lower()
+        self._tokenizer: Any | None = None
         if self.window_mode not in {"loss", "front", "full"}:
             raise ValueError(
                 "feature_store.window_mode for jsonl_token_replay must be "
                 "'loss', 'front' or 'full'"
+            )
+        if self.train_on != "last_assistant":
+            raise ValueError(
+                "feature_store.train_on for jsonl_token_replay currently supports "
+                "only 'last_assistant'"
             )
         self._files = self._resolve_jsonl_files()
         self._line_offsets: dict[str, list[int]] = {}
@@ -672,6 +689,8 @@ class JsonlTokenReplayFeatureStore:
                 "num_samples": len(self._keys),
                 "max_seq_len": self.max_seq_len,
                 "window_mode": self.window_mode,
+                "train_on": self.train_on,
+                "tokenizer_path": self.tokenizer_path,
             }
         )
         return metadata
@@ -714,8 +733,20 @@ class JsonlTokenReplayFeatureStore:
     def _row_to_replay_sample(
         self, payload: dict[str, Any], file_name: str, line_index: int
     ) -> DraftReplaySample:
-        input_ids = _json_list_tensor(payload, "input_ids", dtype=torch.long)
-        loss_mask = _json_list_tensor(payload, "loss_mask", dtype=torch.float32)
+        row_source = "jsonl_token_replay"
+        if "input_ids" in payload or "loss_mask" in payload:
+            input_ids = _json_list_tensor(payload, "input_ids", dtype=torch.long)
+            loss_mask = _json_list_tensor(payload, "loss_mask", dtype=torch.float32)
+        elif "conversations" in payload:
+            input_ids, loss_mask = self._conversation_to_input_ids_and_loss_mask(
+                payload
+            )
+            row_source = "jsonl_conversations"
+        else:
+            raise KeyError(
+                "jsonl_token_replay sample must contain input_ids/loss_mask or "
+                "conversations"
+            )
         if int(input_ids.numel()) != int(loss_mask.numel()):
             raise ValueError(
                 "jsonl_token_replay input_ids/loss_mask length mismatch: "
@@ -737,7 +768,7 @@ class JsonlTokenReplayFeatureStore:
         feature_positions = torch.arange(start, end, dtype=torch.long)
         draft_position_ids = position_ids[start:end].long() + 1
         metadata = {
-            "source": "jsonl_token_replay",
+            "source": row_source,
             "jsonl_path": file_name,
             "jsonl_line": line_index,
             "sequence_length": end - start,
@@ -758,6 +789,66 @@ class JsonlTokenReplayFeatureStore:
             feature_positions=feature_positions,
             draft_position_ids=draft_position_ids,
             metadata=metadata,
+        )
+
+    def _ensure_tokenizer(self) -> Any:
+        if self._tokenizer is not None:
+            return self._tokenizer
+        if not self.tokenizer_path:
+            raise ValueError(
+                "feature_store.tokenizer_path is required when "
+                "jsonl_token_replay reads conversations rows"
+            )
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "jsonl_token_replay conversations rows require transformers"
+            ) from exc
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer_path,
+            trust_remote_code=self.trust_remote_code,
+        )
+        return self._tokenizer
+
+    def _conversation_to_input_ids_and_loss_mask(
+        self, payload: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        conversations = payload.get("conversations")
+        if not isinstance(conversations, list) or not conversations:
+            raise ValueError(
+                "jsonl_token_replay conversations must be a non-empty list"
+            )
+        messages = [_conversation_item_to_message(item) for item in conversations]
+        if not messages or messages[-1]["role"] != "assistant":
+            raise ValueError(
+                "jsonl_token_replay train_on=last_assistant requires the final "
+                "conversation item to be assistant"
+            )
+
+        tokenizer = self._ensure_tokenizer()
+        prompt_ids = tokenizer.apply_chat_template(
+            messages[:-1],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        full_ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+        if not isinstance(prompt_ids, list) or not isinstance(full_ids, list):
+            raise TypeError("tokenizer.apply_chat_template must return token id lists")
+        if len(full_ids) <= len(prompt_ids):
+            raise ValueError(
+                "jsonl_token_replay conversations produced no assistant tokens"
+            )
+        loss_mask = [0.0] * len(prompt_ids) + [1.0] * (
+            len(full_ids) - len(prompt_ids)
+        )
+        return (
+            torch.tensor(full_ids, dtype=torch.long).reshape(-1),
+            torch.tensor(loss_mask, dtype=torch.float32).reshape(-1),
         )
 
     def _feature_window(self, loss_mask: torch.Tensor) -> tuple[int, int]:
@@ -981,6 +1072,12 @@ def build_feature_store_from_config(
             shard_prefix=shard_prefix,
             max_seq_len=int(feature_store_cfg.get("max_seq_len", 512) or 0),
             window_mode=str(feature_store_cfg.get("window_mode", "loss") or "loss"),
+            tokenizer_path=feature_store_cfg.get("tokenizer_path"),
+            trust_remote_code=bool(feature_store_cfg.get("trust_remote_code", False)),
+            train_on=str(
+                feature_store_cfg.get("train_on", "last_assistant")
+                or "last_assistant"
+            ),
         )
     else:
         raise NotImplementedError(f"Unsupported draft feature store type: {store_type}")
@@ -1112,6 +1209,31 @@ def _optional_json_list_tensor(
     if key not in payload or payload[key] is None:
         return None
     return _json_list_tensor(payload, key, dtype=dtype)
+
+
+def _normalize_conversation_role(value: Any) -> str:
+    role = str(value or "").strip().lower()
+    if role in {"human", "user"}:
+        return "user"
+    if role in {"assistant", "gpt"}:
+        return "assistant"
+    if role == "system":
+        return "system"
+    return role
+
+
+def _conversation_item_to_message(item: Any) -> dict[str, str]:
+    if not isinstance(item, dict):
+        raise TypeError(
+            "jsonl_token_replay conversations entries must be JSON objects"
+        )
+    role = _normalize_conversation_role(item.get("role", item.get("from")))
+    content = item.get("content", item.get("value", ""))
+    if role not in {"system", "user", "assistant"}:
+        raise ValueError(
+            f"Unsupported conversation role for jsonl_token_replay: {role!r}"
+        )
+    return {"role": role, "content": str(content)}
 
 
 def _json_safe_metadata(value: Any) -> Any:

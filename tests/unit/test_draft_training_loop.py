@@ -23,6 +23,7 @@ torch = pytest.importorskip("torch")
 
 from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
+    _is_out_of_memory_error,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
     _should_log_batch_progress,
@@ -58,6 +59,13 @@ class _FakeTrainer:
 )
 def test_should_log_standalone_batch_progress(attempted_batches, expected):
     assert _should_log_batch_progress(attempted_batches) is expected
+
+
+def test_is_out_of_memory_error_matches_npu_oom_message():
+    error = RuntimeError("NPU out of memory. Tried to allocate 258.00 MiB")
+
+    assert _is_out_of_memory_error(error)
+    assert not _is_out_of_memory_error(RuntimeError("bad batch"))
 
 
 def test_standalone_checkpoint_schedules_without_waiting():
