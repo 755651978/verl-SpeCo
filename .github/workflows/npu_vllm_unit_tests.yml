@@ -199,8 +199,9 @@ jobs:
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
           SPECO_ENABLE_TRAINING: ${{ (github.event_name == 'schedule' || github.event_name == 'pull_request') && 'true' || inputs.run_training }}
           SPECO_TOTAL_TRAINING_STEPS: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_TOTAL_TRAINING_STEPS }}
-          SPECO_TRAIN_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_TRAIN_MAX_SAMPLES }}
-          SPECO_VAL_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_VAL_MAX_SAMPLES }}
+          SPECO_TRAIN_BATCH_SIZE: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_TRAIN_BATCH_SIZE }}
+          SPECO_TRAIN_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_TRAIN_MAX_SAMPLES }}
+          SPECO_VAL_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_VAL_MAX_SAMPLES }}
           SPECO_DATALOADER_NUM_WORKERS: ${{ github.event_name == 'pull_request' && '0' || vars.SPECO_DATALOADER_NUM_WORKERS }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"

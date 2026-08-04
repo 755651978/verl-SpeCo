@@ -119,9 +119,13 @@ caller has not already set `ASCEND_RT_VISIBLE_DEVICES`. If the caller provides
 PR smoke jobs force lightweight settings through environment variables:
 
 - `SPECO_TOTAL_TRAINING_STEPS=1`
-- `SPECO_TRAIN_MAX_SAMPLES=1`
-- `SPECO_VAL_MAX_SAMPLES=1`
+- `SPECO_TRAIN_BATCH_SIZE=8`
+- `SPECO_TRAIN_MAX_SAMPLES=8`
+- `SPECO_VAL_MAX_SAMPLES=8`
 - `SPECO_DATALOADER_NUM_WORKERS=0`
+
+The NPU vLLM PR smoke batch uses eight samples so the generation batch can be
+split evenly across the eight NPU agent-loop workers.
 
 The runner image is responsible for providing the matching verl, vLLM/SGLang,
 PyTorch accelerator runtime, and model files. Hardware workflows deliberately

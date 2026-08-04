@@ -158,6 +158,9 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             assert "Verify model paths" in source
             assert "Missing target model directory" in source
             assert "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}" in source
+            assert "SPECO_TRAIN_BATCH_SIZE: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_TRAIN_BATCH_SIZE }}" in source
+            assert "SPECO_TRAIN_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_TRAIN_MAX_SAMPLES }}" in source
+            assert "SPECO_VAL_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_VAL_MAX_SAMPLES }}" in source
         assert "SPECO_ACCELERATOR_COUNT" in source
         assert "SPECO_TENSOR_PARALLEL_SIZE" in source
         assert "SPECO_SEQUENCE_PARALLEL_SIZE" in source
