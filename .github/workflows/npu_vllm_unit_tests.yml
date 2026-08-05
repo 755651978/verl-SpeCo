@@ -196,12 +196,12 @@ jobs:
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
           SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
-          SPECO_ENABLE_TRAINING: ${{ (github.event_name == 'schedule' || github.event_name == 'pull_request') && 'true' || inputs.run_training }}
-          SPECO_TOTAL_TRAINING_STEPS: ${{ github.event_name == 'pull_request' && '1' || vars.SPECO_TOTAL_TRAINING_STEPS }}
-          SPECO_TRAIN_BATCH_SIZE: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_TRAIN_BATCH_SIZE }}
-          SPECO_TRAIN_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '32' || vars.SPECO_TRAIN_MAX_SAMPLES }}
-          SPECO_VAL_MAX_SAMPLES: ${{ github.event_name == 'pull_request' && '32' || vars.SPECO_VAL_MAX_SAMPLES }}
-          SPECO_PPO_MINI_BATCH_SIZE: ${{ github.event_name == 'pull_request' && '8' || vars.SPECO_PPO_MINI_BATCH_SIZE }}
-          SPECO_DATALOADER_NUM_WORKERS: ${{ github.event_name == 'pull_request' && '0' || vars.SPECO_DATALOADER_NUM_WORKERS }}
+          SPECO_ENABLE_TRAINING: ${{ github.event_name != 'workflow_dispatch' && 'true' || inputs.run_training }}
+          SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '1' }}
+          SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '8' }}
+          SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '32' }}
+          SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}
+          SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}
+          SPECO_DATALOADER_NUM_WORKERS: ${{ vars.SPECO_DATALOADER_NUM_WORKERS || '0' }}
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"

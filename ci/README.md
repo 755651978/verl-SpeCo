@@ -116,7 +116,8 @@ caller has not already set `ASCEND_RT_VISIBLE_DEVICES`. If the caller provides
 `ASCEND_RT_VISIBLE_DEVICES`, the script preserves it and checks that
 `SPECO_ACCELERATOR_COUNT` does not exceed the visible device count.
 
-PR smoke jobs force lightweight settings through environment variables:
+NPU vLLM smoke jobs use lightweight fallback settings for pull requests, pushes,
+and manual runs:
 
 - `SPECO_TOTAL_TRAINING_STEPS=1`
 - `SPECO_TRAIN_BATCH_SIZE=8`
@@ -125,7 +126,7 @@ PR smoke jobs force lightweight settings through environment variables:
 - `SPECO_PPO_MINI_BATCH_SIZE=8`
 - `SPECO_DATALOADER_NUM_WORKERS=0`
 
-The NPU vLLM PR smoke batch uses eight samples so the generation batch can be
+The NPU vLLM smoke batch uses eight samples so the generation batch can be
 split evenly across the eight NPU agent-loop workers. The PPO mini-batch also
 uses eight samples so actor updates split evenly across the eight data-parallel
 workers.
