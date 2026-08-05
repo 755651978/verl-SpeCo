@@ -77,12 +77,19 @@ def test_ci_layers_match_required_shape() -> None:
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
 
-    manual_hardware_workflows = rollout_workflows | {
+    manual_hardware_workflows = (rollout_workflows - {"npu_vllm_unit_tests.yml"}) | {
         "gpu_drafter_training_smoke.yml",
     }
     for workflow_name in manual_hardware_workflows:
         triggers = _workflow(workflow_name)["on"]
         assert set(triggers) == {"workflow_dispatch"}
+
+    npu_vllm_triggers = _workflow("npu_vllm_unit_tests.yml")["on"]
+    assert set(npu_vllm_triggers) == {
+        "pull_request",
+        "push",
+        "workflow_dispatch",
+    }
 
 
 def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
@@ -122,8 +129,8 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             assert "SPECO_DEFAULT_MODEL_ROOT" not in source
             assert "SPECO_DEFAULT_DATA_ROOT" not in source
             assert "/root/.cache/huggingface/hub" in source
-            assert "BytedTsinghua-SIA/DAPO-Math-17k" in source
-            assert "BytedTsinghua-SIA/AIME-2024" in source
+            assert "dapo-math-17k.parquet" in source
+            assert "aime-2024.parquet" in source
         else:
             assert "SPECO_DEFAULT_MODEL_ROOT" in source
             assert "SPECO_DEFAULT_DATA_ROOT" in source
@@ -142,7 +149,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             } == {"eagle3", "dflash", "dspark"}
             assert workflow["jobs"]["example"]["container"]["image"] == (
                 "swr.cn-north-4.myhuaweicloud.com/"
-                "mindspeed/verl0.8.0_speco:v1"
+                "mindspeed/verl0.8.0_vllm_910b_speco:v1"
             )
             assert (
                 workflow["jobs"]["example"]["container"]["options"]
