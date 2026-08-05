@@ -110,6 +110,7 @@ jobs:
       HF_HUB_ENABLE_HF_TRANSFER: "0"
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - drafter: eagle3
