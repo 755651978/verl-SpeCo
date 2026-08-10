@@ -147,19 +147,55 @@ def _normalize_dspark_runtime_architecture(
         runtime_config["architectures"] = [architecture]
 
 
+_VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "domino": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "emb_dim",
+            "gru_hidden_dim",
+            "pure_draft_prefix_len",
+            "num_target_layers",
+            "target_num_hidden_layers",
+        ),
+    ),
+    "dspark": (
+        "dspark_config",
+        (
+            "block_size",
+            "num_anchors",
+            "markov_rank",
+            "markov_head_type",
+            "confidence_head_alpha",
+            "confidence_head_with_markov",
+            "ce_loss_alpha",
+            "l1_loss_alpha",
+            "loss_decay_gamma",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+        ),
+    ),
+}
+
+
 def rewrite_standalone_runtime_config(
     trainer: Any,
     checkpoint_path: str,
     completed_future: Any = None,
 ) -> str | None:
-    """Rewrite standalone DFlash/DSpark checkpoints with runtime-facing config.
+    """Rewrite standalone block-drafter checkpoints with runtime-facing config.
 
     Returns the source drafter model path so callers can perform additional
     checkpoint post-processing such as appending lm_head.weight.
     """
 
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dspark"}:
+    if backend_type not in {"dflash", "dspark", "domino"}:
         return None
 
     if completed_future is not None:
@@ -249,6 +285,20 @@ def rewrite_standalone_runtime_config(
         _copy_if_present(dspark_config, target_runtime_config, ("head_dim", "rope_theta"))
     else:
         dspark_config = {}
+
+    variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
+        backend_type, (None, ())
+    )
+    variant_config = (
+        _ensure_dict_child(runtime_config, variant_child_key)
+        if variant_child_key
+        else {}
+    )
+    _fill_if_missing(variant_config, training_config, variant_alias_keys)
+    if backend_type == "domino":
+        variant_config["projector_type"] = str(
+            training_config.get("projector_type", "domino") or "domino"
+        )
 
     source_has_rope_theta = isinstance(source_runtime_config, dict) and "rope_theta" in source_runtime_config
     if backend_type == "dspark" and str(target_model_type or "").lower().startswith("qwen3") and not source_has_rope_theta:
