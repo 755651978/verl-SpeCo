@@ -19,6 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.special_sanity.check_example_naming import (
+    ACTOR_BACKENDS,
     DRAFTER_BACKENDS,
     ROLLOUT_BACKENDS,
     STANDALONE_ONLY_BACKENDS,
@@ -44,6 +45,33 @@ def test_backend_matrix_names_pass():
 
 def test_npu_suffix_passes():
     assert _violations("run_qwen3-8b_drafter_eagle3_vllm_npu.sh") == []
+
+
+def test_actor_backend_names_pass():
+    for actor_backend in ACTOR_BACKENDS:
+        assert (
+            _violations(
+                f"run_qwen3-8b_actor_{actor_backend}_drafter_eagle3_vllm_npu.sh"
+            )
+            == []
+        )
+
+
+def test_actor_backend_is_optional_for_separate_training():
+    assert (
+        _violations("run_qwen3-8b_actor_fsdp2_drafter_eagle3_separate_training.sh")
+        == []
+    )
+
+
+def test_unknown_actor_backend_rejected():
+    errs = _violations("run_qwen3-8b_actor_unknown_drafter_eagle3_vllm.sh")
+    assert errs and "unknown actor backend" in errs[0]
+
+
+def test_missing_actor_backend_rejected():
+    errs = _violations("run_qwen3-8b_actor_drafter_eagle3_vllm.sh")
+    assert errs and "exactly one actor backend" in errs[0]
 
 
 def test_separate_training_entrypoint_passes():
