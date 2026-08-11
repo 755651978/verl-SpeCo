@@ -40,8 +40,9 @@ from verl_speco.integration.sglang_adapter import (
     SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH,
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
-    speco_step_matches_interval,
 )
+from verl_speco.trainer.drafter_scheduler import DrafterScheduler
+from verl_speco.trainer.schedule_types import DrafterScheduleConfig
 
 try:
     import torch as _torch
@@ -51,6 +52,7 @@ torch: Any = _torch
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+_DRAFTER_SCHEDULER = DrafterScheduler()
 
 SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_SGLANG_RUNTIME_PATCHED_ENV = "VERL_SPECO_SGLANG_RUNTIME_PATCHED"
@@ -1269,8 +1271,9 @@ class _SpecoSGLangHttpServerMixin:
             else self.global_steps
         )
         self._reset_drafter_collection_budget_if_needed(collection_global_steps)
-        if collection_global_steps is not None and not speco_step_matches_interval(
-            collection_global_steps, training_cfg.get("collect_interval_steps", 1)
+        if collection_global_steps is not None and not _DRAFTER_SCHEDULER.should_collect(
+            collection_global_steps,
+            DrafterScheduleConfig.from_mapping(training_cfg),
         ):
             return self._speco_mark_collection_skip("interval_mismatch")
         if estimated_hidden_rows <= 0:
@@ -1438,8 +1441,9 @@ class _SpecoSGLangHttpServerMixin:
         )
         if skip_drafter_collection or (
             collection_global_steps is not None
-            and not speco_step_matches_interval(
-                collection_global_steps, training_cfg.get("collect_interval_steps", 1)
+            and not _DRAFTER_SCHEDULER.should_collect(
+                collection_global_steps,
+                DrafterScheduleConfig.from_mapping(training_cfg),
             )
         ):
             self._speco_log_collection_skip_once(

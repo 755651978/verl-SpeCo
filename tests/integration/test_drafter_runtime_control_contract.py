@@ -131,6 +131,51 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     assert trainer._speco_should_attempt_drafter_train_this_step() is True
 
 
+def test_sync_scheduler_preserves_released_training_call_order() -> None:
+    trainer = _trainer(
+        {
+            "training_interval_steps": 1,
+            "publish_interval_steps": 0,
+        },
+        step=5,
+    )
+    trainer._speco_last_collected_samples = 1
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._compute_old_log_prob = lambda batch: batch
+    events = []
+
+    trainer._speco_set_drafter_global_step = lambda **kwargs: events.append(
+        "set_global_step"
+    )
+    trainer._speco_sync_target_lm_head_weight = lambda plan: events.append(
+        "sync_target_lm_head"
+    ) or {"drafter/target_lm_head_synced": 1}
+    trainer._update_actor = lambda *args, **kwargs: events.append(
+        "update_actor"
+    ) or SimpleNamespace(meta_info={"metrics": {}})
+    trainer._speco_train_drafter = lambda plan: events.append(
+        ("train_drafter", plan.max_batches, plan.publish_after_success)
+    ) or (
+        True,
+        {"drafter/trained": 1},
+    )
+    trainer._speco_publish_drafter_weights = lambda trained, plan: events.append(
+        ("publish", trained)
+    ) or {"drafter/publish_attempted": 1, "drafter/published": 1}
+
+    with trainer._speco_online_fit_hooks():
+        output = trainer._update_actor("batch")
+
+    assert events == [
+        "set_global_step",
+        "sync_target_lm_head",
+        "update_actor",
+        ("train_drafter", 100, True),
+        ("publish", True),
+    ]
+    assert output.meta_info["metrics"]["drafter/trained"] == 1
+
+
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
     assert (
         _no_drafter_trainer(

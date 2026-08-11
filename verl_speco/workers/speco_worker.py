@@ -362,15 +362,6 @@ class SpecoWorker(Worker):
             self.config.rollout.drafter.enable
             and self.config.rollout.drafter.enable_drafter_training
         )
-        self.training_interval_steps = int(
-            self.config.rollout.drafter.training.get("training_interval_steps", 1)
-        )
-        self.publish_interval_steps = int(
-            self.config.rollout.drafter.training.get("publish_interval_steps", 0)
-        )
-        self.train_steps_per_trigger = int(
-            self.config.rollout.drafter.training.get("step", 100)
-        )
 
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
@@ -1126,7 +1117,7 @@ class SpecoWorker(Worker):
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def train_drafter(self):
+    async def train_drafter(self, training_plan=None):
         result = {
             "trained": False,
             "triggered": False,
@@ -1141,15 +1132,17 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group or self.trainer is None:
             result["reason"] = "not_in_training_group"
             return result
-        if self.last_global_step is None:
-            result["reason"] = "missing_global_step"
+        if not isinstance(training_plan, dict) or not training_plan.get("launch"):
+            result["reason"] = "missing_or_inactive_training_plan"
             return result
-        if self.training_interval_steps <= 0:
-            result["reason"] = "invalid_interval"
+        if training_plan.get("execution_strategy") != "sync":
+            result["reason"] = "unsupported_execution_strategy"
             return result
-        if self.last_global_step % self.training_interval_steps != 0:
-            result["reason"] = "interval_not_reached"
+        if training_plan.get("source_global_step") != self.last_global_step:
+            result["reason"] = "stale_training_plan"
             return result
+        max_batches = max(int(training_plan.get("max_batches", 0)), 0)
+        prepare_publish = bool(training_plan.get("publish_after_success", False))
 
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
@@ -1175,7 +1168,7 @@ class SpecoWorker(Worker):
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
-                for _ in range(self.train_steps_per_trigger):
+                for _ in range(max_batches):
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
                     if step_ok:
@@ -1183,11 +1176,7 @@ class SpecoWorker(Worker):
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
-                    should_prepare_publish = (
-                        self.publish_interval_steps <= 0
-                        or self.last_global_step % self.publish_interval_steps == 0
-                    )
-                    if should_prepare_publish:
+                    if prepare_publish:
                         snapshot_ts = time.time()
                         cached = self.trainer.prepare_model_state_dict_for_publish(
                             self.last_global_step
@@ -1229,11 +1218,6 @@ class SpecoWorker(Worker):
         ):
             return None
         if self.last_global_step is None:
-            return None
-        if (
-            self.training_interval_steps <= 0
-            or self.last_global_step % self.training_interval_steps != 0
-        ):
             return None
         if self.last_trained_step != self.last_global_step:
             return None
