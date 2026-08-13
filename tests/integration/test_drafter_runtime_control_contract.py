@@ -73,6 +73,22 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
     trainer._pending_drafter_publish_refs = None
     trainer._speco_last_collected_samples = 0
     trainer._ray_get_if_needed = lambda value: value
+    trainer.speco_get_drafter_training_data_status = lambda *args: [
+        {
+            "available": True,
+            "current_step": trainer.global_steps,
+            "current_step_samples": trainer._speco_last_collected_samples,
+            "buffer_samples": trainer._speco_last_collected_samples,
+            "trainable_samples": trainer._speco_last_collected_samples,
+            "trainable_batches": int(trainer._speco_last_collected_samples > 0),
+            "batch_size_per_gpu": 1,
+            "partial_batch_available": False,
+            "oldest_sample_step": trainer.global_steps,
+            "newest_sample_step": trainer.global_steps,
+            "same_step_data_required": False,
+            "target_version": trainer.global_steps,
+        }
+    ]
     return trainer
 
 
@@ -174,6 +190,9 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
         ("publish", True),
     ]
     assert output.meta_info["metrics"]["drafter/trained"] == 1
+    assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
+    assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
+    assert output.meta_info["metrics"]["drafter/schedule_reason"] == 3
 
 
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:

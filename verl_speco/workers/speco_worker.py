@@ -1116,6 +1116,29 @@ class SpecoWorker(Worker):
             )
             return result
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_drafter_training_data_status(
+        self,
+        sample_last_n_steps: int = 2,
+        require_full_batch: bool = False,
+    ):
+        if not self.enable_drafter:
+            return {"available": False, "reason": "disabled"}
+        if not self.in_drafter_train_group or self.trainer is None:
+            return {"available": False, "reason": "not_in_training_group"}
+        status = self.trainer.get_training_data_status(
+            sample_last_n_steps=sample_last_n_steps,
+            require_full_batch=require_full_batch,
+        )
+        status.update(
+            {
+                "available": True,
+                "replica_rank": self.replica_rank,
+                "rank": self.rank,
+            }
+        )
+        return status
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def train_drafter(self, training_plan=None):
         result = {
@@ -1143,6 +1166,20 @@ class SpecoWorker(Worker):
             return result
         max_batches = max(int(training_plan.get("max_batches", 0)), 0)
         prepare_publish = bool(training_plan.get("publish_after_success", False))
+        data_status_before = self.trainer.get_training_data_status(
+            sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
+            require_full_batch=bool(training_plan.get("require_full_batch", False)),
+        )
+        result.update(
+            {
+                "source_global_step": int(training_plan["source_global_step"]),
+                "execution_strategy": str(training_plan["execution_strategy"]),
+                "buffer_size_before": int(data_status_before["trainable_samples"]),
+                "buffer_size_after": int(data_status_before["trainable_samples"]),
+                "optimizer_step": int(self.trainer.optimizer_steps_total),
+                "publish_snapshot_cached": 0,
+            }
+        )
 
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
@@ -1206,6 +1243,14 @@ class SpecoWorker(Worker):
             result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
             if result["trained"]:
                 self.last_trained_step = self.last_global_step
+            data_status_after = self.trainer.get_training_data_status(
+                sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
+                require_full_batch=bool(training_plan.get("require_full_batch", False)),
+            )
+            result["buffer_size_after"] = int(
+                data_status_after["trainable_samples"]
+            )
+            result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
             return result
 
