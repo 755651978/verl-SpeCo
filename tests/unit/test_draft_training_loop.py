@@ -23,17 +23,18 @@ torch = pytest.importorskip("torch")
 
 from omegaconf import OmegaConf  # noqa: E402
 
-from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _build_backend,
     _contains_replay_samples,
     _is_out_of_memory_error,
+    _next_batch_across_ranks,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
     _should_log_batch_progress,
     _torch_load_cpu,
 )
 from verl_speco.trainer.feature_store import DraftReplaySample  # noqa: E402
+from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config  # noqa: E402
 
 
 class _FakeTrainer:
@@ -786,3 +787,55 @@ def test_torch_load_cpu_falls_back_without_weights_only(monkeypatch, tmp_path):
         {"map_location": "cpu", "weights_only": True},
         {"map_location": "cpu"},
     ]
+
+
+def test_next_batch_across_ranks_returns_local_batch_without_distributed():
+    batch = [object()]
+
+    assert _next_batch_across_ranks(
+        iter([batch]), rank=0, device=torch.device("cpu")
+    ) is batch
+
+
+def test_next_batch_across_ranks_returns_none_when_source_is_exhausted():
+    assert (
+        _next_batch_across_ranks(
+            iter(()), rank=0, device=torch.device("cpu")
+        )
+        is None
+    )
+
+
+def test_next_batch_across_ranks_preserves_local_producer_error():
+    def broken_source():
+        raise ValueError("producer failed")
+        yield []
+
+    with pytest.raises(RuntimeError, match="failed on rank=0") as exc_info:
+        _next_batch_across_ranks(
+            iter(broken_source()), rank=0, device=torch.device("cpu")
+        )
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
+def test_next_batch_across_ranks_stops_for_remote_rank_failure(monkeypatch):
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.get_world_size", lambda: 2
+    )
+
+    def fake_all_reduce(state, op):
+        del op
+        state[0] = 1
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.all_reduce", fake_all_reduce
+    )
+
+    with pytest.raises(RuntimeError, match="failed on another rank"):
+        _next_batch_across_ranks(
+            iter([[object()]]), rank=1, device=torch.device("cpu")
+        )
