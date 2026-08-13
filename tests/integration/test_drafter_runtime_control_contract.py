@@ -122,29 +122,37 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
         step=6,
     )
 
-    assert trainer._speco_should_collect_drafter_this_step() is True
-    assert trainer._speco_should_train_drafter_this_step() is True
-    assert trainer._speco_should_publish_drafter_weights(True) is False
+    config = trainer._speco_drafter_schedule_config()
+    scheduler = trainer._speco_get_drafter_scheduler()
+    assert scheduler.should_collect(trainer.global_steps, config) is True
+    assert scheduler.training_interval_matched(trainer.global_steps, config) is True
+    assert not scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=True, config=config
+    ).publish
 
     trainer.global_steps = 8
-    assert trainer._speco_should_collect_drafter_this_step() is True
-    assert trainer._speco_should_train_drafter_this_step() is False
-    assert trainer._speco_should_publish_drafter_weights(True) is True
-    assert trainer._speco_should_publish_drafter_weights(False) is False
+    assert scheduler.should_collect(trainer.global_steps, config) is True
+    assert scheduler.training_interval_matched(trainer.global_steps, config) is False
+    assert scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=True, config=config
+    ).publish
+    assert not scheduler.plan_publish(
+        global_step=trainer.global_steps, drafter_trained=False, config=config
+    ).publish
 
 
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
-    assert trainer._speco_should_attempt_drafter_train_this_step() is False
+    assert trainer._speco_plan_drafter_training().launch is False
 
     trainer.global_steps = 5
     trainer._speco_last_collected_samples = 0
     trainer._speco_oldlogprob_collection_requested = lambda: True
-    assert trainer._speco_should_attempt_drafter_train_this_step() is False
+    assert trainer._speco_plan_drafter_training().launch is False
 
     trainer._speco_last_collected_samples = 1
-    assert trainer._speco_should_attempt_drafter_train_this_step() is True
+    assert trainer._speco_plan_drafter_training().launch is True
 
 
 def test_sync_scheduler_preserves_released_training_call_order() -> None:

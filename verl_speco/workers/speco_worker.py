@@ -1164,7 +1164,23 @@ class SpecoWorker(Worker):
         if training_plan.get("source_global_step") != self.last_global_step:
             result["reason"] = "stale_training_plan"
             return result
+        required_target_version = training_plan.get("required_target_version")
+        current_target_version = getattr(
+            self.trainer, "_target_lm_head_weight_step", None
+        )
+        if required_target_version is not None and int(required_target_version) != int(
+            current_target_version if current_target_version is not None else -1
+        ):
+            result["reason"] = "target_version_mismatch"
+            return result
+        data_version = training_plan.get("data_version")
+        if data_version is not None and int(data_version) > int(self.last_global_step):
+            result["reason"] = "future_data_version"
+            return result
         max_batches = max(int(training_plan.get("max_batches", 0)), 0)
+        if max_batches < max(int(training_plan.get("min_batches", 1)), 1):
+            result["reason"] = "insufficient_training_budget"
+            return result
         prepare_publish = bool(training_plan.get("publish_after_success", False))
         data_status_before = self.trainer.get_training_data_status(
             sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),

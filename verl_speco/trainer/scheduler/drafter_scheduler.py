@@ -104,12 +104,50 @@ class DrafterScheduler:
         )
         return self.data_status_policy.aggregate(statuses, global_step=global_step)
 
-    def prepare_training_plan(self, plan: TrainingPlan) -> dict[str, Any]:
+    def prepare_training_plan(
+        self, context: DrafterScheduleContext, config: DrafterScheduleConfig
+    ) -> TrainingPlan:
+        """Build a plan while avoiding worker RPCs for cheap skip conditions."""
+
+        interval_matched = self.training_interval_matched(context.global_step, config)
+        if context.training_mode == "collect_only" or context.pending_training_count > 0 or not interval_matched:
+            return self.plan_training(context, config)
+        data_status = context.data_status or self.inspect_training_data(
+            global_step=context.global_step, config=config
+        )
+        return self.plan_training(
+            DrafterScheduleContext(
+                global_step=context.global_step,
+                training_mode=context.training_mode,
+                collected_samples_this_step=context.collected_samples_this_step,
+                oldlogprob_collection_requested=context.oldlogprob_collection_requested,
+                data_status=data_status,
+                pending_training_count=context.pending_training_count,
+            ),
+            config,
+        )
+
+    def prepare_training_execution(self, plan: TrainingPlan) -> dict[str, Any]:
         if not plan.launch:
             return {"drafter/target_lm_head_synced": 0}
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
         return self._worker_executor.prepare_training(plan)
+
+    def activate_training_workers(self) -> list[Any]:
+        if self._worker_executor is None:
+            raise RuntimeError("Drafter worker executor has not been bound")
+        results = self._worker_executor.activate_training_workers()
+        active = [
+            result
+            for result in results
+            if isinstance(result, dict)
+            and result.get("reason") not in {"disabled", "not_in_training_group"}
+        ]
+        failures = [result for result in active if not result.get("activated", False)]
+        if failures:
+            raise RuntimeError(f"SPECO drafter trainer activation failed: {failures[:3]}")
+        return results
 
     def wait_pending_publish(self) -> int:
         if self._publish_executor is None:
@@ -192,6 +230,12 @@ class DrafterScheduler:
             "deadline_ts": budget.deadline_ts,
             "require_full_batch": budget.require_full_batch,
             "sample_last_n_steps": budget.sample_last_n_steps,
+            "data_version": (
+                context.data_status.data_version if context.data_status else None
+            ),
+            "required_target_version": (
+                None if config.use_logits else int(context.global_step)
+            ),
         }
         if not trigger.should_train:
             return TrainingPlan(
@@ -204,6 +248,13 @@ class DrafterScheduler:
             return TrainingPlan(
                 launch=False,
                 reason=budget.reason,
+                publish_after_success=False,
+                **common,
+            )
+        if budget.max_batches < budget.min_batches:
+            return TrainingPlan(
+                launch=False,
+                reason="insufficient_training_budget",
                 publish_after_success=False,
                 **common,
             )

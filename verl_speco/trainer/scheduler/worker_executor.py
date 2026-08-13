@@ -33,6 +33,8 @@ class DrafterWorkerExecutor(Protocol):
 
     def prepare_training(self, plan: TrainingPlan) -> dict[str, Any]: ...
 
+    def activate_training_workers(self) -> list[Any]: ...
+
 
 @dataclass(frozen=True)
 class CallbackDrafterWorkerExecutor:
@@ -42,6 +44,7 @@ class CallbackDrafterWorkerExecutor:
     resolve: Callable[[Any], Any]
     inspect_data: Callable[[int, bool], Any]
     prepare: Callable[[TrainingPlan], dict[str, Any]]
+    activate: Callable[[], Any]
 
     def submit_training(self, plan: TrainingPlan) -> Any:
         return self.submit(plan.to_worker_payload())
@@ -68,3 +71,7 @@ class CallbackDrafterWorkerExecutor:
 
     def prepare_training(self, plan: TrainingPlan) -> dict[str, Any]:
         return self.prepare(plan)
+
+    def activate_training_workers(self) -> list[Any]:
+        results = self.resolve(self.activate()) or []
+        return results if isinstance(results, list) else [results]

@@ -319,3 +319,42 @@ def test_publish_plan_honors_training_plan_publish_decision() -> None:
 
     assert not plan.publish
     assert plan.reason == "training_plan_publish_disabled"
+
+
+def test_budget_smaller_than_minimum_does_not_launch() -> None:
+    plan = DrafterScheduler().plan_training(
+        _context(trainable_batches=5),
+        DrafterScheduleConfig(
+            training_interval_steps=1,
+            train_batches_per_trigger=2,
+            min_trainable_batches=3,
+        ),
+    )
+
+    assert not plan.launch
+    assert plan.reason == "insufficient_training_budget"
+    assert plan.max_batches == 2
+    assert plan.min_batches == 3
+
+
+def test_inconsistent_target_versions_do_not_launch() -> None:
+    context = _context(trainable_batches=2)
+    context = DrafterScheduleContext(
+        global_step=context.global_step,
+        training_mode=context.training_mode,
+        collected_samples_this_step=context.collected_samples_this_step,
+        oldlogprob_collection_requested=context.oldlogprob_collection_requested,
+        data_status=TrainingDataStatus(
+            **{
+                **context.data_status.__dict__,
+                "target_version_consistent": False,
+            }
+        ),
+    )
+
+    plan = DrafterScheduler().plan_training(
+        context, DrafterScheduleConfig(training_interval_steps=1)
+    )
+
+    assert not plan.launch
+    assert plan.reason == "inconsistent_target_version"

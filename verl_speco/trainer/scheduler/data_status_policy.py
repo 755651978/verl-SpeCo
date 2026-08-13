@@ -16,6 +16,13 @@ class ConservativeTrainingDataStatusPolicy:
     ) -> TrainingDataStatus | None:
         if not statuses:
             return None
+        target_version_consistent = all(
+            s.target_version_consistent for s in statuses
+        ) and all(s.target_version == statuses[0].target_version for s in statuses)
+        newest_sample_step = max(
+            (s.newest_sample_step for s in statuses if s.newest_sample_step is not None),
+            default=None,
+        )
         return TrainingDataStatus(
             current_step=int(global_step),
             current_step_samples=min(s.current_step_samples for s in statuses),
@@ -28,14 +35,9 @@ class ConservativeTrainingDataStatusPolicy:
                 (s.oldest_sample_step for s in statuses if s.oldest_sample_step is not None),
                 default=None,
             ),
-            newest_sample_step=max(
-                (s.newest_sample_step for s in statuses if s.newest_sample_step is not None),
-                default=None,
-            ),
+            newest_sample_step=newest_sample_step,
             same_step_data_required=any(s.same_step_data_required for s in statuses),
-            target_version=(
-                statuses[0].target_version
-                if all(s.target_version == statuses[0].target_version for s in statuses)
-                else None
-            ),
+            target_version=(statuses[0].target_version if target_version_consistent else None),
+            target_version_consistent=target_version_consistent,
+            data_version=newest_sample_step,
         )

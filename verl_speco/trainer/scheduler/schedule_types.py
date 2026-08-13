@@ -47,6 +47,7 @@ class DrafterScheduleConfig:
     training_interval_steps: object = 1
     publish_interval_steps: object = 0
     publish_async: bool = False
+    use_logits: bool = False
     use_data_buffer: bool = False
     train_batches_per_trigger: int = 100
     collection_sample_rate: float = 1.0
@@ -69,6 +70,7 @@ class DrafterScheduleConfig:
             training_interval_steps=get("training_interval_steps", 1),
             publish_interval_steps=get("publish_interval_steps", 0),
             publish_async=bool(get("publish_async", False)),
+            use_logits=bool(get("use_logits", False)),
             use_data_buffer=bool(get("use_data_buffer", False)),
             train_batches_per_trigger=train_batches,
             collection_sample_rate=float(get("collection_sample_rate", 1.0) or 0.0),
@@ -202,6 +204,8 @@ class TrainingDataStatus:
     newest_sample_step: int | None
     same_step_data_required: bool
     target_version: int | None = None
+    target_version_consistent: bool = True
+    data_version: int | None = None
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
@@ -217,6 +221,12 @@ class TrainingDataStatus:
             newest_sample_step=_optional_int(value.get("newest_sample_step")),
             same_step_data_required=bool(value.get("same_step_data_required", False)),
             target_version=_optional_int(value.get("target_version")),
+            target_version_consistent=bool(
+                value.get("target_version_consistent", True)
+            ),
+            data_version=_optional_int(
+                value.get("data_version", value.get("newest_sample_step"))
+            ),
         )
 
     def metrics(self) -> dict[str, int]:
@@ -227,6 +237,9 @@ class TrainingDataStatus:
             "drafter/data_trainable_batches": self.trainable_batches,
             "drafter/data_partial_batch_available": int(self.partial_batch_available),
             "drafter/data_same_step_required": int(self.same_step_data_required),
+            "drafter/data_target_version_consistent": int(
+                self.target_version_consistent
+            ),
         }
 
 
@@ -261,6 +274,8 @@ class TrainingPlan:
     deadline_ts: float | None = None
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
+    data_version: int | None = None
+    required_target_version: int | None = None
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
@@ -274,6 +289,8 @@ class TrainingPlan:
         "no_trainable_batch": 9,
         "training_ready": 10,
         "no_training_budget": 11,
+        "insufficient_training_budget": 12,
+        "inconsistent_target_version": 13,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -289,6 +306,8 @@ class TrainingPlan:
             "deadline_ts": self.deadline_ts,
             "require_full_batch": self.require_full_batch,
             "sample_last_n_steps": self.sample_last_n_steps,
+            "data_version": self.data_version,
+            "required_target_version": self.required_target_version,
         }
 
     def metrics(self) -> dict[str, int]:
