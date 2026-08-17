@@ -24,6 +24,7 @@ import os
 import random
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -334,7 +335,8 @@ class SpecoWorker(Worker):
         self.last_global_step: Optional[int] = None
         self.last_trained_step: Optional[int] = None
         self.worker_incarnation = uuid.uuid4().hex
-        self._staged_rollout_features: dict[str, list[dict]] = {}
+        self._staged_rollout_features: dict[str, dict[str, object]] = {}
+        self._collection_commit_journals: dict[str, dict[str, object]] = {}
         self._prepared_training_plan_id: Optional[str] = None
         self.training_process_group = None
         self.dp_process_group = None
@@ -919,6 +921,7 @@ class SpecoWorker(Worker):
         collected: bool = False,
         reason: str,
         buffer_version_before: int | None = None,
+        expired_stages: int = 0,
     ) -> dict[str, object]:
         source_global_step = int(self.last_global_step)
         current_buffer_version = int(
@@ -939,6 +942,7 @@ class SpecoWorker(Worker):
             "data_version": source_global_step,
             "collected": collected,
             "reason": reason,
+            "expired_stages": expired_stages,
         }
 
     @staticmethod
@@ -947,10 +951,57 @@ class SpecoWorker(Worker):
             raise ValueError("Expected exactly one drafter collection request")
         return requests[0]
 
+    def _cleanup_expired_collection_stages(self) -> int:
+        ttl_sec = float(
+            self.config.rollout.drafter.training.get(
+                "collection_stage_ttl_sec", 300.0
+            )
+            or 0.0
+        )
+        if ttl_sec <= 0:
+            return 0
+        deadline = time.monotonic() - ttl_sec
+        expired = [
+            collection_id
+            for collection_id, entry in self._staged_rollout_features.items()
+            if float(entry.get("staged_at", 0.0)) < deadline
+        ]
+        for collection_id in expired:
+            self._staged_rollout_features.pop(collection_id, None)
+        return len(expired)
+
+    def _snapshot_collection_buffer(self) -> dict[str, object]:
+        trainer = self.trainer
+        if trainer is None:
+            return {}
+        return {
+            "buffer_version": int(trainer.buffer_version),
+            "collected_data": deque(
+                trainer.collected_data, maxlen=trainer.collected_data.maxlen
+            ),
+            "data_buffer": deque(
+                trainer.data_buffer.buffer,
+                maxlen=trainer.data_buffer.buffer.maxlen,
+            ),
+            "data_buffer_step": trainer.data_buffer._current_step,
+        }
+
+    def _restore_collection_buffer(self, snapshot: dict[str, object]) -> None:
+        trainer = self.trainer
+        if trainer is None or not snapshot:
+            return
+        trainer.collected_data = cast(deque, snapshot["collected_data"])
+        trainer.data_buffer.buffer = cast(deque, snapshot["data_buffer"])
+        trainer.data_buffer._current_step = cast(
+            Optional[int], snapshot["data_buffer_step"]
+        )
+        trainer.buffer_version = int(snapshot["buffer_version"])
+
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
     )
     def stage_rollout_features(self, requests: list[dict]):
+        expired_stages = self._cleanup_expired_collection_stages()
         request = self._collection_request(requests)
         collection_id = str(request.get("collection_id", ""))
         samples = request.get("samples")
@@ -966,19 +1017,25 @@ class SpecoWorker(Worker):
             return self._collection_worker_result(
                 collection_id="", reason="missing_collection_id"
             )
-        if collection_id in self._staged_rollout_features:
+        if collection_id in self._staged_rollout_features or collection_id in self._collection_commit_journals:
             return self._collection_worker_result(
-                collection_id=collection_id, reason="collection_already_staged"
+                collection_id=collection_id,
+                reason="collection_already_staged",
+                expired_stages=expired_stages,
             )
         if not isinstance(samples, list):
             return self._collection_worker_result(
                 collection_id=collection_id, reason="invalid_collection_samples"
             )
-        self._staged_rollout_features[collection_id] = samples
+        self._staged_rollout_features[collection_id] = {
+            "samples": samples,
+            "staged_at": time.monotonic(),
+        }
         return self._collection_worker_result(
             collection_id=collection_id,
             staged_samples=len(samples),
             reason="collection_staged",
+            expired_stages=expired_stages,
         )
 
     @register(
@@ -987,11 +1044,18 @@ class SpecoWorker(Worker):
     def commit_rollout_features(self, requests: list[dict]):
         request = self._collection_request(requests)
         collection_id = str(request.get("collection_id", ""))
-        samples = self._staged_rollout_features.pop(collection_id, None)
-        if samples is None:
+        staged = self._staged_rollout_features.pop(collection_id, None)
+        if staged is None:
             return self._collection_worker_result(
                 collection_id=collection_id, reason="collection_not_staged"
             )
+        samples = staged.get("samples")
+        if not isinstance(samples, list):
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="invalid_staged_collection"
+            )
+        snapshot = self._snapshot_collection_buffer()
+        self._collection_commit_journals[collection_id] = snapshot
         return self._commit_rollout_features(collection_id, samples)
 
     @register(
@@ -1004,6 +1068,41 @@ class SpecoWorker(Worker):
         return self._collection_worker_result(
             collection_id=collection_id,
             reason="collection_aborted" if removed is not None else "collection_absent",
+        )
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def rollback_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        self._staged_rollout_features.pop(collection_id, None)
+        snapshot = self._collection_commit_journals.pop(collection_id, None)
+        if snapshot is not None:
+            self._restore_collection_buffer(snapshot)
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            reason=(
+                "collection_rolled_back"
+                if snapshot is not None
+                else "collection_rollback_absent"
+            ),
+        )
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def finalize_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        journal = self._collection_commit_journals.pop(collection_id, None)
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            reason=(
+                "collection_finalized"
+                if journal is not None
+                else "collection_finalize_absent"
+            ),
         )
 
     def _commit_rollout_features(
@@ -1355,6 +1454,8 @@ class SpecoWorker(Worker):
             "attempted_steps": 0,
             "elapsed_sec": 0.0,
             "reason": "",
+            "worker_id": str(self.rank),
+            "worker_incarnation": self.worker_incarnation,
         }
         if not self.enable_drafter:
             result["reason"] = "disabled"
@@ -1374,6 +1475,9 @@ class SpecoWorker(Worker):
         result.update(
             {
                 "source_global_step": int(training_plan["source_global_step"]),
+                "plan_id": plan_id,
+                "data_version": training_plan.get("data_version"),
+                "target_version": training_plan.get("required_target_version"),
                 "execution_strategy": str(training_plan["execution_strategy"]),
                 "buffer_size_before": buffer_size_before,
                 "buffer_size_after": buffer_size_before,

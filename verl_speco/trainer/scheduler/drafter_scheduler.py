@@ -312,6 +312,7 @@ class DrafterScheduler:
         outcome = TrainingOutcome.from_execution(
             execution,
             runtime_state=context.runtime_state,
+            plan=plan,
         )
         return SchedulerEventOutcome(
             training_plan=plan,

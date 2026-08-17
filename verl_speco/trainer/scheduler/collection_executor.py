@@ -23,6 +23,10 @@ class DrafterCollectionExecutor(Protocol):
 
     def abort(self, payload: CollectionPayload) -> None: ...
 
+    def rollback(self, payload: CollectionPayload) -> None: ...
+
+    def finalize(self, payload: CollectionPayload) -> list[CollectionWorkerResult]: ...
+
 
 @dataclass(frozen=True)
 class CallbackDrafterCollectionExecutor:
@@ -32,6 +36,8 @@ class CallbackDrafterCollectionExecutor:
     stage_submit: Callable[[list[list[dict]]], Any]
     commit_submit: Callable[[list[list[dict]]], Any]
     abort_submit: Callable[[list[list[dict]]], Any]
+    rollback_submit: Callable[[list[list[dict]]], Any]
+    finalize_submit: Callable[[list[list[dict]]], Any]
     resolve: Callable[[Any], Any]
 
     def set_global_step(self, global_step: object) -> None:
@@ -77,3 +83,11 @@ class CallbackDrafterCollectionExecutor:
     def abort(self, payload: CollectionPayload) -> None:
         requests = self._control_buckets(payload, include_samples=False)
         self.resolve(self.abort_submit(requests))
+
+    def rollback(self, payload: CollectionPayload) -> None:
+        requests = self._control_buckets(payload, include_samples=False)
+        self.resolve(self.rollback_submit(requests))
+
+    def finalize(self, payload: CollectionPayload) -> list[CollectionWorkerResult]:
+        requests = self._control_buckets(payload, include_samples=False)
+        return self._normalize(self.resolve(self.finalize_submit(requests)) or [])

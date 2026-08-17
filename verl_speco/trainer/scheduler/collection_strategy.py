@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import time
+import logging
 from dataclasses import dataclass
 from typing import ClassVar, Protocol
 
@@ -18,6 +19,8 @@ from verl_speco.trainer.scheduler.schedule_types import (
     CollectionWorkerResult,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class CollectionOutcome:
@@ -29,6 +32,7 @@ class CollectionOutcome:
     raw_samples: int = 0
     elapsed_sec: float = 0.0
     worker_results: list[CollectionWorkerResult] | None = None
+    finalized: bool = False
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collection_completed": 1,
@@ -53,6 +57,10 @@ class CollectionOutcome:
                 result.rejected_samples for result in worker_results
             ),
             "drafter/collection_worker_results": len(worker_results),
+            "drafter/collection_finalized": int(self.finalized),
+            "drafter/collection_expired_stages": sum(
+                result.expired_stages for result in worker_results
+            ),
             "drafter/raw_drafter_samples": self.raw_samples,
             "timing_s/drafter_collection_rpc": self.elapsed_sec,
         }
@@ -149,7 +157,7 @@ class SyncCollectionStrategy:
         try:
             results = executor.commit(payload)
         except Exception:
-            executor.abort(payload)
+            executor.rollback(payload)
             raise
         accepted_samples = sum(result.accepted_samples for result in results)
         rejected_samples = sum(result.rejected_samples for result in results)
@@ -204,13 +212,26 @@ class SyncCollectionStrategy:
             reason = "collection_version_mismatch"
         else:
             reason = "collection_completed"
+        finalized = False
+        if reason == "collection_completed":
+            try:
+                executor.finalize(payload)
+                finalized = True
+            except Exception:
+                logger.exception(
+                    "Failed to finalize committed drafter collection %s",
+                    plan.collection_id,
+                )
+        else:
+            executor.rollback(payload)
         return CollectionOutcome(
             attempted=True,
             collected=reason == "collection_completed",
             reason=reason,
             source_global_step=plan.source_global_step,
-            collected_samples=accepted_samples,
+            collected_samples=(accepted_samples if reason == "collection_completed" else 0),
             raw_samples=payload.raw_samples,
             elapsed_sec=time.perf_counter() - started_at,
             worker_results=results,
+            finalized=finalized,
         )

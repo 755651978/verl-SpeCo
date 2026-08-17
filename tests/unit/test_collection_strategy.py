@@ -78,6 +78,10 @@ def _executor(*, commit_results=None, stage_results=None):
         stage_submit=lambda buckets: stage_results or [_staged_result()],
         commit_submit=lambda buckets: commit_results or [_worker_result()],
         abort_submit=lambda buckets: [],
+        rollback_submit=lambda buckets: [],
+        finalize_submit=lambda buckets: [
+            _worker_result(reason="collection_finalized", accepted_samples=0)
+        ],
         resolve=lambda value: value,
     )
 
@@ -90,6 +94,10 @@ def test_collection_sets_step_submits_buckets_and_returns_outcome() -> None:
         commit_submit=lambda buckets: events.append(("commit", buckets))
         or "commit-ref",
         abort_submit=lambda buckets: events.append(("abort", buckets)) or "abort-ref",
+        rollback_submit=lambda buckets: events.append(("rollback", buckets))
+        or "rollback-ref",
+        finalize_submit=lambda buckets: events.append(("finalize", buckets))
+        or "finalize-ref",
         resolve=lambda value: events.append(("resolve", value))
         or ([_staged_result()] if value == "stage-ref" else [])
         or ([_worker_result()] if value == "commit-ref" else []),
@@ -103,6 +111,7 @@ def test_collection_sets_step_submits_buckets_and_returns_outcome() -> None:
     assert events[2][0] == "stage"
     assert events[3] == ("resolve", "stage-ref")
     assert events[4][0] == "commit"
+    assert any(event[0] == "finalize" for event in events if isinstance(event, tuple))
     assert outcome.attempted
     assert outcome.collected
     assert outcome.collected_samples == 1
@@ -150,7 +159,7 @@ def test_worker_version_mismatch_fails_closed() -> None:
     ).execute_collection_plan(_plan(), _payload())
 
     assert not outcome.collected
-    assert outcome.collected_samples == 1
+    assert outcome.collected_samples == 0
     assert outcome.reason == "collection_version_mismatch"
 
 
@@ -187,6 +196,8 @@ def test_stage_failure_aborts_before_commit() -> None:
         ],
         commit_submit=lambda buckets: events.append("commit"),
         abort_submit=lambda buckets: events.append("abort") or [],
+        rollback_submit=lambda buckets: events.append("rollback") or [],
+        finalize_submit=lambda buckets: events.append("finalize") or [],
         resolve=lambda value: value,
     )
 
@@ -213,12 +224,39 @@ def test_collection_id_must_match_before_worker_rpc() -> None:
         )
 
 
+def test_commit_validation_failure_rolls_back_all_workers() -> None:
+    events = []
+    executor = CallbackDrafterCollectionExecutor(
+        set_step=lambda step: None,
+        stage_submit=lambda buckets: [_staged_result()],
+        commit_submit=lambda buckets: [_worker_result(data_version=3)],
+        abort_submit=lambda buckets: events.append("abort") or [],
+        rollback_submit=lambda buckets: events.append("rollback") or [],
+        finalize_submit=lambda buckets: events.append("finalize") or [],
+        resolve=lambda value: value,
+    )
+
+    outcome = DrafterScheduler(
+        collection_executor=executor
+    ).execute_collection_plan(_plan(), _payload())
+
+    assert not outcome.collected
+    assert outcome.collected_samples == 0
+    assert events == ["rollback"]
+
+
 def test_inactive_collection_plan_does_not_call_executor() -> None:
     executor = CallbackDrafterCollectionExecutor(
         set_step=lambda step: (_ for _ in ()).throw(AssertionError("unexpected")),
         stage_submit=lambda buckets: (_ for _ in ()).throw(AssertionError("unexpected")),
         commit_submit=lambda buckets: (_ for _ in ()).throw(AssertionError("unexpected")),
         abort_submit=lambda buckets: (_ for _ in ()).throw(AssertionError("unexpected")),
+        rollback_submit=lambda buckets: (_ for _ in ()).throw(
+            AssertionError("unexpected")
+        ),
+        finalize_submit=lambda buckets: (_ for _ in ()).throw(
+            AssertionError("unexpected")
+        ),
         resolve=lambda value: value,
     )
 

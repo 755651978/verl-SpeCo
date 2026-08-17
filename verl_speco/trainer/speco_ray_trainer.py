@@ -130,17 +130,6 @@ def _get_nested(config, path, default=None):
     return current
 
 
-def _speco_alpha_counter(value: int) -> str:
-    """Encode a positive counter with letters so Ray log dedup keeps each sample."""
-
-    value = max(int(value), 1)
-    chars = []
-    while value:
-        value, remainder = divmod(value - 1, 26)
-        chars.append(chr(ord("a") + remainder))
-    return "".join(reversed(chars))
-
-
 def _speco_ref_meta_rows(meta: Any) -> int:
     if not isinstance(meta, dict):
         return 0
@@ -312,12 +301,6 @@ def _speco_vllm_spec_decode_metrics_from_stats(
     }
 
 
-def _speco_vllm_spec_decode_metrics_from_batch(batch: Any) -> dict[str, float]:
-    return _speco_vllm_spec_decode_metrics_from_stats(
-        _speco_vllm_spec_decode_stats_from_batch(batch)
-    )
-
-
 def _speco_truthy_meta_value(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -441,6 +424,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 stage_submit=self.speco_stage_rollout_features,
                 commit_submit=self.speco_commit_rollout_features,
                 abort_submit=self.speco_abort_rollout_features,
+                rollback_submit=self.speco_rollback_rollout_features,
+                finalize_submit=self.speco_finalize_rollout_features,
                 resolve=self._ray_get_if_needed,
             )
         )
@@ -472,6 +457,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def speco_abort_rollout_features(self, requests: list[list[dict]]):
         return self._require_speco_worker_group().abort_rollout_features(requests)
+
+    def speco_rollback_rollout_features(self, requests: list[list[dict]]):
+        return self._require_speco_worker_group().rollback_rollout_features(requests)
+
+    def speco_finalize_rollout_features(self, requests: list[list[dict]]):
+        return self._require_speco_worker_group().finalize_rollout_features(requests)
 
     def speco_sync_target_lm_head_weight(self, payload: Any, global_step: Any = None):
         return self._require_speco_worker_group().sync_target_lm_head_weight(
@@ -1137,39 +1128,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return mode
 
     @staticmethod
-    def _speco_oldlogprob_aux_layer_ids_from_config(config) -> Any | None:
-        candidates = (
-            ("model", "eagle_config", "target_hidden_layer_ids"),
-            ("model", "eagle_config", "eagle_aux_hidden_state_layer_ids"),
-            ("eagle_config", "target_hidden_layer_ids"),
-            ("eagle_config", "eagle_aux_hidden_state_layer_ids"),
-            ("target_hidden_layer_ids",),
-            ("eagle_aux_hidden_state_layer_ids",),
-            ("target_layer_ids",),
-        )
-        for path in candidates:
-            layer_ids = _get_nested(config, path, None)
-            if layer_ids is not None:
-                return layer_ids
-        return None
-
-    @staticmethod
-    def _speco_normalize_oldlogprob_aux_layer_ids(layer_ids) -> list[int] | None:
-        if layer_ids is None:
-            return None
-        if isinstance(layer_ids, int):
-            return [int(layer_ids)]
-        if isinstance(layer_ids, str):
-            raw = layer_ids.strip()
-            if not raw:
-                return None
-            if raw.startswith("["):
-                layer_ids = json.loads(raw)
-            else:
-                layer_ids = [part.strip() for part in raw.split(",") if part.strip()]
-        return [int(layer_id) for layer_id in list(layer_ids)]
-
-    @staticmethod
     def _speco_load_model_config(model_path: Any) -> dict[str, Any] | None:
         if not model_path:
             return None
@@ -1206,15 +1164,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         target_model_path = _get_nested(target_model_cfg, ("path",), None)
         target_config = self._speco_load_model_config(target_model_path)
         return self._speco_num_hidden_layers_from_config(target_config)
-
-    @staticmethod
-    def _speco_default_eagle3_aux_layer_ids(num_hidden_layers: int) -> list[int]:
-        num_hidden_layers = int(num_hidden_layers)
-        if num_hidden_layers <= 0:
-            raise RuntimeError(
-                f"SPECO cannot derive EAGLE3 aux hidden layers from num_hidden_layers={num_hidden_layers}"
-            )
-        return [2, num_hidden_layers // 2, num_hidden_layers - 3]
 
     def _speco_validate_sglang_aux_last_layer_norm(self) -> None:
         """Fail closed if SGLang collection would capture the last aux layer pre-norm.

@@ -209,6 +209,7 @@ class CollectionWorkerResult:
     reason: str
     collection_id: str = ""
     staged_samples: int = 0
+    expired_stages: int = 0
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "CollectionWorkerResult":
@@ -225,6 +226,7 @@ class CollectionWorkerResult:
             reason=str(value.get("reason", "")),
             collection_id=str(value.get("collection_id", "")),
             staged_samples=int(value.get("staged_samples", 0)),
+            expired_stages=int(value.get("expired_stages", 0)),
         )
 
 
@@ -430,6 +432,12 @@ class TrainingResult:
     elapsed_sec: float
     reason: str
     snapshot_ready: bool
+    trained: bool = False
+    worker_id: str = ""
+    worker_incarnation: str = ""
+    plan_id: str = ""
+    data_version: int | None = None
+    target_version: int | None = None
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingResult":
@@ -446,5 +454,10 @@ class TrainingResult:
             elapsed_sec=float(value.get("elapsed_sec", 0.0)),
             reason=str(value.get("reason", "")),
             snapshot_ready=bool(value.get("publish_snapshot_cached", False)),
+            trained=bool(value.get("trained", False)),
+            worker_id=str(value.get("worker_id", value.get("rank", ""))),
+            worker_incarnation=str(value.get("worker_incarnation", "")),
+            plan_id=str(value.get("plan_id", "")),
+            data_version=_optional_int(value.get("data_version")),
+            target_version=_optional_int(value.get("target_version")),
         )
-
