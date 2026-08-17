@@ -7,6 +7,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from verl_speco.trainer.scheduler import (
@@ -30,6 +32,8 @@ def _plan(*, launch: bool = True) -> TrainingPlan:
         source_global_step=4,
         max_batches=2,
         publish_after_success=True,
+        plan_id="plan-4",
+        worker_snapshots={"0": {"buffer_version": 1}},
     )
 
 
@@ -41,10 +45,16 @@ def test_sync_execution_submits_payload_and_blocks_for_results() -> None:
         CallbackDrafterWorkerExecutor(
             submit=lambda payload: events.append(("submit", payload)) or "ref",
             resolve=lambda ref: events.append(("resolve", ref))
-            or [{"trained": True}],
+            or (
+                [{"participating": True, "ready": True, "worker_id": "0"}]
+                if ref == "preflight-ref"
+                else [{"trained": True}]
+            ),
             inspect_data=lambda sample_last_n_steps, require_full_batch: [],
             prepare=lambda plan: {},
             activate=lambda: [],
+            preflight=lambda payload: "preflight-ref",
+            abort_preflight=lambda plan_id: [],
         )
     )
     outcome = scheduler.execute_training_plan(
@@ -52,9 +62,10 @@ def test_sync_execution_submits_payload_and_blocks_for_results() -> None:
         runtime_state=state,
     )
 
-    assert events[0][0] == "submit"
-    assert events[0][1]["max_batches"] == 2
-    assert events[1] == ("resolve", "ref")
+    assert events[0] == ("resolve", "preflight-ref")
+    assert events[1][0] == "submit"
+    assert events[1][1]["max_batches"] == 2
+    assert events[2] == ("resolve", "ref")
     assert outcome.raw_results == [{"trained": True}]
     assert state.status is DrafterRuntimeStatus.RUNNING
 
@@ -69,6 +80,8 @@ def test_sync_execution_marks_runtime_failed() -> None:
                 inspect_data=lambda sample_last_n_steps, require_full_batch: [],
                 prepare=lambda plan: {},
                 activate=lambda: [],
+                preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+                abort_preflight=lambda plan_id: [],
             )
         ).execute_training_plan(
             _plan(),
@@ -86,6 +99,8 @@ def test_sync_execution_rejects_inactive_plan() -> None:
                 inspect_data=lambda sample_last_n_steps, require_full_batch: [],
                 prepare=lambda plan: {},
                 activate=lambda: [],
+                preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+                abort_preflight=lambda plan_id: [],
             )
         ).execute_training_plan(
             _plan(launch=False),
@@ -110,6 +125,8 @@ def test_prepare_plan_skips_worker_inspection_before_interval() -> None:
             ),
             prepare=lambda plan: {},
             activate=lambda: [],
+            preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+            abort_preflight=lambda plan_id: [],
         )
     )
     context = DrafterScheduleContext(
@@ -135,8 +152,43 @@ def test_scheduler_validates_training_worker_activation() -> None:
             inspect_data=lambda sample_last_n_steps, require_full_batch: [],
             prepare=lambda plan: {},
             activate=lambda: [{"activated": False, "reason": "activation_failed"}],
+            preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+            abort_preflight=lambda plan_id: [],
         )
     )
 
     with pytest.raises(RuntimeError, match="activation failed"):
         scheduler.activate_training_workers()
+
+
+def test_preflight_failure_aborts_all_workers_without_submitting_training() -> None:
+    events = []
+    scheduler = DrafterScheduler(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: events.append("submit"),
+            resolve=lambda value: value,
+            inspect_data=lambda sample_last_n_steps, require_full_batch: [],
+            prepare=lambda plan: {},
+            activate=lambda: [],
+            preflight=lambda payload: [
+                {"participating": True, "ready": True, "rank": 0, "worker_id": "0"},
+                {
+                    "participating": True,
+                    "ready": False,
+                    "rank": 1,
+                    "worker_id": "1",
+                    "reason": "buffer_version_changed",
+                },
+            ],
+            abort_preflight=lambda plan_id: events.append(("abort", plan_id)) or [],
+        )
+    )
+
+    outcome = scheduler.execute_training_plan(
+        replace(_plan(), worker_snapshots={"0": {}, "1": {}}),
+        runtime_state=DrafterRuntimeState(),
+    )
+
+    assert not outcome.launched
+    assert outcome.reason == "worker_preflight_failed"
+    assert events == [("abort", "plan-4")]

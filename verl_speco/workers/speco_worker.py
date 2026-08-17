@@ -23,6 +23,7 @@ import logging
 import os
 import random
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -332,6 +333,8 @@ class SpecoWorker(Worker):
         self.feature_writer_type: Optional[str] = None
         self.last_global_step: Optional[int] = None
         self.last_trained_step: Optional[int] = None
+        self.worker_incarnation = uuid.uuid4().hex
+        self._prepared_training_plan_id: Optional[str] = None
         self.training_process_group = None
         self.dp_process_group = None
         self.training_group_ranks: list[int] = []
@@ -1135,9 +1138,91 @@ class SpecoWorker(Worker):
                 "available": True,
                 "replica_rank": self.replica_rank,
                 "rank": self.rank,
+                "worker_id": str(self.rank),
+                "worker_incarnation": self.worker_incarnation,
             }
         )
         return status
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def preflight_drafter_training(self, training_plan=None):
+        result = {
+            "ready": False,
+            "participating": False,
+            "activated": False,
+            "rank": self.rank,
+            "worker_id": str(self.rank),
+            "worker_incarnation": self.worker_incarnation,
+            "reason": "",
+        }
+        self._prepared_training_plan_id = None
+        if not self.enable_drafter:
+            result["reason"] = "disabled"
+            return result
+        if not self.in_drafter_train_group or self.trainer is None:
+            result["reason"] = "not_in_training_group"
+            return result
+        result["participating"] = True
+        if not isinstance(training_plan, dict) or not training_plan.get("launch"):
+            result["reason"] = "missing_or_inactive_training_plan"
+            return result
+        if training_plan.get("execution_strategy") != "sync":
+            result["reason"] = "unsupported_execution_strategy"
+            return result
+        if training_plan.get("source_global_step") != self.last_global_step:
+            result["reason"] = "stale_training_plan"
+            return result
+
+        snapshot = (training_plan.get("worker_snapshots") or {}).get(str(self.rank))
+        if not isinstance(snapshot, dict):
+            result["reason"] = "missing_worker_snapshot"
+            return result
+        if snapshot.get("worker_incarnation") != self.worker_incarnation:
+            result["reason"] = "worker_restarted"
+            return result
+        if int(snapshot.get("buffer_version", -1)) != int(self.trainer.buffer_version):
+            result["reason"] = "buffer_version_changed"
+            return result
+        required_target_version = training_plan.get("required_target_version")
+        current_target_version = getattr(self.trainer, "_target_lm_head_weight_step", None)
+        if required_target_version is not None and int(required_target_version) != int(
+            current_target_version if current_target_version is not None else -1
+        ):
+            result["reason"] = "target_version_mismatch"
+            return result
+        data_status = self.trainer.get_training_data_status(
+            sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
+            require_full_batch=bool(training_plan.get("require_full_batch", False)),
+        )
+        if int(data_status["trainable_batches"]) < int(training_plan.get("min_batches", 1)):
+            result["reason"] = "insufficient_worker_data"
+            return result
+
+        self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
+        with _preserve_process_rng_state(self.device_name):
+            activated = bool(await self.trainer.activate_training_model())
+        result["activated"] = activated
+        if not activated:
+            result["reason"] = "activation_failed"
+            return result
+        result.update(
+            {
+                "ready": True,
+                "reason": "ready",
+                "buffer_version": int(self.trainer.buffer_version),
+                "data_version": data_status.get("data_version"),
+                "target_version": current_target_version,
+            }
+        )
+        return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def abort_drafter_training_preflight(self, plan_id: str):
+        was_prepared = self._prepared_training_plan_id == str(plan_id)
+        self._prepared_training_plan_id = None
+        if was_prepared and self.trainer is not None:
+            await self.trainer.cleanup_training(clear_data=False)
+        return {"aborted": was_prepared, "rank": self.rank}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def train_drafter(self, training_plan=None):
@@ -1155,43 +1240,21 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group or self.trainer is None:
             result["reason"] = "not_in_training_group"
             return result
-        if not isinstance(training_plan, dict) or not training_plan.get("launch"):
-            result["reason"] = "missing_or_inactive_training_plan"
+        plan_id = str(training_plan.get("plan_id", "")) if isinstance(training_plan, dict) else ""
+        if not plan_id or self._prepared_training_plan_id != plan_id:
+            result["reason"] = "preflight_not_ready"
             return result
-        if training_plan.get("execution_strategy") != "sync":
-            result["reason"] = "unsupported_execution_strategy"
-            return result
-        if training_plan.get("source_global_step") != self.last_global_step:
-            result["reason"] = "stale_training_plan"
-            return result
-        required_target_version = training_plan.get("required_target_version")
-        current_target_version = getattr(
-            self.trainer, "_target_lm_head_weight_step", None
-        )
-        if required_target_version is not None and int(required_target_version) != int(
-            current_target_version if current_target_version is not None else -1
-        ):
-            result["reason"] = "target_version_mismatch"
-            return result
-        data_version = training_plan.get("data_version")
-        if data_version is not None and int(data_version) > int(self.last_global_step):
-            result["reason"] = "future_data_version"
-            return result
+        self._prepared_training_plan_id = None
         max_batches = max(int(training_plan.get("max_batches", 0)), 0)
-        if max_batches < max(int(training_plan.get("min_batches", 1)), 1):
-            result["reason"] = "insufficient_training_budget"
-            return result
         prepare_publish = bool(training_plan.get("publish_after_success", False))
-        data_status_before = self.trainer.get_training_data_status(
-            sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
-            require_full_batch=bool(training_plan.get("require_full_batch", False)),
-        )
+        snapshot = (training_plan.get("worker_snapshots") or {})[str(self.rank)]
+        buffer_size_before = int(snapshot.get("trainable_samples", 0))
         result.update(
             {
                 "source_global_step": int(training_plan["source_global_step"]),
                 "execution_strategy": str(training_plan["execution_strategy"]),
-                "buffer_size_before": int(data_status_before["trainable_samples"]),
-                "buffer_size_after": int(data_status_before["trainable_samples"]),
+                "buffer_size_before": buffer_size_before,
+                "buffer_size_after": buffer_size_before,
                 "optimizer_step": int(self.trainer.optimizer_steps_total),
                 "publish_snapshot_cached": 0,
             }
@@ -1201,23 +1264,6 @@ class SpecoWorker(Worker):
             result["triggered"] = True
             start_ts = time.time()
             self.trainer.clear_pending_publish_state_dict()
-            activation_ts = time.time()
-            success = await self.trainer.activate_training_model()
-            result["activation_elapsed_sec"] = time.time() - activation_ts
-            if not success:
-                logger.error(
-                    "[SpecoWorker replica=%s] failed to activate trainer at step %s",
-                    self.replica_rank,
-                    self.last_global_step,
-                )
-                self.trainer.clear_pending_publish_state_dict()
-                cleanup_ts = time.time()
-                await self.trainer.cleanup_training(clear_data=False)
-                result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
-                result["reason"] = "activation_failed"
-                result["elapsed_sec"] = time.time() - start_ts
-                return result
-
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()

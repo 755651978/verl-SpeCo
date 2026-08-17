@@ -22,6 +22,7 @@ remain unchanged.
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPlan,
@@ -235,6 +236,10 @@ class DrafterScheduler:
             ),
             "required_target_version": (
                 None if config.use_logits else int(context.global_step)
+            ),
+            "plan_id": uuid4().hex,
+            "worker_snapshots": (
+                context.data_status.worker_snapshots if context.data_status else None
             ),
         }
         if not trigger.should_train:

@@ -49,6 +49,8 @@ class IntervalAndBufferTrigger:
             return TriggerDecision(False, "missing_data_status")
         if not status.target_version_consistent:
             return TriggerDecision(False, "inconsistent_target_version")
+        if not status.data_version_consistent:
+            return TriggerDecision(False, "inconsistent_data_version")
         if status.trainable_batches < max(config.min_trainable_batches, 1):
             return TriggerDecision(False, "no_trainable_batch")
         return TriggerDecision(True, "training_ready")

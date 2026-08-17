@@ -23,6 +23,26 @@ class ConservativeTrainingDataStatusPolicy:
             (s.newest_sample_step for s in statuses if s.newest_sample_step is not None),
             default=None,
         )
+        data_versions = [
+            s.data_version if s.data_version is not None else s.newest_sample_step
+            for s in statuses
+        ]
+        data_version_consistent = all(
+            s.data_version_consistent for s in statuses
+        ) and all(version == data_versions[0] for version in data_versions)
+        worker_snapshots = {
+            s.worker_id: {
+                "buffer_version": s.buffer_version,
+                "data_version": (
+                    s.data_version
+                    if s.data_version is not None
+                    else s.newest_sample_step
+                ),
+                "worker_incarnation": s.worker_incarnation,
+                "trainable_samples": s.trainable_samples,
+            }
+            for s in statuses
+        }
         return TrainingDataStatus(
             current_step=int(global_step),
             current_step_samples=min(s.current_step_samples for s in statuses),
@@ -40,4 +60,7 @@ class ConservativeTrainingDataStatusPolicy:
             target_version=(statuses[0].target_version if target_version_consistent else None),
             target_version_consistent=target_version_consistent,
             data_version=newest_sample_step,
+            data_version_consistent=data_version_consistent,
+            buffer_version=min(s.buffer_version for s in statuses),
+            worker_snapshots=worker_snapshots,
         )

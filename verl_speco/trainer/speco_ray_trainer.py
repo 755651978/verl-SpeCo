@@ -429,6 +429,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 inspect_data=self.speco_get_drafter_training_data_status,
                 prepare=self._speco_prepare_drafter_training_rpc,
                 activate=self.speco_activate_drafter_training_model,
+                preflight=self.speco_preflight_drafter_training,
+                abort_preflight=self.speco_abort_drafter_training_preflight,
             )
         )
         self._speco_bind_publish_executor()
@@ -466,6 +468,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def speco_train_drafter(self, training_plan: dict[str, object]):
         return self._require_speco_worker_group().train_drafter(training_plan)
+
+    def speco_preflight_drafter_training(self, training_plan: dict[str, object]):
+        return self._require_speco_worker_group().preflight_drafter_training(
+            training_plan
+        )
+
+    def speco_abort_drafter_training_preflight(self, plan_id: str):
+        return self._require_speco_worker_group().abort_drafter_training_preflight(
+            plan_id
+        )
 
     def speco_get_drafter_training_data_status(
         self,
@@ -950,6 +962,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     inspect_data=self.speco_get_drafter_training_data_status,
                     prepare=self._speco_prepare_drafter_training_rpc,
                     activate=self.speco_activate_drafter_training_model,
+                    preflight=self.speco_preflight_drafter_training,
+                    abort_preflight=self.speco_abort_drafter_training_preflight,
                 )
             )
         return scheduler.inspect_training_data(

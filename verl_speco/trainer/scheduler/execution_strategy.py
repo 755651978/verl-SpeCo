@@ -25,6 +25,8 @@ from verl_speco.trainer.scheduler.worker_executor import DrafterWorkerExecutor
 class ExecutionOutcome:
     raw_results: list[Any]
     elapsed_sec: float
+    launched: bool = True
+    reason: str = "completed"
 
 
 class DrafterTrainingExecutionStrategy(Protocol):
@@ -57,8 +59,35 @@ class SyncExecutionStrategy:
 
         started_at = time.perf_counter()
         runtime_state.submit(plan, started_at=started_at)
-        runtime_state.mark_running()
         try:
+            try:
+                readiness = executor.preflight_training(plan)
+            except Exception:
+                executor.abort_training_preflight(plan)
+                raise
+            participants = [
+                result
+                for result in readiness
+                if isinstance(result, dict) and result.get("participating", False)
+            ]
+            expected_worker_ids = set((plan.worker_snapshots or {}).keys())
+            ready_worker_ids = {
+                str(result.get("worker_id", result.get("rank", "")))
+                for result in participants
+                if bool(result.get("ready", False))
+            }
+            all_expected_workers_ready = bool(expected_worker_ids) and (
+                ready_worker_ids == expected_worker_ids
+            )
+            if not all_expected_workers_ready:
+                executor.abort_training_preflight(plan)
+                return ExecutionOutcome(
+                    raw_results=readiness,
+                    elapsed_sec=time.perf_counter() - started_at,
+                    launched=False,
+                    reason="worker_preflight_failed",
+                )
+            runtime_state.mark_running()
             submission = executor.submit_training(plan)
             results = executor.resolve_training(submission)
         except Exception as error:

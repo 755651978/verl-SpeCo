@@ -206,6 +206,11 @@ class TrainingDataStatus:
     target_version: int | None = None
     target_version_consistent: bool = True
     data_version: int | None = None
+    data_version_consistent: bool = True
+    buffer_version: int = 0
+    worker_incarnation: str = ""
+    worker_id: str = ""
+    worker_snapshots: dict[str, dict[str, object]] | None = None
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
@@ -227,6 +232,10 @@ class TrainingDataStatus:
             data_version=_optional_int(
                 value.get("data_version", value.get("newest_sample_step"))
             ),
+            data_version_consistent=bool(value.get("data_version_consistent", True)),
+            buffer_version=int(value.get("buffer_version", 0)),
+            worker_incarnation=str(value.get("worker_incarnation", "")),
+            worker_id=str(value.get("worker_id", value.get("rank", ""))),
         )
 
     def metrics(self) -> dict[str, int]:
@@ -240,6 +249,7 @@ class TrainingDataStatus:
             "drafter/data_target_version_consistent": int(
                 self.target_version_consistent
             ),
+            "drafter/data_version_consistent": int(self.data_version_consistent),
         }
 
 
@@ -276,6 +286,8 @@ class TrainingPlan:
     sample_last_n_steps: int = 2
     data_version: int | None = None
     required_target_version: int | None = None
+    plan_id: str = ""
+    worker_snapshots: dict[str, dict[str, object]] | None = None
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
@@ -291,6 +303,8 @@ class TrainingPlan:
         "no_training_budget": 11,
         "insufficient_training_budget": 12,
         "inconsistent_target_version": 13,
+        "inconsistent_data_version": 14,
+        "worker_preflight_failed": 15,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -308,6 +322,8 @@ class TrainingPlan:
             "sample_last_n_steps": self.sample_last_n_steps,
             "data_version": self.data_version,
             "required_target_version": self.required_target_version,
+            "plan_id": self.plan_id,
+            "worker_snapshots": self.worker_snapshots or {},
         }
 
     def metrics(self) -> dict[str, int]:

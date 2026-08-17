@@ -22,6 +22,9 @@ def _status(**overrides) -> TrainingDataStatus:
         "newest_sample_step": 4,
         "same_step_data_required": False,
         "target_version": 4,
+        "worker_id": "0",
+        "worker_incarnation": "worker-0",
+        "buffer_version": 7,
     }
     values.update(overrides)
     return TrainingDataStatus(**values)
@@ -32,6 +35,9 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
         [
             _status(trainable_batches=4, oldest_sample_step=2),
             _status(
+                worker_id="1",
+                worker_incarnation="worker-1",
+                buffer_version=9,
                 trainable_batches=2,
                 batch_size_per_gpu=4,
                 partial_batch_available=False,
@@ -49,6 +55,21 @@ def test_status_policy_aggregates_distributed_capacity_conservatively() -> None:
     assert not result.partial_batch_available
     assert result.oldest_sample_step == 2
     assert result.newest_sample_step == 5
+    assert not result.data_version_consistent
+    assert result.worker_snapshots == {
+        "0": {
+            "buffer_version": 7,
+            "data_version": 4,
+            "worker_incarnation": "worker-0",
+            "trainable_samples": 8,
+        },
+        "1": {
+            "buffer_version": 9,
+            "data_version": 5,
+            "worker_incarnation": "worker-1",
+            "trainable_samples": 8,
+        },
+    }
 
 
 def test_status_policy_marks_mismatched_target_versions_unknown() -> None:
