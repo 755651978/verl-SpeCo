@@ -334,6 +334,7 @@ class SpecoWorker(Worker):
         self.last_global_step: Optional[int] = None
         self.last_trained_step: Optional[int] = None
         self.worker_incarnation = uuid.uuid4().hex
+        self._staged_rollout_features: dict[str, list[dict]] = {}
         self._prepared_training_plan_id: Optional[str] = None
         self.training_process_group = None
         self.dp_process_group = None
@@ -501,21 +502,23 @@ class SpecoWorker(Worker):
         batch: dict,
         hidden_states: Optional[torch.Tensor],
         target_logprobs: Optional[torch.Tensor] = None,
-    ):
+    ) -> bool:
         if (
             not self.enable_drafter
             or not self.in_drafter_train_group
             or self.trainer is None
         ):
-            return
+            return False
         if self._drafter_training_mode() == "collect_only":
-            self._write_rollout_feature_sample(batch, hidden_states, target_logprobs)
-            return
+            return self._write_rollout_feature_sample(
+                batch, hidden_states, target_logprobs
+            )
         if hidden_states is None:
             raise RuntimeError(
                 "Online drafter training requires collected hidden states"
             )
         self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
+        return True
 
     def _drafter_training_mode(self) -> str:
         return (
@@ -619,14 +622,14 @@ class SpecoWorker(Worker):
         batch: dict,
         hidden_states: Optional[torch.Tensor],
         target_logprobs: Optional[torch.Tensor],
-    ) -> None:
+    ) -> bool:
         writer = self._get_feature_writer()
         if writer is None:
             logger.warning(
                 "[SpecoWorker rank=%s] training.mode=collect_only but feature_store.path is empty; drop sample",
                 self.rank,
             )
-            return
+            return False
         full_input_ids = batch["input_ids"].detach().cpu().reshape(-1)
         full_loss_mask = self._build_rollout_loss_mask(batch, full_input_ids)
         hidden_positions = batch.get("hidden_positions")
@@ -773,7 +776,8 @@ class SpecoWorker(Worker):
                 position_ids=position_ids,
                 metadata=metadata,
             )
-            writer.write_many([feature_sample])
+        writer.write_many([feature_sample])
+        return True
 
     @staticmethod
     def _token_replay_hidden_rows(
@@ -905,14 +909,120 @@ class SpecoWorker(Worker):
         flush_interval = int(feature_store_cfg.get("flush_interval_steps", 1))
         self.feature_writer.flush_on_step(self.last_global_step, flush_interval)
 
+    def _collection_worker_result(
+        self,
+        *,
+        collection_id: str,
+        staged_samples: int = 0,
+        accepted_samples: int = 0,
+        rejected_samples: int = 0,
+        collected: bool = False,
+        reason: str,
+        buffer_version_before: int | None = None,
+    ) -> dict[str, object]:
+        source_global_step = int(self.last_global_step)
+        current_buffer_version = int(
+            self.trainer.buffer_version if self.trainer is not None else 0
+        )
+        if buffer_version_before is None:
+            buffer_version_before = current_buffer_version
+        return {
+            "collection_id": collection_id,
+            "worker_id": str(self.replica_rank),
+            "worker_incarnation": self.worker_incarnation,
+            "source_global_step": source_global_step,
+            "staged_samples": staged_samples,
+            "accepted_samples": accepted_samples,
+            "rejected_samples": rejected_samples,
+            "buffer_version_before": buffer_version_before,
+            "buffer_version_after": current_buffer_version,
+            "data_version": source_global_step,
+            "collected": collected,
+            "reason": reason,
+        }
+
+    @staticmethod
+    def _collection_request(requests: list[dict]) -> dict:
+        if len(requests) != 1 or not isinstance(requests[0], dict):
+            raise ValueError("Expected exactly one drafter collection request")
+        return requests[0]
+
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
     )
-    def collect_rollout_features(self, samples: list[dict]):
+    def stage_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        samples = request.get("samples")
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="worker_not_ready"
+            )
+        if not collection_id:
+            return self._collection_worker_result(
+                collection_id="", reason="missing_collection_id"
+            )
+        if collection_id in self._staged_rollout_features:
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="collection_already_staged"
+            )
+        if not isinstance(samples, list):
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="invalid_collection_samples"
+            )
+        self._staged_rollout_features[collection_id] = samples
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            staged_samples=len(samples),
+            reason="collection_staged",
+        )
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def commit_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        samples = self._staged_rollout_features.pop(collection_id, None)
+        if samples is None:
+            return self._collection_worker_result(
+                collection_id=collection_id, reason="collection_not_staged"
+            )
+        return self._commit_rollout_features(collection_id, samples)
+
+    @register(
+        dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
+    )
+    def abort_rollout_features(self, requests: list[dict]):
+        request = self._collection_request(requests)
+        collection_id = str(request.get("collection_id", ""))
+        removed = self._staged_rollout_features.pop(collection_id, None)
+        return self._collection_worker_result(
+            collection_id=collection_id,
+            reason="collection_aborted" if removed is not None else "collection_absent",
+        )
+
+    def _commit_rollout_features(
+        self, collection_id: str, samples: list[dict]
+    ) -> dict[str, object]:
+        buffer_version_before = int(
+            self.trainer.buffer_version if self.trainer is not None else 0
+        )
+        result = self._collection_worker_result(
+            collection_id=collection_id,
+            buffer_version_before=buffer_version_before,
+            collected=True,
+            reason="collection_completed",
+        )
         if not samples:
-            return
+            return result
         for sample in samples:
             if not sample:
+                result["rejected_samples"] += 1
                 continue
             batch = {
                 "input_ids": sample["input_ids"],
@@ -968,13 +1078,25 @@ class SpecoWorker(Worker):
                     sample.get("target_logprobs_ref")
                 )
             if hidden is None and not skip_hidden_payload:
+                result["rejected_samples"] += 1
                 continue
-            self._store_rollout_sample(
+            stored = self._store_rollout_sample(
                 batch=batch,
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
             )
+            if stored:
+                result["accepted_samples"] += 1
+            else:
+                result["rejected_samples"] += 1
         self._flush_rollout_features_for_step()
+        result["buffer_version_after"] = int(
+            self.trainer.buffer_version if self.trainer is not None else 0
+        )
+        if result["rejected_samples"]:
+            result["collected"] = False
+            result["reason"] = "samples_rejected"
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_global_step(self, global_step: int):

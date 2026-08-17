@@ -26,7 +26,9 @@ from uuid import uuid4
 
 from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPlan,
+    CollectionPayload,
     DrafterCollectionContext,
+    DrafterCollectionSource,
     DrafterExecutionStrategy,
     DrafterScheduleConfig,
     DrafterScheduleContext,
@@ -42,6 +44,22 @@ from verl_speco.trainer.scheduler.publish_strategy import PublishExecutionStrate
 from verl_speco.trainer.scheduler.data_status_policy import (
     ConservativeTrainingDataStatusPolicy,
 )
+from verl_speco.trainer.scheduler.lifecycle import (
+    AfterActorUpdateContext,
+    AfterWeightUpdateContext,
+    BeforeActorUpdateContext,
+    SchedulerEventOutcome,
+)
+from verl_speco.trainer.scheduler.collection_executor import (
+    DrafterCollectionExecutor,
+)
+from verl_speco.trainer.scheduler.collection_strategy import SyncCollectionStrategy
+from verl_speco.trainer.scheduler.collection_adapter import (
+    DrafterCollectionAdapter,
+    OldLogProbCollectionAdapter,
+    SGLangCollectionAdapter,
+)
+from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
 
 
 def step_matches_interval(
@@ -77,6 +95,7 @@ class DrafterScheduler:
         self,
         worker_executor: DrafterWorkerExecutor | None = None,
         publish_executor: DrafterPublishExecutor | None = None,
+        collection_executor: DrafterCollectionExecutor | None = None,
     ) -> None:
         self.trigger_policy = IntervalAndBufferTrigger()
         self.sync_budget_policy = SyncTrainingBudgetPolicy()
@@ -85,6 +104,14 @@ class DrafterScheduler:
         self.data_status_policy = ConservativeTrainingDataStatusPolicy()
         self.publish_execution_strategy = PublishExecutionStrategy()
         self._publish_executor = publish_executor
+        self.collection_strategy = SyncCollectionStrategy()
+        self._collection_executor = collection_executor
+        self._collection_adapters: dict[
+            DrafterCollectionSource, DrafterCollectionAdapter
+        ] = {
+            DrafterCollectionSource.SGLANG: SGLangCollectionAdapter(),
+            DrafterCollectionSource.OLD_LOGPROB: OldLogProbCollectionAdapter(),
+        }
 
     def bind_worker_executor(self, worker_executor: DrafterWorkerExecutor) -> None:
         """Bind the worker execution port used by all execution strategies."""
@@ -93,6 +120,41 @@ class DrafterScheduler:
 
     def bind_publish_executor(self, publish_executor: DrafterPublishExecutor) -> None:
         self._publish_executor = publish_executor
+
+    def bind_collection_executor(
+        self, collection_executor: DrafterCollectionExecutor
+    ) -> None:
+        self._collection_executor = collection_executor
+
+    def register_collection_adapter(
+        self, adapter: DrafterCollectionAdapter
+    ) -> None:
+        """Register or replace the payload adapter for a collection source."""
+        self._collection_adapters[adapter.source] = adapter
+
+    def prepare_collection_payload(
+        self,
+        *,
+        source: DrafterCollectionSource,
+        samples: list[dict],
+        owner_count: int,
+        dispatch_bucket_count: int | None,
+        raw_samples: int,
+        collection_id: str = "",
+        owners=None,
+    ) -> CollectionPayload:
+        """Build the common payload without exposing bucketing to the Trainer."""
+        adapter = self._collection_adapters.get(source)
+        if adapter is None:
+            raise ValueError(f"No collection adapter registered for {source.value}")
+        return adapter.prepare_payload(
+            samples,
+            owner_count=owner_count,
+            dispatch_bucket_count=dispatch_bucket_count,
+            raw_samples=raw_samples,
+            collection_id=collection_id,
+            owners=owners,
+        )
 
     def inspect_training_data(
         self, *, global_step: object, config: DrafterScheduleConfig
@@ -172,6 +234,7 @@ class DrafterScheduler:
             context.global_step, config
         )
         common = {
+            "collection_id": uuid4().hex,
             "source": context.source,
             "source_global_step": context.global_step,
             "collect_interval_matched": collect_interval_matched,
@@ -202,6 +265,83 @@ class DrafterScheduler:
         if config.collection_sample_rate <= 0:
             return CollectionPlan(collect=False, reason="sample_rate_zero", **common)
         return CollectionPlan(collect=True, reason="collection_enabled", **common)
+
+    def execute_collection_plan(
+        self, plan: CollectionPlan, payload: CollectionPayload
+    ):
+        if self._collection_executor is None:
+            raise RuntimeError("Drafter collection executor has not been bound")
+        return self.collection_strategy.execute(
+            plan,
+            payload,
+            executor=self._collection_executor,
+        )
+
+    def on_collection_ready(
+        self, plan: CollectionPlan, payload: CollectionPayload
+    ):
+        """Lifecycle Facade event for a source adapter's prepared payload."""
+        return self.execute_collection_plan(plan, payload)
+
+    def on_before_actor_update(
+        self, context: BeforeActorUpdateContext
+    ) -> SchedulerEventOutcome:
+        """Plan and prepare drafter training before the PPO actor update."""
+        plan = self.prepare_training_plan(
+            context.schedule_context,
+            context.config,
+        )
+        metrics: dict[str, Any] = dict(plan.metrics())
+        metrics.update(self.prepare_training_execution(plan))
+        return SchedulerEventOutcome(
+            training_plan=plan,
+            metrics=metrics,
+        )
+
+    def on_after_actor_update(
+        self, context: AfterActorUpdateContext
+    ) -> SchedulerEventOutcome:
+        """Execute the prepared plan after the PPO actor update."""
+        plan = context.training_plan
+        if not plan.launch:
+            return SchedulerEventOutcome(training_plan=plan, metrics={})
+        execution = self.execute_training_plan(
+            plan,
+            runtime_state=context.runtime_state,
+        )
+        outcome = TrainingOutcome.from_execution(
+            execution,
+            runtime_state=context.runtime_state,
+        )
+        return SchedulerEventOutcome(
+            training_plan=plan,
+            training_execution=outcome,
+            metrics=outcome.metrics,
+        )
+
+    def on_safe_point(
+        self, context: AfterWeightUpdateContext
+    ) -> SchedulerEventOutcome:
+        """Plan and execute publication at a rollout-safe lifecycle point."""
+        plan = self.plan_publish(
+            global_step=context.global_step,
+            drafter_trained=context.drafter_trained,
+            config=context.config,
+            training_plan=context.training_plan,
+        )
+        outcome = self.execute_publish_plan(plan)
+        return SchedulerEventOutcome(
+            training_plan=context.training_plan,
+            publish_plan=plan,
+            publish_outcome=outcome,
+            metrics=outcome.metrics(),
+        )
+
+    def on_after_weight_update(
+        self, context: AfterWeightUpdateContext
+    ) -> SchedulerEventOutcome:
+        """Named lifecycle alias for the post-weight-update safe point."""
+        return self.on_safe_point(context)
 
     @staticmethod
     def training_interval_matched(

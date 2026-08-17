@@ -144,15 +144,21 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
-    assert trainer._speco_plan_drafter_training().launch is False
+    scheduler = trainer._speco_get_drafter_scheduler()
+    config = trainer._speco_drafter_schedule_config()
+    def plan():
+        return scheduler.prepare_training_plan(
+            trainer._speco_drafter_schedule_context(), config
+        )
+    assert plan().launch is False
 
     trainer.global_steps = 5
     trainer._speco_last_collected_samples = 0
     trainer._speco_oldlogprob_collection_requested = lambda: True
-    assert trainer._speco_plan_drafter_training().launch is False
+    assert plan().launch is False
 
     trainer._speco_last_collected_samples = 1
-    assert trainer._speco_plan_drafter_training().launch is True
+    assert plan().launch is True
 
 
 def test_sync_scheduler_preserves_released_training_call_order() -> None:

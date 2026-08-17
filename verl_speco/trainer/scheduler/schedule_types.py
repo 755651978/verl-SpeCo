@@ -123,6 +123,7 @@ class CollectionPlan:
     hidden_window_mode: str
     hidden_window_tokens_per_sample: int | None
     hidden_window_min_rows: int
+    collection_id: str = ""
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "drafter_disabled": 1,
@@ -175,6 +176,56 @@ class CollectionPlan:
         except (TypeError, ValueError):
             pass
         return metrics
+
+
+@dataclass(frozen=True)
+class CollectionPayload:
+    """Prepared per-worker samples consumed by a collection executor."""
+
+    source: DrafterCollectionSource
+    buckets: list[list[dict]]
+    collected_samples: int
+    raw_samples: int = 0
+    collection_id: str = ""
+
+    @property
+    def has_samples(self) -> bool:
+        return self.collected_samples > 0 and any(self.buckets)
+
+
+@dataclass(frozen=True)
+class CollectionWorkerResult:
+    """Actual collection result reported by one Worker process."""
+
+    worker_id: str
+    worker_incarnation: str
+    source_global_step: int | None
+    accepted_samples: int
+    rejected_samples: int
+    buffer_version_before: int
+    buffer_version_after: int
+    data_version: int | None
+    collected: bool
+    reason: str
+    collection_id: str = ""
+    staged_samples: int = 0
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, object]) -> "CollectionWorkerResult":
+        return cls(
+            worker_id=str(value.get("worker_id", "")),
+            worker_incarnation=str(value.get("worker_incarnation", "")),
+            source_global_step=_optional_int(value.get("source_global_step")),
+            accepted_samples=int(value.get("accepted_samples", 0)),
+            rejected_samples=int(value.get("rejected_samples", 0)),
+            buffer_version_before=int(value.get("buffer_version_before", 0)),
+            buffer_version_after=int(value.get("buffer_version_after", 0)),
+            data_version=_optional_int(value.get("data_version")),
+            collected=bool(value.get("collected", False)),
+            reason=str(value.get("reason", "")),
+            collection_id=str(value.get("collection_id", "")),
+            staged_samples=int(value.get("staged_samples", 0)),
+        )
 
 
 @dataclass(frozen=True)
@@ -396,3 +447,4 @@ class TrainingResult:
             reason=str(value.get("reason", "")),
             snapshot_ready=bool(value.get("publish_snapshot_cached", False)),
         )
+

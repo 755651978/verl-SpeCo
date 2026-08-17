@@ -15,6 +15,8 @@ from .drafter_runtime_state import DrafterRuntimeState, DrafterRuntimeStatus
 from .drafter_scheduler import DrafterScheduler, step_matches_interval
 from .schedule_types import (
     CollectionPlan,
+    CollectionPayload,
+    CollectionWorkerResult,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterExecutionStrategy,
@@ -31,11 +33,31 @@ from .worker_executor import CallbackDrafterWorkerExecutor, DrafterWorkerExecuto
 from .publish_executor import CallbackDrafterPublishExecutor, DrafterPublishExecutor
 from .publish_strategy import PublishOutcome
 from .data_status_policy import ConservativeTrainingDataStatusPolicy
+from .collection_executor import (
+    CallbackDrafterCollectionExecutor,
+    DrafterCollectionExecutor,
+)
+from .lifecycle import (
+    AfterActorUpdateContext,
+    AfterWeightUpdateContext,
+    BeforeActorUpdateContext,
+    SchedulerEventOutcome,
+)
+from .collection_strategy import CollectionOutcome, DrafterCollectionStrategy
+from .collection_adapter import DrafterCollectionAdapter
+from .training_outcome import TrainingOutcome
 
 __all__ = [
+    "AfterActorUpdateContext",
+    "AfterWeightUpdateContext",
+    "BeforeActorUpdateContext",
     "CollectionPlan",
+    "CollectionPayload",
+    "CollectionWorkerResult",
+    "CollectionOutcome",
     "ConservativeTrainingDataStatusPolicy",
     "CallbackDrafterWorkerExecutor",
+    "CallbackDrafterCollectionExecutor",
     "CallbackDrafterPublishExecutor",
     "DrafterCollectionContext",
     "DrafterCollectionSource",
@@ -46,12 +68,17 @@ __all__ = [
     "DrafterScheduleContext",
     "DrafterScheduler",
     "DrafterWorkerExecutor",
+    "DrafterCollectionExecutor",
+    "DrafterCollectionAdapter",
+    "DrafterCollectionStrategy",
     "DrafterPublishExecutor",
     "PublishPlan",
+    "SchedulerEventOutcome",
     "PublishOutcome",
     "TrainingBudget",
     "TrainingDataStatus",
     "TrainingPlan",
+    "TrainingOutcome",
     "TrainingResult",
     "TriggerDecision",
     "step_matches_interval",
