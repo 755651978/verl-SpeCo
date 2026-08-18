@@ -148,6 +148,7 @@ def test_after_actor_update_rejects_inconsistent_worker_training_results() -> No
             "attempted_steps": 1,
             "optimizer_step": optimizer_step,
             "publish_snapshot_cached": 1,
+            "is_publish_leader": worker_id == "0",
         }
 
     scheduler.execute_training_plan = Mock(
@@ -165,6 +166,54 @@ def test_after_actor_update_rejects_inconsistent_worker_training_results() -> No
     assert outcome.training_execution.reason == "worker_result_inconsistent"
     assert outcome.metrics["drafter/train_worker_results_consistent"] == 0
     assert runtime_state.status.name == "IDLE"
+
+
+def test_after_actor_update_requires_snapshot_only_from_publish_leader() -> None:
+    scheduler = DrafterScheduler()
+    plan = replace(
+        _training_plan(),
+        plan_id="plan-4",
+        worker_snapshots={"0": {}, "1": {}},
+    )
+    runtime_state = DrafterRuntimeState()
+    runtime_state.submit(plan, started_at=0.0)
+    runtime_state.mark_running()
+
+    def result(worker_id: str, *, is_publish_leader: bool, snapshot_ready: bool):
+        return {
+            "trained": True,
+            "triggered": True,
+            "worker_id": worker_id,
+            "worker_incarnation": f"worker-{worker_id}",
+            "plan_id": "plan-4",
+            "source_global_step": 4,
+            "data_version": None,
+            "target_version": None,
+            "successful_steps": 1,
+            "attempted_steps": 1,
+            "optimizer_step": 8,
+            "publish_snapshot_cached": int(snapshot_ready),
+            "is_publish_leader": is_publish_leader,
+        }
+
+    scheduler.execute_training_plan = Mock(
+        return_value=ExecutionOutcome(
+            raw_results=[
+                result("0", is_publish_leader=True, snapshot_ready=True),
+                result("1", is_publish_leader=False, snapshot_ready=False),
+            ],
+            elapsed_sec=0.2,
+        )
+    )
+
+    outcome = scheduler.on_after_actor_update(
+        AfterActorUpdateContext(plan, runtime_state)
+    )
+
+    assert outcome.training_execution.trained
+    assert outcome.metrics["drafter/train_worker_results_consistent"] == 1
+    assert outcome.metrics["drafter/train_publish_leader_count"] == 1
+    assert outcome.metrics["drafter/train_publish_leader_snapshot_ready"] == 1
 
 
 def test_after_weight_update_plans_then_publishes() -> None:

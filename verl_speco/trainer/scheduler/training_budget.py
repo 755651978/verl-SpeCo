@@ -27,16 +27,20 @@ class TrainingBudgetPolicy(Protocol):
 
 
 class SyncTrainingBudgetPolicy:
-    """Bound synchronous work by configuration and actually trainable batches."""
+    """Run the configured number of synchronous optimizer steps.
+
+    Data availability is a launch precondition handled by the trigger.  Once
+    launched, online training samples from the eligible worker-local pool on
+    every optimizer step, so the number of distinct batches in that pool must
+    not silently reduce the configured ``step`` count.
+    """
 
     def make_budget(
         self,
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
     ) -> TrainingBudget:
-        status = context.data_status
-        trainable_batches = status.trainable_batches if status is not None else 0
-        max_batches = min(max(config.train_batches_per_trigger, 0), trainable_batches)
+        max_batches = max(config.train_batches_per_trigger, 0)
         return TrainingBudget(
             max_batches=max_batches,
             min_batches=max(config.min_trainable_batches, 1),

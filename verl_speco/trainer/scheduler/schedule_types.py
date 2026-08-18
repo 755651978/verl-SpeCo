@@ -438,6 +438,7 @@ class TrainingResult:
     plan_id: str = ""
     data_version: int | None = None
     target_version: int | None = None
+    is_publish_leader: bool = False
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingResult":
@@ -460,4 +461,5 @@ class TrainingResult:
             plan_id=str(value.get("plan_id", "")),
             data_version=_optional_int(value.get("data_version")),
             target_version=_optional_int(value.get("target_version")),
+            is_publish_leader=bool(value.get("is_publish_leader", False)),
         )

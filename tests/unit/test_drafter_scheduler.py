@@ -213,7 +213,7 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
         "drafter/schedule_interval_matched": 1,
         "drafter/schedule_strategy": 0,
         "drafter/schedule_reason": 10,
-        "drafter/schedule_max_batches": 1,
+        "drafter/schedule_max_batches": 100,
         "drafter/schedule_publish_after_success": 1,
         "drafter/schedule_min_batches": 1,
         "drafter/schedule_require_full_batch": 0,
@@ -262,6 +262,19 @@ def test_sync_plan_preserves_data_buffer_fallback() -> None:
     assert plan.reason == "training_ready"
     assert plan.max_batches == 9
     assert plan.publish_after_success
+
+
+def test_sync_plan_uses_configured_steps_when_pool_has_fewer_batches() -> None:
+    plan = DrafterScheduler().plan_training(
+        _context(trainable_batches=4),
+        DrafterScheduleConfig(
+            training_interval_steps=1,
+            train_batches_per_trigger=10,
+        ),
+    )
+
+    assert plan.launch
+    assert plan.max_batches == 10
 
 
 def test_sync_plan_carries_publish_decision_to_worker() -> None:

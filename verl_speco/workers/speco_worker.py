@@ -1456,6 +1456,7 @@ class SpecoWorker(Worker):
             "reason": "",
             "worker_id": str(self.rank),
             "worker_incarnation": self.worker_incarnation,
+            "is_publish_leader": self.is_global_publish_leader,
         }
         if not self.enable_drafter:
             result["reason"] = "disabled"

@@ -76,33 +76,54 @@ class TrainingOutcome:
         expected_worker_ids = set((plan.worker_snapshots or {}).keys())
         actual_worker_ids = {result.worker_id for result in participating_results}
         strict_consistency = bool(expected_worker_ids)
-        result_consistent = not strict_consistency or (
+        worker_ids_consistent = (
             actual_worker_ids == expected_worker_ids
             and len(participating_results) == len(expected_worker_ids)
-            and all(result.worker_incarnation for result in participating_results)
-            and all(result.plan_id == plan.plan_id for result in participating_results)
-            and all(
-                result.source_global_step == int(plan.source_global_step)
-                for result in participating_results
-            )
-            and all(
-                result.data_version == plan.data_version
-                for result in participating_results
-            )
-            and all(
-                result.target_version == plan.required_target_version
-                for result in participating_results
-            )
-            and len({result.trained for result in participating_results}) == 1
-            and len(
-                {result.successful_steps for result in participating_results}
-            )
-            == 1
-            and len({result.optimizer_step for result in participating_results}) == 1
-            and (
-                not plan.publish_after_success
-                or all(result.snapshot_ready for result in participating_results)
-            )
+        )
+        incarnations_consistent = all(
+            result.worker_incarnation for result in participating_results
+        )
+        plan_ids_consistent = all(
+            result.plan_id == plan.plan_id for result in participating_results
+        )
+        source_steps_consistent = all(
+            result.source_global_step == int(plan.source_global_step)
+            for result in participating_results
+        )
+        data_versions_consistent = all(
+            result.data_version == plan.data_version
+            for result in participating_results
+        )
+        target_versions_consistent = all(
+            result.target_version == plan.required_target_version
+            for result in participating_results
+        )
+        trained_consistent = len(
+            {result.trained for result in participating_results}
+        ) == 1
+        successful_steps_consistent = len(
+            {result.successful_steps for result in participating_results}
+        ) == 1
+        optimizer_steps_consistent = len(
+            {result.optimizer_step for result in participating_results}
+        ) == 1
+        publish_leaders = [
+            result for result in participating_results if result.is_publish_leader
+        ]
+        publish_snapshot_consistent = not plan.publish_after_success or (
+            len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
+        )
+        result_consistent = not strict_consistency or (
+            worker_ids_consistent
+            and incarnations_consistent
+            and plan_ids_consistent
+            and source_steps_consistent
+            and data_versions_consistent
+            and target_versions_consistent
+            and trained_consistent
+            and successful_steps_consistent
+            and optimizer_steps_consistent
+            and publish_snapshot_consistent
         )
         if not result_consistent:
             trained = False
@@ -134,6 +155,26 @@ class TrainingOutcome:
                 (result.optimizer_step for result in worker_results), default=0
             ),
             "drafter/train_worker_results_consistent": int(result_consistent),
+            "drafter/train_worker_ids_consistent": int(worker_ids_consistent),
+            "drafter/train_worker_incarnations_consistent": int(
+                incarnations_consistent
+            ),
+            "drafter/train_plan_ids_consistent": int(plan_ids_consistent),
+            "drafter/train_source_steps_consistent": int(source_steps_consistent),
+            "drafter/train_data_versions_consistent": int(data_versions_consistent),
+            "drafter/train_target_versions_consistent": int(
+                target_versions_consistent
+            ),
+            "drafter/train_successful_steps_consistent": int(
+                successful_steps_consistent
+            ),
+            "drafter/train_optimizer_steps_consistent": int(
+                optimizer_steps_consistent
+            ),
+            "drafter/train_publish_leader_count": len(publish_leaders),
+            "drafter/train_publish_leader_snapshot_ready": int(
+                len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
+            ),
         }
         for key in (
             "timing_s/drafter_prepare_batch",
