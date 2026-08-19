@@ -1,229 +1,283 @@
-# Drafter Scheduler 实现与策略接入指南
+# Drafter Scheduler Implementation and Strategy Integration Guide
 
 Last updated: 08/19/2026
 
-本文描述 SPECO 在线草稿模型（drafter）的调度边界、当前同步调用链，以及新增调度策略时应修改的接口。它面向需要增加训练、收集或发布策略的开发者。
+## Design Goals
 
-## 设计目标
+The verl_speco.trainer.scheduler package is the single decision point for
+drafter data collection, training, and weight publication. The outer Trainer
+only supplies lifecycle events and runtime RPC adapters; Workers only validate
+and execute generated plans.
 
-`verl_speco.trainer.scheduler` 是数据收集、草稿模型训练和权重发布的唯一决策入口。外层 Trainer 只提供生命周期事件和运行时 RPC 适配；Worker 只校验并执行已生成的计划。
+The boundary is:
 
-这样可以保证同步训练和后续 Bubble Time / rollout idle worker 训练共享同一套触发条件、数据版本校验和发布语义。新增策略只替换“何时执行、在哪里执行、最多执行多少”，不应复制或改变训练语义。
-
-边界如下：
-
-```text
+~~~text
 SpecoRayPPOTrainer
-  ├─ 构造上下文、绑定 Ray WorkerGroup RPC
-  └─ 调用 Scheduler 生命周期事件
+  ├─ Builds contexts and binds Ray WorkerGroup RPCs
+  └─ Calls Scheduler lifecycle events
             │
             ▼
-DrafterScheduler（唯一决策 Facade）
+DrafterScheduler (single decision Facade)
   ├─ CollectionPlan / TrainingPlan / PublishPlan
   ├─ Trigger / Budget / Strategy
   └─ Executor ports
             │
             ▼
 SpecoWorker / rollout runtime
-  └─ 校验 plan 并执行 collection、training、publish RPC
-```
+  └─ Validates plans and executes collection, training, and publish RPCs
+~~~
 
-外部代码应只从 `verl_speco.trainer.scheduler` 包入口导入公共类型，例如：
+External code should import public contracts only from the
+verl_speco.trainer.scheduler package entry point, for example:
 
-```python
+~~~python
 from verl_speco.trainer.scheduler import (
-    DrafterScheduler,
     DrafterScheduleConfig,
+    DrafterScheduler,
     TrainingPlan,
 )
-```
+~~~
 
-不要让 Trainer、Worker 或新业务代码直接依赖 `training_trigger.py`、`training_budget.py`、`execution_strategy.py` 等 Scheduler 内部实现。
+Do not make Trainer, Worker, or feature code depend directly on Scheduler
+implementation modules such as training_trigger.py, training_budget.py, or
+execution_strategy.py.
 
-## 当前同步路径
+## Current Synchronous Path
 
-### 初始化和基础设施绑定
+### Initialization and Infrastructure Binding
 
-`SpecoRayPPOTrainer.attach_speco_worker_group()` 创建并绑定三个 Executor：
+SpecoRayPPOTrainer.attach_speco_worker_group() creates and binds three
+Executors:
 
-| Executor | 作用 | 适配的现有 RPC |
+| Executor | Responsibility | Existing RPC boundary |
 | --- | --- | --- |
-| `DrafterWorkerExecutor` | 数据状态、训练准备、preflight、训练提交 | `SpecoWorkerGroup` |
-| `DrafterCollectionExecutor` | collection 的 stage / commit / rollback / finalize | `SpecoWorkerGroup` |
-| `DrafterPublishExecutor` | 获取训练快照并热更新 rollout drafter | drafter WorkerGroup + rollout runtime |
+| DrafterWorkerExecutor | Data status, training preparation, preflight, and training submission | SpecoWorkerGroup |
+| DrafterCollectionExecutor | Collection stage, commit, rollback, and finalize | SpecoWorkerGroup |
+| DrafterPublishExecutor | Fetch a training snapshot and hot-update the rollout drafter | Drafter WorkerGroup and rollout runtime |
 
-Scheduler 只依赖这些 Protocol，不依赖 Ray。Ray ObjectRef 的提交、等待和结果解析都由 `Callback*Executor` 适配器处理。
+The Scheduler depends only on these Protocols, not on Ray. Ray ObjectRef
+submission, waiting, and result parsing are handled by Callback Executor
+adapters.
 
-### 一次在线训练的完整时序
+### Full Online Training Sequence
 
-```text
-rollout / compute_old_log_prob 生成特征
+~~~text
+rollout / compute_old_log_prob produces features
   │
   ├─ Trainer: plan_collection(context, config)
-  │     └─ CollectionPlan：是否收集、来源、采样和窗口预算、collection_id
+  │     └─ CollectionPlan: whether to collect, source, sampling/window budget,
+  │        and collection_id
   │
   ├─ Trainer: prepare_collection_payload(...)
-  │     └─ SGLang adapter 按 replica_rank 分桶
-  │        old-logprob adapter 按显式 owner 分桶
+  │     └─ SGLang adapter buckets by replica_rank
+  │        old-log-prob adapter buckets by explicit owner
   │
   └─ Scheduler: on_collection_ready(plan, payload)
         └─ SyncCollectionStrategy
              ├─ set_global_step
              ├─ stage
-             ├─ 校验 collection_id、路由、版本和 Worker 身份
+             ├─ validate collection_id, routing, versions, and Worker identity
              ├─ commit
-             └─ finalize；失败则 abort / rollback
+             └─ finalize; abort / rollback on failure
 
-PPO actor update 前
+Before the PPO actor update
   │
   └─ Scheduler: on_before_actor_update(context)
         ├─ prepare_training_plan()
-        │    ├─ 对 collect_only / pending / interval 等低成本跳过条件直接生成 skip plan
-        │    ├─ 仅在可能训练时查询全部 Worker 的 TrainingDataStatus
-        │    ├─ TrainingTrigger：判断是否应训练
-        │    ├─ TrainingBudget：计算 max_batches / min_batches 等预算
-        │    └─ TrainingPlan：冻结本次训练的版本、预算和执行策略
+        │    ├─ Return a skip plan for cheap collect_only / pending / interval conditions
+        │    ├─ Query TrainingDataStatus from all Workers only when training is possible
+        │    ├─ TrainingTrigger decides whether training should start
+        │    ├─ TrainingBudget computes max_batches / min_batches and related limits
+        │    └─ TrainingPlan freezes versions, budget, and execution strategy
         └─ prepare_training_execution(plan)
-             ├─ 设置 Worker global_step
-             └─ use_logits=False 时同步 target lm_head
+             ├─ set Worker global_step
+             └─ synchronize target lm_head when use_logits=False
 
 PPO actor update
   │
-  └─ 保持原 PPO 更新逻辑
+  └─ Existing PPO update logic is unchanged
 
-PPO actor update 后
+After the PPO actor update
   │
   └─ Scheduler: on_after_actor_update(plan, runtime_state)
         └─ SyncExecutionStrategy
-             ├─ 所有 Worker preflight
-             │    └─ 校验 plan_id、step、buffer/data/target version、incarnation、batch
-             ├─ 任一 Worker 未就绪：全部 abort，不提交分布式训练
-             ├─ 全部就绪：提交并等待 train_drafter
-             └─ TrainingOutcome 聚合结果；不一致则 trained=false，禁止发布
+             ├─ preflight all Workers
+             │    └─ validate plan_id, step, buffer/data/target versions,
+             │       incarnation, and batch availability
+             ├─ any Worker is not ready: abort all; do not submit distributed training
+             ├─ all Workers ready: submit and wait for train_drafter
+             └─ TrainingOutcome aggregates results; inconsistency sets trained=false
+                and prevents publication
 
-主模型权重更新后的 rollout-safe point
+At the rollout-safe point after the main-model weight update
   │
   └─ Scheduler: on_after_weight_update(context)
         ├─ plan_publish()
         └─ PublishExecutionStrategy
-             ├─ 等待上一轮异步 publish（如有）
-             ├─ 获取唯一 publish leader 的训练快照
-             └─ 同步或异步更新 rollout drafter 权重
-```
+             ├─ wait for the previous asynchronous publish, if any
+             ├─ fetch the training snapshot from the single publish leader
+             └─ update rollout drafter weights synchronously or asynchronously
+~~~
 
-### 当前同步策略的规则
+### Current Synchronous Strategy Rules
 
-- `TrainingTrigger` 的默认实现是 `IntervalAndBufferTrigger`：必须满足训练 interval、没有 pending training、所有 Worker 数据版本一致，并且 Worker 聚合后至少有 `min_trainable_batches` 个可训练 batch。
-- `SyncTrainingBudgetPolicy` 使用配置中的 `training.step` 作为 `max_batches`。数据是否存在只决定“能不能启动”，不再把实际可区分 batch 数静默缩短为更少的训练步数。
-- `min_batches` 是启动前的最低可训练 batch 要求；若 `max_batches < min_batches`，Scheduler 返回不启动的 `insufficient_training_budget` 计划。
-- `use_logits=False` 时，`required_target_version` 等于本次主训练 `global_step`，所有 Worker 必须使用该 target 版本。
-- `use_logits=True` 时，训练目标已在数据中，`required_target_version=None` 表示 **不约束** Worker 当前 target version，而不是要求其为 `None`。
-- 发布只在 `TrainingOutcome.trained=True` 且 `TrainingPlan.publish_after_success=True` 时进行；发布快照只要求唯一 publish leader 可用。
+- The default TrainingTrigger is IntervalAndBufferTrigger. It requires a
+  matching training interval, no pending training, consistent Worker data
+  versions, and at least min_trainable_batches trainable batches after Worker
+  aggregation.
+- SyncTrainingBudgetPolicy uses the configured training.step as max_batches.
+  Data availability only determines whether training can start; it no longer
+  silently reduces the configured optimizer-step count to the number of
+  distinct batches.
+- min_batches is the minimum trainable-batch requirement before launch. When
+  max_batches is less than min_batches, the Scheduler returns an
+  insufficient_training_budget skip plan.
+- With use_logits=False, required_target_version equals the current
+  main-training global_step and every Worker must use that target version.
+- With use_logits=True, targets are already stored in data.
+  required_target_version=None means that the current Worker target version is
+  unconstrained; it does not require that value to be None.
+- Publication occurs only when TrainingOutcome.trained=True and
+  TrainingPlan.publish_after_success=True. Only the unique publish leader must
+  provide a usable publish snapshot.
 
-## 核心对象与职责
+## Core Objects and Responsibilities
 
-| 对象 | 职责 | 不应承担的职责 |
+| Object | Responsibility | Must not be responsible for |
 | --- | --- | --- |
-| `DrafterScheduleContext` | 当前 step、模式、pending 状态等只读调度事实 | 训练预算或 Worker 执行细节 |
-| `TrainingDataStatus` | 全部 Worker 数据状态的聚合快照 | 触发训练或调用训练 RPC |
-| `TrainingPlan` | 一次不可变训练决定：是否启动、策略、预算、版本、plan_id | 在 Worker 端重新计算触发条件 |
-| `CollectionPlan` | 一次收集决定和静态采样预算 | 解析来源特有的数据格式 |
-| `PublishPlan` | 一次发布决定 | 获取或传输权重 |
-| `TrainingOutcome` | 聚合多 Worker 的训练结果与一致性，决定是否可发布 | 再次决定训练预算 |
-| Executor | 连接 Scheduler 与 Ray/Worker/rollout runtime | 训练触发、预算、发布间隔等策略 |
+| DrafterScheduleContext | Read-only facts: current step, mode, and pending state | Training budget or Worker execution details |
+| TrainingDataStatus | Aggregated snapshot of trainable data on all Workers | Triggering training or invoking training RPCs |
+| TrainingPlan | Immutable decision: launch, strategy, budget, versions, and plan_id | Recomputing trigger conditions in Workers |
+| CollectionPlan | Collection decision and static sampling budget | Parsing source-specific feature formats |
+| PublishPlan | Publication decision | Fetching or transferring weights |
+| TrainingOutcome | Aggregates multi-Worker results and consistency to decide publication | Recomputing training budget |
+| Executor | Connects Scheduler code to Ray, Workers, and rollout runtime | Trigger, budget, or publication-interval policy |
 
-`plan_id`、`collection_id`、`data_version`、`buffer_version`、`worker_incarnation` 用于防止跨进程状态漂移：计划生成后数据变化、Worker 重启或消息错配时，应 fail closed，而不是让部分 Worker 进入分布式训练。
+plan_id, collection_id, data_version, buffer_version, and worker_incarnation
+prevent cross-process state drift. When data changes after planning, a Worker
+restarts, or messages are mismatched, the path must fail closed rather than
+allow only part of a distributed job to enter training.
 
-## 新增策略：修改位置
+## Adding a Strategy: What to Change
 
-选择下面最小的改动范围。不要为了新增策略在 `SpecoRayPPOTrainer` 或 `SpecoWorker` 再写一套 interval、buffer 或 publish 判断。
+Choose the smallest applicable change. Do not add another set of interval,
+buffer, or publish decisions in SpecoRayPPOTrainer or SpecoWorker.
 
-### 1. 只改变“是否触发训练”
+### 1. Change Only Whether Training Is Triggered
 
-适用例子：按接受率、loss、样本年龄或外部 SFT 事件决定是否训练。
+Examples include using acceptance rate, loss, sample age, or an external SFT
+event to decide whether to train.
 
-1. 在 `scheduler/training_trigger.py` 实现 `TrainingTriggerPolicy.should_train(...)`。
-2. 返回 `TriggerDecision(should_train, reason)`；为新 reason 在 `TrainingPlan._REASON_CODES` 增加稳定数值编码。
-3. 在 `DrafterScheduler` 中注入或选择该 trigger policy。
-4. 保持 `prepare_training_plan()` 的“cheap skip 在查询 Worker 前返回”行为，避免无效 Worker RPC。
-5. 为 trigger 的各分支编写纯单元测试。
+1. Implement TrainingTriggerPolicy.should_train(...) in
+   scheduler/training_trigger.py.
+2. Return TriggerDecision(should_train, reason), and add a stable numeric
+   reason code to TrainingPlan._REASON_CODES.
+3. Inject or select the trigger policy in DrafterScheduler.
+4. Preserve prepare_training_plan() cheap-skip behavior so conditions that do
+   not need Worker data return before Worker RPCs.
+5. Add pure unit tests for each trigger branch.
 
-此类策略不应修改 `SyncExecutionStrategy`、Worker 的 preflight 或发布调用链。
+This type of strategy must not modify SyncExecutionStrategy, Worker preflight,
+or the publication call path.
 
-### 2. 只改变“训练多少步 / 何时停止”
+### 2. Change Only How Many Steps Run or When They Stop
 
-适用例子：根据 buffer 大小、token 预算、deadline 或 SFT 配额计算训练步数。
+Examples include using buffer size, token budget, deadline, or SFT quota to
+compute the number of training steps.
 
-1. 在 `scheduler/training_budget.py` 实现 `TrainingBudgetPolicy.make_budget(...)`。
-2. 返回 `TrainingBudget(max_batches, min_batches, deadline_ts, require_full_batch, sample_last_n_steps, reason)`。
-3. 保证 `max_batches >= min_batches`；否则让 `DrafterScheduler.plan_training()` 生成 `insufficient_training_budget` 的 skip plan。
-4. 若增加新的预算字段，先扩展 `TrainingBudget` 和 `TrainingPlan`，再更新 `TrainingPlan.to_worker_payload()`，最后让 Worker 仅消费该字段。
-5. 为 0 预算、最小预算、上限和 deadline 分支写测试。
+1. Implement TrainingBudgetPolicy.make_budget(...) in
+   scheduler/training_budget.py.
+2. Return TrainingBudget(max_batches, min_batches, deadline_ts,
+   require_full_batch, sample_last_n_steps, reason).
+3. Ensure max_batches is at least min_batches. Otherwise,
+   DrafterScheduler.plan_training() returns an insufficient_training_budget
+   skip plan.
+4. For a new budget field, extend TrainingBudget and TrainingPlan, update
+   TrainingPlan.to_worker_payload(), then make Workers consume only that
+   serialized field.
+5. Test zero budget, minimum budget, caps, and deadline branches.
 
-### 3. 新增一种训练执行策略
+### 3. Add a Training Execution Strategy
 
-适用例子：Bubble Time、rollout idle worker、异步队列或 SFT co-train。当前枚举中预留了 `ROLLOUT_IDLE_WORKER`，但尚未实现。
+Examples include Bubble Time, rollout idle workers, asynchronous queues, or
+SFT co-training. ROLLOUT_IDLE_WORKER is reserved in the current enum but is
+not implemented yet.
 
-1. 在 `schedule_types.py` 的 `DrafterExecutionStrategy` 增加或启用策略枚举值，并更新 `TrainingPlan.metrics()` 的 strategy code。
-2. 在 `execution_strategy.py` 实现 `DrafterTrainingExecutionStrategy.execute(plan, executor, runtime_state)`。
-3. 在 `DrafterScheduler.plan_training()` 中选择该执行策略；触发和预算仍复用统一 policy，除非确实需要新的 policy。
-4. 在 `DrafterScheduler.execute_training_plan()` 中路由到新 strategy。未知策略必须显式报错，不能静默回退到同步训练。
-5. 若策略需要新的资源查询、非阻塞 poll、任务取消或 deadline 执行，向 `DrafterWorkerExecutor` 增加明确方法，并由 `CallbackDrafterWorkerExecutor` 将其适配到 Trainer/Ray RPC。
-6. 保持 preflight、版本校验、结果聚合和发布门控。异步策略可以改变等待时间，但不能绕过这些一致性约束。
+1. Add or enable an enum value in DrafterExecutionStrategy in
+   schedule_types.py, and update the strategy code in TrainingPlan.metrics().
+2. Implement DrafterTrainingExecutionStrategy.execute(plan, executor,
+   runtime_state) in execution_strategy.py.
+3. Select the strategy in DrafterScheduler.plan_training(). Reuse the trigger
+   and budget policies unless the new semantics require different policies.
+4. Route the strategy in DrafterScheduler.execute_training_plan(). Unknown
+   strategies must fail explicitly, not silently fall back to sync execution.
+5. If resource queries, non-blocking polling, cancellation, or deadline
+   execution require new RPCs, add explicit methods to DrafterWorkerExecutor
+   and adapt them in CallbackDrafterWorkerExecutor.
+6. Preserve preflight, version validation, result aggregation, and publish
+   gating. An asynchronous strategy may change waiting behavior but must not
+   bypass these consistency constraints.
 
-Bubble Time 策略通常只应改变“何时提交训练、是否等待结果、使用哪些空闲资源”。`TrainingPlan` 仍是执行的唯一输入；Worker 不应自行决定是否训练。
+Bubble Time should usually change only when training is submitted, whether the
+result is awaited, and which idle resources are selected. TrainingPlan remains
+the single execution input; Workers must not decide for themselves whether to
+train.
 
-### 4. 新增收集来源或收集策略
+### 4. Add a Collection Source or Collection Strategy
 
-适用例子：SFT 数据、第三种 rollout engine，或新的 feature 表示。
+Examples include SFT data, a third rollout engine, or a new feature format.
 
-1. 在 `DrafterCollectionSource` 增加来源枚举，并在 `CollectionPlan.metrics()` 中增加 source code。
-2. 实现 `DrafterCollectionAdapter`，负责把来源特有样本转为统一 `CollectionPayload` 并完成 owner 分桶。
-3. 通过 `DrafterScheduler.register_collection_adapter()` 注册 adapter；不要在 Trainer 中手写第二套 payload 分桶和 bucket 对齐逻辑。
-4. 若收集事务语义不同，实现新的 `DrafterCollectionStrategy`；否则复用 `SyncCollectionStrategy` 的 stage / commit / rollback / finalize 流程。
-5. 若需要新的外部 RPC，在 `DrafterCollectionExecutor` 中扩展，并同时实现 callback 适配器与 Worker 端处理。
-6. 保持同一个 `collection_id` 贯穿 stage、commit、rollback 和 finalize；成功 collection 必须更新可验证的数据版本。
+1. Add a source value to DrafterCollectionSource and a source code in
+   CollectionPlan.metrics().
+2. Implement DrafterCollectionAdapter to convert source-specific samples into
+   CollectionPayload and bucket them by owner.
+3. Register the adapter through DrafterScheduler.register_collection_adapter().
+   Do not hand-write another payload-bucketing and bucket-alignment path in
+   the Trainer.
+4. If collection transaction semantics differ, implement a new
+   DrafterCollectionStrategy. Otherwise reuse SyncCollectionStrategy stage,
+   commit, rollback, and finalize behavior.
+5. If external RPCs are required, extend DrafterCollectionExecutor and
+   implement its callback adapter and Worker handler together.
+6. Carry one collection_id through stage, commit, rollback, and finalize. A
+   successful collection must update a verifiable data version.
 
-### 5. 改变发布方式
+### 5. Change Publication Behavior
 
-适用例子：不同 rollout engine、异步热更新、版本化权重仓库。
+Examples include different rollout engines, asynchronous hot updates, or a
+versioned-weight store.
 
-1. 优先复用 `PublishPlan` 和 `PublishExecutionStrategy`。
-2. 仅在 RPC 边界不同的情况下实现或替换 `DrafterPublishExecutor`。
-3. 若新增发布决策规则，集中在 `DrafterScheduler.plan_publish()`；不要在 Trainer 和 Worker 同时判断 publish interval。
-4. 发布输入必须来自训练成功后唯一 publish leader 的快照。
+1. Prefer to reuse PublishPlan and PublishExecutionStrategy.
+2. Replace or extend DrafterPublishExecutor only when the RPC boundary differs.
+3. Put new publication decision rules in DrafterScheduler.plan_publish(). Do
+   not check the publication interval in both Trainer and Worker.
+4. Publication input must come from the snapshot of the single publish leader
+   after successful training.
 
-## SFT Co-Train 的推荐接入方式
+## Development Checklist
 
-SFT co-train 不需要复制在线 Scheduler。推荐将 SFT 数据视为新的 collection source，并将其训练触发/预算实现为 policy：
+When adding a strategy or Executor, verify all of the following:
 
-```text
-SFT dataloader / producer
-  → SFT CollectionAdapter
-  → CollectionPayload
-  → Scheduler.on_collection_ready()
-  → SFT trigger / budget policy 生成 TrainingPlan
-  → 复用统一 preflight、训练执行、TrainingOutcome 和发布路径
-```
+- The outer Trainer calls only the public DrafterScheduler Facade, not an
+  internal policy.
+- Workers execute only TrainingPlan.to_worker_payload() and do not introduce
+  new trigger, interval, or publication decisions.
+- All participating Workers pass preflight before training; one failure skips
+  all Workers.
+- data_version must be consistent. Check target_version only when
+  required_target_version is not None.
+- An asynchronous strategy has explicit pending, completed, failed, and safe
+  publication states; it does not publish unfinished training.
+- Failed collection uses abort or rollback and never treats partially committed
+  data as trainable.
+- New reason, source, and strategy metric codes are stable, and plans and
+  outcomes have observable logs.
+- Add unit tests for the normal path, skip path, version mismatch,
+  duplicate/missing Worker results, and exception cleanup.
 
-若 SFT 与在线 RL 数据必须隔离，应在 payload 和 Worker buffer 中加入明确的数据域或 source 标识，并让 `TrainingDataStatus` 聚合、trigger 和 budget 显式选择可混合或不可混合的域。不要仅依赖“当前 global step”来区分两类数据。
+Existing test commands:
 
-## 开发检查清单
-
-新增策略或 Executor 后，至少确认：
-
-- 外部 Trainer 仍只调用 `DrafterScheduler` 的公共 Facade，而非内部 policy。
-- Worker 只执行 `TrainingPlan.to_worker_payload()`，没有新的 trigger、interval 或发布判断。
-- 所有参与 Worker 在训练前通过 preflight；任一失败会使全部 Worker 跳过。
-- `data_version` 必须一致；仅当 `required_target_version` 非空时才校验 target version。
-- 异步策略仍有明确的 pending、完成、失败和安全发布状态，不会在未完成训练时发布。
-- collection 的失败走 abort 或 rollback；不会把半提交数据当成可训练数据。
-- 新 reason/source/strategy 的指标编码稳定，且计划和 outcome 都有可观测日志。
-- 添加单元测试：正常路径、跳过路径、版本不一致、重复/缺失 Worker 结果、异常清理路径。
-
-现有测试入口可参考：
-
-```bash
+~~~bash
 python -m pytest -q tests/unit tests/integration/test_drafter_runtime_control_contract.py
 python -m ruff check verl_speco/trainer/scheduler tests/unit
-```
+~~~
