@@ -17,11 +17,11 @@
 SpeCo examples intentionally expose both the drafter backend and rollout
 backend in the filename because those combinations are the product surface:
 
-    run_<model>_drafter_<drafter-backend>_<rollout-backend>[_npu].sh
+    run_<model>_[actor_<actor-backend>_]drafter_<drafter-backend>_<rollout-backend>[_npu].sh
 
 The standalone/offline draft-training entry point uses:
 
-    run_<model>_drafter_[<drafter-backend>...]_separate_training.sh
+    run_<model>_[actor_<actor-backend>_]drafter_[<drafter-backend>...]_separate_training.sh
 
 Backends an inference engine cannot serve on its own (Domino, P-EAGLE and
 EAGLE-1/2) exist only in that standalone form, so they may name themselves in
@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 DRAFTER_BACKENDS = ("dflash", "dspark", "eagle3")
+ACTOR_BACKENDS = ("fsdp", "fsdp2", "megatron")
 # Drafters no inference engine serves directly, so they never pair with a
 # rollout backend and only ever appear in the standalone form.
 STANDALONE_ONLY_BACKENDS = ("domino", "peagle", "eagle1", "eagle2")
@@ -67,10 +68,13 @@ def _is_ignored(
 
 def _format_expected() -> str:
     return (
-        "expected run_<model>_drafter_<drafter-backend>_<rollout-backend>[_npu].sh "
+        "expected run_<model>_[actor_<actor-backend>_]drafter_"
+        "<drafter-backend>_<rollout-backend>[_npu].sh "
+        f"with actor-backend in {list(ACTOR_BACKENDS)}, "
         f"with drafter-backend in {list(DRAFTER_BACKENDS)} and rollout-backend "
         f"in {list(ROLLOUT_BACKENDS)}, or "
-        "run_<model>_drafter_[<drafter-backend>...]_separate_training.sh with "
+        "run_<model>_[actor_<actor-backend>_]drafter_"
+        "[<drafter-backend>...]_separate_training.sh with "
         f"drafter-backend in {list(DRAFTER_BACKENDS + STANDALONE_ONLY_BACKENDS)}"
     )
 
@@ -92,6 +96,20 @@ def check_filename(path: Path, display: str | None = None) -> list[str]:
     drafter_index = tokens.index("drafter")
     model_tokens = tokens[:drafter_index]
     spec_tokens = tokens[drafter_index + 1 :]
+    if "actor" in model_tokens:
+        actor_index = model_tokens.index("actor")
+        actor_tokens = model_tokens[actor_index + 1 :]
+        model_tokens = model_tokens[:actor_index]
+        if len(actor_tokens) != 1:
+            errors.append(
+                f"{shown}: expected exactly one actor backend between '_actor_' "
+                "and '_drafter_'"
+            )
+        elif actor_tokens[0] not in ACTOR_BACKENDS:
+            errors.append(
+                f"{shown}: unknown actor backend '{actor_tokens[0]}', "
+                f"expected one of {list(ACTOR_BACKENDS)}"
+            )
     if not model_tokens:
         errors.append(f"{shown}: model name is missing before '_drafter_'")
 
