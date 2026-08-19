@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import threading
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -20,7 +23,9 @@ from verl_speco.trainer.feature_store import DraftFeatureSample, DraftReplaySamp
 from verl_speco.trainer.target_feature_replay import (  # noqa: E402
     BoundedReplayCache,
     TargetFeatureReplayer,
+    _VllmEndpointState,
     _hidden_capture_target,
+    _normalize_vllm_endpoints,
 )
 
 
@@ -37,6 +42,68 @@ def test_hidden_capture_target_matches_transformers_hidden_state_indices():
     assert _hidden_capture_target(0, 36) == ("layer", 0)
     assert _hidden_capture_target(34, 36) == ("layer", 34)
     assert _hidden_capture_target(35, 36) == ("final", None)
+
+
+def test_normalize_vllm_endpoints_prefers_pool_and_deduplicates():
+    assert _normalize_vllm_endpoints(
+        {
+            "vllm_endpoint": "http://legacy:8000/v1",
+            "vllm_endpoints": [
+                "http://host1:8000/v1/",
+                "http://host2:8000/v1",
+                "http://host1:8000/v1",
+            ],
+        }
+    ) == ["http://host1:8000/v1", "http://host2:8000/v1"]
+
+
+def test_vllm_request_fails_over_to_another_endpoint(monkeypatch):
+    class _Completions:
+        def __init__(self, error=None):
+            self.error = error
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            return SimpleNamespace(choices=[])
+
+    failed = _Completions(RuntimeError("endpoint down"))
+    healthy = _Completions()
+    replayer = TargetFeatureReplayer.__new__(TargetFeatureReplayer)
+    replayer.rank = 0
+    replayer.vllm_timeout = 1
+    replayer.vllm_max_retries = 1
+    replayer.vllm_endpoint_cooldown = 5
+    replayer.vllm_requests = 0
+    replayer.vllm_request_seconds = 0.0
+    replayer._metrics_lock = threading.Lock()
+    replayer._endpoint_lock = threading.Lock()
+    replayer._vllm_clients_initialized = True
+    replayer._vllm_endpoint_states = [
+        _VllmEndpointState(
+            index=0,
+            url="http://host1:8000/v1",
+            client=SimpleNamespace(completions=failed),
+            model="target",
+        ),
+        _VllmEndpointState(
+            index=1,
+            url="http://host2:8000/v1",
+            client=SimpleNamespace(completions=healthy),
+            model="target",
+        ),
+    ]
+    monkeypatch.setattr("verl_speco.trainer.target_feature_replay.time.sleep", lambda _: None)
+
+    response = replayer._request_vllm_response([1, 2, 3])
+
+    assert response.choices == []
+    assert failed.calls == 1
+    assert healthy.calls == 1
+    assert replayer._vllm_endpoint_states[0].failures == 1
+    assert replayer._vllm_endpoint_states[1].requests == 1
 
 
 def test_bounded_replay_cache_roundtrip(tmp_path):

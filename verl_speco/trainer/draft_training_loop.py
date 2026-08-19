@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from typing import Any, cast
@@ -127,6 +128,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     last_saved_step = 0
     store = None
     feature_replayer = None
+    feature_producer = None
     current_stage = "activate_training_model"
     try:
         stage_started = time.perf_counter()
@@ -218,8 +220,58 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             bool(feature_store_cfg.get("shuffle", True)),
             bool(feature_store_cfg.get("repeat", True)),
         )
-        for samples in loader:
-            if max_steps > 0 and successful_steps >= max_steps:
+        sample_source = loader
+        pipeline_cfg = training_cfg.get("target_feature_pipeline", {}) or {}
+        pipeline_enabled = bool(pipeline_cfg.get("enabled", False))
+        if pipeline_enabled:
+            if feature_replayer is None or not feature_replayer.backend.startswith(
+                "vllm_"
+            ):
+                raise ValueError(
+                    "target_feature_pipeline.enabled=true requires a vLLM replay "
+                    "backend (vllm_file or vllm_mooncake)"
+                )
+            from verl_speco.trainer.target_feature_pipeline import (
+                TargetFeatureProducer,
+            )
+
+            feature_producer = TargetFeatureProducer(
+                loader,
+                feature_replayer,
+                rank=rank,
+                concurrency=max(
+                    math.ceil(
+                        int(pipeline_cfg.get("concurrency", 16) or 16) / world_size
+                    ),
+                    1,
+                ),
+                transfer_concurrency=int(
+                    max(
+                        math.ceil(
+                            int(
+                                pipeline_cfg.get("transfer_concurrency", 8) or 8
+                            )
+                            / world_size
+                        ),
+                        1,
+                    )
+                ),
+                producer_prefetch_depth=int(
+                    pipeline_cfg.get("producer_prefetch_depth", 4) or 4
+                ),
+                prefetch_depth=int(pipeline_cfg.get("prefetch_depth", 2) or 2),
+                queue_timeout=float(pipeline_cfg.get("queue_timeout", 300.0) or 300.0),
+            )
+            sample_source = feature_producer
+        sample_iterator = iter(sample_source)
+        while max_steps <= 0 or successful_steps < max_steps:
+            current_stage = "load_next_batch"
+            samples = _next_batch_across_ranks(
+                sample_iterator,
+                rank=rank,
+                device=trainer.runtime_device,
+            )
+            if samples is None:
                 break
             step_started = time.perf_counter()
             attempted_batches += 1
@@ -252,7 +304,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     world_size=world_size,
                     device=trainer.runtime_device,
                 )
-            if feature_replayer is not None:
+            if feature_replayer is not None and feature_producer is None:
                 materialize_started = time.perf_counter()
                 if log_batch_progress:
                     logger.info(
@@ -323,6 +375,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             )
             if feature_replayer is not None:
                 step_metrics.update(feature_replayer.metrics())
+            if feature_producer is not None:
+                step_metrics.update(feature_producer.metrics())
             _log_standalone_step_metrics(step_metrics, rank=rank)
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 current_stage = "save_checkpoint"
@@ -358,10 +412,12 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             attempted_batches,
             successful_steps,
         )
-        if store is not None:
-            store.close()
+        if feature_producer is not None:
+            feature_producer.close()
         if feature_replayer is not None:
             feature_replayer.close()
+        if store is not None:
+            store.close()
         logger.info("[standalone rank=%s] cleaning trainer resources", rank)
         await trainer.cleanup_training(clear_data=True)
         if dist.is_initialized():
@@ -934,13 +990,20 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("perf/step_time", "step_time"),
         ("replay/cache_hit_ratio", "cache_hit"),
         ("replay/target_forward_time_total", "target_forward_total"),
+        ("replay/vllm_request_time_total", "vllm_request_total"),
+        ("replay/mooncake_get_time_total", "mooncake_get_total"),
+        ("producer/consumer_wait_time_total", "producer_wait_total"),
+        ("producer/ready_queue_size", "ready_batches"),
     ):
         if key not in metrics:
             continue
         value = float(metrics[key])
         if key == "train/lr":
             fields.append(f"{label}={value:.3e}")
-        elif key in {"perf/step_time", "replay/target_forward_time_total"}:
+        elif key.endswith("_time_total") or key in {
+            "perf/step_time",
+            "replay/target_forward_time_total",
+        }:
             fields.append(f"{label}={value:.3f}s")
         else:
             fields.append(f"{label}={value:.4f}")
@@ -989,6 +1052,64 @@ def _all_ranks_true(value: bool, device: torch.device) -> bool:
     ready = torch.tensor(1 if value else 0, dtype=torch.int32, device=device)
     dist.all_reduce(ready, op=dist.ReduceOp.MIN)
     return bool(ready.item())
+
+
+def _next_batch_across_ranks(
+    source,
+    *,
+    rank: int,
+    device: torch.device,
+) -> list[Any] | None:
+    """Fetch one batch and make producer failures visible to every rank.
+
+    Producer and Mooncake errors happen before the FSDP training step.  Every
+    rank therefore reports its fetch result through the same collective before
+    any rank is allowed to enter model collectives.  This prevents healthy
+    ranks from waiting in FSDP after another rank has already started cleanup.
+    """
+    samples: list[Any] | None = None
+    local_error: BaseException | None = None
+    exhausted = False
+    try:
+        samples = next(source)
+    except StopIteration:
+        exhausted = True
+    except BaseException as exc:  # noqa: BLE001
+        local_error = exc
+
+    state = torch.tensor(
+        [1 if local_error is not None else 0, 1 if exhausted else 0],
+        dtype=torch.int32,
+        device=device,
+    )
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(state, op=dist.ReduceOp.MAX)
+
+    any_failed = bool(state[0].item())
+    any_exhausted = bool(state[1].item())
+    if any_failed:
+        if local_error is not None:
+            raise RuntimeError(
+                f"Standalone target-feature producer failed on rank={rank}; "
+                "all ranks are stopping before the next training collective"
+            ) from local_error
+        raise RuntimeError(
+            "Standalone target-feature producer failed on another rank; "
+            f"rank={rank} is stopping before the next training collective"
+        )
+    if any_exhausted:
+        if not exhausted:
+            logger.warning(
+                "[standalone rank=%s] discarding a prefetched batch because "
+                "another rank exhausted its data source",
+                rank,
+            )
+        return None
+    if samples is None:
+        raise RuntimeError(
+            f"Rank={rank} reported a successful batch fetch without samples"
+        )
+    return samples
 
 
 def _sync_any_rank_saved_checkpoint(saved: Any) -> bool:

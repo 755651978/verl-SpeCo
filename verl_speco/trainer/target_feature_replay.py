@@ -21,7 +21,9 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, cast
 
@@ -36,12 +38,53 @@ from verl_speco.trainer.feature_store import DraftFeatureSample, DraftReplaySamp
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class MooncakeReplayDescriptor:
+    sample: DraftReplaySample
+    prompt_ids: list[int]
+    key: str
+
+
+@dataclass
+class _VllmEndpointState:
+    index: int
+    url: str
+    client: Any | None = None
+    model: str | None = None
+    inflight: int = 0
+    requests: int = 0
+    failures: int = 0
+    consecutive_failures: int = 0
+    request_seconds: float = 0.0
+    cooldown_until: float = 0.0
+
+
 def _config_value(config: Any, key: str, default: Any = None) -> Any:
     if config is None:
         return default
     if hasattr(config, "get"):
         return config.get(key, default)
     return getattr(config, key, default)
+
+
+def _normalize_vllm_endpoints(config: Any) -> list[str]:
+    configured = _config_value(config, "vllm_endpoints", None)
+    if configured is None:
+        configured = [
+            _config_value(config, "vllm_endpoint", "http://localhost:8000/v1")
+        ]
+    elif isinstance(configured, str):
+        configured = [configured]
+    endpoints: list[str] = []
+    for value in configured:
+        endpoint = str(value or "").strip().rstrip("/")
+        if endpoint and endpoint not in endpoints:
+            endpoints.append(endpoint)
+    if not endpoints:
+        raise ValueError(
+            "target_feature_replay.vllm_endpoints must contain at least one URL"
+        )
+    return endpoints
 
 
 def _parse_dtype(value: Any) -> torch.dtype:
@@ -336,10 +379,12 @@ class TargetFeatureReplayer:
             .strip()
             .lower()
         )
-        if self.backend not in {"torch", "vllm_file"}:
+        if self.backend == "mooncake":
+            self.backend = "vllm_mooncake"
+        if self.backend not in {"torch", "vllm_file", "vllm_mooncake"}:
             raise ValueError(
                 f"Unsupported target_feature_replay.backend={self.backend!r}; "
-                "expected 'torch' or 'vllm_file'"
+                "expected 'torch', 'vllm_file', or 'vllm_mooncake'"
             )
         configured_model_path = _config_value(self.replay_cfg, "model_path", None)
         model_path = configured_model_path or self.draft_config.model.path
@@ -369,16 +414,18 @@ class TargetFeatureReplayer:
         self.logits_chunk_rows = max(
             int(_config_value(self.replay_cfg, "logits_chunk_rows", 32) or 32), 1
         )
-        self.vllm_endpoint = str(
-            _config_value(self.replay_cfg, "vllm_endpoint", "http://localhost:8000/v1")
-            or "http://localhost:8000/v1"
-        )
+        self.vllm_endpoints = _normalize_vllm_endpoints(self.replay_cfg)
+        self.vllm_endpoint = self.vllm_endpoints[0]
         self.vllm_model = _config_value(self.replay_cfg, "vllm_model", None)
         self.vllm_timeout = float(
             _config_value(self.replay_cfg, "request_timeout", 120.0) or 120.0
         )
         self.vllm_max_retries = max(
             int(_config_value(self.replay_cfg, "max_retries", 3) or 0), 0
+        )
+        self.vllm_endpoint_cooldown = max(
+            float(_config_value(self.replay_cfg, "endpoint_cooldown", 5.0) or 0.0),
+            0.0,
         )
         self.vllm_on_generate = (
             str(_config_value(self.replay_cfg, "on_generate", "delete") or "delete")
@@ -440,6 +487,7 @@ class TargetFeatureReplayer:
         self.target_config_fingerprint = hashlib.sha256(config_json).hexdigest()
 
         self.cache: BoundedReplayCache | None = None
+        self._cache_lock = threading.Lock()
         cache_cfg = _config_value(self.replay_cfg, "cache", {}) or {}
         if bool(_config_value(cache_cfg, "enabled", False)):
             cache_path = _config_value(cache_cfg, "path", None)
@@ -460,25 +508,38 @@ class TargetFeatureReplayer:
         self.output_embedding: nn.Module | None = None
         self.vllm_client: Any | None = None
         self.vllm_resolved_model: str | None = None
+        self._vllm_endpoint_states = [
+            _VllmEndpointState(index=index, url=endpoint)
+            for index, endpoint in enumerate(self.vllm_endpoints)
+        ]
+        self._vllm_clients_initialized = False
+        self.mooncake_store: Any | None = None
+        self._client_lock = threading.Lock()
+        self._endpoint_lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
+        self._pending_keys_lock = threading.Lock()
+        self._pending_mooncake_keys: set[str] = set()
         self.cache_hits = 0
         self.cache_misses = 0
         self.materialized_samples = 0
         self.target_forward_seconds = 0.0
         self.vllm_request_seconds = 0.0
         self.vllm_requests = 0
+        self.mooncake_get_seconds = 0.0
+        self.mooncake_gets = 0
         self._warned_replay_algorithm_mismatch = False
         self._warned_replay_layer_mismatch = False
         self._warned_replay_layout_mismatch = False
         logger.info(
             "[target replay rank=%s] initialized backend=%s algorithm=%s "
-            "target_layers=%s hidden_layout=%s use_logits=%s endpoint=%s cache=%s",
+            "target_layers=%s hidden_layout=%s use_logits=%s endpoints=%s cache=%s",
             self.rank,
             self.backend,
             self.algorithm,
             self.target_layer_ids,
             self.hidden_layout,
             self.use_logits,
-            self.vllm_endpoint if self.backend == "vllm_file" else None,
+            self.vllm_endpoints if self.backend.startswith("vllm_") else None,
             self.cache is not None,
         )
 
@@ -498,15 +559,19 @@ class TargetFeatureReplayer:
                     )
                 self._validate_target_path(sample)
                 key = self._cache_key(sample)
-                cached = self.cache.get(key) if self.cache is not None else None
+                with self._cache_lock:
+                    cached = self.cache.get(key) if self.cache is not None else None
                 if cached is not None:
-                    self.cache_hits += 1
+                    with self._metrics_lock:
+                        self.cache_hits += 1
                     materialized.append(cached)
                     continue
-                self.cache_misses += 1
+                with self._metrics_lock:
+                    self.cache_misses += 1
                 replayed = self._materialize_one(sample)
                 if self.cache is not None:
-                    self.cache.put(key, replayed)
+                    with self._cache_lock:
+                        self.cache.put(key, replayed)
                 materialized.append(replayed)
             except Exception:
                 metadata = getattr(sample, "metadata", {}) or {}
@@ -520,7 +585,8 @@ class TargetFeatureReplayer:
                     metadata.get("global_step"),
                 )
                 raise
-        self.materialized_samples += len(materialized)
+        with self._metrics_lock:
+            self.materialized_samples += len(materialized)
         return materialized
 
     def _validate_target_path(self, sample: DraftReplaySample) -> None:
@@ -638,6 +704,8 @@ class TargetFeatureReplayer:
     def _materialize_one(self, sample: DraftReplaySample) -> DraftFeatureSample:
         if self.backend == "vllm_file":
             return self._materialize_one_vllm_file(sample)
+        if self.backend == "vllm_mooncake":
+            return self._materialize_one_vllm_mooncake(sample)
         return self._materialize_one_torch(sample)
 
     def _materialize_one_torch(self, sample: DraftReplaySample) -> DraftFeatureSample:
@@ -806,6 +874,117 @@ class TargetFeatureReplayer:
                     logger.warning("Failed to delete vLLM hidden-states file %s", path)
         return feature
 
+    def _materialize_one_vllm_mooncake(
+        self, sample: DraftReplaySample
+    ) -> DraftFeatureSample:
+        return self.consume_mooncake_descriptor(
+            self._request_mooncake_descriptor(sample)
+        )
+
+    def produce_mooncake_descriptor(
+        self, sample: DraftReplaySample | DraftFeatureSample
+    ) -> MooncakeReplayDescriptor | DraftFeatureSample:
+        if isinstance(sample, DraftFeatureSample):
+            return sample
+        if not isinstance(sample, DraftReplaySample):
+            raise TypeError(
+                "Mooncake producer expected DraftReplaySample or "
+                f"DraftFeatureSample, got {type(sample)!r}"
+            )
+        if self.use_logits:
+            raise NotImplementedError(
+                "target_feature_replay.backend=vllm_mooncake does not yet "
+                "support training.use_logits=true; use backend=torch."
+            )
+        self._validate_target_path(sample)
+        cache_key = self._cache_key(sample)
+        with self._cache_lock:
+            cached = self.cache.get(cache_key) if self.cache is not None else None
+        if cached is not None:
+            with self._metrics_lock:
+                self.cache_hits += 1
+            return cached
+        with self._metrics_lock:
+            self.cache_misses += 1
+        return self._request_mooncake_descriptor(sample)
+
+    def _request_mooncake_descriptor(
+        self, sample: DraftReplaySample
+    ) -> MooncakeReplayDescriptor:
+        self._validate_vllm_positions(sample)
+        feature_positions = sample.feature_positions.detach().cpu().long()
+        feature_end = int(feature_positions[-1].item()) + 1
+        prompt_ids = sample.input_ids[:feature_end].detach().cpu().long().tolist()
+        response = self._request_vllm_response(prompt_ids)
+        params = getattr(response, "kv_transfer_params", None)
+        if params is None:
+            raise ValueError("vLLM response missing kv_transfer_params")
+        key = params.get("mooncake_key")
+        if not key:
+            raise ValueError(
+                "vLLM response missing mooncake_key; start vLLM with "
+                "SpeCoMooncakeHiddenStatesConnector"
+            )
+        key = str(key)
+        with self._pending_keys_lock:
+            self._pending_mooncake_keys.add(key)
+        return MooncakeReplayDescriptor(sample, prompt_ids, key)
+
+    def consume_mooncake_descriptor(
+        self, descriptor: MooncakeReplayDescriptor | DraftFeatureSample
+    ) -> DraftFeatureSample:
+        if isinstance(descriptor, DraftFeatureSample):
+            return descriptor
+        store = self._ensure_mooncake_store()
+        transfer_started = time.perf_counter()
+        payload = store.get(descriptor.key)
+        with self._metrics_lock:
+            self.mooncake_get_seconds += time.perf_counter() - transfer_started
+            self.mooncake_gets += 1
+        try:
+            feature = self._feature_from_vllm_payload(
+                descriptor.sample,
+                payload,
+                prompt_ids=descriptor.prompt_ids,
+                source="token_replay_vllm_mooncake",
+            )
+            return feature
+        finally:
+            if self.vllm_on_generate == "delete":
+                store.remove(descriptor.key)
+            with self._pending_keys_lock:
+                self._pending_mooncake_keys.discard(descriptor.key)
+
+    def consume_pipeline_mooncake_descriptor(
+        self, descriptor: MooncakeReplayDescriptor | DraftFeatureSample
+    ) -> DraftFeatureSample:
+        feature = self.consume_mooncake_descriptor(descriptor)
+        if isinstance(descriptor, MooncakeReplayDescriptor) and self.cache is not None:
+            with self._cache_lock:
+                self.cache.put(self._cache_key(descriptor.sample), feature)
+        return feature
+
+    def record_pipeline_materialized(self, count: int) -> None:
+        with self._metrics_lock:
+            self.materialized_samples += int(count)
+
+    def _ensure_mooncake_store(self):
+        if self.mooncake_store is not None:
+            return self.mooncake_store
+        with self._client_lock:
+            if self.mooncake_store is None:
+                from verl_speco.trainer.mooncake_transfer import (
+                    MooncakeTensorStore,
+                    MooncakeTransferConfig,
+                )
+
+                mooncake_cfg = _config_value(self.replay_cfg, "mooncake", {}) or {}
+                self.mooncake_store = MooncakeTensorStore(
+                    MooncakeTransferConfig.from_mapping(mooncake_cfg)
+                )
+                self.mooncake_store.setup()
+        return self.mooncake_store
+
     def _validate_vllm_positions(self, sample: DraftReplaySample) -> None:
         if not self.vllm_require_arange_positions:
             return
@@ -815,66 +994,219 @@ class TargetFeatureReplayer:
         actual = sample.position_ids[:feature_end].detach().cpu().long()
         if not torch.equal(actual, expected):
             raise ValueError(
-                "target_feature_replay.backend=vllm_file currently requires "
+                "vLLM target replay currently requires "
                 "position_ids to be contiguous arange positions for the replay prefix"
             )
 
-    def _ensure_vllm_client(self) -> None:
-        if self.vllm_client is not None:
+    def _ensure_vllm_clients(self) -> None:
+        if self._vllm_clients_initialized:
             return
+        with self._client_lock:
+            if self._vllm_clients_initialized:
+                return
+            started = time.perf_counter()
+            logger.info(
+                "[target replay rank=%s] initializing vLLM endpoint pool=%s "
+                "configured_model=%s",
+                self.rank,
+                self.vllm_endpoints,
+                self.vllm_model,
+            )
+            try:
+                import openai
+            except ImportError as exc:
+                raise RuntimeError(
+                    "vLLM target replay requires the openai package"
+                ) from exc
+            resolved_models: set[str] = set()
+            for state in self._vllm_endpoint_states:
+                state.client = openai.OpenAI(
+                    base_url=state.url,
+                    api_key="EMPTY",
+                    max_retries=0,
+                )
+                state.model = (
+                    os.fspath(self.vllm_model) if self.vllm_model else self.model_path
+                )
+                try:
+                    models = state.client.models.list(timeout=self.vllm_timeout)
+                    if not self.vllm_model and models.data:
+                        state.model = str(models.data[0].id)
+                    resolved_models.add(str(state.model))
+                    logger.info(
+                        "[target replay rank=%s] vLLM endpoint[%s] ready url=%s model=%s",
+                        self.rank,
+                        state.index,
+                        state.url,
+                        state.model,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    state.failures += 1
+                    state.consecutive_failures += 1
+                    state.cooldown_until = (
+                        time.monotonic() + self.vllm_endpoint_cooldown
+                    )
+                    logger.warning(
+                        "[target replay rank=%s] vLLM endpoint[%s] health check "
+                        "failed; requests may retry it after cooldown url=%s error=%r",
+                        self.rank,
+                        state.index,
+                        state.url,
+                        exc,
+                    )
+            self._vllm_clients_initialized = True
+            self.vllm_client = self._vllm_endpoint_states[0].client
+            self.vllm_resolved_model = self._vllm_endpoint_states[0].model
+            if len(resolved_models) > 1:
+                logger.warning(
+                    "[target replay rank=%s] vLLM endpoints advertise different "
+                    "models=%s; set target_feature_replay.vllm_model explicitly "
+                    "after confirming all servers use identical target weights",
+                    self.rank,
+                    sorted(resolved_models),
+                )
+            logger.info(
+                "[target replay rank=%s] vLLM endpoint pool initialized "
+                "endpoints=%s elapsed=%.3fs",
+                self.rank,
+                len(self._vllm_endpoint_states),
+                time.perf_counter() - started,
+            )
+
+    def _acquire_vllm_endpoint(
+        self, excluded: set[int] | None = None
+    ) -> _VllmEndpointState:
+        self._ensure_vllm_clients()
+        excluded = excluded or set()
+        now = time.monotonic()
+        with self._endpoint_lock:
+            candidates = [
+                state
+                for state in self._vllm_endpoint_states
+                if state.client is not None
+                and state.model is not None
+                and state.index not in excluded
+                and state.cooldown_until <= now
+            ]
+            if not candidates:
+                candidates = [
+                    state
+                    for state in self._vllm_endpoint_states
+                    if state.client is not None
+                    and state.model is not None
+                    and state.index not in excluded
+                ]
+            if not candidates:
+                candidates = [
+                    state
+                    for state in self._vllm_endpoint_states
+                    if state.client is not None and state.model is not None
+                ]
+            if not candidates:
+                raise RuntimeError("No configured vLLM endpoint has a usable client")
+            state = min(
+                candidates,
+                key=lambda item: (
+                    item.inflight,
+                    item.consecutive_failures,
+                    item.cooldown_until,
+                    item.index,
+                ),
+            )
+            state.inflight += 1
+            return state
+
+    def _release_vllm_endpoint(
+        self,
+        state: _VllmEndpointState,
+        *,
+        elapsed: float,
+        succeeded: bool,
+    ) -> None:
+        with self._endpoint_lock:
+            state.inflight = max(state.inflight - 1, 0)
+            state.request_seconds += float(elapsed)
+            if succeeded:
+                state.requests += 1
+                state.consecutive_failures = 0
+                state.cooldown_until = 0.0
+            else:
+                state.failures += 1
+                state.consecutive_failures += 1
+                state.cooldown_until = (
+                    time.monotonic() + self.vllm_endpoint_cooldown
+                )
+
+    def _request_vllm_response(self, prompt_ids: list[int]) -> Any:
+        last_error: Exception | None = None
         started = time.perf_counter()
-        logger.info(
-            "[target replay rank=%s] connecting to vLLM endpoint=%s configured_model=%s",
-            self.rank,
-            self.vllm_endpoint,
-            self.vllm_model,
-        )
-        try:
-            import openai
-        except ImportError as exc:
-            raise RuntimeError(
-                "target_feature_replay.backend=vllm_file requires the openai package"
-            ) from exc
-        self.vllm_client = openai.OpenAI(
-            base_url=self.vllm_endpoint,
-            api_key="EMPTY",
-            max_retries=0,
-        )
-        if self.vllm_model:
-            self.vllm_resolved_model = os.fspath(self.vllm_model)
-        else:
-            models = self.vllm_client.models.list()
-            self.vllm_resolved_model = models.data[0].id
-        logger.info(
-            "[target replay rank=%s] connected to vLLM model=%s elapsed=%.3fs",
-            self.rank,
-            self.vllm_resolved_model,
-            time.perf_counter() - started,
-        )
+        attempted_endpoints: set[int] = set()
+        for attempt in range(self.vllm_max_retries + 1):
+            state = self._acquire_vllm_endpoint(attempted_endpoints)
+            attempt_started = time.perf_counter()
+            try:
+                response = state.client.completions.create(
+                    model=state.model,
+                    prompt=prompt_ids,
+                    max_tokens=1,
+                    extra_body={"return_token_ids": True},
+                    timeout=self.vllm_timeout,
+                )
+                choices = getattr(response, "choices", None) or []
+                if choices:
+                    actual = getattr(choices[0], "prompt_token_ids", None)
+                    if actual is not None and list(actual) != prompt_ids:
+                        raise ValueError("vLLM prompt_token_ids mismatch")
+                with self._metrics_lock:
+                    self.vllm_requests += 1
+                    self.vllm_request_seconds += time.perf_counter() - started
+                self._release_vllm_endpoint(
+                    state,
+                    elapsed=time.perf_counter() - attempt_started,
+                    succeeded=True,
+                )
+                return response
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                attempted_endpoints.add(state.index)
+                self._release_vllm_endpoint(
+                    state,
+                    elapsed=time.perf_counter() - attempt_started,
+                    succeeded=False,
+                )
+                if attempt >= self.vllm_max_retries:
+                    break
+                time.sleep(float(2**attempt))
+        with self._metrics_lock:
+            self.vllm_request_seconds += time.perf_counter() - started
+        raise RuntimeError(
+            "Failed to request vLLM hidden states after "
+            f"{self.vllm_max_retries + 1} attempts: {last_error}"
+        ) from last_error
 
     def _request_vllm_hidden_states(self, prompt_ids: list[int]) -> dict[str, Any]:
-        self._ensure_vllm_client()
-        assert self.vllm_client is not None
-        assert self.vllm_resolved_model is not None
         last_error: Exception | None = None
         started = time.perf_counter()
         request_index = self.vllm_requests + 1
         log_request = request_index <= 2 or request_index % 100 == 0
+        attempted_endpoints: set[int] = set()
         for attempt in range(self.vllm_max_retries + 1):
+            state = self._acquire_vllm_endpoint(attempted_endpoints)
             try:
                 attempt_started = time.perf_counter()
                 if log_request:
                     logger.info(
                         "[target replay rank=%s] vLLM request starting request=%s "
-                        "attempt=%s/%s prompt_tokens=%s",
+                        "attempt=%s/%s endpoint=%s prompt_tokens=%s",
                         self.rank,
                         request_index,
                         attempt + 1,
                         self.vllm_max_retries + 1,
+                        state.url,
                         len(prompt_ids),
                     )
-                response = self.vllm_client.completions.create(
-                    model=self.vllm_resolved_model,
+                response = state.client.completions.create(
+                    model=state.model,
                     prompt=prompt_ids,
                     max_tokens=1,
                     extra_body={"return_token_ids": True},
@@ -883,8 +1215,14 @@ class TargetFeatureReplayer:
                 path = self._extract_hidden_states_path(response, prompt_ids)
                 payload = self._load_vllm_hidden_states(path)
                 payload["_path"] = path
-                self.vllm_requests += 1
-                self.vllm_request_seconds += time.perf_counter() - started
+                with self._metrics_lock:
+                    self.vllm_requests += 1
+                    self.vllm_request_seconds += time.perf_counter() - started
+                self._release_vllm_endpoint(
+                    state,
+                    elapsed=time.perf_counter() - attempt_started,
+                    succeeded=True,
+                )
                 if log_request:
                     hidden_states = payload.get("hidden_states")
                     hidden_shape = (
@@ -894,10 +1232,11 @@ class TargetFeatureReplayer:
                     )
                     logger.info(
                         "[target replay rank=%s] vLLM request completed request=%s "
-                        "attempt=%s path=%s hidden_shape=%s elapsed=%.3fs",
+                        "attempt=%s endpoint=%s path=%s hidden_shape=%s elapsed=%.3fs",
                         self.rank,
                         request_index,
                         attempt + 1,
+                        state.url,
                         path,
                         hidden_shape,
                         time.perf_counter() - attempt_started,
@@ -905,13 +1244,20 @@ class TargetFeatureReplayer:
                 return payload
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
+                attempted_endpoints.add(state.index)
+                self._release_vllm_endpoint(
+                    state,
+                    elapsed=time.perf_counter() - attempt_started,
+                    succeeded=False,
+                )
                 logger.warning(
                     "[target replay rank=%s] vLLM request failed request=%s "
-                    "attempt=%s/%s prompt_tokens=%s elapsed=%.3fs error=%r",
+                    "attempt=%s/%s endpoint=%s prompt_tokens=%s elapsed=%.3fs error=%r",
                     self.rank,
                     request_index,
                     attempt + 1,
                     self.vllm_max_retries + 1,
+                    state.url,
                     len(prompt_ids),
                     time.perf_counter() - started,
                     exc,
@@ -919,7 +1265,8 @@ class TargetFeatureReplayer:
                 if attempt >= self.vllm_max_retries:
                     break
                 time.sleep(float(2**attempt))
-        self.vllm_request_seconds += time.perf_counter() - started
+        with self._metrics_lock:
+            self.vllm_request_seconds += time.perf_counter() - started
         raise RuntimeError(
             f"Failed to request vLLM hidden states after "
             f"{self.vllm_max_retries + 1} attempts: {last_error}"
@@ -1096,10 +1443,27 @@ class TargetFeatureReplayer:
             "replay/materialized_samples_total": float(self.materialized_samples),
             "replay/target_forward_time_total": float(self.target_forward_seconds),
         }
-        if self.backend == "vllm_file":
+        if self.backend.startswith("vllm_"):
             metrics["replay/vllm_requests_total"] = float(self.vllm_requests)
             metrics["replay/vllm_request_time_total"] = float(
                 self.vllm_request_seconds
+            )
+            with self._endpoint_lock:
+                metrics["replay/vllm_endpoints_total"] = float(
+                    len(self._vllm_endpoint_states)
+                )
+                for state in self._vllm_endpoint_states:
+                    prefix = f"replay/vllm_endpoint_{state.index}"
+                    metrics[f"{prefix}_inflight"] = float(state.inflight)
+                    metrics[f"{prefix}_requests_total"] = float(state.requests)
+                    metrics[f"{prefix}_failures_total"] = float(state.failures)
+                    metrics[f"{prefix}_request_time_total"] = float(
+                        state.request_seconds
+                    )
+        if self.backend == "vllm_mooncake":
+            metrics["replay/mooncake_gets_total"] = float(self.mooncake_gets)
+            metrics["replay/mooncake_get_time_total"] = float(
+                self.mooncake_get_seconds
             )
         total = self.cache_hits + self.cache_misses
         if total > 0:
@@ -1109,6 +1473,28 @@ class TargetFeatureReplayer:
         return metrics
 
     def close(self) -> None:
+        for state in self._vllm_endpoint_states:
+            client = state.client
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to close vLLM endpoint client %s",
+                        state.url,
+                        exc_info=True,
+                    )
+            state.client = None
+        if self.mooncake_store is not None:
+            with self._pending_keys_lock:
+                pending_keys = tuple(self._pending_mooncake_keys)
+                self._pending_mooncake_keys.clear()
+            if self.vllm_on_generate == "delete":
+                for key in pending_keys:
+                    self.mooncake_store.remove(key)
+            self.mooncake_store.close()
+            self.mooncake_store = None
         if self.model is None:
             return
         try:
