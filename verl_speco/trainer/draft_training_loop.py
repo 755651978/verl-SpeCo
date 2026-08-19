@@ -40,6 +40,17 @@ from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_
 logger = logging.getLogger(__name__)
 
 
+def _should_log_batch_progress(attempted_batches: int) -> bool:
+    return attempted_batches <= 3 or attempted_batches % 100 == 0
+
+
+def _is_out_of_memory_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    if "out of memory" in message or "oom" in message:
+        return True
+    return error.__class__.__name__ in {"OutOfMemoryError", "CudaOutOfMemoryError"}
+
+
 def run_standalone_draft_training(config) -> dict[str, Any]:
     """Run independent draft training from a feature store."""
     return asyncio.run(_run_standalone_draft_training_async(config))
@@ -115,6 +126,15 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 break
             step_started = time.perf_counter()
             attempted_batches += 1
+            log_batch_progress = _should_log_batch_progress(attempted_batches)
+            if log_batch_progress:
+                logger.info(
+                    "[standalone rank=%s] batch=%s loaded samples=%s successful_steps=%s",
+                    rank,
+                    attempted_batches,
+                    len(samples),
+                    successful_steps,
+                )
             batch = trainer.prepare_training_batch_from_samples(
                 cast(list[Any], samples),
                 step=optimizer_step,
@@ -130,6 +150,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 continue
             trainer.reset_training_metrics()
             ok = await trainer.training_step_from_batch(batch, optimizer_step)
+            step_error = getattr(trainer, "last_standalone_training_error", None)
+            if step_error is not None and _is_out_of_memory_error(step_error):
+                raise RuntimeError(
+                    "Standalone drafter training hit an unrecoverable OOM during "
+                    f"batch={attempted_batches} optimizer_step={optimizer_step}. "
+                    "Reduce batch_size_per_gpu or the stored feature sequence length."
+                ) from step_error
             if not _all_ranks_true(ok, trainer.runtime_device):
                 continue
             successful_steps += 1
@@ -690,7 +717,11 @@ def _standalone_step_metrics(
             metrics["train/avg_loss"] = avg_loss
         if avg_acc is not None:
             metrics["train/avg_acc"] = avg_acc
-        if pred_accuracies:
+        if f"{prefix}/simulated_acc_len" in raw_metrics:
+            metrics["train/simulated_acc_len"] = float(
+                raw_metrics[f"{prefix}/simulated_acc_len"]
+            )
+        elif pred_accuracies:
             metrics["train/simulated_acc_len"] = _simulated_accept_length(
                 pred_accuracies
             )

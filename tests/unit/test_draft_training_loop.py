@@ -29,6 +29,7 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _is_out_of_memory_error,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
+    _should_log_batch_progress,
     _torch_load_cpu,
 )
 

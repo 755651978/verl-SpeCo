@@ -691,6 +691,14 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/top5_acc"] = (
                 sums.get(f"{prefix}/top5_correct_count", 0.0) / quality_tokens
             )
+        simulated_accept_blocks = sums.get(
+            f"{prefix}/simulated_accept_block_count", 0.0
+        )
+        if simulated_accept_blocks > 0:
+            metrics[f"{prefix}/simulated_acc_len"] = (
+                sums.get(f"{prefix}/simulated_accept_length_sum", 0.0)
+                / simulated_accept_blocks
+            )
         ce_tokens = sums.get(f"{prefix}/ce_weighted_token_count", 0.0)
         if ce_tokens > 0:
             metrics[f"{prefix}/ce_loss"] = (
@@ -782,6 +790,8 @@ class DrafterBaseTrainer:
             "quality_token_count": f"{prefix}/quality_token_count",
             "valid_token_count": f"{prefix}/valid_token_count",
             "weighted_token_count": f"{prefix}/weighted_token_count",
+            "simulated_accept_length_sum": f"{prefix}/simulated_accept_length_sum",
+            "simulated_accept_block_count": f"{prefix}/simulated_accept_block_count",
             "ce_loss_sum": f"{prefix}/ce_loss_sum",
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
@@ -4292,10 +4302,12 @@ class DrafterBaseTrainer:
         self, batch: dict[str, torch.Tensor], step: int
     ) -> bool:
         """Execute one optimizer step from a pre-built standalone batch."""
+        self.last_standalone_training_error = None
         try:
             with torch.enable_grad():
                 return await self._training_step_on_batch(batch, step)
         except Exception as e:  # noqa: BLE001
+            self.last_standalone_training_error = e
             logger.exception(f"Standalone training step {step} failed with error: {e}")
             return False
 
