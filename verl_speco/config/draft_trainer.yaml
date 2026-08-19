@@ -61,7 +61,6 @@ actor_rollout_ref:
           on_generate: delete
           require_arange_positions: true
           offline_generation:
-            input_type: token_replay
             input_path: null
             output_path: null
             max_samples: 0

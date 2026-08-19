@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
-import json
 
 import pytest
 
@@ -24,11 +23,8 @@ DraftFeatureDataLoader = draft_dataset.DraftFeatureDataLoader
 DraftFeatureDataLoaderConfig = draft_dataset.DraftFeatureDataLoaderConfig
 DraftFeatureSample = feature_store.DraftFeatureSample
 DraftReplaySample = feature_store.DraftReplaySample
-JsonlTokenReplayFeatureStore = feature_store.JsonlTokenReplayFeatureStore
 TokenReplayFeatureStore = feature_store.TokenReplayFeatureStore
 TorchShardFeatureStore = feature_store.TorchShardFeatureStore
-VllmSafetensorsFeatureStore = feature_store.VllmSafetensorsFeatureStore
-build_feature_store_from_config = feature_store.build_feature_store_from_config
 
 
 def _sample(index: int = 0):
@@ -105,119 +101,6 @@ def test_token_replay_rejects_non_contiguous_feature_positions():
 
     with pytest.raises(ValueError, match="contiguous"):
         sample.validate(strict=True)
-
-
-def test_jsonl_token_replay_reads_input_ids_and_loss_mask(tmp_path):
-    path = tmp_path / "samples.jsonl"
-    row = {
-        "id": "sample-0",
-        "input_ids": list(range(10)),
-        "loss_mask": [0, 0, 0, 0, 1, 1, 1, 0, 0, 0],
-        "text": "ignored for replay",
-        "metadata": {"source": "unit"},
-    }
-    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-
-    store = JsonlTokenReplayFeatureStore(path, read_only=True, max_seq_len=4)
-    keys = list(store.iter_keys(shuffle=False))
-    loaded = store.read(keys[0])
-
-    assert keys == ["samples.jsonl:0"]
-    assert loaded.algorithm == "EAGLE3"
-    assert torch.equal(loaded.input_ids, torch.arange(10))
-    assert torch.equal(loaded.loss_mask, torch.tensor(row["loss_mask"], dtype=torch.float32))
-    assert torch.equal(loaded.attention_mask, torch.ones(10, dtype=torch.bool))
-    assert torch.equal(loaded.position_ids, torch.arange(10))
-    assert torch.equal(loaded.feature_positions, torch.arange(3, 7))
-    assert torch.equal(loaded.draft_position_ids, torch.arange(4, 8))
-    assert loaded.metadata["source"] == "jsonl_token_replay"
-    assert loaded.metadata["id"] == "sample-0"
-    assert store.get_metadata()["format"] == "jsonl_token_replay"
-    assert store.get_metadata()["num_samples"] == 1
-
-
-def test_build_feature_store_from_config_supports_jsonl_token_replay(tmp_path):
-    path = tmp_path / "samples.jsonl"
-    path.write_text(
-        json.dumps({"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1]}) + "\n",
-        encoding="utf-8",
-    )
-
-    store = build_feature_store_from_config(
-        {
-            "type": "jsonl_token_replay",
-            "path": path,
-            "max_seq_len": 8,
-        },
-        read_only=True,
-    )
-    loaded = store.read(next(store.iter_keys(shuffle=False)))
-
-    assert isinstance(loaded, DraftReplaySample)
-    assert torch.equal(loaded.feature_positions, torch.arange(0, 3))
-
-
-def test_vllm_safetensors_feature_store_records_manifest_path_and_roundtrips(tmp_path):
-    pytest.importorskip("safetensors.torch")
-    hidden_positions = torch.arange(160, dtype=torch.long)
-    sample = DraftFeatureSample(
-        algorithm="DSPARK",
-        input_ids=torch.arange(160, dtype=torch.long),
-        loss_mask=torch.ones(160, dtype=torch.float32),
-        hidden_states=torch.randn(160, 16, dtype=torch.float32),
-        position_ids=torch.arange(10, 170, dtype=torch.long),
-        metadata={
-            "source": "token_replay_vllm_file",
-            "global_step": 7,
-            "hidden_states_layout": "dflash_aux_plus_last",
-            "hidden_positions": hidden_positions,
-            "feature_start": 10,
-            "feature_end": 170,
-        },
-    )
-    store = VllmSafetensorsFeatureStore(tmp_path)
-
-    keys = store.write_many([sample])
-    store.close()
-
-    manifest_lines = (tmp_path / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(manifest_lines) == 1
-    entry = json.loads(manifest_lines[0])
-    assert entry["path"].endswith(".safetensors")
-    assert (tmp_path / entry["path"]).exists()
-    assert entry["sample"]["metadata"]["hidden_positions"] == {
-        "__tensor__": True,
-        "dtype": "torch.int64",
-        "shape": [160],
-    }
-
-    reader = VllmSafetensorsFeatureStore(tmp_path, read_only=True)
-    loaded = reader.read(keys[0])
-
-    assert loaded.algorithm == "DSPARK"
-    assert torch.equal(loaded.input_ids, sample.input_ids)
-    assert torch.equal(loaded.position_ids, sample.position_ids)
-    assert torch.equal(loaded.hidden_states, sample.hidden_states)
-    assert torch.equal(loaded.metadata["hidden_positions"], hidden_positions)
-    assert reader.get_metadata()["format"] == "vllm_safetensors"
-    assert reader.get_metadata()["num_samples"] == 1
-
-
-def test_build_feature_store_from_config_supports_vllm_safetensors(tmp_path):
-    pytest.importorskip("safetensors.torch")
-    writer = build_feature_store_from_config(
-        {"type": "vllm_safetensors", "path": tmp_path}
-    )
-    writer.write_many([_sample(0)])
-    writer.close()
-
-    reader = build_feature_store_from_config(
-        {"type": "vllm_safetensors", "path": tmp_path}, read_only=True
-    )
-    loaded = reader.read(next(reader.iter_keys(shuffle=False)))
-
-    assert isinstance(loaded, DraftFeatureSample)
-    assert torch.equal(loaded.input_ids, torch.tensor([1, 2, 3, 4]))
 
 
 def test_feature_sample_normalizes_singleton_position_ids():

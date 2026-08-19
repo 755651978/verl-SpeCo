@@ -173,7 +173,7 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
         deadline = time.monotonic() + float(timeout)
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -181,7 +181,6 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
                         f"Timed out waiting for hidden-states lock: {lock_path}"
                     ) from None
                 time.sleep(0.1)
-        fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
     try:
@@ -466,57 +465,31 @@ class TargetFeatureReplayer:
         self.target_forward_seconds = 0.0
         self.vllm_request_seconds = 0.0
         self.vllm_requests = 0
-        logger.info(
-            "[target replay rank=%s] initialized backend=%s algorithm=%s "
-            "target_layers=%s hidden_layout=%s use_logits=%s endpoint=%s cache=%s",
-            self.rank,
-            self.backend,
-            self.algorithm,
-            self.target_layer_ids,
-            self.hidden_layout,
-            self.use_logits,
-            self.vllm_endpoint if self.backend == "vllm_file" else None,
-            self.cache is not None,
-        )
 
     def materialize(
         self, samples: Iterable[DraftReplaySample | DraftFeatureSample]
     ) -> list[DraftFeatureSample]:
         materialized: list[DraftFeatureSample] = []
-        for sample_index, sample in enumerate(samples):
-            try:
-                if isinstance(sample, DraftFeatureSample):
-                    materialized.append(sample)
-                    continue
-                if not isinstance(sample, DraftReplaySample):
-                    raise TypeError(
-                        "Target feature replay expected DraftReplaySample, "
-                        f"got {type(sample)!r}"
-                    )
-                self._validate_target_path(sample)
-                key = self._cache_key(sample)
-                cached = self.cache.get(key) if self.cache is not None else None
-                if cached is not None:
-                    self.cache_hits += 1
-                    materialized.append(cached)
-                    continue
-                self.cache_misses += 1
-                replayed = self._materialize_one(sample)
-                if self.cache is not None:
-                    self.cache.put(key, replayed)
-                materialized.append(replayed)
-            except Exception:
-                metadata = getattr(sample, "metadata", {}) or {}
-                logger.exception(
-                    "[target replay rank=%s] sample materialization failed "
-                    "sample_index=%s algorithm=%s source=%s global_step=%s",
-                    self.rank,
-                    sample_index,
-                    getattr(sample, "algorithm", None),
-                    metadata.get("source"),
-                    metadata.get("global_step"),
+        for sample in samples:
+            if isinstance(sample, DraftFeatureSample):
+                materialized.append(sample)
+                continue
+            if not isinstance(sample, DraftReplaySample):
+                raise TypeError(
+                    f"Target feature replay expected DraftReplaySample, got {type(sample)!r}"
                 )
-                raise
+            self._validate_target_path(sample)
+            key = self._cache_key(sample)
+            cached = self.cache.get(key) if self.cache is not None else None
+            if cached is not None:
+                self.cache_hits += 1
+                materialized.append(cached)
+                continue
+            self.cache_misses += 1
+            replayed = self._materialize_one(sample)
+            if self.cache is not None:
+                self.cache.put(key, replayed)
+            materialized.append(replayed)
         self.materialized_samples += len(materialized)
         return materialized
 
@@ -802,13 +775,6 @@ class TargetFeatureReplayer:
     def _ensure_vllm_client(self) -> None:
         if self.vllm_client is not None:
             return
-        started = time.perf_counter()
-        logger.info(
-            "[target replay rank=%s] connecting to vLLM endpoint=%s configured_model=%s",
-            self.rank,
-            self.vllm_endpoint,
-            self.vllm_model,
-        )
         try:
             import openai
         except ImportError as exc:
@@ -825,12 +791,6 @@ class TargetFeatureReplayer:
         else:
             models = self.vllm_client.models.list()
             self.vllm_resolved_model = models.data[0].id
-        logger.info(
-            "[target replay rank=%s] connected to vLLM model=%s elapsed=%.3fs",
-            self.rank,
-            self.vllm_resolved_model,
-            time.perf_counter() - started,
-        )
 
     def _request_vllm_hidden_states(self, prompt_ids: list[int]) -> dict[str, Any]:
         self._ensure_vllm_client()
@@ -838,21 +798,8 @@ class TargetFeatureReplayer:
         assert self.vllm_resolved_model is not None
         last_error: Exception | None = None
         started = time.perf_counter()
-        request_index = self.vllm_requests + 1
-        log_request = request_index <= 2 or request_index % 100 == 0
         for attempt in range(self.vllm_max_retries + 1):
             try:
-                attempt_started = time.perf_counter()
-                if log_request:
-                    logger.info(
-                        "[target replay rank=%s] vLLM request starting request=%s "
-                        "attempt=%s/%s prompt_tokens=%s",
-                        self.rank,
-                        request_index,
-                        attempt + 1,
-                        self.vllm_max_retries + 1,
-                        len(prompt_ids),
-                    )
                 response = self.vllm_client.completions.create(
                     model=self.vllm_resolved_model,
                     prompt=prompt_ids,
@@ -865,37 +812,9 @@ class TargetFeatureReplayer:
                 payload["_path"] = path
                 self.vllm_requests += 1
                 self.vllm_request_seconds += time.perf_counter() - started
-                if log_request:
-                    hidden_states = payload.get("hidden_states")
-                    hidden_shape = (
-                        tuple(hidden_states.shape)
-                        if torch.is_tensor(hidden_states)
-                        else None
-                    )
-                    logger.info(
-                        "[target replay rank=%s] vLLM request completed request=%s "
-                        "attempt=%s path=%s hidden_shape=%s elapsed=%.3fs",
-                        self.rank,
-                        request_index,
-                        attempt + 1,
-                        path,
-                        hidden_shape,
-                        time.perf_counter() - attempt_started,
-                    )
                 return payload
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                logger.warning(
-                    "[target replay rank=%s] vLLM request failed request=%s "
-                    "attempt=%s/%s prompt_tokens=%s elapsed=%.3fs error=%r",
-                    self.rank,
-                    request_index,
-                    attempt + 1,
-                    self.vllm_max_retries + 1,
-                    len(prompt_ids),
-                    time.perf_counter() - started,
-                    exc,
-                )
                 if attempt >= self.vllm_max_retries:
                     break
                 time.sleep(float(2**attempt))

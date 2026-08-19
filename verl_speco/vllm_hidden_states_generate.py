@@ -61,9 +61,8 @@ def generate_vllm_safetensors_features(config) -> dict[str, Any]:
             "training.feature_store.path is required"
         )
 
-    input_type = str(generation_cfg.get("input_type", "token_replay") or "token_replay")
     input_cfg = _plain_config(feature_store_cfg)
-    input_cfg.update({"type": input_type, "path": os.fspath(input_path)})
+    input_cfg.update({"type": "token_replay", "path": os.fspath(input_path)})
 
     output_cfg = _plain_config(feature_store_cfg)
     output_cfg.update({"type": "vllm_safetensors", "path": os.fspath(output_path)})
@@ -85,7 +84,7 @@ def generate_vllm_safetensors_features(config) -> dict[str, Any]:
         output_cfg,
         read_only=False,
         metadata={
-            "source_format": input_type,
+            "source_format": "token_replay",
             "source_path": os.fspath(input_path),
             "target_feature_backend": "vllm_file",
         },

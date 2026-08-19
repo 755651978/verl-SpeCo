@@ -598,190 +598,6 @@ class TokenReplayFeatureStore(TorchShardFeatureStore):
         return DraftReplaySample.from_dict(sample, strict=self.strict_schema)
 
 
-class JsonlTokenReplayFeatureStore:
-    """Read ``input_ids``/``loss_mask`` JSONL rows as token replay samples."""
-
-    def __init__(
-        self,
-        path: str | os.PathLike[str],
-        *,
-        max_samples_per_shard: int = 1024,
-        metadata: dict[str, Any] | None = None,
-        strict_schema: bool = True,
-        read_only: bool = False,
-        shard_prefix: str = "shard",
-        max_seq_len: int = 512,
-        window_mode: str = "loss",
-    ):
-        if path is None:
-            raise ValueError("JsonlTokenReplayFeatureStore requires a non-empty path")
-        if not read_only:
-            raise RuntimeError("JsonlTokenReplayFeatureStore is read-only")
-        self.path = Path(path)
-        self.max_samples_per_shard = max(int(max_samples_per_shard), 1)
-        self.metadata = {
-            "schema_version": SCHEMA_VERSION,
-            "format": "jsonl_token_replay",
-            "created_by": "verl_speco",
-            "created_at": time.time(),
-        }
-        if metadata:
-            self.metadata.update(metadata)
-        self.strict_schema = bool(strict_schema)
-        self.read_only = bool(read_only)
-        self.shard_prefix = str(shard_prefix or "shard")
-        self.max_seq_len = int(max_seq_len or 0)
-        self.window_mode = str(window_mode or "loss").strip().lower()
-        if self.window_mode not in {"loss", "front", "full"}:
-            raise ValueError(
-                "feature_store.window_mode for jsonl_token_replay must be "
-                "'loss', 'front' or 'full'"
-            )
-        self._files = self._resolve_jsonl_files()
-        self._line_offsets: dict[str, list[int]] = {}
-        self._keys = self._build_keys()
-
-    def write_many(
-        self, samples: list[DraftStoredSample | dict[str, Any]]
-    ) -> list[str]:
-        raise RuntimeError("JsonlTokenReplayFeatureStore is read-only")
-
-    def read(self, key: str) -> DraftReplaySample:
-        file_name, row_index = _parse_key(key)
-        file_path = self.path / file_name if self.path.is_dir() else self.path
-        offsets = self._line_offsets.get(file_name)
-        if offsets is None:
-            self._keys = self._build_keys()
-            offsets = self._line_offsets.get(file_name)
-        if offsets is None or int(row_index) >= len(offsets):
-            raise IndexError(f"JSONL row {row_index} not found in {file_path}")
-        payload = _load_jsonl_offset(file_path, offsets[int(row_index)])
-        return self._row_to_replay_sample(payload, file_name, int(row_index))
-
-    def iter_keys(self, *, shuffle: bool = False, seed: int = 0) -> Iterator[str]:
-        keys = list(self._keys)
-        if shuffle:
-            random.Random(int(seed)).shuffle(keys)
-        yield from keys
-
-    def get_metadata(self) -> dict[str, Any]:
-        metadata = dict(self.metadata)
-        metadata.update(
-            {
-                "num_files": len(self._files),
-                "num_samples": len(self._keys),
-                "max_seq_len": self.max_seq_len,
-                "window_mode": self.window_mode,
-            }
-        )
-        return metadata
-
-    def close(self) -> None:
-        return
-
-    def _resolve_jsonl_files(self) -> list[Path]:
-        if self.path.is_file():
-            return [self.path]
-        if self.path.is_dir():
-            files = sorted(self.path.glob("*.jsonl"))
-            if files:
-                return files
-        raise FileNotFoundError(f"No JSONL file found at {self.path}")
-
-    def _build_keys(self) -> list[str]:
-        keys: list[str] = []
-        self._line_offsets = {}
-        for file_path in self._files:
-            file_key = (
-                file_path.relative_to(self.path).as_posix()
-                if self.path.is_dir()
-                else file_path.name
-            )
-            offsets: list[int] = []
-            with file_path.open("rb") as jsonl_file:
-                while True:
-                    offset = int(jsonl_file.tell())
-                    line = jsonl_file.readline()
-                    if not line:
-                        break
-                    if line.strip():
-                        row_index = len(offsets)
-                        offsets.append(offset)
-                        keys.append(f"{file_key}:{row_index}")
-            self._line_offsets[file_key] = offsets
-        return keys
-
-    def _row_to_replay_sample(
-        self, payload: dict[str, Any], file_name: str, line_index: int
-    ) -> DraftReplaySample:
-        input_ids = _json_list_tensor(payload, "input_ids", dtype=torch.long)
-        loss_mask = _json_list_tensor(payload, "loss_mask", dtype=torch.float32)
-        if int(input_ids.numel()) != int(loss_mask.numel()):
-            raise ValueError(
-                "jsonl_token_replay input_ids/loss_mask length mismatch: "
-                f"{int(input_ids.numel())} vs {int(loss_mask.numel())}"
-            )
-        attention_mask = _optional_json_list_tensor(
-            payload, "attention_mask", dtype=torch.bool
-        )
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
-        position_ids = _optional_json_list_tensor(
-            payload, "position_ids", dtype=torch.long
-        )
-        if position_ids is None:
-            position_ids = attention_mask.long().cumsum(dim=0).sub(1).clamp_min(0)
-
-        sequence_length = int(input_ids.numel())
-        start, end = self._feature_window(loss_mask)
-        feature_positions = torch.arange(start, end, dtype=torch.long)
-        draft_position_ids = position_ids[start:end].long() + 1
-        metadata = {
-            "source": "jsonl_token_replay",
-            "jsonl_path": file_name,
-            "jsonl_line": line_index,
-            "sequence_length": end - start,
-            "full_sequence_length": sequence_length,
-            "feature_start": start,
-            "feature_end": end,
-            "loss_tokens": int(loss_mask[start:end].sum().item()),
-        }
-        for key in ("id", "hash", "primary_id", "finish_reason"):
-            if key in payload:
-                metadata[key] = payload[key]
-        return DraftReplaySample(
-            algorithm=str(payload.get("algorithm", "EAGLE3")),
-            input_ids=input_ids,
-            loss_mask=loss_mask,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            feature_positions=feature_positions,
-            draft_position_ids=draft_position_ids,
-            metadata=metadata,
-        )
-
-    def _feature_window(self, loss_mask: torch.Tensor) -> tuple[int, int]:
-        sequence_length = int(loss_mask.numel())
-        if sequence_length <= 0:
-            raise ValueError("jsonl_token_replay input_ids must not be empty")
-        max_seq_len = self.max_seq_len if self.max_seq_len > 0 else sequence_length
-        max_seq_len = min(max_seq_len, sequence_length)
-        if self.window_mode == "full":
-            return 0, sequence_length
-        if self.window_mode == "front":
-            return 0, max_seq_len
-
-        active = torch.nonzero(loss_mask.float() > 0, as_tuple=False).reshape(-1)
-        if int(active.numel()) <= 0:
-            return 0, max_seq_len
-        first_loss = int(active[0].item())
-        start = max(first_loss - 1, 0)
-        end = min(start + max_seq_len, sequence_length)
-        if end <= start:
-            end = min(start + 1, sequence_length)
-        return start, end
-
-
 class VllmSafetensorsFeatureStore(TorchShardFeatureStore):
     """Feature store for vLLM-extracted hidden states saved as safetensors.
 
@@ -894,10 +710,6 @@ class VllmSafetensorsFeatureStore(TorchShardFeatureStore):
             "hidden_states": tensors["hidden_states"],
             "metadata": dict(manifest_sample.get("metadata") or {}),
         }
-        if "metadata.hidden_positions" in tensors:
-            payload["metadata"]["hidden_positions"] = tensors[
-                "metadata.hidden_positions"
-            ].long()
         for optional_key in (
             "last_hidden_states",
             "target",
@@ -918,15 +730,10 @@ class VllmSafetensorsFeatureStore(TorchShardFeatureStore):
         self, sample: DraftFeatureSample
     ) -> dict[str, torch.Tensor]:
         payload = sample.to_dict()
-        hidden_states = payload["hidden_states"]
-        if not torch.is_tensor(hidden_states):
-            raise TypeError(
-                "feature_store.type=vllm_safetensors requires tensor hidden_states"
-            )
         tensors = {
             "input_ids": payload["input_ids"].long().contiguous(),
             "loss_mask": payload["loss_mask"].float().contiguous(),
-            "hidden_states": hidden_states.contiguous(),
+            "hidden_states": payload["hidden_states"].contiguous(),
         }
         for optional_key in (
             "last_hidden_states",
@@ -937,10 +744,6 @@ class VllmSafetensorsFeatureStore(TorchShardFeatureStore):
             value = payload.get(optional_key)
             if torch.is_tensor(value):
                 tensors[optional_key] = value.contiguous()
-        metadata = payload.get("metadata") or {}
-        hidden_positions = metadata.get("hidden_positions")
-        if torch.is_tensor(hidden_positions):
-            tensors["metadata.hidden_positions"] = hidden_positions.long().contiguous()
         return tensors
 
     def _sample_manifest(self, sample: DraftFeatureSample) -> dict[str, Any]:
@@ -963,25 +766,13 @@ def build_feature_store_from_config(
         .strip()
         .lower()
     )
+    store_cls: type[TorchShardFeatureStore]
     if store_type == "torch_shard":
-        store_cls: type[TorchShardFeatureStore] = TorchShardFeatureStore
+        store_cls = TorchShardFeatureStore
     elif store_type == "token_replay":
         store_cls = TokenReplayFeatureStore
     elif store_type in {"vllm_safetensors", "safetensors"}:
         store_cls = VllmSafetensorsFeatureStore
-    elif store_type in {"jsonl_token_replay", "jsonl"}:
-        return JsonlTokenReplayFeatureStore(
-            feature_store_cfg.get("path"),
-            max_samples_per_shard=int(
-                feature_store_cfg.get("max_samples_per_shard", 1024)
-            ),
-            metadata=metadata,
-            strict_schema=bool(feature_store_cfg.get("strict_schema", True)),
-            read_only=read_only,
-            shard_prefix=shard_prefix,
-            max_seq_len=int(feature_store_cfg.get("max_seq_len", 512) or 0),
-            window_mode=str(feature_store_cfg.get("window_mode", "loss") or "loss"),
-        )
     else:
         raise NotImplementedError(f"Unsupported draft feature store type: {store_type}")
     return store_cls(
@@ -1077,41 +868,6 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.remove(tmp_name)
-
-
-def _load_jsonl_offset(path: Path, offset: int) -> dict[str, Any]:
-    with path.open("rb") as jsonl_file:
-        jsonl_file.seek(int(offset))
-        line = jsonl_file.readline().decode("utf-8").strip()
-    if not line:
-        raise ValueError(f"JSONL offset {offset} in {path} points to an empty line")
-    payload = json.loads(line)
-    if not isinstance(payload, dict):
-        raise TypeError(
-            f"JSONL offset {offset} in {path} must contain a JSON object"
-        )
-    return payload
-
-
-def _json_list_tensor(
-    payload: dict[str, Any], key: str, *, dtype: torch.dtype
-) -> torch.Tensor:
-    if key not in payload:
-        raise KeyError(f"jsonl_token_replay sample missing required key {key!r}")
-    value = payload[key]
-    if not isinstance(value, list):
-        raise TypeError(
-            f"jsonl_token_replay {key} must be a JSON list, got {type(value).__name__}"
-        )
-    return torch.tensor(value, dtype=dtype).reshape(-1)
-
-
-def _optional_json_list_tensor(
-    payload: dict[str, Any], key: str, *, dtype: torch.dtype
-) -> torch.Tensor | None:
-    if key not in payload or payload[key] is None:
-        return None
-    return _json_list_tensor(payload, key, dtype=dtype)
 
 
 def _json_safe_metadata(value: Any) -> Any:
