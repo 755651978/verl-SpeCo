@@ -181,8 +181,3 @@ actor_rollout_ref:
           repeat: true
           prefetch_depth: 2
           strict_schema: true
-          max_seq_len: 512
-          window_mode: loss
-          tokenizer_path: null
-          trust_remote_code: false
-          train_on: last_assistant

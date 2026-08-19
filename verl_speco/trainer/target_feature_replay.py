@@ -466,9 +466,6 @@ class TargetFeatureReplayer:
         self.target_forward_seconds = 0.0
         self.vllm_request_seconds = 0.0
         self.vllm_requests = 0
-        self._warned_replay_algorithm_mismatch = False
-        self._warned_replay_layer_mismatch = False
-        self._warned_replay_layout_mismatch = False
         logger.info(
             "[target replay rank=%s] initialized backend=%s algorithm=%s "
             "target_layers=%s hidden_layout=%s use_logits=%s endpoint=%s cache=%s",
@@ -525,16 +522,10 @@ class TargetFeatureReplayer:
 
     def _validate_target_path(self, sample: DraftReplaySample) -> None:
         if sample.algorithm.upper() != self.algorithm:
-            if not self._warned_replay_algorithm_mismatch:
-                logger.warning(
-                    "[target replay rank=%s] token replay algorithm differs from "
-                    "training algorithm; using the training algorithm for "
-                    "materialized features sample=%s training=%s",
-                    self.rank,
-                    sample.algorithm,
-                    self.algorithm,
-                )
-                self._warned_replay_algorithm_mismatch = True
+            raise ValueError(
+                "Token replay algorithm mismatch: "
+                f"sample={sample.algorithm!r} training={self.algorithm!r}"
+            )
         collected_layer_ids = sample.metadata.get("target_layer_ids")
         if collected_layer_ids is not None:
             normalized_layer_ids = (
@@ -543,28 +534,17 @@ class TargetFeatureReplayer:
                 else [int(value) for value in collected_layer_ids]
             )
             if normalized_layer_ids != self.target_layer_ids:
-                if not self._warned_replay_layer_mismatch:
-                    logger.warning(
-                        "[target replay rank=%s] token replay target layers differ "
-                        "from replay target layers; recomputing hidden states with "
-                        "the training configuration collected=%s replay=%s",
-                        self.rank,
-                        normalized_layer_ids,
-                        self.target_layer_ids,
-                    )
-                    self._warned_replay_layer_mismatch = True
+                raise ValueError(
+                    "Token replay target layer mismatch: "
+                    f"collected={normalized_layer_ids} "
+                    f"replay={self.target_layer_ids}"
+                )
         collected_layout = sample.metadata.get("hidden_states_layout")
         if collected_layout and str(collected_layout) != self.hidden_layout:
-            if not self._warned_replay_layout_mismatch:
-                logger.warning(
-                    "[target replay rank=%s] token replay hidden layout differs "
-                    "from replay layout; recomputing hidden states with the "
-                    "training configuration collected=%s replay=%s",
-                    self.rank,
-                    collected_layout,
-                    self.hidden_layout,
-                )
-                self._warned_replay_layout_mismatch = True
+            raise ValueError(
+                "Token replay hidden layout mismatch: "
+                f"collected={collected_layout!r} replay={self.hidden_layout!r}"
+            )
         if not self.strict_target_model_path:
             return
         collected_path = sample.metadata.get("target_model_path")
@@ -976,7 +956,6 @@ class TargetFeatureReplayer:
                 f"got {tuple(hidden.shape)}"
             )
         feature_positions = sample.feature_positions.detach().cpu().long()
-        hidden_position_offset = max(len(prompt_ids) - int(hidden.size(0)), 0)
         expected_layers = len(self.target_layer_ids)
         include_final = self.hidden_layout in {
             "eagle3_aux_plus_last",
@@ -990,36 +969,7 @@ class TargetFeatureReplayer:
                 "Start vLLM with target layer ids plus the final layer when the "
                 "training layout needs last hidden states."
             )
-        relative_feature_positions = feature_positions - hidden_position_offset
-        feature_keep_mask = (
-            (relative_feature_positions >= 0)
-            & (relative_feature_positions < int(hidden.size(0)))
-        )
-        filtered_feature_positions = not bool(feature_keep_mask.all().item())
-        if filtered_feature_positions:
-            dropped = int((~feature_keep_mask).sum().item())
-            logger.warning(
-                "[target replay rank=%s] dropping vLLM feature positions outside "
-                "hidden rows dropped=%s hidden_rows=%s hidden_offset=%s "
-                "feature_min=%s feature_max=%s",
-                self.rank,
-                dropped,
-                int(hidden.size(0)),
-                hidden_position_offset,
-                int(feature_positions.min().item()),
-                int(feature_positions.max().item()),
-            )
-            feature_positions = feature_positions[feature_keep_mask]
-            relative_feature_positions = relative_feature_positions[feature_keep_mask]
-            if int(feature_positions.numel()) <= 0:
-                raise ValueError(
-                    "vLLM hidden_states contain no rows for replay feature positions: "
-                    f"hidden_rows={int(hidden.size(0))}, "
-                    f"hidden_position_offset={hidden_position_offset}"
-                )
-        selected = hidden.index_select(0, relative_feature_positions).to(
-            dtype=self.dtype
-        )
+        selected = hidden.index_select(0, feature_positions).to(dtype=self.dtype)
         aux_hidden = selected[:, :expected_layers, :].flatten(1)
         if include_final:
             final_hidden = selected[:, required_layers - 1, :]
@@ -1028,9 +978,6 @@ class TargetFeatureReplayer:
             hidden_states = aux_hidden
         selected_input_ids = sample.input_ids.index_select(0, feature_positions).long()
         selected_loss_mask = sample.loss_mask.index_select(0, feature_positions).float()
-        draft_position_ids = sample.draft_position_ids.detach().cpu().long()
-        if filtered_feature_positions:
-            draft_position_ids = draft_position_ids[feature_keep_mask]
         metadata = dict(sample.metadata)
         feature_start = int(feature_positions[0].item())
         feature_end = int(feature_positions[-1].item()) + 1
@@ -1042,8 +989,6 @@ class TargetFeatureReplayer:
                 "target_config_fingerprint": self.target_config_fingerprint,
                 "target_layer_ids": list(self.target_layer_ids),
                 "vllm_hidden_layers": int(hidden.size(1)),
-                "vllm_hidden_rows": int(hidden.size(0)),
-                "vllm_hidden_position_offset": hidden_position_offset,
                 "hidden_states_layout": self.hidden_layout,
                 "feature_start": feature_start,
                 "feature_end": feature_end,
@@ -1060,7 +1005,7 @@ class TargetFeatureReplayer:
             input_ids=selected_input_ids,
             loss_mask=selected_loss_mask,
             hidden_states=hidden_states.cpu().contiguous(),
-            position_ids=draft_position_ids,
+            position_ids=sample.draft_position_ids.long(),
             metadata=metadata,
         )
 

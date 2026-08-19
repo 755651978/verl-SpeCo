@@ -157,49 +157,6 @@ def test_build_feature_store_from_config_supports_jsonl_token_replay(tmp_path):
     assert torch.equal(loaded.feature_positions, torch.arange(0, 3))
 
 
-def test_jsonl_token_replay_reads_conversations_with_chat_template(tmp_path):
-    class FakeTokenizer:
-        def apply_chat_template(
-            self, messages, *, tokenize, add_generation_prompt
-        ):
-            assert tokenize is True
-            token_ids = []
-            for message in messages:
-                role_id = {"user": 10, "assistant": 20, "system": 30}[message["role"]]
-                token_ids.extend([role_id, len(message["content"])])
-            if add_generation_prompt:
-                token_ids.append(20)
-            return token_ids
-
-    path = tmp_path / "samples.jsonl"
-    row = {
-        "id": "conv-0",
-        "conversations": [
-            {"from": "human", "value": "question"},
-            {"from": "assistant", "value": "answer"},
-        ],
-        "algorithm": "DSPARK",
-    }
-    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
-
-    store = JsonlTokenReplayFeatureStore(
-        path,
-        read_only=True,
-        max_seq_len=8,
-        tokenizer_path="/target",
-    )
-    store._tokenizer = FakeTokenizer()
-    loaded = store.read(next(store.iter_keys(shuffle=False)))
-
-    assert loaded.algorithm == "DSPARK"
-    assert torch.equal(loaded.input_ids, torch.tensor([10, 8, 20, 6]))
-    assert torch.equal(loaded.loss_mask, torch.tensor([0.0, 0.0, 0.0, 1.0]))
-    assert torch.equal(loaded.feature_positions, torch.arange(2, 4))
-    assert torch.equal(loaded.draft_position_ids, torch.arange(3, 5))
-    assert loaded.metadata["source"] == "jsonl_conversations"
-    assert loaded.metadata["id"] == "conv-0"
-
-
 def test_vllm_safetensors_feature_store_records_manifest_path_and_roundtrips(tmp_path):
     pytest.importorskip("safetensors.torch")
     hidden_positions = torch.arange(160, dtype=torch.long)

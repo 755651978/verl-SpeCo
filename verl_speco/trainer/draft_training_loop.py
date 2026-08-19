@@ -44,13 +44,6 @@ def _should_log_batch_progress(attempted_batches: int) -> bool:
     return attempted_batches <= 3 or attempted_batches % 100 == 0
 
 
-def _is_out_of_memory_error(error: BaseException) -> bool:
-    message = str(error).lower()
-    if "out of memory" in message or "oom" in message:
-        return True
-    return error.__class__.__name__ in {"OutOfMemoryError", "CudaOutOfMemoryError"}
-
-
 def run_standalone_draft_training(config) -> dict[str, Any]:
     """Run independent draft training from a feature store."""
     return asyncio.run(_run_standalone_draft_training_async(config))
@@ -150,14 +143,6 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             feature_store_type,
             feature_store_cfg.get("path"),
         )
-        if feature_store_type in {"jsonl_token_replay", "jsonl"} and not (
-            feature_store_cfg.get("tokenizer_path")
-        ):
-            tokenizer_path = draft_config.actor_rollout_ref.model.path
-            try:
-                feature_store_cfg.tokenizer_path = tokenizer_path
-            except AttributeError:
-                feature_store_cfg["tokenizer_path"] = tokenizer_path
         store = build_feature_store_from_config(feature_store_cfg, read_only=True)
         logger.info(
             "[standalone rank=%s] feature store opened elapsed=%.3fs",
@@ -275,14 +260,6 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     optimizer_step,
                 )
             ok = await trainer.training_step_from_batch(batch, optimizer_step)
-            step_error = getattr(trainer, "last_standalone_training_error", None)
-            if step_error is not None and _is_out_of_memory_error(step_error):
-                raise RuntimeError(
-                    "Standalone drafter training hit an unrecoverable OOM during "
-                    f"batch={attempted_batches} optimizer_step={optimizer_step}. "
-                    "Reduce batch_size_per_gpu, feature_store.max_seq_len, "
-                    "dspark_num_anchors/block_size or disable DSpark L1 loss."
-                ) from step_error
             current_stage = "synchronize_training_step"
             if not _all_ranks_true(ok, trainer.runtime_device):
                 continue
