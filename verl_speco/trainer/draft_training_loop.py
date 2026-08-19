@@ -34,10 +34,7 @@ from verl_speco.trainer.draft_dataset import (
     DraftFeatureDataLoader,
     DraftFeatureDataLoaderConfig,
 )
-from verl_speco.trainer.feature_store import (
-    DraftReplaySample,
-    build_feature_store_from_config,
-)
+from verl_speco.trainer.feature_store import build_feature_store_from_config
 from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config
 
 logger = logging.getLogger(__name__)
@@ -52,10 +49,6 @@ def _is_out_of_memory_error(error: BaseException) -> bool:
     if "out of memory" in message or "oom" in message:
         return True
     return error.__class__.__name__ in {"OutOfMemoryError", "CudaOutOfMemoryError"}
-
-
-def _contains_replay_samples(samples: list[Any]) -> bool:
-    return any(isinstance(sample, DraftReplaySample) for sample in samples)
 
 
 def run_standalone_draft_training(config) -> dict[str, Any]:
@@ -160,7 +153,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         if feature_store_type in {"jsonl_token_replay", "jsonl"} and not (
             feature_store_cfg.get("tokenizer_path")
         ):
-            tokenizer_path = draft_config.model.path
+            tokenizer_path = draft_config.actor_rollout_ref.model.path
             try:
                 feature_store_cfg.tokenizer_path = tokenizer_path
             except AttributeError:
@@ -234,24 +227,6 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     successful_steps,
                 )
             current_stage = "materialize_target_features"
-            if feature_replayer is None and _contains_replay_samples(samples):
-                logger.warning(
-                    "[standalone rank=%s] feature store type=%s yielded replay "
-                    "samples without an initialized target feature replayer; "
-                    "initializing replayer lazily",
-                    rank,
-                    feature_store_type,
-                )
-                from verl_speco.trainer.target_feature_replay import (
-                    TargetFeatureReplayer,
-                )
-
-                feature_replayer = TargetFeatureReplayer(
-                    config,
-                    rank=rank,
-                    world_size=world_size,
-                    device=trainer.runtime_device,
-                )
             if feature_replayer is not None:
                 materialize_started = time.perf_counter()
                 if log_batch_progress:
@@ -897,11 +872,7 @@ def _standalone_step_metrics(
             metrics["train/avg_loss"] = avg_loss
         if avg_acc is not None:
             metrics["train/avg_acc"] = avg_acc
-        if f"{prefix}/simulated_acc_len" in raw_metrics:
-            metrics["train/simulated_acc_len"] = float(
-                raw_metrics[f"{prefix}/simulated_acc_len"]
-            )
-        elif pred_accuracies:
+        if pred_accuracies:
             metrics["train/simulated_acc_len"] = _simulated_accept_length(
                 pred_accuracies
             )

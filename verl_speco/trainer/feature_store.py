@@ -837,8 +837,8 @@ class JsonlTokenReplayFeatureStore:
             tokenize=True,
             add_generation_prompt=False,
         )
-        prompt_ids = _token_ids_to_list(prompt_ids)
-        full_ids = _token_ids_to_list(full_ids)
+        if not isinstance(prompt_ids, list) or not isinstance(full_ids, list):
+            raise TypeError("tokenizer.apply_chat_template must return token id lists")
         if len(full_ids) <= len(prompt_ids):
             raise ValueError(
                 "jsonl_token_replay conversations produced no assistant tokens"
@@ -1234,31 +1234,6 @@ def _conversation_item_to_message(item: Any) -> dict[str, str]:
             f"Unsupported conversation role for jsonl_token_replay: {role!r}"
         )
     return {"role": role, "content": str(content)}
-
-
-def _token_ids_to_list(value: Any) -> list[int]:
-    if hasattr(value, "data") and isinstance(getattr(value, "data", None), dict):
-        data = getattr(value, "data")
-        if "input_ids" in data:
-            value = data["input_ids"]
-    elif isinstance(value, dict) and "input_ids" in value:
-        value = value["input_ids"]
-    if torch.is_tensor(value):
-        value = value.detach().cpu().tolist()
-    elif hasattr(value, "tolist"):
-        value = value.tolist()
-    if (
-        isinstance(value, list)
-        and len(value) == 1
-        and isinstance(value[0], (list, tuple))
-    ):
-        value = value[0]
-    if not isinstance(value, (list, tuple)):
-        raise TypeError(
-            "tokenizer.apply_chat_template must return token ids as a list, "
-            f"tuple, tensor, or tolist()-compatible value; got {type(value).__name__}"
-        )
-    return [int(token_id) for token_id in value]
 
 
 def _json_safe_metadata(value: Any) -> Any:
