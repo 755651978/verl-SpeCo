@@ -202,132 +202,12 @@ class DraftFeatureSample:
         return item
 
 
-@dataclass
-class DraftReplaySample:
-    """Compact token sample used to reconstruct target features offline."""
-
-    input_ids: torch.Tensor
-    loss_mask: torch.Tensor
-    attention_mask: torch.Tensor
-    position_ids: torch.Tensor
-    feature_positions: torch.Tensor
-    draft_position_ids: torch.Tensor
-    algorithm: str = "EAGLE3"
-    schema_version: int = SCHEMA_VERSION
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(
-        cls, payload: dict[str, Any], *, strict: bool = True
-    ) -> "DraftReplaySample":
-        sample = cls(
-            schema_version=int(payload.get("schema_version", SCHEMA_VERSION)),
-            algorithm=str(
-                payload.get(
-                    "algorithm", payload.get("metadata", {}).get("algorithm", "EAGLE3")
-                )
-            ),
-            input_ids=payload["input_ids"],
-            loss_mask=payload["loss_mask"],
-            attention_mask=payload["attention_mask"],
-            position_ids=payload["position_ids"],
-            feature_positions=payload["feature_positions"],
-            draft_position_ids=payload["draft_position_ids"],
-            metadata=dict(payload.get("metadata") or {}),
-        )
-        sample.validate(strict=strict)
-        return sample
-
-    def validate(self, *, strict: bool = True) -> None:
-        if self.schema_version != SCHEMA_VERSION and strict:
-            raise ValueError(
-                f"Unsupported DraftReplaySample schema_version={self.schema_version}"
-            )
-        tensor_fields = (
-            "input_ids",
-            "loss_mask",
-            "attention_mask",
-            "position_ids",
-            "feature_positions",
-            "draft_position_ids",
-        )
-        for name in tensor_fields:
-            value = getattr(self, name)
-            if not torch.is_tensor(value):
-                raise TypeError(f"DraftReplaySample.{name} must be a torch.Tensor")
-            if value.dim() > 1:
-                setattr(self, name, value.reshape(-1))
-
-        sequence_length = int(self.input_ids.numel())
-        for name in ("loss_mask", "attention_mask", "position_ids"):
-            value = cast(torch.Tensor, getattr(self, name))
-            if strict and int(value.numel()) != sequence_length:
-                raise ValueError(
-                    f"DraftReplaySample input_ids/{name} length mismatch: "
-                    f"{sequence_length} vs {int(value.numel())}"
-                )
-        if strict and int(self.feature_positions.numel()) <= 0:
-            raise ValueError("DraftReplaySample.feature_positions must not be empty")
-        if strict and int(self.draft_position_ids.numel()) != int(
-            self.feature_positions.numel()
-        ):
-            raise ValueError(
-                "DraftReplaySample feature_positions/draft_position_ids length mismatch: "
-                f"{int(self.feature_positions.numel())} vs "
-                f"{int(self.draft_position_ids.numel())}"
-            )
-        if int(self.feature_positions.numel()) > 0:
-            positions = self.feature_positions.detach().cpu().long()
-            if strict and (
-                int(positions.min().item()) < 0
-                or int(positions.max().item()) >= sequence_length
-            ):
-                raise ValueError(
-                    "DraftReplaySample.feature_positions are outside input_ids: "
-                    f"min={int(positions.min().item())} "
-                    f"max={int(positions.max().item())} sequence_length={sequence_length}"
-                )
-            if strict and int(positions.numel()) > 1:
-                deltas = positions[1:] - positions[:-1]
-                if not bool((deltas == 1).all().item()):
-                    raise ValueError(
-                        "DraftReplaySample.feature_positions must be contiguous and increasing"
-                    )
-
-    def to_dict(self) -> dict[str, Any]:
-        self.validate(strict=False)
-        return {
-            "schema_version": self.schema_version,
-            "sample_type": "token_replay",
-            "algorithm": self.algorithm,
-            "input_ids": self.input_ids.detach().cpu().to(torch.int32).contiguous(),
-            "loss_mask": self.loss_mask.detach().cpu().to(torch.float16).contiguous(),
-            "attention_mask": self.attention_mask.detach().cpu().bool().contiguous(),
-            "position_ids": self.position_ids.detach()
-            .cpu()
-            .to(torch.int32)
-            .contiguous(),
-            "feature_positions": self.feature_positions.detach()
-            .cpu()
-            .to(torch.int32)
-            .contiguous(),
-            "draft_position_ids": self.draft_position_ids.detach()
-            .cpu()
-            .to(torch.int32)
-            .contiguous(),
-            "metadata": dict(self.metadata),
-        }
-
-
-DraftStoredSample = DraftFeatureSample | DraftReplaySample
-
-
 class DraftFeatureStore(Protocol):
     def write_many(
-        self, samples: list[DraftStoredSample | dict[str, Any]]
+        self, samples: list[DraftFeatureSample | dict[str, Any]]
     ) -> list[str]: ...
 
-    def read(self, key: str) -> DraftStoredSample: ...
+    def read(self, key: str) -> DraftFeatureSample: ...
 
     def iter_keys(self, *, shuffle: bool = False, seed: int = 0) -> Iterator[str]: ...
 
@@ -411,7 +291,7 @@ class TorchShardFeatureStore:
             self._write_metadata()
 
     def write_many(
-        self, samples: list[DraftStoredSample | dict[str, Any]]
+        self, samples: list[DraftFeatureSample | dict[str, Any]]
     ) -> list[str]:
         if self.read_only:
             raise RuntimeError("Cannot write to a read-only TorchShardFeatureStore")
@@ -462,7 +342,7 @@ class TorchShardFeatureStore:
             return []
         return self.flush()
 
-    def read(self, key: str) -> DraftStoredSample:
+    def read(self, key: str) -> DraftFeatureSample:
         shard_name, sample_index = _parse_key(key)
         shard = self._load_shard(shard_name)
         samples = shard.get("samples") or []
@@ -552,241 +432,22 @@ class TorchShardFeatureStore:
             return torch.load(path, map_location="cpu")
 
 
-class TokenReplayFeatureStore(TorchShardFeatureStore):
-    """Compact shard store containing tokens and replay alignment metadata."""
-
-    def __init__(
-        self,
-        path: str | os.PathLike[str],
-        *,
-        max_samples_per_shard: int = 1024,
-        metadata: dict[str, Any] | None = None,
-        strict_schema: bool = True,
-        read_only: bool = False,
-        shard_prefix: str = "shard",
-    ):
-        replay_metadata = dict(metadata or {})
-        replay_metadata["format"] = "token_replay"
-        super().__init__(
-            path,
-            max_samples_per_shard=max_samples_per_shard,
-            metadata=replay_metadata,
-            strict_schema=strict_schema,
-            read_only=read_only,
-            shard_prefix=shard_prefix,
-        )
-
-    def write_many(
-        self, samples: list[DraftStoredSample | dict[str, Any]]
-    ) -> list[str]:
-        if self.read_only:
-            raise RuntimeError("Cannot write to a read-only TokenReplayFeatureStore")
-        keys: list[str] = []
-        for sample_like in samples:
-            sample = _coerce_replay_sample(sample_like, strict=self.strict_schema)
-            self._pending.append(sample.to_dict())
-            keys.append(f"pending:{len(self._pending) - 1}")
-            if len(self._pending) >= self.max_samples_per_shard:
-                self.flush()
-        return keys
-
-    def read(self, key: str) -> DraftReplaySample:
-        shard_name, sample_index = _parse_key(key)
-        shard = self._load_shard(shard_name)
-        samples = shard.get("samples") or []
-        sample = samples[int(sample_index)]
-        return DraftReplaySample.from_dict(sample, strict=self.strict_schema)
-
-
-class VllmSafetensorsFeatureStore(TorchShardFeatureStore):
-    """Feature store for vLLM-extracted hidden states saved as safetensors.
-
-    Each sample is stored in an individual ``.safetensors`` file with the
-    non-tensor schema/metadata recorded in the shared manifest. This mirrors
-    the vLLM/speculators hidden-state extraction flow while exposing the same
-    ``DraftFeatureStore`` interface used by standalone training.
-    """
-
-    def __init__(
-        self,
-        path: str | os.PathLike[str],
-        *,
-        max_samples_per_shard: int = 1024,
-        metadata: dict[str, Any] | None = None,
-        strict_schema: bool = True,
-        read_only: bool = False,
-        shard_prefix: str = "hs",
-    ):
-        safetensors_metadata = dict(metadata or {})
-        safetensors_metadata["format"] = "vllm_safetensors"
-        super().__init__(
-            path,
-            max_samples_per_shard=max_samples_per_shard,
-            metadata=safetensors_metadata,
-            strict_schema=strict_schema,
-            read_only=read_only,
-            shard_prefix=shard_prefix,
-        )
-
-    def write_many(
-        self, samples: list[DraftStoredSample | dict[str, Any]]
-    ) -> list[str]:
-        if self.read_only:
-            raise RuntimeError(
-                "Cannot write to a read-only VllmSafetensorsFeatureStore"
-            )
-        try:
-            from safetensors.torch import save_file
-        except ImportError as exc:
-            raise RuntimeError(
-                "feature_store.type=vllm_safetensors requires safetensors"
-            ) from exc
-
-        keys: list[str] = []
-        for sample_like in samples:
-            sample = _coerce_sample(sample_like, strict=self.strict_schema)
-            sample_index = self._infer_next_shard_index()
-            file_name = f"{self.shard_prefix}_{sample_index:06d}.safetensors"
-            file_path = self.path / file_name
-            tensor_payload = self._sample_to_safetensors(sample)
-            with tempfile.NamedTemporaryFile(
-                prefix=file_path.name,
-                suffix=".tmp",
-                dir=file_path.parent,
-                delete=False,
-            ) as tmp_file:
-                tmp_name = tmp_file.name
-            try:
-                save_file(tensor_payload, tmp_name)
-                os.replace(tmp_name, file_path)
-            finally:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
-
-            entry = {
-                "path": file_name,
-                "num_samples": 1,
-                "num_tokens": _sample_token_count(sample.to_dict()),
-                "sample": self._sample_manifest(sample),
-            }
-            with self.manifest_path.open("a", encoding="utf-8") as manifest_file:
-                manifest_file.write(
-                    json.dumps(entry, ensure_ascii=True, sort_keys=True) + "\n"
-                )
-            self._manifest.append(entry)
-            self._next_shard_index = sample_index + 1
-            keys.append(f"{file_name}:0")
-        return keys
-
-    def flush(self) -> list[str]:
-        return []
-
-    def read(self, key: str) -> DraftFeatureSample:
-        try:
-            from safetensors.torch import load_file
-        except ImportError as exc:
-            raise RuntimeError(
-                "feature_store.type=vllm_safetensors requires safetensors"
-            ) from exc
-
-        file_name, sample_index = _parse_key(key)
-        if int(sample_index) != 0:
-            raise ValueError(
-                f"Invalid vllm_safetensors key {key!r}; expected sample index 0"
-            )
-        entries = {
-            str(entry.get("path")): entry for entry in self._load_manifest()
-        }
-        entry = entries.get(file_name)
-        if entry is None:
-            raise KeyError(f"Missing vllm_safetensors manifest entry for {file_name}")
-        tensors = load_file(str(self.path / file_name), device="cpu")
-        manifest_sample = dict(entry.get("sample") or {})
-        payload: dict[str, Any] = {
-            "schema_version": int(manifest_sample.get("schema_version", SCHEMA_VERSION)),
-            "algorithm": manifest_sample.get("algorithm", "EAGLE3"),
-            "input_ids": tensors["input_ids"],
-            "loss_mask": tensors["loss_mask"],
-            "hidden_states": tensors["hidden_states"],
-            "metadata": dict(manifest_sample.get("metadata") or {}),
-        }
-        for optional_key in (
-            "last_hidden_states",
-            "target",
-            "target_logprobs",
-            "position_ids",
-        ):
-            if optional_key in tensors:
-                payload[optional_key] = tensors[optional_key]
-        return DraftFeatureSample.from_dict(payload, strict=self.strict_schema)
-
-    def iter_keys(self, *, shuffle: bool = False, seed: int = 0) -> Iterator[str]:
-        keys = [f"{entry['path']}:0" for entry in self._load_manifest()]
-        if shuffle:
-            random.Random(int(seed)).shuffle(keys)
-        yield from keys
-
-    def _sample_to_safetensors(
-        self, sample: DraftFeatureSample
-    ) -> dict[str, torch.Tensor]:
-        payload = sample.to_dict()
-        tensors = {
-            "input_ids": payload["input_ids"].long().contiguous(),
-            "loss_mask": payload["loss_mask"].float().contiguous(),
-            "hidden_states": payload["hidden_states"].contiguous(),
-        }
-        for optional_key in (
-            "last_hidden_states",
-            "target",
-            "target_logprobs",
-            "position_ids",
-        ):
-            value = payload.get(optional_key)
-            if torch.is_tensor(value):
-                tensors[optional_key] = value.contiguous()
-        return tensors
-
-    def _sample_manifest(self, sample: DraftFeatureSample) -> dict[str, Any]:
-        return {
-            "schema_version": sample.schema_version,
-            "algorithm": sample.algorithm,
-            "metadata": _json_safe_metadata(sample.metadata),
-        }
-
-
 def build_feature_store_from_config(
-    feature_store_cfg,
-    *,
-    read_only: bool = False,
-    metadata: dict[str, Any] | None = None,
-    shard_prefix: str = "shard",
-) -> DraftFeatureStore:
-    store_type = (
-        str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
-        .strip()
-        .lower()
-    )
-    store_cls: type[TorchShardFeatureStore]
-    if store_type == "torch_shard":
-        store_cls = TorchShardFeatureStore
-    elif store_type == "token_replay":
-        store_cls = TokenReplayFeatureStore
-    elif store_type in {"vllm_safetensors", "safetensors"}:
-        store_cls = VllmSafetensorsFeatureStore
-    else:
+    feature_store_cfg, *, read_only: bool = False
+) -> TorchShardFeatureStore:
+    store_type = str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
+    if store_type != "torch_shard":
         raise NotImplementedError(f"Unsupported draft feature store type: {store_type}")
-    return store_cls(
+    return TorchShardFeatureStore(
         feature_store_cfg.get("path"),
         max_samples_per_shard=int(feature_store_cfg.get("max_samples_per_shard", 1024)),
-        metadata=metadata,
         strict_schema=bool(feature_store_cfg.get("strict_schema", True)),
         read_only=read_only,
-        shard_prefix=shard_prefix,
     )
 
 
 def _coerce_sample(
-    sample_like: DraftStoredSample | dict[str, Any], *, strict: bool
+    sample_like: DraftFeatureSample | dict[str, Any], *, strict: bool
 ) -> DraftFeatureSample:
     if isinstance(sample_like, DraftFeatureSample):
         sample_like.validate(strict=strict)
@@ -794,17 +455,6 @@ def _coerce_sample(
     if isinstance(sample_like, dict):
         return DraftFeatureSample.from_dict(sample_like, strict=strict)
     raise TypeError(f"Unsupported draft feature sample type: {type(sample_like)!r}")
-
-
-def _coerce_replay_sample(
-    sample_like: DraftStoredSample | dict[str, Any], *, strict: bool
-) -> DraftReplaySample:
-    if isinstance(sample_like, DraftReplaySample):
-        sample_like.validate(strict=strict)
-        return sample_like
-    if isinstance(sample_like, dict):
-        return DraftReplaySample.from_dict(sample_like, strict=strict)
-    raise TypeError(f"Unsupported draft replay sample type: {type(sample_like)!r}")
 
 
 def _cpu_tensor_tree(value: Any) -> Any:
@@ -868,21 +518,3 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.remove(tmp_name)
-
-
-def _json_safe_metadata(value: Any) -> Any:
-    if torch.is_tensor(value):
-        if value.numel() <= 128:
-            return value.detach().cpu().tolist()
-        return {
-            "__tensor__": True,
-            "shape": list(value.shape),
-            "dtype": str(value.dtype),
-        }
-    if isinstance(value, dict):
-        return {str(key): _json_safe_metadata(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe_metadata(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return str(value)

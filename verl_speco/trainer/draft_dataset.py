@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator
 
-from verl_speco.trainer.feature_store import DraftFeatureStore, DraftStoredSample
+from verl_speco.trainer.feature_store import DraftFeatureSample, DraftFeatureStore
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,7 @@ class DraftFeatureDataLoader:
                 f"Invalid rank/world_size configuration: rank={rank}, world_size={world_size}"
             )
 
-    def __iter__(self) -> Iterator[list[DraftStoredSample]]:
+    def __iter__(self) -> Iterator[list[DraftFeatureSample]]:
         epoch = 0
         while True:
             keys = list(
@@ -68,7 +68,7 @@ class DraftFeatureDataLoader:
             rank_keys = keys[rank::world_size]
             if world_size > 1:
                 rank_keys = rank_keys[: len(keys) // world_size]
-            batch: list[DraftStoredSample] = []
+            batch: list[DraftFeatureSample] = []
             for key in rank_keys:
                 batch.append(self.store.read(key))
                 if len(batch) >= int(self.config.batch_size):
