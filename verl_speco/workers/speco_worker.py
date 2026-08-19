@@ -338,6 +338,8 @@ class SpecoWorker(Worker):
         self._staged_rollout_features: dict[str, dict[str, object]] = {}
         self._collection_commit_journals: dict[str, dict[str, object]] = {}
         self._prepared_training_plan_id: Optional[str] = None
+        self._prepared_training_data_version: Optional[int] = None
+        self._prepared_training_target_version: Optional[int] = None
         self.training_process_group = None
         self.dp_process_group = None
         self.training_group_ranks: list[int] = []
@@ -953,9 +955,7 @@ class SpecoWorker(Worker):
 
     def _cleanup_expired_collection_stages(self) -> int:
         ttl_sec = float(
-            self.config.rollout.drafter.training.get(
-                "collection_stage_ttl_sec", 300.0
-            )
+            self.config.rollout.drafter.training.get("collection_stage_ttl_sec", 300.0)
             or 0.0
         )
         if ttl_sec <= 0:
@@ -1017,7 +1017,10 @@ class SpecoWorker(Worker):
             return self._collection_worker_result(
                 collection_id="", reason="missing_collection_id"
             )
-        if collection_id in self._staged_rollout_features or collection_id in self._collection_commit_journals:
+        if (
+            collection_id in self._staged_rollout_features
+            or collection_id in self._collection_commit_journals
+        ):
             return self._collection_worker_result(
                 collection_id=collection_id,
                 reason="collection_already_staged",
@@ -1377,6 +1380,8 @@ class SpecoWorker(Worker):
             "reason": "",
         }
         self._prepared_training_plan_id = None
+        self._prepared_training_data_version = None
+        self._prepared_training_target_version = None
         if not self.enable_drafter:
             result["reason"] = "disabled"
             return result
@@ -1405,7 +1410,9 @@ class SpecoWorker(Worker):
             result["reason"] = "buffer_version_changed"
             return result
         required_target_version = training_plan.get("required_target_version")
-        current_target_version = getattr(self.trainer, "_target_lm_head_weight_step", None)
+        current_target_version = getattr(
+            self.trainer, "_target_lm_head_weight_step", None
+        )
         if required_target_version is not None and int(required_target_version) != int(
             current_target_version if current_target_version is not None else -1
         ):
@@ -1415,11 +1422,30 @@ class SpecoWorker(Worker):
             sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
             require_full_batch=bool(training_plan.get("require_full_batch", False)),
         )
-        if int(data_status["trainable_batches"]) < int(training_plan.get("min_batches", 1)):
+        actual_data_version = data_status.get("data_version")
+        planned_data_version = training_plan.get("data_version")
+        snapshot_data_version = snapshot.get("data_version")
+        if (
+            actual_data_version != planned_data_version
+            or actual_data_version != snapshot_data_version
+        ):
+            result.update(
+                {
+                    "reason": "data_version_changed",
+                    "data_version": actual_data_version,
+                    "target_version": current_target_version,
+                }
+            )
+            return result
+        if int(data_status["trainable_batches"]) < int(
+            training_plan.get("min_batches", 1)
+        ):
             result["reason"] = "insufficient_worker_data"
             return result
 
         self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
+        self._prepared_training_data_version = actual_data_version
+        self._prepared_training_target_version = current_target_version
         with _preserve_process_rng_state(self.device_name):
             activated = bool(await self.trainer.activate_training_model())
         result["activated"] = activated
@@ -1431,7 +1457,7 @@ class SpecoWorker(Worker):
                 "ready": True,
                 "reason": "ready",
                 "buffer_version": int(self.trainer.buffer_version),
-                "data_version": data_status.get("data_version"),
+                "data_version": actual_data_version,
                 "target_version": current_target_version,
             }
         )
@@ -1441,6 +1467,8 @@ class SpecoWorker(Worker):
     async def abort_drafter_training_preflight(self, plan_id: str):
         was_prepared = self._prepared_training_plan_id == str(plan_id)
         self._prepared_training_plan_id = None
+        self._prepared_training_data_version = None
+        self._prepared_training_target_version = None
         if was_prepared and self.trainer is not None:
             await self.trainer.cleanup_training(clear_data=False)
         return {"aborted": was_prepared, "rank": self.rank}
@@ -1464,11 +1492,19 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group or self.trainer is None:
             result["reason"] = "not_in_training_group"
             return result
-        plan_id = str(training_plan.get("plan_id", "")) if isinstance(training_plan, dict) else ""
+        plan_id = (
+            str(training_plan.get("plan_id", ""))
+            if isinstance(training_plan, dict)
+            else ""
+        )
         if not plan_id or self._prepared_training_plan_id != plan_id:
             result["reason"] = "preflight_not_ready"
             return result
+        prepared_data_version = self._prepared_training_data_version
+        prepared_target_version = self._prepared_training_target_version
         self._prepared_training_plan_id = None
+        self._prepared_training_data_version = None
+        self._prepared_training_target_version = None
         max_batches = max(int(training_plan.get("max_batches", 0)), 0)
         prepare_publish = bool(training_plan.get("publish_after_success", False))
         snapshot = (training_plan.get("worker_snapshots") or {})[str(self.rank)]
@@ -1477,8 +1513,8 @@ class SpecoWorker(Worker):
             {
                 "source_global_step": int(training_plan["source_global_step"]),
                 "plan_id": plan_id,
-                "data_version": training_plan.get("data_version"),
-                "target_version": training_plan.get("required_target_version"),
+                "data_version": prepared_data_version,
+                "target_version": prepared_target_version,
                 "execution_strategy": str(training_plan["execution_strategy"]),
                 "buffer_size_before": buffer_size_before,
                 "buffer_size_after": buffer_size_before,
@@ -1536,9 +1572,7 @@ class SpecoWorker(Worker):
                 sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
             )
-            result["buffer_size_after"] = int(
-                data_status_after["trainable_samples"]
-            )
+            result["buffer_size_after"] = int(data_status_after["trainable_samples"])
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
             return result

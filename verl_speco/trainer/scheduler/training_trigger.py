@@ -47,7 +47,7 @@ class IntervalAndBufferTrigger:
         status = context.data_status
         if status is None:
             return TriggerDecision(False, "missing_data_status")
-        if not status.target_version_consistent:
+        if not config.use_logits and not status.target_version_consistent:
             return TriggerDecision(False, "inconsistent_target_version")
         if not status.data_version_consistent:
             return TriggerDecision(False, "inconsistent_data_version")

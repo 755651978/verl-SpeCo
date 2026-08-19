@@ -216,6 +216,51 @@ def test_after_actor_update_requires_snapshot_only_from_publish_leader() -> None
     assert outcome.metrics["drafter/train_publish_leader_snapshot_ready"] == 1
 
 
+def test_after_actor_update_allows_target_version_when_not_required() -> None:
+    scheduler = DrafterScheduler()
+    plan = replace(
+        _training_plan(),
+        plan_id="plan-4",
+        required_target_version=None,
+        worker_snapshots={"0": {}, "1": {}},
+    )
+    runtime_state = DrafterRuntimeState()
+    runtime_state.submit(plan, started_at=0.0)
+    runtime_state.mark_running()
+
+    def result(worker_id: str):
+        return {
+            "trained": True,
+            "triggered": True,
+            "worker_id": worker_id,
+            "worker_incarnation": f"worker-{worker_id}",
+            "plan_id": "plan-4",
+            "source_global_step": 4,
+            "data_version": None,
+            "target_version": 4,
+            "successful_steps": 1,
+            "attempted_steps": 1,
+            "optimizer_step": 8,
+            "publish_snapshot_cached": int(worker_id == "0"),
+            "is_publish_leader": worker_id == "0",
+        }
+
+    scheduler.execute_training_plan = Mock(
+        return_value=ExecutionOutcome(
+            raw_results=[result("0"), result("1")],
+            elapsed_sec=0.2,
+        )
+    )
+
+    outcome = scheduler.on_after_actor_update(
+        AfterActorUpdateContext(plan, runtime_state)
+    )
+
+    assert outcome.training_execution.trained
+    assert outcome.training_execution.reason == "completed"
+    assert outcome.metrics["drafter/train_target_versions_consistent"] == 1
+
+
 def test_after_weight_update_plans_then_publishes() -> None:
     scheduler = DrafterScheduler()
     publish_plan = PublishPlan(

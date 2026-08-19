@@ -78,6 +78,17 @@ class SyncExecutionStrategy:
             }
             all_expected_workers_ready = bool(expected_worker_ids) and (
                 ready_worker_ids == expected_worker_ids
+                and len(participants) == len(expected_worker_ids)
+                and all(bool(result.get("ready", False)) for result in participants)
+                and all(
+                    result.get("data_version") == plan.data_version
+                    for result in participants
+                )
+                and all(
+                    plan.required_target_version is None
+                    or result.get("target_version") == plan.required_target_version
+                    for result in participants
+                )
             )
             if not all_expected_workers_ready:
                 executor.abort_training_preflight(plan)

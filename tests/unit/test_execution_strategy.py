@@ -80,7 +80,9 @@ def test_sync_execution_marks_runtime_failed() -> None:
                 inspect_data=lambda sample_last_n_steps, require_full_batch: [],
                 prepare=lambda plan: {},
                 activate=lambda: [],
-                preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+                preflight=lambda payload: [
+                    {"participating": True, "ready": True, "worker_id": "0"}
+                ],
                 abort_preflight=lambda plan_id: [],
             )
         ).execute_training_plan(
@@ -99,7 +101,9 @@ def test_sync_execution_rejects_inactive_plan() -> None:
                 inspect_data=lambda sample_last_n_steps, require_full_batch: [],
                 prepare=lambda plan: {},
                 activate=lambda: [],
-                preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+                preflight=lambda payload: [
+                    {"participating": True, "ready": True, "worker_id": "0"}
+                ],
                 abort_preflight=lambda plan_id: [],
             )
         ).execute_training_plan(
@@ -125,7 +129,9 @@ def test_prepare_plan_skips_worker_inspection_before_interval() -> None:
             ),
             prepare=lambda plan: {},
             activate=lambda: [],
-            preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+            preflight=lambda payload: [
+                {"participating": True, "ready": True, "worker_id": "0"}
+            ],
             abort_preflight=lambda plan_id: [],
         )
     )
@@ -152,7 +158,9 @@ def test_scheduler_validates_training_worker_activation() -> None:
             inspect_data=lambda sample_last_n_steps, require_full_batch: [],
             prepare=lambda plan: {},
             activate=lambda: [{"activated": False, "reason": "activation_failed"}],
-            preflight=lambda payload: [{"participating": True, "ready": True, "worker_id": "0"}],
+            preflight=lambda payload: [
+                {"participating": True, "ready": True, "worker_id": "0"}
+            ],
             abort_preflight=lambda plan_id: [],
         )
     )
@@ -186,6 +194,102 @@ def test_preflight_failure_aborts_all_workers_without_submitting_training() -> N
 
     outcome = scheduler.execute_training_plan(
         replace(_plan(), worker_snapshots={"0": {}, "1": {}}),
+        runtime_state=DrafterRuntimeState(),
+    )
+
+    assert not outcome.launched
+    assert outcome.reason == "worker_preflight_failed"
+    assert events == [("abort", "plan-4")]
+
+
+def test_preflight_rejects_actual_data_version_mismatch() -> None:
+    events = []
+    scheduler = DrafterScheduler(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: events.append("submit"),
+            resolve=lambda value: value,
+            inspect_data=lambda sample_last_n_steps, require_full_batch: [],
+            prepare=lambda plan: {},
+            activate=lambda: [],
+            preflight=lambda payload: [
+                {
+                    "participating": True,
+                    "ready": True,
+                    "worker_id": "0",
+                    "data_version": 5,
+                    "target_version": 4,
+                }
+            ],
+            abort_preflight=lambda plan_id: events.append(("abort", plan_id)) or [],
+        )
+    )
+    plan = replace(_plan(), data_version=4, required_target_version=4)
+
+    outcome = scheduler.execute_training_plan(
+        plan,
+        runtime_state=DrafterRuntimeState(),
+    )
+
+    assert not outcome.launched
+    assert outcome.reason == "worker_preflight_failed"
+    assert events == [("abort", "plan-4")]
+
+
+def test_preflight_allows_actual_target_version_when_not_required() -> None:
+    events = []
+    scheduler = DrafterScheduler(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: events.append("submit") or [],
+            resolve=lambda value: value,
+            inspect_data=lambda sample_last_n_steps, require_full_batch: [],
+            prepare=lambda plan: {},
+            activate=lambda: [],
+            preflight=lambda payload: [
+                {
+                    "participating": True,
+                    "ready": True,
+                    "worker_id": "0",
+                    "data_version": None,
+                    "target_version": 4,
+                }
+            ],
+            abort_preflight=lambda plan_id: events.append(("abort", plan_id)) or [],
+        )
+    )
+
+    outcome = scheduler.execute_training_plan(
+        replace(_plan(), required_target_version=None),
+        runtime_state=DrafterRuntimeState(),
+    )
+
+    assert outcome.launched
+    assert outcome.reason == "completed"
+    assert events == ["submit"]
+
+
+def test_preflight_rejects_duplicate_worker_results() -> None:
+    events = []
+    duplicate = {
+        "participating": True,
+        "ready": True,
+        "worker_id": "0",
+        "data_version": None,
+        "target_version": None,
+    }
+    scheduler = DrafterScheduler(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: events.append("submit"),
+            resolve=lambda value: value,
+            inspect_data=lambda sample_last_n_steps, require_full_batch: [],
+            prepare=lambda plan: {},
+            activate=lambda: [],
+            preflight=lambda payload: [duplicate, dict(duplicate)],
+            abort_preflight=lambda plan_id: events.append(("abort", plan_id)) or [],
+        )
+    )
+
+    outcome = scheduler.execute_training_plan(
+        _plan(),
         runtime_state=DrafterRuntimeState(),
     )
 

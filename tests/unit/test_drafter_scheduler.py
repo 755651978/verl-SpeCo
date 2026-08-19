@@ -371,3 +371,28 @@ def test_inconsistent_target_versions_do_not_launch() -> None:
 
     assert not plan.launch
     assert plan.reason == "inconsistent_target_version"
+
+
+def test_inconsistent_target_versions_do_not_block_logits_training() -> None:
+    context = _context(trainable_batches=2)
+    context = DrafterScheduleContext(
+        global_step=context.global_step,
+        training_mode=context.training_mode,
+        collected_samples_this_step=context.collected_samples_this_step,
+        oldlogprob_collection_requested=context.oldlogprob_collection_requested,
+        data_status=TrainingDataStatus(
+            **{
+                **context.data_status.__dict__,
+                "target_version_consistent": False,
+            }
+        ),
+    )
+
+    plan = DrafterScheduler().plan_training(
+        context,
+        DrafterScheduleConfig(training_interval_steps=1, use_logits=True),
+    )
+
+    assert plan.launch
+    assert plan.reason == "training_ready"
+    assert plan.required_target_version is None
