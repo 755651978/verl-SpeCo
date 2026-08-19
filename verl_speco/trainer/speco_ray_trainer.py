@@ -387,6 +387,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._drafter_runtime_state = DrafterRuntimeState()
         self._pending_drafter_publish_refs = None
         self._pending_drafter_checkpoint_refs = []
+        self._pending_target_lm_head_sync = None
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
         self._speco_last_oldlogprob_candidate_samples = 0
@@ -1005,7 +1006,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self, training_plan: TrainingPlan
     ) -> dict[str, Any]:
         self._speco_set_drafter_global_step()
-        return self._speco_sync_target_lm_head_weight(training_plan)
+        metrics, pending = self._speco_start_target_lm_head_weight_sync(training_plan)
+        self._pending_target_lm_head_sync = pending
+        return metrics
 
     def _speco_execute_collection(
         self,
@@ -1045,9 +1048,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(self.config, ("actor_rollout_ref", "actor", "strategy"), "")
             or ""
         ).lower()
-        if strategy not in {"fsdp", "fsdp2"}:
+        if strategy not in {"fsdp", "fsdp2", "veomni"}:
             raise ValueError(
-                "SPECO old-logprob hidden collection currently supports actor.strategy=fsdp/fsdp2 only, "
+                "SPECO old-logprob hidden collection supports "
+                "actor.strategy=fsdp/fsdp2/veomni, "
                 f"got {strategy!r}"
             )
         capture_impl = str(
@@ -1803,15 +1807,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ]
         return payload_buckets, global_step_buckets, target_sync_bucket_count
 
-    def _speco_sync_target_lm_head_weight(
-        self, training_plan: TrainingPlan
-    ) -> dict[str, Any]:
+    def _speco_start_target_lm_head_weight_sync(
+        self,
+        training_plan: TrainingPlan | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         sync_started = time.perf_counter()
         training_cfg = self._speco_drafter_training_config()
         if bool(training_cfg.get("use_logits", False)):
-            return {"drafter/target_lm_head_synced": 0}
-        if not training_plan.launch:
-            return {"drafter/target_lm_head_synced": 0}
+            return {"drafter/target_lm_head_synced": 0}, None
+        if training_plan is not None and not training_plan.launch:
+            return {"drafter/target_lm_head_synced": 0}, None
 
         row_selection = self._speco_get_drafter_target_lm_head_row_selection()
         row_indices = (
@@ -1830,46 +1835,133 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         get_actor_lm_head_weight = self._speco_actor_rollout_method(
             "get_actor_lm_head_weight"
         )
+        actor_backend = (
+            str(
+                _get_nested(
+                    self.config,
+                    ("actor_rollout_ref", "actor", "strategy"),
+                    "",
+                )
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        actor_veomni_param_offload = bool(
+            _get_nested(
+                self.config,
+                ("actor_rollout_ref", "actor", "veomni", "param_offload"),
+                False,
+            )
+        )
+        keep_actor_model_on_device = bool(
+            actor_backend == "veomni"
+            and str(self.device_name).lower() == "npu"
+            and actor_veomni_param_offload
+        )
         fetch_started = time.perf_counter()
-        payloads = self._ray_get_if_needed(get_actor_lm_head_weight(row_indices)) or []
+        payloads = (
+            self._ray_get_if_needed(
+                get_actor_lm_head_weight(
+                    row_indices,
+                    keep_model_on_device=keep_actor_model_on_device,
+                )
+            )
+            or []
+        )
         fetch_elapsed = time.perf_counter() - fetch_started
         payload = self._first_non_null(payloads)
         if payload is None:
-            return {
-                "drafter/target_lm_head_synced": 0,
-                "drafter/target_lm_head_selected_rows": selected_rows,
-                "drafter/target_lm_head_source_vocab_size": source_vocab_size,
-                "timing_s/drafter_sync_target_lm_head": time.perf_counter()
-                - sync_started,
-                "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
-            }
-
-        payload_arg, global_step_arg, _ = (
-            self._speco_build_drafter_target_lm_head_sync_args(payload)
-        )
-        apply_started = time.perf_counter()
-        self._ray_get_if_needed(
-            self.speco_sync_target_lm_head_weight(
-                payload_arg, global_step=global_step_arg
+            return (
+                {
+                    "drafter/target_lm_head_synced": 0,
+                    "drafter/target_lm_head_selected_rows": selected_rows,
+                    "drafter/target_lm_head_source_vocab_size": source_vocab_size,
+                    "timing_s/drafter_sync_target_lm_head": time.perf_counter()
+                    - sync_started,
+                    "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
+                },
+                None,
             )
-        )
-        apply_elapsed = time.perf_counter() - apply_started
+
         export_strategy = (
             str(payload.get("export_strategy", "unknown"))
             if isinstance(payload, dict)
             else "unknown"
         )
-        return {
-            "drafter/target_lm_head_synced": 1,
+        # Reconstructing supervision from last hidden states requires a fresh
+        # target head for every drafter backend. Stage the payload on CPU while
+        # the actor updates, then apply it when the drafter activates.
+        defer_device_apply = isinstance(payload, dict)
+        if defer_device_apply:
+            payload = dict(payload)
+            payload["defer_device_apply"] = True
+        payload_arg, global_step_arg, _ = (
+            self._speco_build_drafter_target_lm_head_sync_args(payload)
+        )
+        dispatch_started = time.perf_counter()
+        pending_refs = self.speco_sync_target_lm_head_weight(
+            payload_arg, global_step=global_step_arg
+        )
+        dispatch_elapsed = time.perf_counter() - dispatch_started
+        metrics = {
+            "drafter/target_lm_head_apply_deferred": int(defer_device_apply),
             "drafter/target_lm_head_selected_rows": selected_rows,
             "drafter/target_lm_head_source_vocab_size": source_vocab_size,
             "drafter/target_lm_head_direct_sparse_export": int(
-                export_strategy == "direct_sparse"
+                export_strategy in {"direct_sparse", "veomni_lm_head_sparse"}
             ),
-            "timing_s/drafter_sync_target_lm_head": time.perf_counter() - sync_started,
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
-            "timing_s/drafter_sync_target_lm_head_apply": apply_elapsed,
+            "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
+        pending = {
+            "refs": pending_refs,
+            "dispatch_finished": dispatch_started + dispatch_elapsed,
+            "dispatch_elapsed": dispatch_elapsed,
+            "pre_dispatch_elapsed": dispatch_started - sync_started,
+        }
+        if defer_device_apply and pending_refs is not None:
+            return metrics, pending
+
+        metrics.update(self._speco_finish_target_lm_head_weight_sync(pending))
+        return metrics, None
+
+    def _speco_finish_target_lm_head_weight_sync(
+        self, pending: dict[str, Any]
+    ) -> dict[str, Any]:
+        wait_started = time.perf_counter()
+        self._ray_get_if_needed(pending.get("refs"))
+        finished = time.perf_counter()
+        wait_elapsed = finished - wait_started
+        dispatch_elapsed = float(pending.get("dispatch_elapsed", 0.0) or 0.0)
+        pre_dispatch_elapsed = float(pending.get("pre_dispatch_elapsed", 0.0) or 0.0)
+        dispatch_finished = float(
+            pending.get("dispatch_finished", wait_started) or wait_started
+        )
+        overlap_window_elapsed = max(
+            wait_started - dispatch_finished,
+            0.0,
+        )
+        critical_path_elapsed = pre_dispatch_elapsed + dispatch_elapsed + wait_elapsed
+        return {
+            "drafter/target_lm_head_synced": 1,
+            "timing_s/drafter_sync_target_lm_head": critical_path_elapsed,
+            "timing_s/drafter_sync_target_lm_head_apply": (
+                dispatch_elapsed + wait_elapsed
+            ),
+            "timing_s/drafter_sync_target_lm_head_wait": wait_elapsed,
+            "timing_s/drafter_sync_target_lm_head_overlap_window": (
+                overlap_window_elapsed
+            ),
+        }
+
+    def _speco_sync_target_lm_head_weight(
+        self, training_plan: TrainingPlan | None = None
+    ) -> dict[str, Any]:
+        metrics, pending = self._speco_start_target_lm_head_weight_sync(training_plan)
+        if pending is not None:
+            metrics.update(self._speco_finish_target_lm_head_weight_sync(pending))
+        return metrics
 
     def _speco_train_drafter(
         self, training_plan: TrainingPlan
@@ -2325,6 +2417,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_actor_with_speco(trainer_self, *args, **kwargs):
             update_actor_started = time.perf_counter()
+            pending_target_lm_head_sync = None
             metrics = {
                 "drafter/raw_drafter_samples": int(
                     getattr(self, "_speco_last_raw_drafter_samples", 0)
@@ -2356,6 +2449,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             actor_started = time.perf_counter()
             actor_output = original_update_actor(*args, **kwargs)
             actor_elapsed = time.perf_counter() - actor_started
+            pending_target_lm_head_sync = self._pending_target_lm_head_sync
+            self._pending_target_lm_head_sync = None
+            if pending_target_lm_head_sync is not None:
+                metrics.update(
+                    self._speco_finish_target_lm_head_weight_sync(
+                        pending_target_lm_head_sync
+                    )
+                )
             if training_plan.launch:
                 drafter_trained, train_metrics = self._speco_train_drafter(
                     training_plan
