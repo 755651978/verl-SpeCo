@@ -705,7 +705,6 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         target_layer_ids = self._training_value(
             training_cfg, "dspark_target_layer_ids", "dflash_target_layer_ids", None
         )
-        target_head_dim = getattr(target_text_config, "head_dim", None)
         if target_layer_ids is None:
             from verl_speco.models.dflash import build_target_layer_ids
 
@@ -733,13 +732,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                     getattr(target_text_config, "num_attention_heads"),
                 )
             ),
-            head_dim=int(target_head_dim) if target_head_dim is not None else None,
             vocab_size=int(target_text_config.vocab_size),
             rms_norm_eps=float(getattr(target_text_config, "rms_norm_eps", 1e-6)),
             max_position_embeddings=int(
                 getattr(target_text_config, "max_position_embeddings", 32768)
             ),
-            rope_theta=self._target_rope_theta(target_text_config),
+            rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),

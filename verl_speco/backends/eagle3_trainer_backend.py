@@ -1165,22 +1165,6 @@ class Eagle3TrainerBackend:
         quality_tokens = torch.tensor(0.0, device=input_ids.device, dtype=torch.float32)
         quality_topk = min(5, int(all_step_logits[0].size(-1)))
         quality_step_stats = []
-        collect_diagnostics = bool(
-            getattr(self, "enable_standalone_training_metrics", False)
-        )
-        loss_sum_per_position = None
-        correct_per_position = None
-        count_per_position = None
-        if collect_diagnostics:
-            loss_sum_per_position = torch.zeros(
-                length, device=input_ids.device, dtype=torch.float32
-            )
-            correct_per_position = torch.zeros(
-                length, device=input_ids.device, dtype=torch.float32
-            )
-            count_per_position = torch.zeros(
-                length, device=input_ids.device, dtype=torch.float32
-            )
         sparse_base_tokens = torch.tensor(
             0.0, device=input_ids.device, dtype=torch.float32
         )
@@ -1289,9 +1273,6 @@ class Eagle3TrainerBackend:
                         quality_topk_correct += step_topk_correct
                     step_tokens = valid_position.float().sum()
                     quality_tokens += step_tokens
-                    if collect_diagnostics:
-                        correct_per_position[idx] = step_top1_correct
-                        count_per_position[idx] = step_tokens
                     quality_step_stats.append(
                         {
                             "step": idx,
@@ -1317,8 +1298,6 @@ class Eagle3TrainerBackend:
                         }
                     )
             step_loss_sum = per_token_ploss.sum()
-            if collect_diagnostics:
-                loss_sum_per_position[idx] = step_loss_sum
 
             # Apply EAGLE3 step-wise temporal decay
             total_local_ploss += (gamma**idx) * step_loss_sum
@@ -1360,27 +1339,13 @@ class Eagle3TrainerBackend:
                 quality_step_stats,
             )
 
-        result = {
+        return {
             "total_local_vloss": torch.tensor(0.0, device=input_ids.device),
             "total_local_ploss": total_local_ploss,
             "local_num_tokens": total_local_tokens,
             "v_weight": 0.0,
             "p_weight": 1.0,
         }
-        if collect_diagnostics:
-            result["diagnostics"] = {
-                "correct_count": quality_top1_correct.detach(),
-                "eval_token_count": quality_tokens.detach(),
-                "top1_correct_count": quality_top1_correct.detach(),
-                "top5_correct_count": quality_topk_correct.detach(),
-                "quality_token_count": quality_tokens.detach(),
-                "valid_token_count": quality_tokens.detach(),
-                "weighted_token_count": total_local_tokens.detach(),
-                "loss_sum_per_position": loss_sum_per_position.detach(),
-                "correct_per_position": correct_per_position.detach(),
-                "count_per_position": count_per_position.detach(),
-            }
-        return result
 
     def _compute_target_p_padded(self, target_scores, t2d, loss_mask, length):
         with torch.no_grad():

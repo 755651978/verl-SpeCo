@@ -21,7 +21,6 @@ torch = pytest.importorskip("torch")
 
 from verl_speco.backends.lr_scheduler import (  # noqa: E402
     ClampedGlobalCosineLR,
-    LinearWarmupDecayLR,
     build_drafter_lr_scheduler,
 )
 
@@ -93,34 +92,6 @@ def test_scheduler_builder_uses_configured_global_cosine_values() -> None:
     assert optimizer.param_groups[0]["lr"] == pytest.approx(5e-6)
 
 
-def test_linear_warmup_decay_reaches_zero_after_decay_steps() -> None:
-    optimizer = _optimizer()
-    scheduler = LinearWarmupDecayLR(
-        optimizer, decay_steps=100, min_lr_ratio=0.0, warmup_steps=10
-    )
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.0)
-    _step(optimizer, scheduler, 10)
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
-    _step(optimizer, scheduler, 90)
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.0)
-
-
-def test_linear_scheduler_builder_resumes_from_optimizer_steps() -> None:
-    optimizer = _optimizer()
-    scheduler = build_drafter_lr_scheduler(
-        optimizer,
-        {
-            "lr_scheduler_type": "linear",
-            "lr_decay_steps": 100,
-            "min_lr_ratio": 0.0,
-            "lr_warmup_steps": 10,
-            "_resume_optimizer_steps": 55,
-        },
-    )
-    assert scheduler.last_epoch == 55
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(5e-6)
-
-
 def test_scheduler_builder_resumes_from_successful_optimizer_steps() -> None:
     optimizer = _optimizer()
     scheduler = build_drafter_lr_scheduler(
@@ -165,16 +136,3 @@ def test_scheduler_builder_does_not_replace_explicit_invalid_decay() -> None:
 def test_clamped_global_cosine_rejects_invalid_config(kwargs, message) -> None:
     with pytest.raises(ValueError, match=message):
         ClampedGlobalCosineLR(_optimizer(), **kwargs)
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"decay_steps": 0}, "lr_decay_steps"),
-        ({"decay_steps": 10, "warmup_steps": 10}, "lr_warmup_steps"),
-        ({"decay_steps": 10, "min_lr_ratio": -0.1}, "min_lr_ratio"),
-    ],
-)
-def test_linear_warmup_decay_rejects_invalid_config(kwargs, message) -> None:
-    with pytest.raises(ValueError, match=message):
-        LinearWarmupDecayLR(_optimizer(), **kwargs)
