@@ -28,8 +28,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import OmegaConf, open_dict
 from verl.utils.device import get_device_name, get_torch_device
 
-from verl_speco.backends.dflash_trainer_backend import DFlashTrainerBackend
-from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
+from verl_speco.backends.factory import build_trainer_backend
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 from verl_speco.trainer.draft_dataset import (
     DraftFeatureDataLoader,
@@ -366,9 +365,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         logger.info("[standalone rank=%s] cleaning trainer resources", rank)
         await trainer.cleanup_training(clear_data=True)
         if dist.is_initialized():
-            logger.info("[standalone rank=%s] entering final process-group barrier", rank)
+            logger.info(
+                "[standalone rank=%s] entering final process-group barrier", rank
+            )
             dist.barrier()
-            logger.info("[standalone rank=%s] final process-group barrier complete", rank)
+            logger.info(
+                "[standalone rank=%s] final process-group barrier complete", rank
+            )
             dist.destroy_process_group()
         logger.info("[standalone rank=%s] cleanup complete", rank)
 
@@ -384,18 +387,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
 
 
 def _build_backend(draft_config):
-    algo = str(draft_config.rollout.drafter.speculative_algorithm).upper()
-    if algo == "EAGLE3":
-        return Eagle3TrainerBackend(draft_config, draft_config.model)
-    if algo == "DFLASH":
-        return DFlashTrainerBackend(draft_config, draft_config.model)
-    if algo == "DSPARK":
-        from verl_speco.backends.dspark_trainer_backend import DSparkTrainerBackend
-
-        return DSparkTrainerBackend(draft_config, draft_config.model)
-    raise ValueError(
-        f"Unsupported drafter algorithm {algo!r}; expected EAGLE3, DFLASH or DSPARK"
-    )
+    return build_trainer_backend(draft_config, draft_config.model)
 
 
 def _save_standalone_checkpoint(
