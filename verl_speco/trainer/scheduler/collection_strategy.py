@@ -17,6 +17,7 @@ from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPayload,
     CollectionPlan,
     CollectionWorkerResult,
+    _as_int,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,9 +50,7 @@ class CollectionOutcome:
         return {
             "drafter/collection_attempted": int(self.attempted),
             "drafter/collection_completed": int(self.collected),
-            "drafter/collection_outcome_reason": self._REASON_CODES.get(
-                self.reason, 0
-            ),
+            "drafter/collection_outcome_reason": self._REASON_CODES.get(self.reason, 0),
             "drafter/collected_samples": self.collected_samples,
             "drafter/collection_rejected_samples": sum(
                 result.rejected_samples for result in worker_results
@@ -92,9 +91,7 @@ class SyncCollectionStrategy:
                 f"plan source {plan.source.value}"
             )
         if not plan.collection_id or payload.collection_id != plan.collection_id:
-            raise ValueError(
-                "Collection payload collection_id does not match its plan"
-            )
+            raise ValueError("Collection payload collection_id does not match its plan")
         if not plan.collect:
             return CollectionOutcome(
                 attempted=False,
@@ -125,9 +122,7 @@ class SyncCollectionStrategy:
             for owner, bucket in enumerate(payload.buckets)
             if bucket
         }
-        staged_by_owner = {
-            result.worker_id: result.staged_samples for result in staged
-        }
+        staged_by_owner = {result.worker_id: result.staged_samples for result in staged}
         stage_ids = [result.worker_id for result in staged]
         stage_valid = (
             len(stage_ids) == len(set(stage_ids))
@@ -135,7 +130,7 @@ class SyncCollectionStrategy:
             and all(
                 result.collection_id == plan.collection_id
                 and result.worker_incarnation
-                and result.source_global_step == int(plan.source_global_step)
+                and result.source_global_step == _as_int(plan.source_global_step)
                 and result.buffer_version_after == result.buffer_version_before
                 and result.reason == "collection_staged"
                 for result in staged
@@ -187,8 +182,8 @@ class SyncCollectionStrategy:
             result.collection_id == plan.collection_id for result in results
         )
         versions_valid = (
-            result_steps == {int(plan.source_global_step)}
-            and data_versions == {int(plan.source_global_step)}
+            result_steps == {_as_int(plan.source_global_step)}
+            and data_versions == {_as_int(plan.source_global_step)}
             and all(
                 result.buffer_version_after >= result.buffer_version_before
                 for result in results
@@ -229,7 +224,9 @@ class SyncCollectionStrategy:
             collected=reason == "collection_completed",
             reason=reason,
             source_global_step=plan.source_global_step,
-            collected_samples=(accepted_samples if reason == "collection_completed" else 0),
+            collected_samples=(
+                accepted_samples if reason == "collection_completed" else 0
+            ),
             raw_samples=payload.raw_samples,
             elapsed_sec=time.perf_counter() - started_at,
             worker_results=results,

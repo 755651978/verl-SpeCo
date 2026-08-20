@@ -72,16 +72,14 @@ def _plan_sglang_drafter_collection(
             global_step=global_step,
             source=DrafterCollectionSource.SGLANG,
             drafter_enabled=bool(
-                drafter_cfg.get("enable")
-                and drafter_cfg.get("enable_drafter_training")
+                drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training")
             ),
-            source_enabled=bool(
-                training_cfg.get("collect_hidden_states_from_sgl")
-            ),
+            source_enabled=bool(training_cfg.get("collect_hidden_states_from_sgl")),
             validation=validation,
         ),
         DrafterScheduleConfig.from_mapping(training_cfg),
     )
+
 
 SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_SGLANG_RUNTIME_PATCHED_ENV = "VERL_SPECO_SGLANG_RUNTIME_PATCHED"

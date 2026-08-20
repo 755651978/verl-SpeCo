@@ -52,15 +52,11 @@ def _build_payload(
     for sample, owner in zip(samples, owners, strict=True):
         owner = int(owner)
         if owner < 0 or owner >= owner_count:
-            raise ValueError(
-                f"Collection owner {owner} is outside [0, {owner_count})"
-            )
+            raise ValueError(f"Collection owner {owner} is outside [0, {owner_count})")
         buckets[owner].append(sample)
 
     if dispatch_bucket_count is not None:
-        buckets.extend(
-            [[] for _ in range(max(dispatch_bucket_count - owner_count, 0))]
-        )
+        buckets.extend([[] for _ in range(max(dispatch_bucket_count - owner_count, 0))])
 
     return CollectionPayload(
         source=source,

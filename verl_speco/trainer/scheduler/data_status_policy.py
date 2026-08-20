@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from verl_speco.trainer.scheduler.schedule_types import TrainingDataStatus
+from verl_speco.trainer.scheduler.schedule_types import TrainingDataStatus, _as_int
 
 
 class ConservativeTrainingDataStatusPolicy:
@@ -20,7 +20,11 @@ class ConservativeTrainingDataStatusPolicy:
             s.target_version_consistent for s in statuses
         ) and all(s.target_version == statuses[0].target_version for s in statuses)
         newest_sample_step = max(
-            (s.newest_sample_step for s in statuses if s.newest_sample_step is not None),
+            (
+                s.newest_sample_step
+                for s in statuses
+                if s.newest_sample_step is not None
+            ),
             default=None,
         )
         data_versions = [
@@ -30,7 +34,7 @@ class ConservativeTrainingDataStatusPolicy:
         data_version_consistent = all(
             s.data_version_consistent for s in statuses
         ) and all(version == data_versions[0] for version in data_versions)
-        worker_snapshots = {
+        worker_snapshots: dict[str, dict[str, object]] = {
             s.worker_id: {
                 "buffer_version": s.buffer_version,
                 "data_version": (
@@ -44,7 +48,7 @@ class ConservativeTrainingDataStatusPolicy:
             for s in statuses
         }
         return TrainingDataStatus(
-            current_step=int(global_step),
+            current_step=_as_int(global_step),
             current_step_samples=min(s.current_step_samples for s in statuses),
             buffer_samples=min(s.buffer_samples for s in statuses),
             trainable_samples=min(s.trainable_samples for s in statuses),
@@ -52,12 +56,18 @@ class ConservativeTrainingDataStatusPolicy:
             batch_size_per_gpu=max(s.batch_size_per_gpu for s in statuses),
             partial_batch_available=all(s.partial_batch_available for s in statuses),
             oldest_sample_step=min(
-                (s.oldest_sample_step for s in statuses if s.oldest_sample_step is not None),
+                (
+                    s.oldest_sample_step
+                    for s in statuses
+                    if s.oldest_sample_step is not None
+                ),
                 default=None,
             ),
             newest_sample_step=newest_sample_step,
             same_step_data_required=any(s.same_step_data_required for s in statuses),
-            target_version=(statuses[0].target_version if target_version_consistent else None),
+            target_version=(
+                statuses[0].target_version if target_version_consistent else None
+            ),
             target_version_consistent=target_version_consistent,
             data_version=newest_sample_step,
             data_version_consistent=data_version_consistent,

@@ -13,12 +13,17 @@ from verl_speco.trainer.scheduler.drafter_runtime_state import (
     DrafterRuntimeStatus,
 )
 from verl_speco.trainer.scheduler.execution_strategy import ExecutionOutcome
-from verl_speco.trainer.scheduler.schedule_types import TrainingPlan, TrainingResult
+from verl_speco.trainer.scheduler.schedule_types import (
+    TrainingPlan,
+    TrainingResult,
+    _as_float,
+    _as_int,
+)
 
 
 def _metric_float(value: object) -> float | None:
     try:
-        return float(value)
+        return _as_float(value)
     except (TypeError, ValueError):
         return None
 
@@ -62,7 +67,10 @@ class TrainingOutcome:
             bool(result.get("trained", False)) for result in normalized_results
         )
         successful_steps = max(
-            (int(result.get("successful_steps", 0)) for result in normalized_results),
+            (
+                _as_int(result.get("successful_steps", 0))
+                for result in normalized_results
+            ),
             default=0,
         )
         worker_results = [
@@ -86,7 +94,7 @@ class TrainingOutcome:
             result.plan_id == plan.plan_id for result in participating_results
         )
         source_steps_consistent = all(
-            result.source_global_step == int(plan.source_global_step)
+            result.source_global_step == _as_int(plan.source_global_step)
             for result in participating_results
         )
         data_versions_consistent = all(

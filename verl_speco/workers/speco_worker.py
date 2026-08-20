@@ -772,7 +772,11 @@ class SpecoWorker(Worker):
         reason: str,
         buffer_version_before: int | None = None,
         expired_stages: int = 0,
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
+        if self.last_global_step is None:
+            raise RuntimeError(
+                "Cannot collect drafter samples before setting global_step"
+            )
         source_global_step = int(self.last_global_step)
         current_buffer_version = int(
             self.trainer.buffer_version if self.trainer is not None else 0
@@ -803,8 +807,13 @@ class SpecoWorker(Worker):
 
     def _cleanup_expired_collection_stages(self) -> int:
         ttl_sec = float(
-            self.config.rollout.drafter.training.get("collection_stage_ttl_sec", 300.0)
-            or 0.0
+            cast(
+                Any,
+                self.config.rollout.drafter.training.get(
+                    "collection_stage_ttl_sec", 300.0
+                )
+                or 0.0,
+            )
         )
         if ttl_sec <= 0:
             return 0
@@ -812,7 +821,7 @@ class SpecoWorker(Worker):
         expired = [
             collection_id
             for collection_id, entry in self._staged_rollout_features.items()
-            if float(entry.get("staged_at", 0.0)) < deadline
+            if float(cast(Any, entry.get("staged_at", 0.0))) < deadline
         ]
         for collection_id in expired:
             self._staged_rollout_features.pop(collection_id, None)
@@ -843,7 +852,7 @@ class SpecoWorker(Worker):
         trainer.data_buffer._current_step = cast(
             Optional[int], snapshot["data_buffer_step"]
         )
-        trainer.buffer_version = int(snapshot["buffer_version"])
+        trainer.buffer_version = int(cast(Any, snapshot["buffer_version"]))
 
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
@@ -958,7 +967,7 @@ class SpecoWorker(Worker):
 
     def _commit_rollout_features(
         self, collection_id: str, samples: list[dict]
-    ) -> dict[str, object]:
+    ) -> dict[str, Any]:
         buffer_version_before = int(
             self.trainer.buffer_version if self.trainer is not None else 0
         )

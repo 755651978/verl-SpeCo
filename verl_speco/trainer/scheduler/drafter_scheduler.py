@@ -34,6 +34,7 @@ from verl_speco.trainer.scheduler.schedule_types import (
     DrafterScheduleContext,
     PublishPlan,
     TrainingPlan,
+    _as_int,
 )
 from verl_speco.trainer.scheduler.execution_strategy import SyncExecutionStrategy
 from verl_speco.trainer.scheduler.training_budget import SyncTrainingBudgetPolicy
@@ -126,9 +127,7 @@ class DrafterScheduler:
     ) -> None:
         self._collection_executor = collection_executor
 
-    def register_collection_adapter(
-        self, adapter: DrafterCollectionAdapter
-    ) -> None:
+    def register_collection_adapter(self, adapter: DrafterCollectionAdapter) -> None:
         """Register or replace the payload adapter for a collection source."""
         self._collection_adapters[adapter.source] = adapter
 
@@ -173,7 +172,11 @@ class DrafterScheduler:
         """Build a plan while avoiding worker RPCs for cheap skip conditions."""
 
         interval_matched = self.training_interval_matched(context.global_step, config)
-        if context.training_mode == "collect_only" or context.pending_training_count > 0 or not interval_matched:
+        if (
+            context.training_mode == "collect_only"
+            or context.pending_training_count > 0
+            or not interval_matched
+        ):
             return self.plan_training(context, config)
         data_status = context.data_status or self.inspect_training_data(
             global_step=context.global_step, config=config
@@ -209,7 +212,9 @@ class DrafterScheduler:
         ]
         failures = [result for result in active if not result.get("activated", False)]
         if failures:
-            raise RuntimeError(f"SPECO drafter trainer activation failed: {failures[:3]}")
+            raise RuntimeError(
+                f"SPECO drafter trainer activation failed: {failures[:3]}"
+            )
         return results
 
     def wait_pending_publish(self) -> int:
@@ -233,7 +238,7 @@ class DrafterScheduler:
         training_interval_matched = self.training_interval_matched(
             context.global_step, config
         )
-        common = {
+        common: Any = {
             "collection_id": uuid4().hex,
             "source": context.source,
             "source_global_step": context.global_step,
@@ -266,9 +271,7 @@ class DrafterScheduler:
             return CollectionPlan(collect=False, reason="sample_rate_zero", **common)
         return CollectionPlan(collect=True, reason="collection_enabled", **common)
 
-    def execute_collection_plan(
-        self, plan: CollectionPlan, payload: CollectionPayload
-    ):
+    def execute_collection_plan(self, plan: CollectionPlan, payload: CollectionPayload):
         if self._collection_executor is None:
             raise RuntimeError("Drafter collection executor has not been bound")
         return self.collection_strategy.execute(
@@ -277,9 +280,7 @@ class DrafterScheduler:
             executor=self._collection_executor,
         )
 
-    def on_collection_ready(
-        self, plan: CollectionPlan, payload: CollectionPayload
-    ):
+    def on_collection_ready(self, plan: CollectionPlan, payload: CollectionPayload):
         """Lifecycle Facade event for a source adapter's prepared payload."""
         return self.execute_collection_plan(plan, payload)
 
@@ -320,9 +321,7 @@ class DrafterScheduler:
             metrics=outcome.metrics,
         )
 
-    def on_safe_point(
-        self, context: AfterWeightUpdateContext
-    ) -> SchedulerEventOutcome:
+    def on_safe_point(self, context: AfterWeightUpdateContext) -> SchedulerEventOutcome:
         """Plan and execute publication at a rollout-safe lifecycle point."""
         plan = self.plan_publish(
             global_step=context.global_step,
@@ -363,7 +362,7 @@ class DrafterScheduler:
             interval_matched=interval_matched,
         )
         budget = self.sync_budget_policy.make_budget(context, config)
-        common = {
+        common: Any = {
             "interval_matched": interval_matched,
             "execution_strategy": DrafterExecutionStrategy.SYNC,
             "source_global_step": context.global_step,
@@ -376,7 +375,7 @@ class DrafterScheduler:
                 context.data_status.data_version if context.data_status else None
             ),
             "required_target_version": (
-                None if config.use_logits else int(context.global_step)
+                None if config.use_logits else _as_int(context.global_step)
             ),
             "plan_id": uuid4().hex,
             "worker_snapshots": (
@@ -434,8 +433,8 @@ class DrafterScheduler:
         global_step: object,
         config: DrafterScheduleConfig,
     ) -> bool:
-        interval = int(config.publish_interval_steps or 0)
-        return interval <= 0 or global_step % interval == 0
+        interval = _as_int(config.publish_interval_steps or 0)
+        return interval <= 0 or _as_int(global_step) % interval == 0
 
     @staticmethod
     def plan_publish(

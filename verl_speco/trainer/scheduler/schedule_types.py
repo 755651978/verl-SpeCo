@@ -17,7 +17,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar
+from typing import Any, ClassVar, cast
+
+
+def _as_int(value: object) -> int:
+    """Convert a value received from configuration or an RPC payload."""
+
+    return int(cast(Any, value))
+
+
+def _as_float(value: object) -> float:
+    """Convert a value received from configuration or an RPC payload."""
+
+    return float(cast(Any, value))
 
 
 class DrafterExecutionStrategy(str, Enum):
@@ -92,7 +104,7 @@ class DrafterScheduleConfig:
 
 
 def _optional_int(value: object) -> int | None:
-    return None if value is None else int(value)
+    return None if value is None else _as_int(value)
 
 
 @dataclass(frozen=True)
@@ -170,7 +182,7 @@ class CollectionPlan:
             "drafter/collection_plan_window_min_rows": self.hidden_window_min_rows,
         }
         try:
-            metrics["drafter/collection_plan_source_global_step"] = int(
+            metrics["drafter/collection_plan_source_global_step"] = _as_int(
                 self.source_global_step
             )
         except (TypeError, ValueError):
@@ -217,16 +229,16 @@ class CollectionWorkerResult:
             worker_id=str(value.get("worker_id", "")),
             worker_incarnation=str(value.get("worker_incarnation", "")),
             source_global_step=_optional_int(value.get("source_global_step")),
-            accepted_samples=int(value.get("accepted_samples", 0)),
-            rejected_samples=int(value.get("rejected_samples", 0)),
-            buffer_version_before=int(value.get("buffer_version_before", 0)),
-            buffer_version_after=int(value.get("buffer_version_after", 0)),
+            accepted_samples=_as_int(value.get("accepted_samples", 0)),
+            rejected_samples=_as_int(value.get("rejected_samples", 0)),
+            buffer_version_before=_as_int(value.get("buffer_version_before", 0)),
+            buffer_version_after=_as_int(value.get("buffer_version_after", 0)),
             data_version=_optional_int(value.get("data_version")),
             collected=bool(value.get("collected", False)),
             reason=str(value.get("reason", "")),
             collection_id=str(value.get("collection_id", "")),
-            staged_samples=int(value.get("staged_samples", 0)),
-            expired_stages=int(value.get("expired_stages", 0)),
+            staged_samples=_as_int(value.get("staged_samples", 0)),
+            expired_stages=_as_int(value.get("expired_stages", 0)),
         )
 
 
@@ -268,12 +280,12 @@ class TrainingDataStatus:
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
         return cls(
-            current_step=int(value.get("current_step", 0)),
-            current_step_samples=int(value.get("current_step_samples", 0)),
-            buffer_samples=int(value.get("buffer_samples", 0)),
-            trainable_samples=int(value.get("trainable_samples", 0)),
-            trainable_batches=int(value.get("trainable_batches", 0)),
-            batch_size_per_gpu=int(value.get("batch_size_per_gpu", 1)),
+            current_step=_as_int(value.get("current_step", 0)),
+            current_step_samples=_as_int(value.get("current_step_samples", 0)),
+            buffer_samples=_as_int(value.get("buffer_samples", 0)),
+            trainable_samples=_as_int(value.get("trainable_samples", 0)),
+            trainable_batches=_as_int(value.get("trainable_batches", 0)),
+            batch_size_per_gpu=_as_int(value.get("batch_size_per_gpu", 1)),
             partial_batch_available=bool(value.get("partial_batch_available", False)),
             oldest_sample_step=_optional_int(value.get("oldest_sample_step")),
             newest_sample_step=_optional_int(value.get("newest_sample_step")),
@@ -286,7 +298,7 @@ class TrainingDataStatus:
                 value.get("data_version", value.get("newest_sample_step"))
             ),
             data_version_consistent=bool(value.get("data_version_consistent", True)),
-            buffer_version=int(value.get("buffer_version", 0)),
+            buffer_version=_as_int(value.get("buffer_version", 0)),
             worker_incarnation=str(value.get("worker_incarnation", "")),
             worker_id=str(value.get("worker_id", value.get("rank", ""))),
         )
@@ -399,7 +411,7 @@ class TrainingPlan:
             "drafter/schedule_sample_last_n_steps": int(self.sample_last_n_steps),
         }
         try:
-            metrics["drafter/schedule_source_global_step"] = int(
+            metrics["drafter/schedule_source_global_step"] = _as_int(
                 self.source_global_step
             )
         except (TypeError, ValueError):
@@ -443,16 +455,16 @@ class TrainingResult:
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingResult":
         return cls(
-            source_global_step=int(value.get("source_global_step", 0)),
+            source_global_step=_as_int(value.get("source_global_step", 0)),
             execution_strategy=DrafterExecutionStrategy(
                 value.get("execution_strategy", DrafterExecutionStrategy.SYNC.value)
             ),
-            attempted_batches=int(value.get("attempted_steps", 0)),
-            successful_steps=int(value.get("successful_steps", 0)),
-            optimizer_step=int(value.get("optimizer_step", 0)),
-            buffer_size_before=int(value.get("buffer_size_before", 0)),
-            buffer_size_after=int(value.get("buffer_size_after", 0)),
-            elapsed_sec=float(value.get("elapsed_sec", 0.0)),
+            attempted_batches=_as_int(value.get("attempted_steps", 0)),
+            successful_steps=_as_int(value.get("successful_steps", 0)),
+            optimizer_step=_as_int(value.get("optimizer_step", 0)),
+            buffer_size_before=_as_int(value.get("buffer_size_before", 0)),
+            buffer_size_after=_as_int(value.get("buffer_size_after", 0)),
+            elapsed_sec=_as_float(value.get("elapsed_sec", 0.0)),
             reason=str(value.get("reason", "")),
             snapshot_ready=bool(value.get("publish_snapshot_cached", False)),
             trained=bool(value.get("trained", False)),

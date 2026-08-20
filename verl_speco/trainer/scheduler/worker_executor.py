@@ -64,9 +64,10 @@ class CallbackDrafterWorkerExecutor:
     def get_training_data_status(
         self, *, sample_last_n_steps: int, require_full_batch: bool
     ) -> list[TrainingDataStatus]:
-        results = self.resolve(
-            self.inspect_data(sample_last_n_steps, require_full_batch)
-        ) or []
+        results = (
+            self.resolve(self.inspect_data(sample_last_n_steps, require_full_batch))
+            or []
+        )
         if not isinstance(results, list):
             results = [results]
         return [
