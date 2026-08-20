@@ -173,6 +173,7 @@ actor_rollout_ref:
         data_buffer_max_size: 1024
         hidden_state_clip_value: 1.0e4
         feature_store:
+          # `tq` selects the streaming standalone Consumer and does not use path.
           type: torch_shard
           path: null
           max_samples_per_shard: 1024

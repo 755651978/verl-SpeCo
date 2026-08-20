@@ -1048,12 +1048,26 @@ def build_feature_store_from_config(
     read_only: bool = False,
     metadata: dict[str, Any] | None = None,
     shard_prefix: str = "shard",
-) -> DraftFeatureStore:
+    transfer_queue_cfg: Any | None = None,
+) -> Any:
     store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
         .strip()
         .lower()
     )
+    if store_type == "tq":
+        if not read_only:
+            raise ValueError("feature_store.type=tq is a read-only Consumer data source")
+        from verl_speco.trainer.tq_feature_store import TQFeatureStore
+
+        tq_cfg = transfer_queue_cfg
+        if tq_cfg is None:
+            tq_cfg = feature_store_cfg.get("tq")
+        if tq_cfg is None:
+            raise ValueError(
+                "feature_store.type=tq requires the sibling training.transfer_queue configuration"
+            )
+        return TQFeatureStore.from_config(tq_cfg)
     if store_type == "torch_shard":
         store_cls: type[TorchShardFeatureStore] = TorchShardFeatureStore
     elif store_type == "token_replay":

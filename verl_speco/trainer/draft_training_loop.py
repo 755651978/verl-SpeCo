@@ -40,6 +40,7 @@ from verl_speco.trainer.feature_store import (
     build_feature_store_from_config,
 )
 from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config
+from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatch
 
 logger = logging.getLogger(__name__)
 
@@ -85,10 +86,12 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         str(training_cfg.get("mode", "offline") or "offline").strip().lower()
     )
     replay_feature_store_types = {"token_replay", "jsonl_token_replay", "jsonl"}
-    if not feature_store_cfg.get("path"):
+    if feature_store_type != "tq" and not feature_store_cfg.get("path"):
         raise ValueError(
             "actor_rollout_ref.rollout.drafter.training.feature_store.path is required"
         )
+    if feature_store_type == "tq" and training_mode != "offline":
+        raise ValueError("feature_store.type=tq requires standalone training.mode=offline")
     if feature_store_type in replay_feature_store_types and training_mode != "offline":
         raise ValueError(
             f"feature_store.type={feature_store_type} is supported only by "
@@ -167,7 +170,18 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 feature_store_cfg.tokenizer_path = tokenizer_path
             except AttributeError:
                 feature_store_cfg["tokenizer_path"] = tokenizer_path
-        store = build_feature_store_from_config(feature_store_cfg, read_only=True)
+        store = build_feature_store_from_config(
+            feature_store_cfg,
+            read_only=True,
+            transfer_queue_cfg=training_cfg.get("transfer_queue"),
+        )
+        if feature_store_type == "tq":
+            current_stage = "connect_tq_feature_store"
+            _connect_tq_store_across_ranks(
+                store,
+                rank=rank,
+                device=trainer.runtime_device,
+            )
         logger.info(
             "[standalone rank=%s] feature store opened elapsed=%.3fs",
             rank,
@@ -201,17 +215,31 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 time.perf_counter() - stage_started,
             )
         current_stage = "create_dataloader"
-        loader = DraftFeatureDataLoader(
-            store,
-            DraftFeatureDataLoaderConfig(
+        loader: Any
+        if feature_store_type == "tq":
+            tq_cfg = training_cfg.get("transfer_queue") or {}
+            loader = TQFeatureDataLoader(
+                store,
                 batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
                 rank=rank,
                 world_size=world_size,
-                shuffle=bool(feature_store_cfg.get("shuffle", True)),
-                repeat=bool(feature_store_cfg.get("repeat", True)),
-                seed=int(training_cfg.get("seed", 0) or 0),
-            ),
-        )
+                poll_interval_seconds=float(
+                    tq_cfg.get("poll_interval_seconds", 0.5) or 0.5
+                ),
+                drop_last=bool(tq_cfg.get("drop_last", True)),
+            )
+        else:
+            loader = DraftFeatureDataLoader(
+                store,
+                DraftFeatureDataLoaderConfig(
+                    batch_size=int(training_cfg.get("batch_size_per_gpu", 4)),
+                    rank=rank,
+                    world_size=world_size,
+                    shuffle=bool(feature_store_cfg.get("shuffle", True)),
+                    repeat=bool(feature_store_cfg.get("repeat", True)),
+                    seed=int(training_cfg.get("seed", 0) or 0),
+                ),
+            )
         logger.info(
             "[standalone rank=%s] dataloader ready batch_size_per_gpu=%s "
             "shuffle=%s repeat=%s",
@@ -223,6 +251,11 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         sample_source = loader
         pipeline_cfg = training_cfg.get("target_feature_pipeline", {}) or {}
         pipeline_enabled = bool(pipeline_cfg.get("enabled", False))
+        if feature_store_type == "tq" and pipeline_enabled:
+            raise ValueError(
+                "feature_store.type=tq already contains target hidden states and cannot be "
+                "combined with target_feature_pipeline.enabled=true"
+            )
         if pipeline_enabled:
             if feature_replayer is None or not feature_replayer.backend.startswith(
                 "vllm_"
@@ -266,13 +299,21 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         sample_iterator = iter(sample_source)
         while max_steps <= 0 or successful_steps < max_steps:
             current_stage = "load_next_batch"
-            samples = _next_batch_across_ranks(
+            loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
                 rank=rank,
                 device=trainer.runtime_device,
             )
-            if samples is None:
+            if loaded_batch is None:
                 break
+            tq_local_batch = (
+                loaded_batch if isinstance(loaded_batch, TQLocalBatch) else None
+            )
+            samples = (
+                tq_local_batch.local_samples
+                if tq_local_batch is not None
+                else loaded_batch
+            )
             step_started = time.perf_counter()
             attempted_batches += 1
             log_batch_progress = _should_log_batch_progress(attempted_batches)
@@ -334,6 +375,11 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             has_batch = batch is not None
             current_stage = "synchronize_batch_readiness"
             if not _all_ranks_true(has_batch, trainer.runtime_device):
+                if tq_local_batch is not None:
+                    raise RuntimeError(
+                        "TQ Consumer could not prepare a valid batch on every rank; "
+                        "the TQ keys were intentionally not cleared"
+                    )
                 if rank == 0:
                     logger.warning(
                         "Skipping standalone drafter batch: at least one rank has no valid batch"
@@ -362,7 +408,20 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 ) from step_error
             current_stage = "synchronize_training_step"
             if not _all_ranks_true(ok, trainer.runtime_device):
+                if tq_local_batch is not None:
+                    raise RuntimeError(
+                        "TQ Consumer training_step_from_batch failed on at least one rank; "
+                        "the TQ keys were intentionally not cleared"
+                    )
                 continue
+            if tq_local_batch is not None:
+                current_stage = "clear_tq_batch"
+                _clear_tq_batch_across_ranks(
+                    cast(TQFeatureDataLoader, loader),
+                    tq_local_batch.global_keys,
+                    rank=rank,
+                    device=trainer.runtime_device,
+                )
             successful_steps += 1
             optimizer_step = int(trainer.optimizer_steps_total)
             if optimizer_step <= initial_optimizer_step:
@@ -1054,12 +1113,58 @@ def _all_ranks_true(value: bool, device: torch.device) -> bool:
     return bool(ready.item())
 
 
+def _clear_tq_batch_across_ranks(
+    loader: TQFeatureDataLoader,
+    global_keys: list[str] | None,
+    *,
+    rank: int,
+    device: torch.device,
+) -> None:
+    """Clear once on rank 0 and report a clear failure to every training rank."""
+
+    local_error: BaseException | None = None
+    if rank == 0:
+        try:
+            loader.clear_completed_batch(global_keys)
+        except BaseException as exc:  # noqa: BLE001
+            local_error = exc
+    failed = torch.tensor(
+        1 if local_error is not None else 0,
+        dtype=torch.int32,
+        device=device,
+    )
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    if bool(failed.item()):
+        if local_error is not None:
+            raise RuntimeError("rank 0 failed to clear a completed TQ batch") from local_error
+        raise RuntimeError("rank 0 failed to clear a completed TQ batch")
+
+
+def _connect_tq_store_across_ranks(store, *, rank: int, device: torch.device) -> None:
+    """Connect every rank before any rank enters TQ key-discovery broadcasts."""
+
+    local_error: BaseException | None = None
+    try:
+        store.connect()
+    except BaseException as exc:  # noqa: BLE001
+        local_error = exc
+    connected = _all_ranks_true(local_error is None, device)
+    if connected:
+        return
+    if local_error is not None:
+        raise RuntimeError(f"TQ Consumer failed to connect on rank={rank}") from local_error
+    raise RuntimeError(
+        f"TQ Consumer failed to connect on another rank; rank={rank} is stopping"
+    )
+
+
 def _next_batch_across_ranks(
     source,
     *,
     rank: int,
     device: torch.device,
-) -> list[Any] | None:
+) -> Any | None:
     """Fetch one batch and make producer failures visible to every rank.
 
     Producer and Mooncake errors happen before the FSDP training step.  Every
@@ -1067,7 +1172,7 @@ def _next_batch_across_ranks(
     any rank is allowed to enter model collectives.  This prevents healthy
     ranks from waiting in FSDP after another rank has already started cleanup.
     """
-    samples: list[Any] | None = None
+    samples: Any | None = None
     local_error: BaseException | None = None
     exhausted = False
     try:

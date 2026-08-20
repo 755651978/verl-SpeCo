@@ -25,6 +25,8 @@ from omegaconf import OmegaConf  # noqa: E402
 
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _build_backend,
+    _clear_tq_batch_across_ranks,
+    _connect_tq_store_across_ranks,
     _contains_replay_samples,
     _is_out_of_memory_error,
     _next_batch_across_ranks,
@@ -49,6 +51,62 @@ class _FakeTrainer:
         self.step = step
         self._pending_full_checkpoint_future = self.future
         return self.future
+
+
+class _FakeTQLoader:
+    def __init__(self, error: BaseException | None = None):
+        self.error = error
+        self.clear_calls: list[list[str] | None] = []
+
+    def clear_completed_batch(self, keys):
+        self.clear_calls.append(keys)
+        if self.error is not None:
+            raise self.error
+
+
+class _FakeTQStore:
+    def __init__(self, error: BaseException | None = None):
+        self.error = error
+        self.connect_calls = 0
+
+    def connect(self):
+        self.connect_calls += 1
+        if self.error is not None:
+            raise self.error
+
+
+def test_tq_completed_batch_is_cleared_once_on_rank_zero() -> None:
+    loader = _FakeTQLoader()
+    _clear_tq_batch_across_ranks(
+        loader,
+        ["k0", "k1"],
+        rank=0,
+        device=torch.device("cpu"),
+    )
+    assert loader.clear_calls == [["k0", "k1"]]
+
+
+def test_tq_clear_failure_is_reported_and_not_retried() -> None:
+    loader = _FakeTQLoader(RuntimeError("clear failed"))
+    with pytest.raises(RuntimeError, match="failed to clear"):
+        _clear_tq_batch_across_ranks(
+            loader,
+            ["k0", "k1"],
+            rank=0,
+            device=torch.device("cpu"),
+        )
+    assert loader.clear_calls == [["k0", "k1"]]
+
+
+def test_tq_store_connection_failure_is_reported() -> None:
+    store = _FakeTQStore(RuntimeError("connect failed"))
+    with pytest.raises(RuntimeError, match="failed to connect"):
+        _connect_tq_store_across_ranks(
+            store,
+            rank=0,
+            device=torch.device("cpu"),
+        )
+    assert store.connect_calls == 1
 
 
 def _export_trainer(model_type: str, model_path=None):
