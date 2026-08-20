@@ -286,6 +286,51 @@ def test_empty_collection_payload_is_skipped() -> None:
     assert outcome.reason == "empty_collection_payload"
 
 
+def test_collection_executor_sends_control_request_for_empty_worker_bucket() -> None:
+    submitted = {}
+
+    def capture(phase):
+        def submit(requests):
+            submitted[phase] = requests
+            return []
+
+        return submit
+
+    executor = CallbackDrafterCollectionExecutor(
+        set_step=lambda step: None,
+        stage_submit=capture("stage"),
+        commit_submit=capture("commit"),
+        abort_submit=capture("abort"),
+        rollback_submit=capture("rollback"),
+        finalize_submit=capture("finalize"),
+        resolve=lambda value: value,
+    )
+    sample = {"input_ids": [1, 2]}
+    payload = CollectionPayload(
+        source=DrafterCollectionSource.SGLANG,
+        buckets=[[sample], []],
+        collected_samples=1,
+        collection_id="collection-4",
+    )
+
+    executor.stage(payload)
+    executor.commit(payload)
+    executor.abort(payload)
+    executor.rollback(payload)
+    executor.finalize(payload)
+
+    assert submitted["stage"] == [
+        [{"collection_id": "collection-4", "samples": [sample]}],
+        [{"collection_id": "collection-4", "samples": []}],
+    ]
+    expected_control_requests = [
+        [{"collection_id": "collection-4", "samples": None}],
+        [{"collection_id": "collection-4", "samples": None}],
+    ]
+    for phase in ("commit", "abort", "rollback", "finalize"):
+        assert submitted[phase] == expected_control_requests
+
+
 def test_collection_rejects_payload_from_another_source() -> None:
     executor = _executor()
 

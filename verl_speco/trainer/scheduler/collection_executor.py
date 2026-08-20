@@ -48,16 +48,12 @@ class CallbackDrafterCollectionExecutor:
         payload: CollectionPayload, *, include_samples: bool
     ) -> list[list[dict]]:
         return [
-            (
-                [
-                    {
-                        "collection_id": payload.collection_id,
-                        "samples": bucket if include_samples else None,
-                    }
-                ]
-                if bucket
-                else []
-            )
+            [
+                {
+                    "collection_id": payload.collection_id,
+                    "samples": bucket if include_samples else None,
+                }
+            ]
             for bucket in payload.buckets
         ]
 
