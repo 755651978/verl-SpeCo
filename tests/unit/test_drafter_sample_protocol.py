@@ -113,6 +113,19 @@ def test_encode_rejects_shape_mismatch() -> None:
         encode_sample(_sample(), meta)
 
 
+def test_protocol_algorithm_is_not_hardcoded_to_dspark() -> None:
+    meta = replace(_metadata(), algorithm="EAGLE3")
+    sample = replace(_sample(), algorithm="EAGLE3")
+    expected = replace(_expected(), algorithm="EAGLE3")
+
+    key = make_sample_key(meta)
+    fields = encode_sample(sample, meta)
+    restored = decode_sample(key, make_ready_tag(meta), fields, expected)
+
+    assert make_ready_tag(meta)["algorithm"] == "EAGLE3"
+    assert restored.algorithm == "EAGLE3"
+
+
 def test_eos_record_is_control_only() -> None:
     key, fields, tag = make_eos_record("run-a", 18)
     assert key == "control:v1:run-a:eos"
