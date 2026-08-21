@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import importlib
 import inspect
 import os
 import time
@@ -41,6 +42,7 @@ class VllmEndpoint:
 class VllmResponse:
     hidden_states_path: str
     endpoint_url: str
+    generated_token_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,7 @@ class RawVllmFeature:
     temporary_path: str
     endpoint_url: str
     byte_size: int
+    generated_token_ids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -89,6 +92,51 @@ async def request_prefill(
     return VllmResponse(os.fspath(path), endpoint.base_url)
 
 
+async def request_generate(
+    endpoint: VllmEndpoint,
+    client: Any,
+    prompt_token_ids: list[int],
+    *,
+    model: str,
+    max_tokens: int,
+    timeout: float,
+) -> VllmResponse:
+    """Generate a response and request hidden states for prompt and output tokens."""
+
+    response = await client.completions.create(
+        model=model,
+        prompt=prompt_token_ids,
+        max_tokens=max_tokens,
+        extra_body={
+            "return_token_ids": True,
+            "kv_transfer_params": {"include_output_tokens": True},
+        },
+        timeout=timeout,
+    )
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        raise ValueError("vLLM generation response has no choices")
+    actual_prompt = getattr(choices[0], "prompt_token_ids", None)
+    if actual_prompt is not None and list(actual_prompt) != prompt_token_ids:
+        raise ValueError("vLLM generation prompt_token_ids mismatch")
+    generated = getattr(choices[0], "token_ids", None)
+    if not isinstance(generated, (list, tuple)) or not generated:
+        raise ValueError(
+            "vLLM generation response missing token_ids; enable return_token_ids support"
+        )
+    params = getattr(response, "kv_transfer_params", None)
+    if not isinstance(params, Mapping):
+        raise ValueError("vLLM generation response missing kv_transfer_params")
+    path = params.get("hidden_states_path")
+    if not path:
+        raise ValueError("vLLM generation response missing hidden_states_path")
+    return VllmResponse(
+        os.fspath(path),
+        endpoint.base_url,
+        tuple(int(token_id) for token_id in generated),
+    )
+
+
 def load_hidden_state_result(response: VllmResponse) -> RawVllmFeature:
     try:
         from safetensors.torch import load_file
@@ -103,6 +151,7 @@ def load_hidden_state_result(response: VllmResponse) -> RawVllmFeature:
         temporary_path=str(path),
         endpoint_url=response.endpoint_url,
         byte_size=int(path.stat().st_size),
+        generated_token_ids=response.generated_token_ids,
     )
 
 
@@ -160,19 +209,35 @@ class VllmFeatureClientPool:
         ]
 
     async def prefill(self, request: Any) -> RawVllmFeature:
+        return await self._request(request, generate=False)
+
+    async def generate(self, request: Any) -> RawVllmFeature:
+        return await self._request(request, generate=True)
+
+    async def _request(self, request: Any, *, generate: bool) -> RawVllmFeature:
         if not self._states:
             raise RuntimeError("VllmFeatureClientPool.start() must be called first")
         state = choose_endpoint(self._states)
         state.inflight += 1
         try:
             async with self._global_semaphore, state.semaphore:
-                response = await request_prefill(
-                    state.endpoint,
-                    state.client,
-                    list(request.prompt_token_ids),
-                    model=self.model,
-                    timeout=self.request_timeout,
-                )
+                if generate:
+                    response = await request_generate(
+                        state.endpoint,
+                        state.client,
+                        list(request.prompt_token_ids),
+                        model=self.model,
+                        max_tokens=int(request.max_tokens),
+                        timeout=self.request_timeout,
+                    )
+                else:
+                    response = await request_prefill(
+                        state.endpoint,
+                        state.client,
+                        list(request.prompt_token_ids),
+                        model=self.model,
+                        timeout=self.request_timeout,
+                    )
                 raw = await asyncio.to_thread(load_hidden_state_result, response)
                 state.requests += 1
                 return raw
@@ -194,7 +259,7 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
     if not lock_path.exists():
         return
     try:
-        import fcntl
+        fcntl: Any = importlib.import_module("fcntl")
     except ImportError:
         # vLLM's file connector is Linux-only. Keep the old existence-based
         # fallback for dependency-light tests on other platforms.
@@ -233,4 +298,5 @@ __all__ = [
     "delete_temporary_result",
     "load_hidden_state_result",
     "request_prefill",
+    "request_generate",
 ]

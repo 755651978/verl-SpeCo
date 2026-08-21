@@ -1,11 +1,13 @@
 # 独立 vLLM Producer + TQ + DSpark Consumer 第一版方案
 
+Last updated: 08/21/2026
+
 ## 1. 第一版要实现什么
 
 只实现下面这条主链路：
 
 ```text
-包含 prompt + 预生成 response 的输入文件
+verl prompt-only 数据或包含 prompt + response 的输入文件
 → Producer 并发请求 vLLM prefill
 → Producer 将每条训练样本写入 TQ
 → Consumer 从同一个 TQ 取样本
@@ -25,7 +27,7 @@
 | Producer | 1 个进程 | 读文件、并发请求 vLLM、写 TQ |
 | Consumer | 1 个 torchrun 任务 | 多个 rank 从 TQ 取数并训练 DSpark |
 
-Producer 和 Consumer 不互相调用，也不通过 HTTP 或 Ray 传样本。二者先连接同一个 Ray 集群，再通过无参 `tq.init()` 找到同一个 TQ，最后使用 TQ KV API 读写样本。
+Producer 和 Consumer 不互相调用，也不通过 HTTP 或 Ray 传样本。二者先连接同一个 Ray 集群，再通过携带相同 native 配置的 `tq.init(config)` 找到同一个 TQ，最后使用 TQ KV API 读写样本。已有 Controller 时 TransferQueue 0.1.7 会忽略后续配置并只连接；若 Client 意外先初始化，同一配置可避免默认 backend 抢先生效。
 
 ## 2. 共同的数据约定
 
@@ -295,7 +297,7 @@ EOS 不进入训练 batch。Consumer 看到 EOS 后继续处理剩余 ready samp
 
 ### 3.1 已验证的 TQ 0.1.7 连接机制
 
-`TransferQueue==0.1.7` 没有提供“把 Controller 地址直接传给第二个进程”的高层连接接口。它的无参 `tq.init()` 内部执行：
+`TransferQueue==0.1.7` 没有提供“把 Controller 地址直接传给第二个进程”的高层连接接口。`tq.init(config)` 会先尝试以下已有 Controller 连接逻辑；存在时忽略传入配置，不存在时才用配置创建服务：
 
 ```python
 _TQ_CONTROLLER = ray.get_actor("TransferQueueController")
@@ -309,8 +311,8 @@ _maybe_create_tq_client(conf)
 
 ```text
 TQ owner：ray.init(address) → tq.init(full_tq_config) → 创建 named Controller
-Producer：ray.init(address) → tq.init() → ray.get_actor() → 创建本地 TQ client
-Consumer rank 0..N：ray.init(address) → tq.init() → ray.get_actor() → 创建各自 TQ client
+Producer：ray.init(address) → tq.init(same config) → ray.get_actor() → 创建本地 TQ client
+Consumer rank 0..N：ray.init(address) → tq.init(same config) → ray.get_actor() → 创建各自 TQ client
 ```
 
 ### 3.2 直接移植并扩展 PR #48 的 bridge
@@ -370,7 +372,7 @@ def close_transfer_queue_owner() -> None: ...
 
 - 由 Producer 和每个 Consumer rank 调用；
 - 前置条件是当前进程已经连接 Ray；
-- 调用无参 `tq.init()`，通过 `ray.get_actor("TransferQueueController")` 发现 owner；
+- 调用 `tq.init(same native config)`，通过 `ray.get_actor("TransferQueueController")` 发现 owner；已有 Controller 时配置会被忽略，意外抢先时则以相同配置创建；
 - 只创建当前进程的 TQ client，不创建新的 Controller；
 - 成功后设置 `_state.initialized=True`；重复调用直接返回。
 
@@ -466,8 +468,8 @@ Owner 必须常驻。TQ 0.1.7 创建 Controller 时没有设置 `lifetime="detac
 3. 启动 TQ owner；owner 连接 Ray并调用 tq.init(full config)
 4. 等待 owner_ready
 5. 启动一个或多个 vLLM servers
-6. 启动 Consumer；每个 torchrun rank 连接 Ray，然后 tq.init()
-7. 启动 Producer；连接 Ray，然后 tq.init()
+6. 启动 Consumer；每个 torchrun rank 连接 Ray，然后 tq.init(same native config)
+7. 启动 Producer；连接 Ray，然后 tq.init(same native config)
 8. Producer 写 EOS，关闭本地 client并退出
 9. Consumer drain、保存 final checkpoint，所有 ranks 关闭本地 client并退出
 10. 给 TQ owner 发送 SIGTERM；仅 owner 执行 tq.close()
@@ -488,7 +490,7 @@ Owner 必须常驻。TQ 0.1.7 创建 Controller 时没有设置 `lifetime="detac
 → 初始化多个 vLLM endpoint clients
 → 流式读取输入文件
 → 为每条输入分配 sequence_no/sample_id
-→ 拼接 prompt+预生成 response，得到 input_ids/loss_mask
+→ 缺少 response 时由 target vLLM 生成；构造 input_ids/loss_mask
 → 并发请求 vLLM prefill
 → 读取 vLLM hidden-state 临时结果
 → 转换成 DSpark DraftFeatureSample
@@ -595,7 +597,7 @@ class InputRecord:
     sequence_no: int
     sample_id: str
     prompt: str
-    response: str
+    response: str | None
     source_metadata: dict[str, Any]
 
 def iter_input_records(path: str) -> Iterator[InputRecord]: ...
@@ -603,7 +605,7 @@ def tokenize_record(record: InputRecord, tokenizer, config) -> TokenizedRequest:
 def build_loss_mask(input_ids: Tensor, prompt_length: int) -> Tensor: ...
 ```
 
-`iter_input_records()` 流式读取，不把全文件载入内存；在这里按文件顺序分配稳定的 `sequence_no`。`tokenize_record()` 拼接已经存在的 prompt/response，不调用模型生成 response；输出至少包含 `input_ids:int64[L]`、`position_ids:int64[L]`、`loss_mask:float32[L]` 和请求 vLLM 所需字段。
+`iter_input_records()` 流式读取 JSONL/Parquet，不把全文件载入内存，并按文件顺序分配稳定的 `sequence_no`。已有 response 时 `tokenize_record()` 直接拼接；prompt-only verl 数据通过 chat template 编码后由 target vLLM 生成 response，并设置 `include_output_tokens=true` 同步提取输出 hidden states。
 
 #### `verl_speco/producer/vllm_feature_client.py`
 

@@ -1,10 +1,11 @@
 # Standalone vLLM → TransferQueue Producer
 
-Last updated: 08/20/2026
+Last updated: 08/21/2026
 
-本文解释这次新增的 standalone Producer：它读取已经有 `prompt` 和
-`response` 的 JSONL，向 vLLM 请求 target hidden states，并把每条样本写到
-已存在的 TransferQueue（TQ）。它不启动 TQ owner，也不启动 Consumer/训练。
+本文解释 standalone Producer：它可以直接读取 verl 的 prompt-only Parquet（包括
+DAPO-Math-17k 的 chat-message `prompt`），也兼容已有 `prompt`/`response` 的 JSONL
+或 Parquet。缺少 response 时由 target vLLM 生成，并在同一请求中提取 prompt 与
+output hidden states，之后把样本写到已存在的 TransferQueue（TQ）。
 
 这条路径面向第一版 DSpark standalone 训练：Producer、TQ owner 和 Consumer
 是三个独立 OS 进程；Ray 只用于让它们找到同一个 TQ Controller，hidden states
@@ -25,7 +26,7 @@ Producer 补上这一段，不引入第二套协议或 feature store。
 ## 数据流
 
 ```text
-prompt/response JSONL
+verl prompt Parquet 或 prompt/response JSONL/Parquet
   │
   │  按文件顺序分配 sequence_no 和 sample_id
   ▼
@@ -49,8 +50,10 @@ Ray head、TQ Controller 或 storage backend；这些由 `verl-speco-tq-owner` �
 
 ## 输入文件
 
-输入只能是 JSONL：每个非空行是一个 JSON object，必须有字符串 `prompt` 与非空
-字符串 `response`。
+输入可以是 JSONL 或 Parquet。`prompt` 可以是字符串，也可以是 verl 常用的
+`[{"role": ..., "content": ...}]` chat-message 列表。`response` 是可选字符串：
+存在时直接 replay；不存在时由 target vLLM 生成。Parquet 通过
+`data.train_files` 直接传入，不需要转换。
 
 ```json
 {"sample_id":"train-000017","prompt":"Question: 1 + 1 = ","response":"2"}
@@ -59,6 +62,9 @@ Ray head、TQ Controller 或 storage backend；这些由 `verl-speco-tq-owner` �
 
 - `sequence_no` 按非空行的文件顺序从 0 分配；并发完成顺序不会影响它。
 - `sample_id` 可选；省略时生成 `train-000000`、`train-000001` 等稳定值。
+- verl 数据的 `extra_info.index` 存在时会优先作为稳定 `sample_id`。
+- chat-message prompt 通过 target tokenizer 的 `apply_chat_template()` 编码，并加上
+  generation prompt；不能把 `reward_model.ground_truth` 当作模型 response。
 - Producer tokenize `prompt` 和 `prompt + response`。后者必须以 prompt 的 token IDs
   为前缀；否则会报错，而不会猜测 response 的 loss-mask 边界。
 - `loss_mask` 中 prompt token 为 0，response token 为 1。
@@ -69,12 +75,16 @@ Ray head、TQ Controller 或 storage backend；这些由 `verl-speco-tq-owner` �
 
 ## vLLM 与 hidden states
 
-Producer 使用 OpenAI-compatible completions API：
+对已有 response，Producer 使用 OpenAI-compatible completions API 做 prefill。
+对 prompt-only 数据，Producer 在一次请求中生成 response 并要求保存输出 hidden：
 
 ```text
-prompt=<token IDs>
-max_tokens=1
-extra_body={"return_token_ids": true}
+prompt=<chat-template token IDs>
+max_tokens=<内部有界长度>
+extra_body={
+  "return_token_ids": true,
+  "kv_transfer_params": {"include_output_tokens": true}
+}
 ```
 
 响应必须同时满足：
@@ -151,7 +161,7 @@ vLLM 请求会暂停，等待 Consumer 清理已成功训练的 key。
 
 | 字段 | 含义 |
 | --- | --- |
-| `input_path` | 上述 JSONL 文件 |
+| `input_path` | 上述 JSONL 或 Parquet 文件 |
 | `tokenizer_path` / `tokenizer_fingerprint` | 用于 tokenization 和 Consumer 合同校验 |
 | `target_model_id` / `target_model_revision` | target checkpoint 身份 |
 | `target_layer_ids` | auxiliary target layer IDs；DSpark L1 时 wire metadata 会额外写 `-1` 表示 final layer |
@@ -189,10 +199,15 @@ verl-speco-tq-producer \
 
 完整生命周期顺序仍是：Ray/TQ backend → TQ owner → Consumer → Producer → Consumer
 drain → owner shutdown。Producer 完成不代表训练完成，EOS 只表示不会再有新样本。
+正式独立训练入口
+`examples/run_qwen3-8b_drafter_separate_training.sh` 会通过
+`verl_speco.standalone_tq_training_launcher` 自动管理这套生命周期；上面的 Producer
+脚本仅用于单独调试 Producer。
 
 ## 测试覆盖与未验证项
 
-新增测试覆盖：JSONL 解析与 token 边界、多个 endpoint 的并发限制、ready 队列背压、
+新增测试覆盖：JSONL/真实 Parquet 解析、DAPO chat prompt、target response generation、
+token 边界、多个 endpoint 的并发限制、ready 队列背压、
 成功时 sample 后 EOS 与临时文件删除、失败时无 EOS 且保留临时文件，以及旧 EAGLE3
 转换路径仍可复用公共函数。
 

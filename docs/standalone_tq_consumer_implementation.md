@@ -1,5 +1,7 @@
 # 独立 DSpark 训练 TQ Consumer 实现说明
 
+Last updated: 08/21/2026
+
 ## 1. 文档范围和当前结论
 
 本文只说明当前仓库中已经实现的独立训练 Consumer。这里的 Consumer 是由 `torchrun` 启动的 DSpark 草稿模型训练任务：它持续从 TransferQueue（下文简称 TQ）发现样本，各训练 rank 分别取得自己负责的 Tensor，复用原有 DSpark 训练逻辑完成一次 optimizer step，然后由 rank 0 删除这一整个 global batch 对应的 TQ 记录。
@@ -146,7 +148,7 @@ connect_ray_cluster(ray_address, ray_namespace)
 connect_transfer_queue_client()
 ```
 
-`connect_ray_cluster()` 内部调用 `ray.init(address=..., namespace=...)`。`connect_transfer_queue_client()` 再调用无参数 `tq.init()`；TQ 由此在当前 Ray namespace 查找 Owner 创建的 named Controller。之后所有 KV 操作都显式携带相同的 `partition_id`。
+`connect_ray_cluster()` 内部调用 `ray.init(address=..., namespace=...)`。`connect_transfer_queue_client()` 再使用与 Owner 相同的 native 配置调用 `tq.init(config)`；TQ 会优先在当前 Ray namespace 查找 Owner 创建的 named Controller，找到时忽略本次配置并只创建本地 Client。即使 Client 意外先于 Owner 初始化，也会使用同一份 backend/controller 配置，而不会按默认配置创建服务。之后所有 KV 操作都显式携带相同的 `partition_id`。
 
 因此，“连接同一个 TQ”实际由三层身份共同决定：同一 Ray 集群、同一 namespace 下的同一 named Controller、同一 `partition_id`。
 
@@ -366,7 +368,7 @@ TQ store 被限定为 `read_only=True`，意思是它是训练 Consumer source�
 ```text
 configure_transfer_queue
 → ray.init(address, namespace)
-→ tq.init() 连接 named Controller
+→ tq.init(same native config) 连接 named Controller
 → 本 rank 设置 _connected=True
 ```
 

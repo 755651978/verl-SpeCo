@@ -1,3 +1,17 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """TransferQueue bridge for SPECO drafter feature transport.
 
 This module lets SPECO route large per-sample drafter-training tensors (hidden
@@ -51,7 +65,6 @@ try:
 
     _TQ_IMPORTABLE = True
 except ImportError:
-
     _TQ_IMPORTABLE = False
 
     class KVBatchMeta:  # type: ignore[no-redef]
@@ -78,12 +91,12 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _state_lock = threading.Lock()
-_state = {
-    "enabled": False,        # config says enable=true
-    "configured": False,     # configure_transfer_queue has run
-    "initialized": False,    # tq.init() has run in this process
-    "config": None,          # the transfer_queue sub-config (plain dict)
-    "owner": False,          # this process created the task-level TQ system
+_state: dict[str, Any] = {
+    "enabled": False,  # config says enable=true
+    "configured": False,  # configure_transfer_queue has run
+    "initialized": False,  # tq.init() has run in this process
+    "config": None,  # the transfer_queue sub-config (plain dict)
+    "owner": False,  # this process created the task-level TQ system
     "ray_initialized_here": False,
     "ray_address": None,
     "ray_namespace": None,
@@ -214,7 +227,9 @@ def connect_transfer_queue_client() -> None:
     if not _TQ_IMPORTABLE:
         raise RuntimeError("TransferQueue==0.1.7 is required to connect a TQ client")
     if not bool(_state["enabled"]):
-        raise RuntimeError("configure_transfer_queue() must enable TQ before client connect")
+        raise RuntimeError(
+            "configure_transfer_queue() must enable TQ before client connect"
+        )
     _ensure_initialized()
 
 
@@ -223,8 +238,9 @@ def init_transfer_queue(config: Any) -> bool:
 
     Mirrors verl ``main_ppo_sync`` calling ``tq.init(config.transfer_queue)``
     in the TaskRunner before workers spawn. Other Ray processes lazily call
-    ``tq.init()`` and connect to the named TransferQueue controller. Returns
-    whether TQ is usable; no-op (returns False) when disabled or not installed.
+    ``tq.init(config)`` with the same native configuration and connect to the
+    named TransferQueue controller. Returns whether TQ is usable; no-op
+    (returns False) when disabled or not installed.
     """
 
     tq_cfg = _extract_tq_config(_drafter_training_cfg(config))
@@ -236,7 +252,10 @@ def init_transfer_queue(config: Any) -> bool:
         _state["enabled"] = True
         _state["initialized"] = True
         _state["owner"] = True
-    logger.info("[SpeCo TQ] TransferQueue bootstrapped in task runner (partition=%s)", _SPECO_TQ_PARTITION)
+    logger.info(
+        "[SpeCo TQ] TransferQueue bootstrapped in task runner (partition=%s)",
+        _SPECO_TQ_PARTITION,
+    )
     return True
 
 
@@ -248,11 +267,13 @@ def _drafter_training_cfg(config: Any) -> Any:
 
 
 def _ensure_initialized() -> None:
-    """Lazily ``tq.init()`` once per worker process (mirrors verl TQ_INITIALIZED).
+    """Lazily ``tq.init(config)`` once per worker process.
 
-    A no-argument initialization discovers the named TransferQueue controller
-    on the connected Ray cluster. It deliberately does not create a separate
-    per-worker configuration.
+    TransferQueue 0.1.7 first tries to discover the named controller and ignores
+    the supplied configuration when one already exists. Supplying the same
+    native configuration in every process is therefore safe for ordinary
+    clients and also prevents an unexpectedly early client from creating a
+    default-configured controller.
     """
 
     if _state["initialized"]:
@@ -260,7 +281,12 @@ def _ensure_initialized() -> None:
     with _state_lock:
         if _state["initialized"]:
             return
-        tq.init()
+        configured = _state.get("config")
+        if not isinstance(configured, Mapping):
+            raise RuntimeError(
+                "configure_transfer_queue() must provide TQ configuration before init"
+            )
+        tq.init(_as_tq_config(_native_tq_config(configured)))
         _state["initialized"] = True
 
 
@@ -301,6 +327,7 @@ def _partition_id() -> str:
 # ---------------------------------------------------------------------------
 # Key / put / get / close
 # ---------------------------------------------------------------------------
+
 
 def make_sample_key(global_step: Any, replica_rank: Any, request_id: Any) -> str:
     """Build a deterministic, cluster-unique key for one drafter sample.
@@ -377,7 +404,9 @@ def list_samples() -> dict[str, dict[str, Any]]:
     # 0.1.7 returns key -> tag when partition_id is supplied.  Accept the
     # partition -> (key -> tag) wrapper as well to keep the bridge version-safe.
     nested = result.get(_partition_id())
-    if isinstance(nested, Mapping) and all(isinstance(v, Mapping) for v in nested.values()):
+    if isinstance(nested, Mapping) and all(
+        isinstance(v, Mapping) for v in nested.values()
+    ):
         result = nested
     records: dict[str, dict[str, Any]] = {}
     for key, tag in result.items():
@@ -386,7 +415,9 @@ def list_samples() -> dict[str, dict[str, Any]]:
         elif isinstance(tag, Mapping):
             records[str(key)] = dict(tag)
         else:
-            raise TypeError(f"TQ tag for key {key!r} must be a mapping, got {type(tag)!r}")
+            raise TypeError(
+                f"TQ tag for key {key!r} must be a mapping, got {type(tag)!r}"
+            )
     return records
 
 

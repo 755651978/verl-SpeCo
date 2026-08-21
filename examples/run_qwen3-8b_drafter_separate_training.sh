@@ -1,120 +1,42 @@
+#!/usr/bin/env bash
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 set -euo pipefail
 set -x
 
-# GPU smoke example for separate EAGLE3 draft model training.
-#
-# Stage 1 collects draft-training features from a short PPO/vLLM run without
-# training the drafter inside PPO. Stage 2 launches independent multi-GPU draft
-# training with python -m verl_speco.draft_train_launcher, which internally
-# starts torch.distributed.run.
-#
-# Usage:
-#   bash examples/run_qwen3-8b_drafter_separate_training.sh
-#   RUN_STAGE=collect bash examples/run_qwen3-8b_drafter_separate_training.sh
-#   RUN_STAGE=train bash examples/run_qwen3-8b_drafter_separate_training.sh
+# One-command standalone DSpark draft-model training. The launcher internally
+# starts the hidden-state target vLLM and uses the
+# Producer -> TransferQueue -> Consumer path.
 
-project_name='verl_grpo_example_eagle3_drafter'
-exp_name='qwen3_8b_eagle3_separate_drafter_vllm_gpu'
+project_name=verl_dspark_drafter
+exp_name=qwen3_8b_dspark_separate_training
 
-gen_tp=2
-train_sp=1
-ppo_gpus_per_node=8
 draft_train_gpus_per_node=8
-ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
-ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-eagle3-drafter
-FEATURE_STORE_DIR=/path/to/speco/eagle3_features
-DRAFT_CKPTS_DIR=/path/to/speco/eagle3_draft_ckpts
+MODEL_PATH=/path/to/Qwen3-8B
+# Ordinary verl prompt Parquet is supported; target vLLM generates responses.
+TRAIN_FILE=/path/to/train_file.parquet
+DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+DRAFT_CKPTS_DIR=/path/to/dspark_draft_checkpoints
 
-RUN_STAGE=${RUN_STAGE:-both}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 
-if [ "${RUN_STAGE}" = "both" ] || [ "${RUN_STAGE}" = "collect" ]; then
-PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
-    algorithm.adv_estimator=grpo \
-    ray_kwargs.ray_init.num_cpus=${ray_num_cpus} \
-    +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \
-    +ray_kwargs.ray_init._system_config.num_workers_soft_limit=${ray_worker_soft_limit} \
-    data.train_files=${TRAIN_FILE} \
-    data.val_files=${TEST_FILE} \
-    data.train_batch_size=64 \
-    data.max_prompt_length=512 \
-    data.max_response_length=8192 \
-    data.filter_overlong_prompts=True \
-    data.filter_overlong_prompts_workers=256 \
-    data.truncation='error' \
-    actor_rollout_ref.model.path=${MODEL_PATH} \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.calculate_entropy=False \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${train_sp} \
-    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${train_sp} \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
-    actor_rollout_ref.rollout.n=5 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.rollout.drafter.enable=True \
-    actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
-    actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
-    actor_rollout_ref.rollout.drafter.speculative_algorithm="EAGLE3" \
-    actor_rollout_ref.rollout.drafter.training.mode=collect_only \
-    actor_rollout_ref.rollout.drafter.training.feature_store.type=torch_shard \
-    actor_rollout_ref.rollout.drafter.training.feature_store.path=${FEATURE_STORE_DIR} \
-    actor_rollout_ref.rollout.drafter.training.feature_store.max_samples_per_shard=256 \
-    actor_rollout_ref.rollout.drafter.training.feature_store.flush_interval_steps=1 \
-    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=True \
-    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
-    actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
-    actor_rollout_ref.rollout.drafter.training.use_logits=False \
-    actor_rollout_ref.rollout.drafter.rollout.spec_steps=3 \
-    actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
-    actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=4 \
-    actor_rollout_ref.rollout.drafter.training.step=20 \
-    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=1 \
-    actor_rollout_ref.rollout.drafter.training.training_interval_steps=1 \
-    actor_rollout_ref.rollout.drafter.training.publish_interval_steps=0 \
-    actor_rollout_ref.rollout.drafter.training.publish_async=False \
-    actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
-    actor_rollout_ref.rollout.load_format="auto" \
-    actor_rollout_ref.actor.strategy=fsdp2 \
-    algorithm.use_kl_in_reward=False \
-    trainer.val_before_train=False \
-    trainer.critic_warmup=0 \
-    trainer.logger='["console"]' \
-    trainer.project_name=${project_name} \
-    trainer.experiment_name=${exp_name}_collect \
-    trainer.n_gpus_per_node=${ppo_gpus_per_node} \
-    trainer.nnodes=1 \
-    trainer.default_local_dir=${CKPTS_DIR} \
-    trainer.save_freq=20 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=1 $@
-fi
-
-if [ "${RUN_STAGE}" = "both" ] || [ "${RUN_STAGE}" = "train" ]; then
-PYTHONUNBUFFERED=1 python3 -m verl_speco.draft_train_launcher \
+PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher \
     speco.draft_training.num_gpus_per_node=${draft_train_gpus_per_node} \
     speco.draft_training.nnodes=1 \
     speco.draft_training.standalone=True \
+    data.train_files=${TRAIN_FILE} \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
@@ -124,7 +46,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
     actor_rollout_ref.rollout.drafter.checkpoint_path=${DRAFT_CKPTS_DIR} \
-    actor_rollout_ref.rollout.drafter.speculative_algorithm="EAGLE3" \
+    actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
     actor_rollout_ref.rollout.drafter.training.mode=offline \
     actor_rollout_ref.rollout.drafter.training.max_steps=10 \
     actor_rollout_ref.rollout.drafter.training.save_interval_steps=5 \
@@ -133,9 +55,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.draft_train_launcher \
     actor_rollout_ref.rollout.drafter.training.lr_warmup_steps=0 \
     actor_rollout_ref.rollout.drafter.training.warmup_style=constant \
     actor_rollout_ref.rollout.drafter.training.use_logits=False \
-    actor_rollout_ref.rollout.drafter.training.feature_store.type=torch_shard \
-    actor_rollout_ref.rollout.drafter.training.feature_store.path=${FEATURE_STORE_DIR} \
-    actor_rollout_ref.rollout.drafter.training.feature_store.shuffle=True \
-    actor_rollout_ref.rollout.drafter.training.feature_store.repeat=True \
-    actor_rollout_ref.rollout.drafter.training.feature_store.strict_schema=True $@
-fi
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${exp_name} \
+    "$@"

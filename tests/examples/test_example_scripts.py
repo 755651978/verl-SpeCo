@@ -22,6 +22,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = sorted((ROOT / "examples").glob("*.sh"))
+PPO_EXAMPLES = [
+    script
+    for script in EXAMPLES
+    if not script.name.endswith("_separate_training.sh")
+    and script.name != "run_dspark_tq_producer.sh"
+]
 
 
 def _require_working_bash() -> str:
@@ -40,7 +46,7 @@ def test_example_shell_syntax_is_valid(script: Path) -> None:
     subprocess.run([bash, "-n", str(script)], check=True)
 
 
-@pytest.mark.parametrize("script", EXAMPLES, ids=lambda path: path.name)
+@pytest.mark.parametrize("script", PPO_EXAMPLES, ids=lambda path: path.name)
 def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
     script: Path,
 ) -> None:
@@ -60,6 +66,35 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
         "actor_rollout_ref.rollout.drafter.training.training_interval_steps=" in source
     )
     assert "actor_rollout_ref.rollout.drafter.training.publish_async=" in source
+
+
+def test_standalone_tq_training_example_uses_unified_launcher() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_drafter_separate_training.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "-m verl_speco.standalone_tq_training_launcher" in source
+    assert "data.train_files=${TRAIN_FILE}" in source
+    assert "actor_rollout_ref.rollout.drafter.enable=True" in source
+    assert "actor_rollout_ref.rollout.drafter.enable_drafter_training=True" in source
+    assert "actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH}" in source
+    assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK" in source
+
+
+def test_standalone_tq_compatibility_example_delegates_to_formal_entry() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_drafter_dspark_separate_training.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'run_qwen3-8b_drafter_separate_training.sh" "$@"' in source
+
+
+def test_standalone_tq_producer_example_uses_producer_entrypoint() -> None:
+    source = (ROOT / "examples" / "run_dspark_tq_producer.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "-m verl_speco.standalone_tq_producer" in source
 
 
 def test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches() -> None:

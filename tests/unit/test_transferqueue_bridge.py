@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -144,7 +143,13 @@ def test_client_put_list_get_many_clear_and_local_close(fake_runtime) -> None:
     assert bridge.configure_transfer_queue(_config())
     bridge.connect_ray_cluster("ray-head:6379", "speco-drafter")
     bridge.connect_transfer_queue_client()
-    assert fake_tq.init_calls == [None]
+    native = bridge._to_plain_dict(fake_tq.init_calls[0])
+    assert set(native) == {"controller", "backend"}
+    assert native["backend"]["storage_backend"] == "SimpleStorage"
+    assert native["backend"]["SimpleStorage"] == {
+        "total_storage_size": 16,
+        "num_data_storage_units": 1,
+    }
 
     bridge.put_sample(
         "k0",

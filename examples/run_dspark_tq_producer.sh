@@ -23,12 +23,17 @@ set -euo pipefail
 : "${TOKENIZER_FINGERPRINT:?Set TOKENIZER_FINGERPRINT to a verified fingerprint}"
 : "${TARGET_LAYER_IDS:?Set TARGET_LAYER_IDS as a Hydra list, for example '[2,8,14,20,26]'}"
 : "${VLLM_ENDPOINTS:?Set VLLM_ENDPOINTS as a Hydra list, for example '[http://node0:8000/v1]'}"
+PYTHON_BIN=${PYTHON_BIN:-python3}
+TQ_NAMESPACE=${TQ_NAMESPACE:-speco-drafter}
+TQ_PARTITION_ID=${TQ_PARTITION_ID:-speco_drafter_features}
+VLLM_MODEL=${VLLM_MODEL:-${TARGET_MODEL_PATH}}
 
-python -m verl_speco.standalone_tq_producer \
+exec "${PYTHON_BIN}" -m verl_speco.standalone_tq_producer \
   actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
   actor_rollout_ref.rollout.drafter.training.transfer_queue.enable=true \
   actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address="${RAY_ADDRESS}" \
-  actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.namespace=speco-drafter \
+  actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.namespace="${TQ_NAMESPACE}" \
+  actor_rollout_ref.rollout.drafter.training.transfer_queue.partition_id="${TQ_PARTITION_ID}" \
   actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id="${SPECO_TQ_RUN_ID}" \
   speco.standalone_tq_producer.input_path="${PRODUCER_INPUT_PATH}" \
   speco.standalone_tq_producer.target_model_id="${TARGET_MODEL_PATH}" \
@@ -37,4 +42,5 @@ python -m verl_speco.standalone_tq_producer \
   speco.standalone_tq_producer.tokenizer_fingerprint="${TOKENIZER_FINGERPRINT}" \
   speco.standalone_tq_producer.target_layer_ids="${TARGET_LAYER_IDS}" \
   speco.standalone_tq_producer.vllm_endpoints="${VLLM_ENDPOINTS}" \
-  speco.standalone_tq_producer.vllm_model="${TARGET_MODEL_PATH}"
+  speco.standalone_tq_producer.vllm_model="${VLLM_MODEL}" \
+  "$@"

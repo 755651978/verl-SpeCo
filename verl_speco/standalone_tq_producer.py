@@ -27,8 +27,11 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
 from verl_speco.producer.input_reader import (
+    GenerationRequest,
     TokenizedRequest,
+    finalize_generated_request,
     iter_input_records,
+    prepare_generation_request,
     tokenize_record,
 )
 from verl_speco.producer.vllm_feature_client import (
@@ -135,6 +138,7 @@ def validate_producer_config(config: Any) -> None:
         "input_queue_size",
         "publish_queue_size",
         "max_pending_samples",
+        "generation_max_tokens",
     )
     invalid = [name for name in positive_fields if int(producer_cfg.get(name, 0)) <= 0]
     if invalid:
@@ -210,7 +214,11 @@ async def run_producer(
 
         async def read_inputs() -> None:
             for record in iter_input_records(str(producer_cfg["input_path"])):
-                request = tokenize_record(record, tokenizer, producer_cfg)
+                request = (
+                    prepare_generation_request(record, tokenizer, producer_cfg)
+                    if record.response is None
+                    else tokenize_record(record, tokenizer, producer_cfg)
+                )
                 await input_queue.put(request)
                 stats.input_count += 1
             for _ in range(worker_count):
@@ -228,7 +236,16 @@ async def run_producer(
                     max_pending_samples=int(producer_cfg["max_pending_samples"]),
                     poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
                 )
-                raw = await pool.prefill(request)
+                if isinstance(request, GenerationRequest):
+                    raw = await pool.generate(request)
+                    request = finalize_generated_request(
+                        request,
+                        raw.payload.get("token_ids"),
+                        producer_cfg,
+                        expected_response_token_ids=raw.generated_token_ids,
+                    )
+                else:
+                    raw = await pool.prefill(request)
                 stats.pending_bytes += int(raw.byte_size)
                 sample = feature_from_vllm_payload(raw, request, feature_contract)
                 await publish_queue.put(
@@ -279,10 +296,12 @@ async def run_producer(
         )
         return stats
     finally:
-        if pool is not None:
-            await pool.close()
-        if connected:
-            transport.close_transfer_queue_client()
+        try:
+            if pool is not None:
+                await pool.close()
+        finally:
+            if connected:
+                transport.close_transfer_queue_client()
 
 
 async def _wait_for_owner_ready(

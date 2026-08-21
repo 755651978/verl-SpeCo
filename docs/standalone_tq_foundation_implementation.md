@@ -1,5 +1,7 @@
 # Standalone TQ 公共基础层实现说明
 
+Last updated: 08/21/2026
+
 ## 1. 文档范围和已验证结论
 
 本文解释当前仓库已经实现并测试通过的 TQ 公共基础层：
@@ -86,10 +88,10 @@ Controller 保存控制信息和数据位置；使用 MooncakeStore 时，大 te
 
 Owner、Producer、每个 Consumer rank 都在各自 OS 进程内拥有独立 TQ Client。
 
-普通 Client 通过无参：
+普通 Client 也传入相同的 native 配置：
 
 ```python
-tq.init()
+tq.init(native_config)
 ```
 
 发现 named Controller并初始化本进程的 storage manager。Client 不是 Ray actor，Producer 和 torchrun rank 也不需要改成 Ray actor。
@@ -194,7 +196,7 @@ drop_last
 → _native_tq_config()
 → controller/backend等TQ字段
 → OmegaConf DictConfig
-→ tq.init()
+→ tq.init(same native config)
 ```
 
 ## 4. Bridge 的进程内状态
@@ -364,10 +366,10 @@ connect_ray_cluster(ray_address, namespace)
 connect_transfer_queue_client()
 ```
 
-`connect_transfer_queue_client()` 最终调用无参：
+`connect_transfer_queue_client()` 最终调用：
 
 ```python
-tq.init()
+tq.init(same_native_config)
 ```
 
 TQ 0.1.7 内部通过：
@@ -573,7 +575,7 @@ bridge 执行：
 
 1. 检查 TQ 已启用；
 2. 丢弃 fields 中非 tensor 值；
-3. 确保本进程已经 `tq.init()`；
+3. 确保本进程已经使用相同 native 配置执行 `tq.init(config)`；
 4. 取得配置中的 partition；
 5. 调用：
 
@@ -886,7 +888,7 @@ bridge 测试 `tests/unit/test_transferqueue_bridge.py` 覆盖：
 
 1. Ray address/namespace 参数；
 2. Owner 只向 TQ 传原生配置；
-3. Client 无参 `tq.init()`；
+3. Client 使用相同 native 配置调用 `tq.init(config)`；
 4. put/list/get-many/clear；
 5. batch 返回顺序；
 6. Client close 不调用全局 close；
@@ -926,7 +928,7 @@ Client 路径：
 
 ```text
 连接同一个Ray
-→ tq.init()
+→ tq.init(same native config)
 → kv_list发现两个key
 → 一次kv_batch_get([k0,k1])
 → 拆成两个fields dict
@@ -966,7 +968,7 @@ Owner
 
 普通Client
 → ray.init(same address, same namespace)
-→ tq.init()
+→ tq.init(same native config)
 → 找到同一个Controller
 
 DraftFeatureSample + SampleMetadata

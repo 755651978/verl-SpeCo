@@ -1,5 +1,7 @@
 # verl-SpeCo TransferQueue 落地方案
 
+Last updated: 08/21/2026
+
 > 目标:在**不修改上游 verl**的前提下,把 SpeCo online 训练里的逐样本特征流
 > 从「`SpecoRayPPOTrainer` driver 中转 + Ray object store」改为「TransferQueue
 > 直传」,干掉 driver 这个数据瓶颈,并解锁流式消费与跨副本负载均衡。

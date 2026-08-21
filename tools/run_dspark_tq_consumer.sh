@@ -1,3 +1,17 @@
+#!/usr/bin/env bash
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 set -euo pipefail
 set -x
 
@@ -15,9 +29,10 @@ RAY_ADDRESS=${RAY_ADDRESS:-127.0.0.1:6379}
 TQ_NAMESPACE=${TQ_NAMESPACE:-speco-drafter}
 TQ_PARTITION_ID=${TQ_PARTITION_ID:-speco_drafter_features}
 SPECO_TQ_RUN_ID=${SPECO_TQ_RUN_ID:-dspark-standalone-run}
+PYTHON_BIN=${PYTHON_BIN:-python3}
 
 CUDA_VISIBLE_DEVICES=${TRAIN_DEVICES} PYTHONUNBUFFERED=1 \
-python3 -m verl_speco.draft_train_launcher \
+exec "${PYTHON_BIN}" -m verl_speco.draft_train_launcher \
   speco.draft_training.nproc_per_node=${TRAIN_GPUS} \
   speco.draft_training.nnodes=1 \
   actor_rollout_ref.model.path=${MODEL_PATH} \

@@ -1,22 +1,28 @@
 # verl-SpeCo 异步 vLLM → TransferQueue（Mooncake 后端）→ DSpark 流式训练方案
 
+Last updated: 08/21/2026
+
 ## 1. 文档范围
 
 本文只讨论当前 `verl-SpeCo-ls` 项目的独立草稿模型训练入口：
 
 ```text
 examples/run_qwen3-8b_drafter_separate_training.sh
-  → python -m verl_speco.draft_train_launcher
-  → torch.distributed.run
-  → python -m verl_speco.draft_train
-  → run_standalone_draft_training()
+  → python -m verl_speco.standalone_tq_training_launcher
+       ├─→ TransferQueue owner
+       ├─→ vLLM hidden-state producer
+       └─→ TransferQueue consumer
+            → python -m verl_speco.draft_train_launcher
+            → torch.distributed.run
+            → python -m verl_speco.draft_train
+            → run_standalone_draft_training()
 ```
 
 目标是训练 `mode=train/offline` 的草稿模型，不是 RL 与草稿模型一起训练，也不是先生成全量 hidden states 再长期保存到磁盘。
 
-输入文件已经包含提前生成好的 response。新流水线需要：
+输入既可以是已有 response 的 replay 文件，也可以是 verl prompt-only Parquet。新流水线需要：
 
-1. Producer 读取 prompt 和预生成 response，构造完整 token 序列；
+1. Producer 读取 prompt；缺少 response 时由 target vLLM 生成；
 2. Producer 并行请求一个或多个 vLLM endpoint 做 prefill；
 3. hidden states 写入 TransferQueue（简称 TQ），TQ 的数据后端使用 Mooncake；
 4. DSpark 的各训练 rank 从 TQ/Mooncake 并行读取自己的 local batch；
