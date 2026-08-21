@@ -566,9 +566,12 @@ clear 成功后才增加 `successful_steps`，然后复用原有 metrics 和 che
 ExpectedFeatureConfig(
     run_id=<当前训练 run_id>,
     schema_version=<当前 schema>,
-    algorithm="DSPARK",
 )
 ```
+
+TQ 会保留 Producer 写入的 `SampleMetadata.algorithm`，但不使用它选择训练 backend，
+也不额外与启动配置比较。与原有离线 feature-store 训练一致，实际 trainer/backend 只由
+`rollout.drafter.speculative_algorithm` 和既有 backend factory 决定。
 
 因此当前不会拿 Consumer 配置额外比较：
 
@@ -679,7 +682,10 @@ OWNER_CLOSED
 当前第一版有意不实现以下复杂能力：
 
 1. Producer 本身尚未在本次 Consumer 改动中实现。
-2. 只支持 `algorithm=DSPARK`。
+2. TQ 公共协议和 Consumer 已不再写死 `DSPARK`；当前测试 Producer、启动脚本和已验证的
+   feature 语义仍是 DSPARK。其他算法若能复用当前公共 dense fields，只需由对应 Producer
+   生成正确的 `DraftFeatureSample`；若字段结构不同，则在协议模块增加对应 codec，不需要改
+   TQ 的 key/tag 发现、rank 分配和 clear 流程。
 3. 只支持 `drop_last=true`。
 4. 不支持 TQ 与 `target_feature_pipeline.enabled=true` 同时开启。
 5. 不提供严格的 crash exactly-once 或 checkpoint/queue 联合恢复。

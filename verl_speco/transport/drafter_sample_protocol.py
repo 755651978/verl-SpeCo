@@ -77,10 +77,8 @@ class SampleMetadata:
             raise ValueError("SampleMetadata.sample_id must not be empty")
         if self.sequence_no < 0:
             raise ValueError("SampleMetadata.sequence_no must be non-negative")
-        if self.algorithm.strip().upper() != "DSPARK":
-            raise ValueError(
-                f"Standalone TQ protocol currently requires algorithm=DSPARK, got {self.algorithm!r}"
-            )
+        if not self.algorithm.strip():
+            raise ValueError("SampleMetadata.algorithm must not be empty")
         if len(self.hidden_shape) != 2:
             raise ValueError(
                 f"SampleMetadata.hidden_shape must be [rows, hidden_dim], got {self.hidden_shape!r}"
@@ -143,7 +141,7 @@ class ExpectedFeatureConfig:
 
     run_id: str
     schema_version: int = PROTOCOL_SCHEMA_VERSION
-    algorithm: str = "DSPARK"
+    algorithm: str | None = None
     target_model_id: str | None = None
     target_model_revision: str | None = None
     tokenizer_fingerprint: str | None = None
@@ -288,7 +286,11 @@ def _validate_expected(meta: SampleMetadata, expected: ExpectedFeatureConfig) ->
     checks = {
         "run_id": expected.run_id,
         "schema_version": expected.schema_version,
-        "algorithm": expected.algorithm.strip().upper(),
+        "algorithm": (
+            expected.algorithm.strip().upper()
+            if expected.algorithm is not None
+            else None
+        ),
         "target_model_id": expected.target_model_id,
         "target_model_revision": expected.target_model_revision,
         "tokenizer_fingerprint": expected.tokenizer_fingerprint,

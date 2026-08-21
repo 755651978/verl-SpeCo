@@ -66,24 +66,18 @@ class TQFeatureStore:
         if not self.run_id:
             raise ValueError("transfer_queue.run_id is required for a TQ Consumer")
         self.schema_version = int(self.config.get("schema_version", 1))
-        self.algorithm = str(self.config.get("algorithm", "DSPARK") or "DSPARK").upper()
-        if self.algorithm != "DSPARK":
-            raise ValueError(
-                f"Standalone TQ Consumer currently supports only DSPARK, got {self.algorithm!r}"
-            )
         ray_cfg = _plain_dict(self.config.get("ray") or {})
         self.ray_address = str(ray_cfg.get("address") or "").strip()
         self.ray_namespace = str(ray_cfg.get("namespace") or "").strip() or None
         if not self.ray_address:
             raise ValueError("transfer_queue.ray.address is required for a TQ Consumer")
         self._connected = False
-        # First version deliberately checks only run/protocol/algorithm. Tensor
+        # First version deliberately checks only run/protocol. Tensor
         # presence, lengths, shape and dtype self-consistency remain enforced by
         # decode_sample; model/tokenizer/layer identity checks stay disabled.
         self.expected_config = ExpectedFeatureConfig(
             run_id=self.run_id,
             schema_version=self.schema_version,
-            algorithm=self.algorithm,
         )
 
     @classmethod
@@ -112,8 +106,6 @@ class TQFeatureStore:
             if str(tag.get("run_id") or "") != expected_run_id:
                 continue
             if int(tag.get("schema_version", -1)) != self.schema_version:
-                continue
-            if str(tag.get("algorithm") or "").upper() != self.algorithm:
                 continue
             try:
                 int(tag["sequence_no"])
