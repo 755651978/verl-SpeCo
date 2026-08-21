@@ -1,0 +1,451 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Standalone vLLM target-feature Producer writing directly to TransferQueue."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Any, Mapping
+
+import torch
+
+from verl_speco.integration import transferqueue_bridge as default_transport
+from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
+)
+from verl_speco.producer.input_reader import (
+    TokenizedRequest,
+    iter_input_records,
+    tokenize_record,
+)
+from verl_speco.producer.vllm_feature_client import (
+    RawVllmFeature,
+    VllmEndpoint,
+    VllmFeatureClientPool,
+    delete_temporary_result,
+)
+from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.target_feature_replay import (
+    FeatureContract,
+    feature_from_vllm_payload,
+)
+from verl_speco.transport.drafter_sample_protocol import (
+    DRAFTER_TQ_PARTITION,
+    PROTOCOL_SCHEMA_VERSION,
+    SampleMetadata,
+    encode_sample,
+    make_eos_record,
+    make_ready_tag,
+    make_sample_key,
+)
+
+
+logger = logging.getLogger(__name__)
+_INPUT_DONE = object()
+_PUBLISH_DONE = object()
+
+
+@dataclass
+class ProducerStats:
+    input_count: int = 0
+    published_count: int = 0
+    failed_count: int = 0
+    pending_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class PreparedFeature:
+    request: TokenizedRequest
+    raw: RawVllmFeature
+    sample: DraftFeatureSample
+    metadata: SampleMetadata
+
+
+async def publish_one(result: PreparedFeature, transport: Any) -> str:
+    """Publish one sample and delete its temporary file only after TQ succeeds."""
+
+    key = make_sample_key(result.metadata)
+    fields = encode_sample(result.sample, result.metadata)
+    tag = make_ready_tag(result.metadata)
+    await asyncio.to_thread(transport.put_sample, key, fields, tag=tag)
+    delete_temporary_result(result.raw)
+    return key
+
+
+def validate_producer_config(config: Any) -> None:
+    producer_cfg, training_cfg, tq_cfg = _config_sections(config)
+    required = (
+        "input_path",
+        "tokenizer_path",
+        "tokenizer_fingerprint",
+        "target_model_id",
+        "target_model_revision",
+        "vllm_model",
+    )
+    missing = [name for name in required if not producer_cfg.get(name)]
+    if missing:
+        raise ValueError(f"standalone_tq_producer missing required fields: {missing}")
+    endpoints = producer_cfg.get("vllm_endpoints")
+    if not isinstance(endpoints, list) or not endpoints or not all(endpoints):
+        raise ValueError(
+            "standalone_tq_producer.vllm_endpoints must be a non-empty list"
+        )
+    target_layer_ids = producer_cfg.get("target_layer_ids")
+    if not isinstance(target_layer_ids, list) or not target_layer_ids:
+        raise ValueError(
+            "standalone_tq_producer.target_layer_ids must be a non-empty list"
+        )
+    if str(training_cfg.get("speculative_algorithm", "DSPARK")).upper() != "DSPARK":
+        raise ValueError("Standalone TQ Producer currently supports only DSPARK")
+    if bool(training_cfg.get("use_logits", False)):
+        raise ValueError("Standalone TQ Producer does not support use_logits=true")
+    if int(tq_cfg.get("schema_version", 0)) != PROTOCOL_SCHEMA_VERSION:
+        raise ValueError(
+            f"transfer_queue.schema_version must be {PROTOCOL_SCHEMA_VERSION}"
+        )
+    if tq_cfg.get("package_version") != "0.1.7":
+        raise ValueError("transfer_queue.package_version must be '0.1.7'")
+    if tq_cfg.get("partition_id") != DRAFTER_TQ_PARTITION:
+        raise ValueError(
+            f"transfer_queue.partition_id must be {DRAFTER_TQ_PARTITION!r}"
+        )
+    if not tq_cfg.get("run_id"):
+        raise ValueError("transfer_queue.run_id must not be empty")
+    ray_cfg = tq_cfg.get("ray") or {}
+    if not isinstance(ray_cfg, Mapping) or not ray_cfg.get("address"):
+        raise ValueError(
+            "transfer_queue.ray.address must point to a running Ray cluster"
+        )
+    positive_fields = (
+        "max_inflight_requests",
+        "per_endpoint_concurrency",
+        "input_queue_size",
+        "publish_queue_size",
+        "max_pending_samples",
+    )
+    invalid = [name for name in positive_fields if int(producer_cfg.get(name, 0)) <= 0]
+    if invalid:
+        raise ValueError(f"standalone_tq_producer fields must be positive: {invalid}")
+
+
+async def run_producer(
+    config: Any,
+    *,
+    transport: Any = default_transport,
+    tokenizer: Any | None = None,
+    client_pool: Any | None = None,
+) -> ProducerStats:
+    """Run the bounded input -> vLLM -> TQ pipeline and publish EOS on success."""
+
+    validate_producer_config(config)
+    producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
+    run_id = str(tq_cfg["run_id"])
+    stats = ProducerStats()
+    connected = False
+    pool = client_pool
+    try:
+        if not transport.configure_transfer_queue(tq_cfg):
+            raise RuntimeError("Standalone TQ Producer requires TransferQueue==0.1.7")
+        ray_cfg = tq_cfg["ray"]
+        transport.connect_ray_cluster(
+            str(ray_cfg["address"]),
+            str(ray_cfg["namespace"]) if ray_cfg.get("namespace") else None,
+        )
+        transport.connect_transfer_queue_client()
+        connected = True
+        await _wait_for_owner_ready(
+            transport,
+            run_id,
+            timeout=float(producer_cfg["owner_ready_timeout_seconds"]),
+            poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
+        )
+
+        if tokenizer is None:
+            tokenizer = await asyncio.to_thread(_load_tokenizer, producer_cfg)
+        if pool is None:
+            endpoint_concurrency = int(producer_cfg["per_endpoint_concurrency"])
+            pool = VllmFeatureClientPool(
+                [
+                    VllmEndpoint(str(url).rstrip("/"), endpoint_concurrency)
+                    for url in producer_cfg["vllm_endpoints"]
+                ],
+                model=str(producer_cfg["vllm_model"]),
+                max_inflight_requests=int(producer_cfg["max_inflight_requests"]),
+                request_timeout=float(producer_cfg["request_timeout"]),
+            )
+        await pool.start()
+
+        feature_contract = FeatureContract(
+            algorithm="DSPARK",
+            target_layer_ids=[int(value) for value in producer_cfg["target_layer_ids"]],
+            hidden_states_layout=resolve_drafter_hidden_states_layout(
+                "DSPARK", drafter_cfg
+            ),
+            dtype=_parse_dtype(producer_cfg["hidden_dtype"]),
+            target_model_id=str(producer_cfg["target_model_id"]),
+            target_model_revision=str(producer_cfg["target_model_revision"]),
+            tokenizer_fingerprint=str(producer_cfg["tokenizer_fingerprint"]),
+            use_logits=False,
+        )
+        worker_count = int(producer_cfg["max_inflight_requests"])
+        input_queue: asyncio.Queue[Any] = asyncio.Queue(
+            maxsize=int(producer_cfg["input_queue_size"])
+        )
+        publish_queue: asyncio.Queue[Any] = asyncio.Queue(
+            maxsize=int(producer_cfg["publish_queue_size"])
+        )
+
+        async def read_inputs() -> None:
+            for record in iter_input_records(str(producer_cfg["input_path"])):
+                request = tokenize_record(record, tokenizer, producer_cfg)
+                await input_queue.put(request)
+                stats.input_count += 1
+            for _ in range(worker_count):
+                await input_queue.put(_INPUT_DONE)
+
+        async def request_worker() -> None:
+            while True:
+                request = await input_queue.get()
+                if request is _INPUT_DONE:
+                    await publish_queue.put(_PUBLISH_DONE)
+                    return
+                await _wait_for_pending_capacity(
+                    transport,
+                    run_id,
+                    max_pending_samples=int(producer_cfg["max_pending_samples"]),
+                    poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
+                )
+                raw = await pool.prefill(request)
+                stats.pending_bytes += int(raw.byte_size)
+                sample = feature_from_vllm_payload(raw, request, feature_contract)
+                await publish_queue.put(
+                    PreparedFeature(
+                        request=request,
+                        raw=raw,
+                        sample=sample,
+                        metadata=_sample_metadata(
+                            request, sample, feature_contract, run_id, tq_cfg
+                        ),
+                    )
+                )
+
+        async def publish_results() -> None:
+            finished_workers = 0
+            while finished_workers < worker_count:
+                result = await publish_queue.get()
+                if result is _PUBLISH_DONE:
+                    finished_workers += 1
+                    continue
+                await publish_one(result, transport)
+                stats.published_count += 1
+                stats.pending_bytes = max(
+                    stats.pending_bytes - int(result.raw.byte_size), 0
+                )
+
+        tasks = [asyncio.create_task(read_inputs())]
+        tasks.extend(asyncio.create_task(request_worker()) for _ in range(worker_count))
+        tasks.append(asyncio.create_task(publish_results()))
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        failure = next(
+            (task.exception() for task in done if task.exception() is not None), None
+        )
+        if failure is not None:
+            stats.failed_count += 1
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise failure
+        await asyncio.gather(*pending)
+
+        eos_key, eos_fields, eos_tag = make_eos_record(run_id, stats.published_count)
+        await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)
+        logger.info(
+            "Standalone TQ Producer completed inputs=%s published=%s",
+            stats.input_count,
+            stats.published_count,
+        )
+        return stats
+    finally:
+        if pool is not None:
+            await pool.close()
+        if connected:
+            transport.close_transfer_queue_client()
+
+
+async def _wait_for_owner_ready(
+    transport: Any,
+    run_id: str,
+    *,
+    timeout: float,
+    poll_interval: float,
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        records = await asyncio.to_thread(transport.list_samples)
+        if any(
+            tag.get("record_type") == "control"
+            and tag.get("status") == "owner_ready"
+            and tag.get("run_id") == run_id
+            for tag in records.values()
+        ):
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError(
+                f"Timed out waiting for TQ owner_ready for run_id={run_id!r}"
+            )
+        await asyncio.sleep(poll_interval)
+
+
+async def _wait_for_pending_capacity(
+    transport: Any,
+    run_id: str,
+    *,
+    max_pending_samples: int,
+    poll_interval: float,
+) -> None:
+    while True:
+        records = await asyncio.to_thread(transport.list_samples)
+        ready_count = sum(
+            1
+            for tag in records.values()
+            if tag.get("record_type") == "sample"
+            and tag.get("status") == "ready"
+            and tag.get("run_id") == run_id
+        )
+        if ready_count < max_pending_samples:
+            return
+        await asyncio.sleep(poll_interval)
+
+
+def _sample_metadata(
+    request: TokenizedRequest,
+    sample: DraftFeatureSample,
+    contract: FeatureContract,
+    run_id: str,
+    tq_cfg: Mapping[str, Any],
+) -> SampleMetadata:
+    hidden = sample.hidden_states
+    if not torch.is_tensor(hidden):
+        raise TypeError("Standalone TQ Producer requires dense hidden_states")
+    feature_start = int(sample.metadata["feature_start"])
+    feature_end = int(sample.metadata["feature_end"])
+    wire_layer_ids = list(contract.target_layer_ids)
+    if contract.hidden_states_layout == "dflash_aux_plus_last":
+        wire_layer_ids.append(-1)
+    return SampleMetadata(
+        schema_version=int(tq_cfg["schema_version"]),
+        run_id=run_id,
+        sample_id=request.sample_id,
+        sequence_no=request.sequence_no,
+        algorithm=contract.algorithm,
+        target_model_id=contract.target_model_id,
+        target_model_revision=str(contract.target_model_revision or ""),
+        tokenizer_fingerprint=contract.tokenizer_fingerprint,
+        target_layer_ids=wire_layer_ids,
+        hidden_states_layout=contract.hidden_states_layout,
+        hidden_dtype=str(hidden.dtype).removeprefix("torch."),
+        hidden_shape=[int(value) for value in hidden.shape],
+        feature_length=int(hidden.size(0)),
+        full_sequence_length=int(request.input_ids.numel()),
+        feature_start=feature_start,
+        feature_end=feature_end,
+        use_logits=contract.use_logits,
+    )
+
+
+def _config_sections(
+    config: Any,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    plain = _plain_config(config)
+    try:
+        producer_cfg = plain["speco"]["standalone_tq_producer"]
+        drafter = plain["actor_rollout_ref"]["rollout"]["drafter"]
+        training_cfg = drafter["training"]
+        tq_cfg = training_cfg["transfer_queue"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Producer configuration missing section {exc}") from exc
+    if not all(
+        isinstance(value, dict) for value in (producer_cfg, training_cfg, tq_cfg)
+    ):
+        raise TypeError("Producer configuration sections must resolve to mappings")
+    return (
+        producer_cfg,
+        {**training_cfg, "speculative_algorithm": drafter.get("speculative_algorithm")},
+        tq_cfg,
+    )
+
+
+def _plain_config(config: Any) -> dict[str, Any]:
+    value = config
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(config):
+            value = OmegaConf.to_container(config, resolve=True)
+    except ImportError:
+        pass
+    if not isinstance(value, Mapping):
+        raise TypeError("Producer configuration must be a mapping")
+    return dict(value)
+
+
+def _load_tokenizer(config: Mapping[str, Any]) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("Standalone TQ Producer requires transformers") from exc
+    return AutoTokenizer.from_pretrained(
+        str(config["tokenizer_path"]),
+        trust_remote_code=bool(config.get("trust_remote_code", False)),
+    )
+
+
+def _parse_dtype(value: Any) -> torch.dtype:
+    name = str(value).strip().lower().removeprefix("torch.")
+    aliases = {"fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
+    dtype = getattr(torch, aliases.get(name, name), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported standalone_tq_producer.hidden_dtype={value!r}")
+    return dtype
+
+
+def _hydra_main(config: Any) -> None:
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(run_producer(config))
+
+
+def main() -> None:
+    try:
+        import hydra
+    except ImportError as exc:
+        raise RuntimeError("Standalone TQ Producer requires hydra-core") from exc
+    hydra.main(config_path="config", config_name="speco_base", version_base=None)(
+        _hydra_main
+    )()
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "PreparedFeature",
+    "ProducerStats",
+    "main",
+    "publish_one",
+    "run_producer",
+    "validate_producer_config",
+]

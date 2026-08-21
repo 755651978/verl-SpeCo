@@ -25,7 +25,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, cast
+from typing import Any, Iterable, Mapping, cast
 
 import torch
 from torch import nn
@@ -43,6 +43,22 @@ class MooncakeReplayDescriptor:
     sample: DraftReplaySample
     prompt_ids: list[int]
     key: str
+
+
+@dataclass(frozen=True)
+class FeatureContract:
+    """Explicit inputs for converting one vLLM payload into a training sample."""
+
+    algorithm: str
+    target_layer_ids: list[int]
+    hidden_states_layout: str
+    dtype: torch.dtype
+    target_model_id: str
+    target_model_revision: str | None
+    tokenizer_fingerprint: str
+    use_logits: bool = False
+    target_config_fingerprint: str | None = None
+    source: str = "standalone_tq_producer"
 
 
 @dataclass
@@ -353,6 +369,139 @@ class BoundedReplayCache:
             "replay/cache_size_gb": self._total_bytes / float(1024**3),
             "replay/cache_budget_gb_per_rank": self.max_bytes / float(1024**3),
         }
+
+
+def feature_from_vllm_payload(
+    payload: Mapping[str, Any] | Any,
+    request: DraftReplaySample | Any,
+    feature_config: FeatureContract,
+) -> DraftFeatureSample:
+    """Pure vLLM payload conversion shared by replay and standalone Producer."""
+
+    values = getattr(payload, "payload", payload)
+    if not isinstance(values, Mapping):
+        raise TypeError("vLLM hidden-states payload must be a mapping")
+    token_ids = values.get("token_ids")
+    hidden = values.get("hidden_states")
+    if not torch.is_tensor(token_ids) or not torch.is_tensor(hidden):
+        raise ValueError(
+            "vLLM hidden-states payload must contain token_ids and hidden_states"
+        )
+    feature_positions = request.feature_positions.detach().cpu().long()
+    if int(feature_positions.numel()) <= 0:
+        raise ValueError("vLLM feature positions must not be empty")
+    feature_end_for_request = int(feature_positions[-1].item()) + 1
+    expected_prompt_ids = (
+        list(request.prompt_token_ids)
+        if hasattr(request, "prompt_token_ids")
+        else request.input_ids[:feature_end_for_request].detach().cpu().long().tolist()
+    )
+    if token_ids.detach().cpu().long().tolist() != expected_prompt_ids:
+        raise ValueError("vLLM hidden-states token_ids do not match replay input")
+    if hidden.dim() != 3:
+        raise ValueError(
+            "vLLM hidden_states must have shape [seq, layers, hidden], "
+            f"got {tuple(hidden.shape)}"
+        )
+
+    algorithm = str(feature_config.algorithm).strip().upper()
+    if algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
+        raise ValueError(f"Unsupported vLLM feature algorithm {algorithm!r}")
+    target_layer_ids = [int(layer_id) for layer_id in feature_config.target_layer_ids]
+    if not target_layer_ids:
+        raise ValueError("FeatureContract.target_layer_ids must not be empty")
+    hidden_layout = str(feature_config.hidden_states_layout)
+    if hidden_layout not in {
+        "eagle3_aux_plus_last",
+        "dflash_aux",
+        "dflash_aux_plus_last",
+    }:
+        raise ValueError(f"Unsupported vLLM hidden_states_layout {hidden_layout!r}")
+
+    hidden_position_offset = max(len(expected_prompt_ids) - int(hidden.size(0)), 0)
+    include_final = hidden_layout in {
+        "eagle3_aux_plus_last",
+        "dflash_aux_plus_last",
+    }
+    required_layers = len(target_layer_ids) + (1 if include_final else 0)
+    if int(hidden.size(1)) < required_layers:
+        raise ValueError(
+            "vLLM hidden_states layer count is too small: "
+            f"got {int(hidden.size(1))}, need at least {required_layers}. "
+            "Start vLLM with target layer ids plus the final layer when the "
+            "training layout needs last hidden states."
+        )
+    relative_positions = feature_positions - hidden_position_offset
+    keep_mask = (relative_positions >= 0) & (relative_positions < int(hidden.size(0)))
+    filtered = not bool(keep_mask.all().item())
+    if filtered:
+        logger.warning(
+            "Dropping vLLM feature positions outside hidden rows dropped=%s "
+            "hidden_rows=%s hidden_offset=%s feature_min=%s feature_max=%s",
+            int((~keep_mask).sum().item()),
+            int(hidden.size(0)),
+            hidden_position_offset,
+            int(feature_positions.min().item()),
+            int(feature_positions.max().item()),
+        )
+        feature_positions = feature_positions[keep_mask]
+        relative_positions = relative_positions[keep_mask]
+        if int(feature_positions.numel()) <= 0:
+            raise ValueError(
+                "vLLM hidden_states contain no rows for replay feature positions: "
+                f"hidden_rows={int(hidden.size(0))}, "
+                f"hidden_position_offset={hidden_position_offset}"
+            )
+
+    selected = hidden.index_select(0, relative_positions).to(dtype=feature_config.dtype)
+    aux_hidden = selected[:, : len(target_layer_ids), :].flatten(1)
+    if include_final:
+        final_hidden = selected[:, required_layers - 1, :]
+        output_hidden = torch.cat([aux_hidden, final_hidden], dim=-1)
+    else:
+        output_hidden = aux_hidden
+    selected_input_ids = request.input_ids.index_select(0, feature_positions).long()
+    selected_loss_mask = request.loss_mask.index_select(0, feature_positions).float()
+    draft_position_ids = request.draft_position_ids.detach().cpu().long()
+    if filtered:
+        draft_position_ids = draft_position_ids[keep_mask]
+
+    source_metadata = getattr(request, "source_metadata", None)
+    if source_metadata is None:
+        source_metadata = getattr(request, "metadata", {})
+    metadata = dict(source_metadata or {})
+    feature_start = int(feature_positions[0].item())
+    feature_end = int(feature_positions[-1].item()) + 1
+    metadata.update(
+        {
+            "source": feature_config.source,
+            "target_model_path": feature_config.target_model_id,
+            "target_revision": feature_config.target_model_revision,
+            "target_config_fingerprint": feature_config.target_config_fingerprint,
+            "tokenizer_fingerprint": feature_config.tokenizer_fingerprint,
+            "target_layer_ids": target_layer_ids,
+            "vllm_hidden_layers": int(hidden.size(1)),
+            "vllm_hidden_rows": int(hidden.size(0)),
+            "vllm_hidden_position_offset": hidden_position_offset,
+            "hidden_states_layout": hidden_layout,
+            "feature_start": feature_start,
+            "feature_end": feature_end,
+            "hidden_position_start": feature_start,
+            "hidden_position_end": feature_end,
+            "hidden_positions": feature_positions,
+            "sequence_length": int(selected_input_ids.numel()),
+            "full_sequence_length": int(request.input_ids.numel()),
+            "use_logits": feature_config.use_logits,
+        }
+    )
+    return DraftFeatureSample(
+        algorithm=algorithm,
+        input_ids=selected_input_ids,
+        loss_mask=selected_loss_mask,
+        hidden_states=output_hidden.cpu().contiguous(),
+        position_ids=draft_position_ids,
+        metadata=metadata,
+    )
 
 
 class TargetFeatureReplayer:
@@ -1133,9 +1282,7 @@ class TargetFeatureReplayer:
             else:
                 state.failures += 1
                 state.consecutive_failures += 1
-                state.cooldown_until = (
-                    time.monotonic() + self.vllm_endpoint_cooldown
-                )
+                state.cooldown_until = time.monotonic() + self.vllm_endpoint_cooldown
 
     def _request_vllm_response(self, prompt_ids: list[int]) -> Any:
         last_error: Exception | None = None
@@ -1309,106 +1456,32 @@ class TargetFeatureReplayer:
         prompt_ids: list[int],
         source: str,
     ) -> DraftFeatureSample:
-        token_ids = payload.get("token_ids")
-        hidden = payload.get("hidden_states")
-        if not torch.is_tensor(token_ids) or not torch.is_tensor(hidden):
-            raise ValueError(
-                "vLLM hidden-states payload must contain token_ids and hidden_states"
-            )
-        if token_ids.detach().cpu().long().tolist() != prompt_ids:
-            raise ValueError("vLLM hidden-states token_ids do not match replay input")
-        if hidden.dim() != 3:
-            raise ValueError(
-                "vLLM hidden_states must have shape [seq, layers, hidden], "
-                f"got {tuple(hidden.shape)}"
-            )
-        feature_positions = sample.feature_positions.detach().cpu().long()
-        hidden_position_offset = max(len(prompt_ids) - int(hidden.size(0)), 0)
-        expected_layers = len(self.target_layer_ids)
-        include_final = self.hidden_layout in {
-            "eagle3_aux_plus_last",
-            "dflash_aux_plus_last",
-        }
-        required_layers = expected_layers + (1 if include_final else 0)
-        if int(hidden.size(1)) < required_layers:
-            raise ValueError(
-                "vLLM hidden_states layer count is too small: "
-                f"got {int(hidden.size(1))}, need at least {required_layers}. "
-                "Start vLLM with target layer ids plus the final layer when the "
-                "training layout needs last hidden states."
-            )
-        relative_feature_positions = feature_positions - hidden_position_offset
-        feature_keep_mask = (
-            (relative_feature_positions >= 0)
-            & (relative_feature_positions < int(hidden.size(0)))
+        expected_prompt_ids = (
+            sample.input_ids[: int(sample.feature_positions[-1].item()) + 1]
+            .detach()
+            .cpu()
+            .long()
+            .tolist()
         )
-        filtered_feature_positions = not bool(feature_keep_mask.all().item())
-        if filtered_feature_positions:
-            dropped = int((~feature_keep_mask).sum().item())
-            logger.warning(
-                "[target replay rank=%s] dropping vLLM feature positions outside "
-                "hidden rows dropped=%s hidden_rows=%s hidden_offset=%s "
-                "feature_min=%s feature_max=%s",
-                self.rank,
-                dropped,
-                int(hidden.size(0)),
-                hidden_position_offset,
-                int(feature_positions.min().item()),
-                int(feature_positions.max().item()),
-            )
-            feature_positions = feature_positions[feature_keep_mask]
-            relative_feature_positions = relative_feature_positions[feature_keep_mask]
-            if int(feature_positions.numel()) <= 0:
-                raise ValueError(
-                    "vLLM hidden_states contain no rows for replay feature positions: "
-                    f"hidden_rows={int(hidden.size(0))}, "
-                    f"hidden_position_offset={hidden_position_offset}"
-                )
-        selected = hidden.index_select(0, relative_feature_positions).to(
-            dtype=self.dtype
-        )
-        aux_hidden = selected[:, :expected_layers, :].flatten(1)
-        if include_final:
-            final_hidden = selected[:, required_layers - 1, :]
-            hidden_states = torch.cat([aux_hidden, final_hidden], dim=-1)
-        else:
-            hidden_states = aux_hidden
-        selected_input_ids = sample.input_ids.index_select(0, feature_positions).long()
-        selected_loss_mask = sample.loss_mask.index_select(0, feature_positions).float()
-        draft_position_ids = sample.draft_position_ids.detach().cpu().long()
-        if filtered_feature_positions:
-            draft_position_ids = draft_position_ids[feature_keep_mask]
-        metadata = dict(sample.metadata)
-        feature_start = int(feature_positions[0].item())
-        feature_end = int(feature_positions[-1].item()) + 1
-        metadata.update(
-            {
-                "source": source,
-                "target_model_path": self.model_path,
-                "target_revision": self.target_revision,
-                "target_config_fingerprint": self.target_config_fingerprint,
-                "target_layer_ids": list(self.target_layer_ids),
-                "vllm_hidden_layers": int(hidden.size(1)),
-                "vllm_hidden_rows": int(hidden.size(0)),
-                "vllm_hidden_position_offset": hidden_position_offset,
-                "hidden_states_layout": self.hidden_layout,
-                "feature_start": feature_start,
-                "feature_end": feature_end,
-                "hidden_position_start": feature_start,
-                "hidden_position_end": feature_end,
-                "hidden_positions": feature_positions,
-                "sequence_length": int(selected_input_ids.numel()),
-                "full_sequence_length": int(sample.input_ids.numel()),
-                "use_logits": self.use_logits,
-            }
-        )
-        return DraftFeatureSample(
-            algorithm=self.algorithm,
-            input_ids=selected_input_ids,
-            loss_mask=selected_loss_mask,
-            hidden_states=hidden_states.cpu().contiguous(),
-            position_ids=draft_position_ids,
-            metadata=metadata,
+        if expected_prompt_ids != prompt_ids:
+            raise ValueError("prompt_ids do not match replay feature window")
+        return feature_from_vllm_payload(
+            payload,
+            sample,
+            FeatureContract(
+                algorithm=getattr(self, "algorithm", sample.algorithm),
+                target_layer_ids=list(self.target_layer_ids),
+                hidden_states_layout=self.hidden_layout,
+                dtype=self.dtype,
+                target_model_id=self.model_path,
+                target_model_revision=self.target_revision,
+                tokenizer_fingerprint=str(
+                    getattr(self, "tokenizer_fingerprint", "replay-unspecified")
+                ),
+                use_logits=self.use_logits,
+                target_config_fingerprint=self.target_config_fingerprint,
+                source=source,
+            ),
         )
 
     def _build_sparse_target_logprobs(
@@ -1445,9 +1518,7 @@ class TargetFeatureReplayer:
         }
         if self.backend.startswith("vllm_"):
             metrics["replay/vllm_requests_total"] = float(self.vllm_requests)
-            metrics["replay/vllm_request_time_total"] = float(
-                self.vllm_request_seconds
-            )
+            metrics["replay/vllm_request_time_total"] = float(self.vllm_request_seconds)
             with self._endpoint_lock:
                 metrics["replay/vllm_endpoints_total"] = float(
                     len(self._vllm_endpoint_states)
@@ -1462,9 +1533,7 @@ class TargetFeatureReplayer:
                     )
         if self.backend == "vllm_mooncake":
             metrics["replay/mooncake_gets_total"] = float(self.mooncake_gets)
-            metrics["replay/mooncake_get_time_total"] = float(
-                self.mooncake_get_seconds
-            )
+            metrics["replay/mooncake_get_time_total"] = float(self.mooncake_get_seconds)
         total = self.cache_hits + self.cache_misses
         if total > 0:
             metrics["replay/cache_hit_ratio"] = self.cache_hits / float(total)

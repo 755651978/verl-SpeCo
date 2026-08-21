@@ -43,7 +43,12 @@ OPTIONAL_SUFFIXES = ("npu",)
 STANDALONE_SUFFIX = ("separate", "training")
 
 DEFAULT_IGNORE_DIRS: tuple[str, ...] = ()
-DEFAULT_IGNORE_FILES: tuple[str, ...] = ()
+# Dedicated TQ role launchers are lifecycle utilities, not rollout/training
+# examples, so the model/drafter/rollout naming grammar does not apply.
+DEFAULT_IGNORE_FILES: tuple[str, ...] = (
+    "examples/run_dspark_tq_owner.sh",
+    "examples/run_dspark_tq_producer.sh",
+)
 
 
 def _split_tokens(stem: str) -> list[str]:
