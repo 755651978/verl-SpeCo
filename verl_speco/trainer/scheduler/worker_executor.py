@@ -27,8 +27,16 @@ class DrafterWorkerExecutor(Protocol):
 
     def resolve_training(self, submission: Any) -> list[Any]: ...
 
+    def poll_training(self, submission: Any) -> tuple[bool, Any]: ...
+
+    def request_reclaim(self, worker_ids: tuple[str, ...]) -> Any: ...
+
     def get_training_data_status(
-        self, *, sample_last_n_steps: int, require_full_batch: bool
+        self,
+        *,
+        sample_last_n_steps: int,
+        require_full_batch: bool,
+        worker_ids: tuple[str, ...] | None = None,
     ) -> list[TrainingDataStatus]: ...
 
     def prepare_training(self, plan: TrainingPlan) -> dict[str, Any]: ...
@@ -51,6 +59,8 @@ class CallbackDrafterWorkerExecutor:
     activate: Callable[[], Any]
     preflight: Callable[[dict[str, object]], Any]
     abort_preflight: Callable[[str], Any]
+    poll: Callable[[Any], Any] | None = None
+    reclaim: Callable[[tuple[str, ...]], Any] | None = None
 
     def submit_training(self, plan: TrainingPlan) -> Any:
         return self.submit(plan.to_worker_payload())
@@ -61,20 +71,46 @@ class CallbackDrafterWorkerExecutor:
             return results
         return [results]
 
+    def poll_training(self, submission: Any) -> tuple[bool, Any]:
+        if self.poll is None:
+            return (False, submission)
+        result = self.poll(submission)
+        if isinstance(result, tuple) and len(result) == 2:
+            return (bool(result[0]), result[1])
+        if isinstance(result, dict):
+            return (bool(result.get("ready", False)), result.get("submission", submission))
+        return (bool(result), submission)
+
+    def request_reclaim(self, worker_ids: tuple[str, ...]) -> Any:
+        if self.reclaim is None:
+            return None
+        return self.reclaim(worker_ids)
+
     def get_training_data_status(
-        self, *, sample_last_n_steps: int, require_full_batch: bool
+        self,
+        *,
+        sample_last_n_steps: int,
+        require_full_batch: bool,
+        worker_ids: tuple[str, ...] | None = None,
     ) -> list[TrainingDataStatus]:
-        results = (
-            self.resolve(self.inspect_data(sample_last_n_steps, require_full_batch))
-            or []
-        )
+        try:
+            inspection = self.inspect_data(
+                sample_last_n_steps, require_full_batch, worker_ids
+            )
+        except TypeError:
+            inspection = self.inspect_data(sample_last_n_steps, require_full_batch)
+        results = self.resolve(inspection) or []
         if not isinstance(results, list):
             results = [results]
-        return [
+        statuses = [
             TrainingDataStatus.from_mapping(result)
             for result in results
             if isinstance(result, dict) and bool(result.get("available", False))
         ]
+        if worker_ids is None:
+            return statuses
+        expected = {str(worker_id) for worker_id in worker_ids}
+        return [status for status in statuses if str(status.worker_id) in expected]
 
     def prepare_training(self, plan: TrainingPlan) -> dict[str, Any]:
         return self.prepare(plan)

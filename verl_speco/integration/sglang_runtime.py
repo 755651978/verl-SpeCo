@@ -41,6 +41,10 @@ from verl_speco.integration.sglang_adapter import (
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
 )
+from verl_speco.integration.rollout_idle_events import (
+    SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
+    emit_rollout_idle_event,
+)
 from verl_speco.trainer.scheduler import (
     CollectionPlan,
     DrafterCollectionContext,
@@ -131,6 +135,94 @@ def _plain_container(value: Any):
     if isinstance(value, (list, tuple)):
         return [_plain_container(item) for item in value]
     return value
+
+
+def _rollout_idle_worker_config(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
+    training_cfg = drafter_cfg.get("training") or {}
+    scheduler_cfg = training_cfg.get("scheduler") or {}
+    idle_cfg = scheduler_cfg.get("idle_worker") or {}
+    execution_cfg = scheduler_cfg.get("execution") or {}
+    strategy = str(execution_cfg.get("strategy", "sync") or "sync").strip().lower()
+    if strategy != "rollout_idle_worker":
+        return {}
+    return dict(idle_cfg)
+
+
+def _rollout_idle_event_bus_name(drafter_cfg: dict[str, Any]) -> str | None:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    if not idle_cfg:
+        return ""
+    return str(
+        idle_cfg.get("event_bus_name")
+        or os.getenv(SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV)
+        or ""
+    )
+
+
+def _rollout_idle_worker_id_for_replica(
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+) -> str:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    flattened = [
+        str(worker_id)
+        for group in idle_cfg.get("training_groups") or []
+        for worker_id in group
+    ]
+    if 0 <= int(replica_rank) < len(flattened):
+        return flattened[int(replica_rank)]
+    return str(replica_rank)
+
+
+def _rollout_idle_deadline_ts(drafter_cfg: dict[str, Any]) -> float:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    try:
+        batch_estimate = float(idle_cfg.get("initial_batch_estimate_sec", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        batch_estimate = 1.0
+    try:
+        max_batches = int(idle_cfg.get("max_batches_per_window", 2) or 2)
+    except (TypeError, ValueError):
+        max_batches = 2
+    try:
+        guard = float(idle_cfg.get("deadline_guard_sec", 0.1) or 0.1)
+    except (TypeError, ValueError):
+        guard = 0.1
+    try:
+        min_window = float(idle_cfg.get("min_idle_window_sec", 0.25) or 0.25)
+    except (TypeError, ValueError):
+        min_window = 0.25
+    window_sec = max(batch_estimate * max(max_batches, 1) + guard, min_window)
+    return time.time() + window_sec
+
+
+def _emit_rollout_idle_worker_event(
+    *,
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+    event_type: str,
+    memory_released: bool = False,
+) -> bool:
+    bus_name = _rollout_idle_event_bus_name(drafter_cfg)
+    if not bus_name:
+        return False
+    return emit_rollout_idle_event(
+        bus_name,
+        {
+            "event_type": event_type,
+            "worker_id": _rollout_idle_worker_id_for_replica(
+                drafter_cfg, replica_rank
+            ),
+            "replica_rank": int(replica_rank),
+            "memory_released": memory_released,
+            "must_be_ready_at": (
+                _rollout_idle_deadline_ts(drafter_cfg)
+                if event_type == "WORKER_IDLE"
+                else None
+            ),
+            "event_ts": time.time(),
+        },
+    )
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -1437,19 +1529,40 @@ class _SpecoSGLangHttpServerMixin:
 
         drafter_cfg = self._speco_drafter_cfg()
         training_cfg = drafter_cfg.get("training") or {}
+        skip_rollout_idle_event = bool(
+            sampling_params.get("_verl_skip_drafter_collection", False)
+        )
+        if not skip_rollout_idle_event:
+            _emit_rollout_idle_worker_event(
+                drafter_cfg=drafter_cfg,
+                replica_rank=int(self.replica_rank),
+                event_type="GENERATION_STARTED",
+            )
+
+        def emit_idle_event() -> None:
+            if not skip_rollout_idle_event:
+                _emit_rollout_idle_worker_event(
+                    drafter_cfg=drafter_cfg,
+                    replica_rank=int(self.replica_rank),
+                    event_type="WORKER_IDLE",
+                    memory_released=True,
+                )
+
         uses_dflash_aux_hidden = _drafter_uses_dflash_aux_hidden(drafter_cfg)
         if not bool(
             drafter_cfg.get("enable")
             and drafter_cfg.get("enable_drafter_training")
             and training_cfg.get("collect_hidden_states_from_sgl")
         ):
-            return await cast(Any, super()).generate(
+            output = await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(sampling_params),
                 request_id,
                 image_data=image_data,
                 video_data=video_data,
             )
+            emit_idle_event()
+            return output
 
         original_sampling_params = sampling_params
         request_global_steps = original_sampling_params.get("_verl_global_steps")
@@ -1482,13 +1595,15 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=None,
                 hidden_window_plan=None,
             )
-            return await cast(Any, super()).generate(
+            output = await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
                 image_data=image_data,
                 video_data=video_data,
             )
+            emit_idle_event()
+            return output
 
         sampling_params = self._speco_strip_internal_sampling_params(
             original_sampling_params
@@ -1544,13 +1659,15 @@ class _SpecoSGLangHttpServerMixin:
                 max_new_tokens=max_new_tokens,
                 hidden_window_plan=hidden_window_plan,
             )
-            return await cast(Any, super()).generate(
+            output = await cast(Any, super()).generate(
                 prompt_ids,
                 self._speco_strip_internal_sampling_params(original_sampling_params),
                 request_id,
                 image_data=image_data,
                 video_data=video_data,
             )
+            emit_idle_event()
+            return output
         request["return_hidden_states"] = True
 
         generate_request = GenerateReqInput(**request)
@@ -2070,15 +2187,18 @@ class _SpecoSGLangHttpServerMixin:
                 stop_reason=finish_reason,
                 extra_fields=extra_fields,
             )
+            emit_idle_event()
             return output
 
-        return TokenOutput(
+        output = TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
             extra_fields={"global_steps": collection_global_steps},
         )
+        emit_idle_event()
+        return output
 
 
 def _build_speco_http_server_class(upstream_module):

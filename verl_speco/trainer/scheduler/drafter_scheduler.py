@@ -21,22 +21,32 @@ remain unchanged.
 
 from __future__ import annotations
 
+import math
+import time
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
 from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPlan,
     CollectionPayload,
+    AvailableTrainingResources,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterExecutionStrategy,
     DrafterScheduleConfig,
     DrafterScheduleContext,
+    RolloutWorkerEvent,
+    RolloutWorkerEventType,
     PublishPlan,
+    TrainingBudget,
     TrainingPlan,
     _as_int,
 )
-from verl_speco.trainer.scheduler.execution_strategy import SyncExecutionStrategy
+from verl_speco.trainer.scheduler.execution_strategy import (
+    RolloutIdleWorkerExecutionStrategy,
+    SyncExecutionStrategy,
+)
 from verl_speco.trainer.scheduler.training_budget import SyncTrainingBudgetPolicy
 from verl_speco.trainer.scheduler.training_trigger import IntervalAndBufferTrigger
 from verl_speco.trainer.scheduler.worker_executor import DrafterWorkerExecutor
@@ -61,6 +71,63 @@ from verl_speco.trainer.scheduler.collection_adapter import (
     SGLangCollectionAdapter,
 )
 from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
+
+
+@dataclass
+class _IdleWorkerState:
+    worker_id: str
+    replica_rank: int
+    status: str = "ready"
+    memory_released: bool = False
+    must_be_ready_at: float | None = None
+    event_ts: float = 0.0
+
+
+def _rollout_worker_event_type(value: object) -> RolloutWorkerEventType:
+    if isinstance(value, RolloutWorkerEventType):
+        return value
+    text = str(value)
+    try:
+        return RolloutWorkerEventType(text)
+    except ValueError:
+        return RolloutWorkerEventType[text.upper()]
+
+
+def _natural_worker_sort_key(worker_id: object) -> tuple[str, int, str]:
+    """Sort worker ids by trailing numeric rank when possible."""
+
+    text = str(worker_id)
+    prefix, separator, suffix = text.rpartition("-")
+    if separator and suffix.isdigit():
+        return (prefix, int(suffix), text)
+    if text.isdigit():
+        return ("", int(text), text)
+    return (text, -1, text)
+
+
+def _normalize_worker_id_group(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        return (str(value),)
+    try:
+        worker_ids = [str(worker_id) for worker_id in value]  # type: ignore[union-attr]
+    except TypeError:
+        return (str(value),)
+    return tuple(dict.fromkeys(sorted(worker_ids, key=_natural_worker_sort_key)))
+
+
+def _flatten_metadata_records(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        records: list[dict[str, Any]] = []
+        for item in value:
+            records.extend(_flatten_metadata_records(item))
+        return records
+    return []
 
 
 def step_matches_interval(
@@ -113,6 +180,13 @@ class DrafterScheduler:
             DrafterCollectionSource.SGLANG: SGLangCollectionAdapter(),
             DrafterCollectionSource.OLD_LOGPROB: OldLogProbCollectionAdapter(),
         }
+        self.rollout_idle_execution_strategy = RolloutIdleWorkerExecutionStrategy()
+        self._idle_workers: dict[str, _IdleWorkerState] = {}
+        self._metadata_idle_training_groups: tuple[tuple[str, ...], ...] = ()
+        self._replica_idle_worker_groups: dict[int, tuple[str, ...]] = {}
+        self._last_successful_training_step: int | None = None
+        self._last_successful_training_ts: float | None = None
+        self._training_progress_start_ts: float = time.time()
 
     def bind_worker_executor(self, worker_executor: DrafterWorkerExecutor) -> None:
         """Bind the worker execution port used by all execution strategies."""
@@ -156,22 +230,258 @@ class DrafterScheduler:
         )
 
     def inspect_training_data(
-        self, *, global_step: object, config: DrafterScheduleConfig
+        self,
+        *,
+        global_step: object,
+        config: DrafterScheduleConfig,
+        worker_ids: tuple[str, ...] | None = None,
     ):
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
         statuses = self._worker_executor.get_training_data_status(
             sample_last_n_steps=config.sample_last_n_steps,
             require_full_batch=config.require_full_batch,
+            worker_ids=worker_ids,
         )
         return self.data_status_policy.aggregate(statuses, global_step=global_step)
 
+    def on_worker_event(
+        self,
+        event: RolloutWorkerEvent | dict[str, object],
+    ) -> dict[str, float | int]:
+        """Record rollout replica state for Bubble Time idle-worker planning."""
+
+        if isinstance(event, dict):
+            event = RolloutWorkerEvent(
+                event_type=_rollout_worker_event_type(event.get("event_type", "")),
+                worker_id=str(event.get("worker_id", "")),
+                replica_rank=_as_int(event.get("replica_rank", 0)),
+                memory_released=bool(event.get("memory_released", False)),
+                must_be_ready_at=(
+                    None
+                    if event.get("must_be_ready_at") is None
+                    else float(event.get("must_be_ready_at", 0.0))
+                ),
+                event_ts=(
+                    None
+                    if event.get("event_ts") is None
+                    else float(event.get("event_ts", 0.0))
+                ),
+            )
+        elif not isinstance(event.event_type, RolloutWorkerEventType):
+            event = RolloutWorkerEvent(
+                event_type=_rollout_worker_event_type(event.event_type),
+                worker_id=event.worker_id,
+                replica_rank=event.replica_rank,
+                memory_released=event.memory_released,
+                must_be_ready_at=event.must_be_ready_at,
+                event_ts=event.event_ts,
+            )
+        event_ts = event.event_ts if event.event_ts is not None else time.time()
+        worker_ids = self._replica_idle_worker_groups.get(event.replica_rank)
+        if not worker_ids:
+            worker_ids = (event.worker_id,)
+        for worker_id in worker_ids:
+            self._record_worker_event_state(event, worker_id, event_ts)
+        return self.idle_worker_metrics()
+
+    def _record_worker_event_state(
+        self,
+        event: RolloutWorkerEvent,
+        worker_id: str,
+        event_ts: float,
+    ) -> None:
+        worker_id = str(worker_id)
+        state = self._idle_workers.get(worker_id)
+        if state is None:
+            state = _IdleWorkerState(
+                worker_id=worker_id,
+                replica_rank=event.replica_rank,
+            )
+            self._idle_workers[worker_id] = state
+        state.replica_rank = event.replica_rank
+        state.event_ts = event_ts
+        if event.event_type is RolloutWorkerEventType.GENERATION_STARTED:
+            state.status = "generating"
+            state.memory_released = False
+            state.must_be_ready_at = None
+        elif event.event_type is RolloutWorkerEventType.WORKER_IDLE:
+            state.status = "idle"
+            state.memory_released = event.memory_released
+            state.must_be_ready_at = event.must_be_ready_at
+        elif event.event_type is RolloutWorkerEventType.WORKER_RECLAIM_REQUESTED:
+            state.status = "reclaiming"
+        elif event.event_type is RolloutWorkerEventType.WORKER_READY:
+            state.status = "ready"
+            state.memory_released = False
+            state.must_be_ready_at = None
+
+    def register_idle_training_resource_metadata(
+        self,
+        metadata: Any,
+    ) -> dict[str, float | int]:
+        """Register true drafter training groups discovered from workers.
+
+        Metadata is intentionally authoritative over ``group_size``.  If the
+        drafter mesh uses both SP and DP collectives, workers report the whole
+        connected mesh as ``full_collective_ranks``; scheduler then waits until
+        every rank in that real group is idle.
+        """
+
+        records = _flatten_metadata_records(metadata)
+        replica_groups: dict[int, tuple[str, ...]] = {}
+        full_groups: list[tuple[str, ...]] = []
+        seen_groups: set[tuple[str, ...]] = set()
+        for record in records:
+            if not bool(record.get("in_drafter_train_group", False)):
+                continue
+            replica_rank = record.get("replica_rank")
+            training_ranks = _normalize_worker_id_group(
+                record.get("training_group_ranks", ())
+            )
+            if replica_rank is not None and training_ranks:
+                replica_groups[int(replica_rank)] = training_ranks
+            full_group = _normalize_worker_id_group(
+                record.get("full_collective_ranks", ())
+            )
+            if not full_group:
+                full_group = training_ranks
+            if full_group and full_group not in seen_groups:
+                full_groups.append(full_group)
+                seen_groups.add(full_group)
+        self._replica_idle_worker_groups = replica_groups
+        self._metadata_idle_training_groups = tuple(full_groups)
+        return {
+            "bubble/registered_training_groups": len(full_groups),
+            "bubble/registered_training_workers": len(
+                {worker_id for group in full_groups for worker_id in group}
+            ),
+            "bubble/registered_replica_groups": len(replica_groups),
+        }
+
+    def idle_worker_metrics(self) -> dict[str, float | int]:
+        return {
+            "bubble/idle_workers": sum(
+                int(state.status == "idle") for state in self._idle_workers.values()
+            )
+        }
+
+    def _idle_training_groups(
+        self,
+        config: DrafterScheduleConfig,
+    ) -> tuple[tuple[str, ...], ...]:
+        """Resolve legal collective groups for rollout-idle training.
+
+        Explicit ``training_groups`` remains the most precise option.  In the
+        common case, ``group_mode: auto`` builds stable groups from all known
+        rollout workers, including workers that are currently still generating.
+        That makes a half-idle collective group report ``incomplete`` instead
+        of accidentally training only the idle subset.
+        """
+
+        if config.idle_worker_training_groups:
+            return config.idle_worker_training_groups
+        if self._metadata_idle_training_groups:
+            return self._metadata_idle_training_groups
+        if config.idle_worker_group_mode != "auto":
+            return ()
+        known_workers = tuple(
+            sorted(self._idle_workers, key=_natural_worker_sort_key)
+        )
+        if not known_workers:
+            return ()
+        if config.idle_worker_group_size is None:
+            return ()
+        group_size = config.idle_worker_group_size
+        if group_size <= 1:
+            return tuple((worker_id,) for worker_id in known_workers)
+        groups: list[tuple[str, ...]] = []
+        for start in range(0, len(known_workers), group_size):
+            group = known_workers[start : start + group_size]
+            if len(group) == group_size:
+                groups.append(tuple(group))
+        return tuple(groups)
+
+    def select_idle_training_resources(
+        self,
+        config: DrafterScheduleConfig,
+        *,
+        now: float | None = None,
+    ) -> AvailableTrainingResources:
+        now = time.time() if now is None else now
+        idle_states = {
+            worker_id: state
+            for worker_id, state in self._idle_workers.items()
+            if state.status == "idle"
+            and (
+                not config.idle_worker_require_memory_released
+                or state.memory_released
+            )
+        }
+        groups = self._idle_training_groups(config)
+        if not groups:
+            if (
+                config.idle_worker_group_mode == "auto"
+                and not config.idle_worker_training_groups
+                and not self._metadata_idle_training_groups
+                and config.idle_worker_group_size is None
+                and self._idle_workers
+            ):
+                return AvailableTrainingResources(
+                    False, "missing_training_group_metadata"
+                )
+            return AvailableTrainingResources(False, "no_idle_worker")
+        incomplete_seen = False
+        for index, group in enumerate(groups):
+            group = tuple(str(worker_id) for worker_id in group)
+            missing = [worker_id for worker_id in group if worker_id not in idle_states]
+            if missing:
+                incomplete_seen = True
+                continue
+            windows = [
+                max(float(state.must_be_ready_at) - now, 0.0)
+                for worker_id in group
+                if (state := idle_states[worker_id]).must_be_ready_at is not None
+            ]
+            minimum_window = min(windows, default=math.inf)
+            if math.isinf(minimum_window):
+                minimum_window = config.idle_worker_min_idle_window_sec
+            if minimum_window < config.idle_worker_min_idle_window_sec:
+                return AvailableTrainingResources(
+                    False,
+                    "window_too_small",
+                    training_group_id=f"idle-group-{index}",
+                    worker_ids=group,
+                    minimum_idle_window_sec=minimum_window,
+                )
+            return AvailableTrainingResources(
+                True,
+                "training_group_ready",
+                training_group_id=f"idle-group-{index}",
+                worker_ids=group,
+                minimum_idle_window_sec=minimum_window,
+            )
+        return AvailableTrainingResources(
+            False,
+            "incomplete_training_group" if incomplete_seen else "no_idle_worker",
+        )
+
     def prepare_training_plan(
-        self, context: DrafterScheduleContext, config: DrafterScheduleConfig
+        self,
+        context: DrafterScheduleContext,
+        config: DrafterScheduleConfig,
+        *,
+        allow_sync_fallback: bool = True,
     ) -> TrainingPlan:
         """Build a plan while avoiding worker RPCs for cheap skip conditions."""
 
         interval_matched = self.training_interval_matched(context.global_step, config)
+        if config.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+            return self.prepare_idle_worker_training_plan(
+                context,
+                config,
+                allow_sync_fallback=allow_sync_fallback,
+            )
         if (
             context.training_mode == "collect_only"
             or context.pending_training_count > 0
@@ -191,6 +501,138 @@ class DrafterScheduler:
                 pending_training_count=context.pending_training_count,
             ),
             config,
+        )
+
+    def prepare_idle_worker_training_plan(
+        self,
+        context: DrafterScheduleContext,
+        config: DrafterScheduleConfig,
+        *,
+        allow_sync_fallback: bool = True,
+    ) -> TrainingPlan:
+        resources = self.select_idle_training_resources(config)
+        if not resources.available:
+            if (
+                allow_sync_fallback
+                and self._should_sync_fallback(context.global_step, config)
+            ):
+                return self._plan_sync_fallback_training(context, config)
+            return self._skip_idle_worker_plan(context, config, resources)
+        data_status = context.data_status or self.inspect_training_data(
+            global_step=context.global_step,
+            config=config,
+            worker_ids=resources.worker_ids,
+        )
+        return self.plan_training(
+            DrafterScheduleContext(
+                global_step=context.global_step,
+                training_mode=context.training_mode,
+                collected_samples_this_step=context.collected_samples_this_step,
+                oldlogprob_collection_requested=context.oldlogprob_collection_requested,
+                data_status=data_status,
+                pending_training_count=context.pending_training_count,
+            ),
+            config,
+            resources=resources,
+        )
+
+    def _steps_without_training(self, global_step: object) -> int:
+        try:
+            step = _as_int(global_step)
+        except (TypeError, ValueError):
+            return 0
+        if self._last_successful_training_step is None:
+            return max(step, 0)
+        return max(step - self._last_successful_training_step, 0)
+
+    def _seconds_without_training(self) -> float:
+        last_ts = self._last_successful_training_ts or self._training_progress_start_ts
+        return max(time.time() - last_ts, 0.0)
+
+    def _should_sync_fallback(
+        self,
+        global_step: object,
+        config: DrafterScheduleConfig,
+    ) -> bool:
+        if not config.idle_worker_fallback_to_sync:
+            return False
+        max_steps = config.max_steps_without_training
+        if max_steps is not None and self._steps_without_training(global_step) >= max(
+            int(max_steps), 1
+        ):
+            return True
+        max_seconds = config.idle_worker_max_seconds_without_training
+        if max_seconds is not None and self._seconds_without_training() >= max(
+            float(max_seconds), 0.0
+        ):
+            return True
+        return False
+
+    def _plan_sync_fallback_training(
+        self,
+        context: DrafterScheduleContext,
+        config: DrafterScheduleConfig,
+    ) -> TrainingPlan:
+        data_status = context.data_status or self.inspect_training_data(
+            global_step=context.global_step,
+            config=config,
+            worker_ids=None,
+        )
+        fallback_context = DrafterScheduleContext(
+            global_step=context.global_step,
+            training_mode=context.training_mode,
+            collected_samples_this_step=context.collected_samples_this_step,
+            oldlogprob_collection_requested=context.oldlogprob_collection_requested,
+            data_status=data_status,
+            pending_training_count=context.pending_training_count,
+        )
+        plan = self.plan_training(
+            fallback_context,
+            replace(config, training_interval_steps=1),
+        )
+        fallback_reason = (
+            "sync_fallback_training_ready"
+            if plan.launch
+            else (
+                "sync_fallback_no_trainable_batch"
+                if plan.reason == "no_trainable_batch"
+                else plan.reason
+            )
+        )
+        return replace(
+            plan,
+            reason=fallback_reason,
+            execution_strategy=DrafterExecutionStrategy.SYNC,
+            deadline_ts=None,
+            target_worker_ids=(),
+            training_group_id="sync-fallback",
+        )
+
+    def _skip_idle_worker_plan(
+        self,
+        context: DrafterScheduleContext,
+        config: DrafterScheduleConfig,
+        resources: AvailableTrainingResources,
+    ) -> TrainingPlan:
+        interval_matched = self.training_interval_matched(context.global_step, config)
+        return TrainingPlan(
+            launch=False,
+            reason=resources.reason,
+            interval_matched=interval_matched,
+            execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+            source_global_step=context.global_step,
+            max_batches=0,
+            min_batches=max(config.min_trainable_batches, 1),
+            deadline_ts=None,
+            require_full_batch=config.require_full_batch,
+            sample_last_n_steps=config.sample_last_n_steps,
+            publish_after_success=False,
+            required_target_version=(
+                None if config.use_logits else _as_int(context.global_step)
+            ),
+            plan_id=uuid4().hex,
+            target_worker_ids=resources.worker_ids,
+            training_group_id=resources.training_group_id,
         )
 
     def prepare_training_execution(self, plan: TrainingPlan) -> dict[str, Any]:
@@ -291,8 +733,30 @@ class DrafterScheduler:
         plan = self.prepare_training_plan(
             context.schedule_context,
             context.config,
+            allow_sync_fallback=context.allow_sync_fallback,
         )
         metrics: dict[str, Any] = dict(plan.metrics())
+        metrics.update(
+            {
+                "scheduler/train_requested": int(plan.launch),
+                "scheduler/planned_batches": int(plan.max_batches),
+                "bubble/starvation_steps": self._steps_without_training(
+                    context.schedule_context.global_step
+                ),
+                "bubble/starvation_seconds": self._seconds_without_training(),
+                "bubble/sync_fallback_requested": int(
+                    plan.reason.startswith("sync_fallback")
+                ),
+                "bubble/sync_fallback_launched": int(
+                    plan.launch and plan.reason == "sync_fallback_training_ready"
+                ),
+                "bubble/sync_fallback_batches": (
+                    int(plan.max_batches)
+                    if plan.launch and plan.reason == "sync_fallback_training_ready"
+                    else 0
+                ),
+            }
+        )
         metrics.update(self.prepare_training_execution(plan))
         return SchedulerEventOutcome(
             training_plan=plan,
@@ -310,11 +774,22 @@ class DrafterScheduler:
             plan,
             runtime_state=context.runtime_state,
         )
+        if execution.reason == "submitted_async":
+            metrics = {
+                "scheduler/train_launched": 1,
+                "scheduler/pending_training_count": 1,
+            }
+            metrics.update(context.runtime_state.metrics())
+            return SchedulerEventOutcome(
+                training_plan=plan,
+                metrics=metrics,
+            )
         outcome = TrainingOutcome.from_execution(
             execution,
             runtime_state=context.runtime_state,
             plan=plan,
         )
+        self._record_training_outcome(plan, outcome)
         return SchedulerEventOutcome(
             training_plan=plan,
             training_execution=outcome,
@@ -354,17 +829,52 @@ class DrafterScheduler:
         self,
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
+        resources: AvailableTrainingResources | None = None,
     ) -> TrainingPlan:
         interval_matched = self.training_interval_matched(context.global_step, config)
+        execution_strategy = (
+            DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            if resources is not None
+            else DrafterExecutionStrategy.SYNC
+        )
         trigger = self.trigger_policy.should_train(
             context,
             config,
             interval_matched=interval_matched,
         )
         budget = self.sync_budget_policy.make_budget(context, config)
+        if resources is not None and budget.max_batches > 0:
+            usable_window = max(
+                resources.minimum_idle_window_sec
+                - config.idle_worker_deadline_guard_sec,
+                0.0,
+            )
+            batch_estimate = max(
+                config.idle_worker_initial_batch_estimate_sec,
+                1.0e-9,
+            )
+            window_batches = int(math.floor(usable_window / batch_estimate))
+            max_batches = min(
+                window_batches,
+                context.data_status.trainable_batches if context.data_status else 0,
+                config.idle_worker_max_batches_per_window,
+                budget.max_batches,
+            )
+            budget = TrainingBudget(
+                max_batches=max_batches,
+                min_batches=budget.min_batches,
+                deadline_ts=time.time() + usable_window,
+                require_full_batch=budget.require_full_batch,
+                sample_last_n_steps=budget.sample_last_n_steps,
+                reason=(
+                    "idle_worker_budget_ready"
+                    if max_batches > 0
+                    else "window_too_small"
+                ),
+            )
         common: Any = {
             "interval_matched": interval_matched,
-            "execution_strategy": DrafterExecutionStrategy.SYNC,
+            "execution_strategy": execution_strategy,
             "source_global_step": context.global_step,
             "max_batches": budget.max_batches,
             "min_batches": budget.min_batches,
@@ -381,6 +891,8 @@ class DrafterScheduler:
             "worker_snapshots": (
                 context.data_status.worker_snapshots if context.data_status else None
             ),
+            "target_worker_ids": resources.worker_ids if resources else (),
+            "training_group_id": resources.training_group_id if resources else "",
         }
         if not trigger.should_train:
             return TrainingPlan(
@@ -424,9 +936,55 @@ class DrafterScheduler:
                 executor=self._worker_executor,
                 runtime_state=runtime_state,
             )
+        if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+            return self.rollout_idle_execution_strategy.execute(
+                plan,
+                executor=self._worker_executor,
+                runtime_state=runtime_state,
+            )
         raise NotImplementedError(
             f"Unsupported drafter execution strategy: {plan.execution_strategy.value}"
         )
+
+    def poll_pending_training(self, *, runtime_state) -> TrainingOutcome | None:
+        plan = runtime_state.active_plan
+        if plan is None:
+            return None
+        if self._worker_executor is None:
+            raise RuntimeError("Drafter worker executor has not been bound")
+        execution = self.rollout_idle_execution_strategy.poll(
+            executor=self._worker_executor,
+            runtime_state=runtime_state,
+        )
+        if execution is None:
+            return None
+        outcome = TrainingOutcome.from_execution(
+            execution,
+            runtime_state=runtime_state,
+            plan=plan,
+        )
+        self._record_training_outcome(plan, outcome)
+        return outcome
+
+    def _record_training_outcome(
+        self,
+        plan: TrainingPlan,
+        outcome: TrainingOutcome,
+    ) -> None:
+        if outcome.trained and outcome.successful_steps > 0:
+            try:
+                self._last_successful_training_step = _as_int(plan.source_global_step)
+            except (TypeError, ValueError):
+                self._last_successful_training_step = None
+            self._last_successful_training_ts = time.time()
+
+    def request_reclaim(self, worker_ids: tuple[str, ...]) -> Any:
+        if self._worker_executor is None:
+            raise RuntimeError("Drafter worker executor has not been bound")
+        for worker_id in worker_ids:
+            if worker_id in self._idle_workers:
+                self._idle_workers[worker_id].status = "reclaiming"
+        return self._worker_executor.request_reclaim(tuple(str(worker_id) for worker_id in worker_ids))
 
     @staticmethod
     def _publish_interval_matched(

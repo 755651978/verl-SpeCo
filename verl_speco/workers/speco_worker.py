@@ -336,12 +336,14 @@ class SpecoWorker(Worker):
         self._prepared_training_plan_id: Optional[str] = None
         self._prepared_training_data_version: Optional[int] = None
         self._prepared_training_target_version: Optional[int] = None
+        self._drafter_reclaim_requested = False
         self.training_process_group = None
         self.dp_process_group = None
         self.training_group_ranks: list[int] = []
         self.training_group_world_size = 1
         self.dp_group_ranks: list[int] = []
         self.dp_group_world_size = 1
+        self.full_collective_ranks: list[int] = []
         self.num_rollout_replicas = 1
         self.training_device_mesh = None
         self._process_group_initialized = False
@@ -431,6 +433,14 @@ class SpecoWorker(Worker):
             ]
             self.training_group_world_size = self.training_device_mesh["sp"].size()
             self.dp_group_world_size = self.training_device_mesh["dp"].size()
+            if self.dp_group_world_size > 1:
+                self.full_collective_ranks = [
+                    rank
+                    for replica_ranks in rollout_layout.replica_training_ranks
+                    for rank in replica_ranks
+                ]
+            else:
+                self.full_collective_ranks = list(self.training_group_ranks)
             self.local_drafter_sp_rank = mesh_sp_rank
             self.is_drafter_group_leader = mesh_sp_rank == 0
             owner_route_rank = self.replica_rank
@@ -1224,6 +1234,47 @@ class SpecoWorker(Worker):
         return status
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_drafter_training_resource_metadata(self):
+        """Return the true drafter training mesh membership for Bubble Time."""
+
+        result = {
+            "available": False,
+            "rank": self.rank,
+            "worker_id": str(self.rank),
+            "worker_incarnation": self.worker_incarnation,
+            "replica_rank": self.replica_rank,
+            "in_drafter_train_group": False,
+            "training_group_ranks": [],
+            "training_group_world_size": 0,
+            "dp_group_ranks": [],
+            "dp_group_world_size": 0,
+            "full_collective_ranks": [],
+            "reason": "",
+        }
+        if not self.enable_drafter:
+            result["reason"] = "disabled"
+            return result
+        self._ensure_training_group_initialized()
+        if not self.in_drafter_train_group:
+            result["reason"] = "not_in_training_group"
+            return result
+        result.update(
+            {
+                "available": True,
+                "in_drafter_train_group": True,
+                "training_group_ranks": list(self.training_group_ranks),
+                "training_group_world_size": int(self.training_group_world_size),
+                "dp_group_ranks": list(self.dp_group_ranks),
+                "dp_group_world_size": int(self.dp_group_world_size),
+                "full_collective_ranks": list(
+                    self.full_collective_ranks or self.training_group_ranks
+                ),
+                "reason": "ok",
+            }
+        )
+        return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def preflight_drafter_training(self, training_plan=None):
         result = {
             "ready": False,
@@ -1247,8 +1298,16 @@ class SpecoWorker(Worker):
         if not isinstance(training_plan, dict) or not training_plan.get("launch"):
             result["reason"] = "missing_or_inactive_training_plan"
             return result
-        if training_plan.get("execution_strategy") != "sync":
+        execution_strategy = str(training_plan.get("execution_strategy", "sync"))
+        if execution_strategy not in {"sync", "rollout_idle_worker"}:
             result["reason"] = "unsupported_execution_strategy"
+            return result
+        target_worker_ids = {
+            str(worker_id) for worker_id in training_plan.get("target_worker_ids", ())
+        }
+        if execution_strategy == "rollout_idle_worker" and str(self.rank) not in target_worker_ids:
+            result["participating"] = False
+            result["reason"] = "not_in_training_group"
             return result
         if training_plan.get("source_global_step") != self.last_global_step:
             result["reason"] = "stale_training_plan"
@@ -1301,6 +1360,7 @@ class SpecoWorker(Worker):
         self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
         self._prepared_training_data_version = actual_data_version
         self._prepared_training_target_version = current_target_version
+        self._drafter_reclaim_requested = False
         with _preserve_process_rng_state(self.device_name):
             activated = bool(await self.trainer.activate_training_model())
         result["activated"] = activated
@@ -1347,6 +1407,22 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group or self.trainer is None:
             result["reason"] = "not_in_training_group"
             return result
+        execution_strategy = (
+            str(training_plan.get("execution_strategy", "sync"))
+            if isinstance(training_plan, dict)
+            else "sync"
+        )
+        target_worker_ids = {
+            str(worker_id)
+            for worker_id in (
+                training_plan.get("target_worker_ids", ())
+                if isinstance(training_plan, dict)
+                else ()
+            )
+        }
+        if execution_strategy == "rollout_idle_worker" and str(self.rank) not in target_worker_ids:
+            result["reason"] = "not_in_training_group"
+            return result
         plan_id = (
             str(training_plan.get("plan_id", ""))
             if isinstance(training_plan, dict)
@@ -1386,6 +1462,13 @@ class SpecoWorker(Worker):
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
                 for _ in range(max_batches):
+                    deadline_ts = training_plan.get("deadline_ts")
+                    if deadline_ts is not None and time.time() >= float(deadline_ts):
+                        result["reason"] = "deadline_reached"
+                        break
+                    if self._drafter_reclaim_requested:
+                        result["reason"] = "reclaim_requested"
+                        break
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
                     if step_ok:
@@ -1420,7 +1503,11 @@ class SpecoWorker(Worker):
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0
-            result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
+            result["reason"] = (
+                "trained"
+                if result["trained"]
+                else result["reason"] or "no_trainable_batch"
+            )
             if result["trained"]:
                 self.last_trained_step = self.last_global_step
             data_status_after = self.trainer.get_training_data_status(
@@ -1431,6 +1518,14 @@ class SpecoWorker(Worker):
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
             return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def request_drafter_training_reclaim(self, worker_ids=None):
+        target_worker_ids = {str(worker_id) for worker_id in (worker_ids or ())}
+        if target_worker_ids and str(self.rank) not in target_worker_ids:
+            return {"rank": self.rank, "worker_id": str(self.rank), "requested": False}
+        self._drafter_reclaim_requested = True
+        return {"rank": self.rank, "worker_id": str(self.rank), "requested": True}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def maybe_publish(self):

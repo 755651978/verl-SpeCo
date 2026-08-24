@@ -32,6 +32,8 @@ from verl_speco.integration.vllm_runtime import (
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
+    _rollout_idle_event_bus_name,
+    _rollout_idle_worker_id_for_replica,
     _speco_can_use_npu_target_staging,
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
@@ -72,6 +74,23 @@ def test_vllm_speculative_config_maps_eagle3_contract() -> None:
         "model": "/models/drafter",
         "num_speculative_tokens": 3,
     }
+
+
+def test_vllm_rollout_idle_event_config_maps_replica_to_worker() -> None:
+    drafter_cfg = _drafter(
+        training={
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {
+                    "event_bus_name": "bubble-bus",
+                    "training_groups": [["worker-0", "worker-1"]],
+                },
+            }
+        }
+    )
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == "bubble-bus"
+    assert _rollout_idle_worker_id_for_replica(drafter_cfg, 1) == "worker-1"
 
 
 def test_vllm_fresh_training_does_not_load_checkpoint_output_root() -> None:

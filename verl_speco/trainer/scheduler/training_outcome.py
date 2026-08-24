@@ -206,6 +206,14 @@ class TrainingOutcome:
                 metrics[metric_key] = max(values)
 
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
+        if plan.reason.startswith("sync_fallback"):
+            metrics.update(
+                {
+                    "bubble/sync_fallback_completed": int(trained),
+                    "bubble/sync_fallback_successful_steps": successful_steps,
+                    "bubble/sync_fallback_elapsed_s": execution.elapsed_sec,
+                }
+            )
         outcome_reason = (
             execution.reason if result_consistent else "worker_result_inconsistent"
         )

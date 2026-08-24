@@ -37,6 +37,10 @@ from typing import Any, Iterable, cast
 from verl_speco.integration.verl_npu_vllm_compat import (
     install_verl_npu_vllm_import_compat,
 )
+from verl_speco.integration.rollout_idle_events import (
+    SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
+    emit_rollout_idle_event,
+)
 from verl_speco.trainer.checkpoint import trim_process_host_memory
 
 logger = logging.getLogger(__file__)
@@ -864,6 +868,94 @@ def _load_env_drafter_config() -> dict[str, Any]:
 
 def _vllm_drafter_env_payload(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
     return dict(drafter_cfg)
+
+
+def _rollout_idle_worker_config(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
+    training_cfg = drafter_cfg.get("training") or {}
+    scheduler_cfg = training_cfg.get("scheduler") or {}
+    idle_cfg = scheduler_cfg.get("idle_worker") or {}
+    execution_cfg = scheduler_cfg.get("execution") or {}
+    strategy = str(execution_cfg.get("strategy", "sync") or "sync").strip().lower()
+    return dict(idle_cfg) if strategy == "rollout_idle_worker" else {}
+
+
+def _rollout_idle_event_bus_name(drafter_cfg: dict[str, Any]) -> str:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    if not idle_cfg:
+        return ""
+    return str(
+        idle_cfg.get("event_bus_name")
+        or os.getenv(SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV)
+        or ""
+    )
+
+
+def _rollout_idle_worker_id_for_replica(
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+) -> str:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    flattened = [
+        str(worker_id)
+        for group in idle_cfg.get("training_groups") or []
+        for worker_id in group
+    ]
+    if 0 <= int(replica_rank) < len(flattened):
+        return flattened[int(replica_rank)]
+    return str(replica_rank)
+
+
+def _rollout_idle_deadline_ts(drafter_cfg: dict[str, Any]) -> float:
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    try:
+        batch_estimate = float(idle_cfg.get("initial_batch_estimate_sec", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        batch_estimate = 1.0
+    try:
+        max_batches = int(idle_cfg.get("max_batches_per_window", 2) or 2)
+    except (TypeError, ValueError):
+        max_batches = 2
+    try:
+        guard = float(idle_cfg.get("deadline_guard_sec", 0.1) or 0.1)
+    except (TypeError, ValueError):
+        guard = 0.1
+    try:
+        min_window = float(idle_cfg.get("min_idle_window_sec", 0.25) or 0.25)
+    except (TypeError, ValueError):
+        min_window = 0.25
+    return time.time() + max(
+        batch_estimate * max(max_batches, 1) + guard,
+        min_window,
+    )
+
+
+def _emit_rollout_idle_worker_event(
+    *,
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+    event_type: str,
+    memory_released: bool = False,
+) -> bool:
+    bus_name = _rollout_idle_event_bus_name(drafter_cfg)
+    if not bus_name:
+        return False
+    return emit_rollout_idle_event(
+        bus_name,
+        {
+            "event_type": event_type,
+            "worker_id": _rollout_idle_worker_id_for_replica(
+                drafter_cfg, replica_rank
+            ),
+            "replica_rank": int(replica_rank),
+            "memory_released": memory_released,
+            "must_be_ready_at": (
+                _rollout_idle_deadline_ts(drafter_cfg)
+                if event_type == "WORKER_IDLE"
+                else None
+            ),
+            "event_ts": time.time(),
+        },
+    )
 
 
 def _rollout_name(config: Any) -> str | None:
@@ -2016,7 +2108,20 @@ class _SpecoVLLMHttpServerMixin:
             AsyncLLM.from_vllm_config = original_from_vllm_config_attr
 
     async def generate(self, *args, **kwargs):
+        drafter_cfg = _load_env_drafter_config()
+        replica_rank = int(getattr(self, "replica_rank", 0) or 0)
+        _emit_rollout_idle_worker_event(
+            drafter_cfg=drafter_cfg,
+            replica_rank=replica_rank,
+            event_type="GENERATION_STARTED",
+        )
         output = await super().generate(*args, **kwargs)
+        _emit_rollout_idle_worker_event(
+            drafter_cfg=drafter_cfg,
+            replica_rank=replica_rank,
+            event_type="WORKER_IDLE",
+            memory_released=True,
+        )
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)

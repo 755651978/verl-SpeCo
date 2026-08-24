@@ -30,6 +30,8 @@ from verl_speco.integration.sglang_adapter import (
 )
 from verl_speco.integration.sglang_runtime import (
     _SpecoSGLangHttpServerMixin,
+    _rollout_idle_event_bus_name,
+    _rollout_idle_worker_id_for_replica,
     attach_update_draft_weights_to_rollout,
     speco_update_draft_weights,
 )
@@ -108,6 +110,36 @@ def test_sglang_patch_install_forwards_config_and_is_repeatable(monkeypatch) -> 
     assert install_calls[0]["target_weight_loader"] == "target.loader"
     assert install_calls[0]["draft_weight_loader"] == "draft.loader"
     assert install_calls[0]["patches"] == {"hidden_states_tensor_output"}
+
+
+def test_sglang_rollout_idle_event_config_maps_replica_to_worker() -> None:
+    drafter_cfg = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {
+                    "event_bus_name": "bubble-bus",
+                    "training_groups": [["worker-0", "worker-1"]],
+                },
+            }
+        }
+    }
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == "bubble-bus"
+    assert _rollout_idle_worker_id_for_replica(drafter_cfg, 1) == "worker-1"
+
+
+def test_sglang_rollout_idle_event_config_ignores_sync_strategy() -> None:
+    drafter_cfg = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "sync"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    }
+
+    assert _rollout_idle_event_bus_name(drafter_cfg) == ""
 
 
 def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(
