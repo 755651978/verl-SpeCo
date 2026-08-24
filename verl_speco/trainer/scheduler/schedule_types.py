@@ -127,20 +127,6 @@ class DrafterScheduleConfig:
             if hasattr(scheduler_cfg, "get")
             else lambda key, default: default
         )
-        collection_cfg = scheduler_get("collection", {}) or {}
-        collection_get = (
-            collection_cfg.get
-            if hasattr(collection_cfg, "get")
-            else lambda key, default: default
-        )
-        trigger_cfg = scheduler_get("trigger", {}) or {}
-        trigger_get = (
-            trigger_cfg.get if hasattr(trigger_cfg, "get") else lambda key, default: default
-        )
-        budget_cfg = scheduler_get("budget", {}) or {}
-        budget_get = (
-            budget_cfg.get if hasattr(budget_cfg, "get") else lambda key, default: default
-        )
         execution_cfg = scheduler_get("execution", {}) or {}
         execution_get = (
             execution_cfg.get
@@ -151,63 +137,36 @@ class DrafterScheduleConfig:
         idle_get = (
             idle_cfg.get if hasattr(idle_cfg, "get") else lambda key, default: default
         )
-        publish_cfg = scheduler_get("publish", {}) or {}
-        publish_get = (
-            publish_cfg.get
-            if hasattr(publish_cfg, "get")
-            else lambda key, default: default
-        )
-        train_batches = int(budget_get("max_batches", get("step", 100)))
+        train_batches = int(get("step", 100))
         strategy_value = execution_get("strategy", get("execution_strategy", "sync"))
         groups_value = idle_get("training_groups", ())
         training_groups = _normalize_training_groups(groups_value)
         return cls(
-            collect_interval_steps=collection_get(
-                "interval_steps", get("collect_interval_steps", 1)
-            ),
-            training_interval_steps=trigger_get(
-                "interval_steps", get("training_interval_steps", 1)
-            ),
-            publish_interval_steps=publish_get(
-                "interval_optimizer_steps", get("publish_interval_steps", 0)
-            ),
-            publish_async=bool(publish_get("async_update", get("publish_async", False))),
+            collect_interval_steps=get("collect_interval_steps", 1),
+            training_interval_steps=get("training_interval_steps", 1),
+            publish_interval_steps=get("publish_interval_steps", 0),
+            publish_async=bool(get("publish_async", False)),
             use_logits=bool(get("use_logits", False)),
             use_data_buffer=bool(get("use_data_buffer", False)),
             train_batches_per_trigger=train_batches,
-            collection_sample_rate=float(
-                collection_get("sample_rate", get("collection_sample_rate", 1.0))
-                or 0.0
-            ),
+            collection_sample_rate=float(get("collection_sample_rate", 1.0) or 0.0),
             max_collect_samples_per_replica=_optional_int(
-                collection_get(
-                    "max_samples_per_step_per_replica",
-                    get("max_collect_samples_per_step_per_replica", 16),
-                )
+                get("max_collect_samples_per_step_per_replica", 16)
             ),
             max_collect_tokens_per_replica=_optional_int(
-                collection_get(
-                    "max_tokens_per_step_per_replica",
-                    get("max_collect_tokens_per_step_per_replica", None),
-                )
+                get("max_collect_tokens_per_step_per_replica", None)
             ),
             hidden_window_mode=str(get("hidden_state_window_mode", "front") or "front"),
             hidden_window_tokens_per_sample=_optional_int(
                 get("hidden_state_window_tokens_per_sample", 512)
             ),
             hidden_window_min_rows=int(get("hidden_state_window_min_rows", 512)),
-            min_trainable_batches=int(
-                trigger_get("min_trainable_batches", get("min_trainable_batches", 1))
-            ),
+            min_trainable_batches=int(get("min_trainable_batches", 1)),
             max_steps_without_training=_optional_int(
-                trigger_get("max_steps_without_training", None)
+                get("max_steps_without_training", None)
             ),
-            require_full_batch=bool(
-                budget_get("require_full_batch", get("require_full_batch", False))
-            ),
-            sample_last_n_steps=int(
-                budget_get("sample_last_n_steps", get("sample_last_n_steps", 2))
-            ),
+            require_full_batch=bool(get("require_full_batch", False)),
+            sample_last_n_steps=int(get("sample_last_n_steps", 2)),
             execution_strategy=DrafterExecutionStrategy(strategy_value),
             idle_worker_min_idle_window_sec=float(
                 idle_get("min_idle_window_sec", 0.25)

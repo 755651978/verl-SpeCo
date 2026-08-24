@@ -458,8 +458,8 @@ def test_sync_fallback_training_outcome_reports_bubble_metrics() -> None:
 def test_idle_worker_starvation_guard_config_from_nested_mapping() -> None:
     config = DrafterScheduleConfig.from_mapping(
         {
+            "max_steps_without_training": 20,
             "scheduler": {
-                "trigger": {"max_steps_without_training": 20},
                 "idle_worker": {
                     "fallback_to_sync": True,
                     "max_seconds_without_training": 60.5,
@@ -471,6 +471,60 @@ def test_idle_worker_starvation_guard_config_from_nested_mapping() -> None:
     assert config.idle_worker_fallback_to_sync is True
     assert config.max_steps_without_training == 20
     assert config.idle_worker_max_seconds_without_training == 60.5
+
+
+def test_scheduler_duplicate_tuning_subtrees_do_not_override_training_fields() -> None:
+    config = DrafterScheduleConfig.from_mapping(
+        {
+            "collect_interval_steps": 2,
+            "training_interval_steps": 3,
+            "publish_interval_steps": 4,
+            "publish_async": False,
+            "step": 5,
+            "collection_sample_rate": 0.5,
+            "max_collect_samples_per_step_per_replica": 6,
+            "max_collect_tokens_per_step_per_replica": 7,
+            "min_trainable_batches": 8,
+            "max_steps_without_training": 9,
+            "require_full_batch": False,
+            "sample_last_n_steps": 10,
+            "scheduler": {
+                "collection": {
+                    "interval_steps": 20,
+                    "sample_rate": 0.1,
+                    "max_samples_per_step_per_replica": 60,
+                    "max_tokens_per_step_per_replica": 70,
+                },
+                "trigger": {
+                    "interval_steps": 30,
+                    "min_trainable_batches": 80,
+                    "max_steps_without_training": 90,
+                },
+                "budget": {
+                    "max_batches": 50,
+                    "require_full_batch": True,
+                    "sample_last_n_steps": 100,
+                },
+                "publish": {
+                    "interval_optimizer_steps": 40,
+                    "async_update": True,
+                },
+            },
+        }
+    )
+
+    assert config.collect_interval_steps == 2
+    assert config.training_interval_steps == 3
+    assert config.publish_interval_steps == 4
+    assert config.publish_async is False
+    assert config.train_batches_per_trigger == 5
+    assert config.collection_sample_rate == 0.5
+    assert config.max_collect_samples_per_replica == 6
+    assert config.max_collect_tokens_per_replica == 7
+    assert config.min_trainable_batches == 8
+    assert config.max_steps_without_training == 9
+    assert config.require_full_batch is False
+    assert config.sample_last_n_steps == 10
 
 
 def test_idle_worker_plan_caps_batches_by_window_data_and_config() -> None:
