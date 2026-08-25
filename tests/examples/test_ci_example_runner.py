@@ -167,11 +167,10 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             assert "SPECO_DEFAULT_ACCELERATOR_COUNT: ${{ vars.SPECO_ACCELERATOR_COUNT || '8' }}" in source
             assert "SPECO_TOTAL_TRAINING_STEPS: ${{ vars.SPECO_TOTAL_TRAINING_STEPS || '2' }}" in source
             assert "SPECO_MAX_RESPONSE_LENGTH: ${{ vars.SPECO_MAX_RESPONSE_LENGTH || '512' }}" in source
-            assert "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '16' }}" in source
-            assert "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '64' }}" in source
+            assert "SPECO_TRAIN_BATCH_SIZE: ${{ vars.SPECO_TRAIN_BATCH_SIZE || '64' }}" in source
+            assert "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}" in source
             assert "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}" in source
             assert "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}" in source
-            assert "SPECO_REQUIRE_DRAFTER_TRAINED: ${{ vars.SPECO_REQUIRE_DRAFTER_TRAINED || 'true' }}" in source
         assert "SPECO_ACCELERATOR_COUNT" in source
         assert "SPECO_TENSOR_PARALLEL_SIZE" in source
         assert "SPECO_SEQUENCE_PARALLEL_SIZE" in source
@@ -289,7 +288,6 @@ def test_example_runner_exposes_required_hydra_overrides() -> None:
     assert "SPECO_DSPARK_NUM_ANCHORS" in source
     assert "SPECO_DSPARK_MAX_WINDOW" in source
     assert "SPECO_TOTAL_TRAINING_STEPS" in source
-    assert "SPECO_REQUIRE_DRAFTER_TRAINED" in source
     assert "SPECO_TRAIN_MAX_SAMPLES" in source
     assert "SPECO_VAL_MAX_SAMPLES" in source
     assert "SPECO_DATALOADER_NUM_WORKERS" in source
@@ -322,7 +320,6 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
 
     assert "example=examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh" in stdout
     assert "draft_algorithm=DSPARK" in stdout
-    assert "require_drafter_trained=false" in stdout
     assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK" in stdout
     assert "actor_rollout_ref.rollout.drafter.training.dspark_block_size=7" in stdout
     assert "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7" in stdout

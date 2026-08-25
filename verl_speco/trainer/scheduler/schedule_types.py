@@ -163,30 +163,7 @@ class CollectionPlan:
             "drafter/collection_plan_training_interval_matched": int(
                 self.training_interval_matched
             ),
-            "drafter/collection_plan_sample_rate": self.sample_rate,
-            "drafter/collection_plan_max_samples_per_replica": (
-                -1
-                if self.max_samples_per_replica is None
-                else self.max_samples_per_replica
-            ),
-            "drafter/collection_plan_max_tokens_per_replica": (
-                -1
-                if self.max_tokens_per_replica is None
-                else self.max_tokens_per_replica
-            ),
-            "drafter/collection_plan_window_tokens_per_sample": (
-                -1
-                if self.hidden_window_tokens_per_sample is None
-                else self.hidden_window_tokens_per_sample
-            ),
-            "drafter/collection_plan_window_min_rows": self.hidden_window_min_rows,
         }
-        try:
-            metrics["drafter/collection_plan_source_global_step"] = _as_int(
-                self.source_global_step
-            )
-        except (TypeError, ValueError):
-            pass
         return metrics
 
 
@@ -404,18 +381,7 @@ class TrainingPlan:
             "drafter/schedule_interval_matched": int(self.interval_matched),
             "drafter/schedule_strategy": strategy_code,
             "drafter/schedule_reason": self._REASON_CODES.get(self.reason, 0),
-            "drafter/schedule_max_batches": int(self.max_batches),
-            "drafter/schedule_publish_after_success": int(self.publish_after_success),
-            "drafter/schedule_min_batches": int(self.min_batches),
-            "drafter/schedule_require_full_batch": int(self.require_full_batch),
-            "drafter/schedule_sample_last_n_steps": int(self.sample_last_n_steps),
         }
-        try:
-            metrics["drafter/schedule_source_global_step"] = _as_int(
-                self.source_global_step
-            )
-        except (TypeError, ValueError):
-            pass
         return metrics
 
 

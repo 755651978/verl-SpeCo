@@ -213,12 +213,6 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
         "drafter/schedule_interval_matched": 1,
         "drafter/schedule_strategy": 0,
         "drafter/schedule_reason": 10,
-        "drafter/schedule_max_batches": 100,
-        "drafter/schedule_publish_after_success": 1,
-        "drafter/schedule_min_batches": 1,
-        "drafter/schedule_require_full_batch": 0,
-        "drafter/schedule_sample_last_n_steps": 2,
-        "drafter/schedule_source_global_step": 5,
     }
 
 
