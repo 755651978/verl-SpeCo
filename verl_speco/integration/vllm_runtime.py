@@ -907,22 +907,24 @@ def _rollout_idle_worker_id_for_replica(
 
 def _rollout_idle_deadline_ts(drafter_cfg: dict[str, Any]) -> float:
     idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    if idle_cfg.get("initial_batch_estimate_sec") is None:
+        return time.time() + 30.0
     try:
-        batch_estimate = float(idle_cfg.get("initial_batch_estimate_sec", 1.0) or 1.0)
+        batch_estimate = float(idle_cfg.get("initial_batch_estimate_sec") or 1.0)
     except (TypeError, ValueError):
         batch_estimate = 1.0
     try:
-        max_batches = int(idle_cfg.get("max_batches_per_window", 2) or 2)
+        max_batches = int(idle_cfg.get("max_batches_per_window") or 1)
     except (TypeError, ValueError):
-        max_batches = 2
+        max_batches = 1
     try:
-        guard = float(idle_cfg.get("deadline_guard_sec", 0.1) or 0.1)
+        guard = float(idle_cfg.get("deadline_guard_sec") or 0.05)
     except (TypeError, ValueError):
-        guard = 0.1
+        guard = 0.05
     try:
-        min_window = float(idle_cfg.get("min_idle_window_sec", 0.25) or 0.25)
+        min_window = float(idle_cfg.get("min_idle_window_sec") or 0.05)
     except (TypeError, ValueError):
-        min_window = 0.25
+        min_window = 0.05
     return time.time() + max(
         batch_estimate * max(max_batches, 1) + guard,
         min_window,
@@ -939,23 +941,48 @@ def _emit_rollout_idle_worker_event(
     bus_name = _rollout_idle_event_bus_name(drafter_cfg)
     if not bus_name:
         return False
-    return emit_rollout_idle_event(
+    event_ts = time.time()
+    must_be_ready_at = (
+        _rollout_idle_deadline_ts(drafter_cfg)
+        if event_type == "WORKER_IDLE"
+        else None
+    )
+    worker_id = _rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank)
+    deadline_source = (
+        "auto"
+        if _rollout_idle_worker_config(drafter_cfg).get("initial_batch_estimate_sec")
+        is None
+        else "config"
+    )
+    emitted = emit_rollout_idle_event(
         bus_name,
         {
             "event_type": event_type,
-            "worker_id": _rollout_idle_worker_id_for_replica(
-                drafter_cfg, replica_rank
-            ),
+            "worker_id": worker_id,
             "replica_rank": int(replica_rank),
             "memory_released": memory_released,
-            "must_be_ready_at": (
-                _rollout_idle_deadline_ts(drafter_cfg)
-                if event_type == "WORKER_IDLE"
-                else None
-            ),
-            "event_ts": time.time(),
+            "must_be_ready_at": must_be_ready_at,
+            "event_ts": event_ts,
         },
     )
+    logger.info(
+        "[BubbleTime] emit_rollout_idle_event runtime=vllm bus=%s type=%s "
+        "worker_id=%s replica_rank=%s memory_released=%s deadline_in_s=%s "
+        "deadline_source=%s emitted=%s",
+        bus_name,
+        event_type,
+        worker_id,
+        replica_rank,
+        memory_released,
+        (
+            None
+            if must_be_ready_at is None
+            else round(max(must_be_ready_at - event_ts, 0.0), 3)
+        ),
+        deadline_source,
+        emitted,
+    )
+    return emitted
 
 
 def _rollout_name(config: Any) -> str | None:

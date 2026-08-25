@@ -329,6 +329,35 @@ def test_auto_idle_worker_without_metadata_or_group_size_fails_closed() -> None:
     assert plan.reason == "missing_training_group_metadata"
 
 
+def test_idle_worker_auto_budget_bootstraps_one_batch_without_manual_estimate() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    deadline_ts = time.time() + 30.0
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=deadline_ts,
+            )
+        )
+    config = replace(
+        _auto_idle_config(2),
+        idle_worker_min_idle_window_sec=None,
+        idle_worker_max_batches_per_window=None,
+        idle_worker_initial_batch_estimate_sec=None,
+        idle_worker_deadline_guard_sec=None,
+    )
+
+    plan = scheduler.prepare_training_plan(_context(), config)
+
+    assert plan.launch
+    assert plan.max_batches == 1
+    assert plan.reason == "training_ready"
+    assert plan.idle_batch_estimate_sec == pytest.approx(0.25)
+
+
 def test_idle_worker_starvation_guard_launches_sync_fallback_at_safe_point() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler.on_worker_event(
@@ -669,6 +698,7 @@ def test_idle_worker_async_submit_and_poll_completion() -> None:
     assert outcome is not None
     assert outcome.trained
     assert outcome.successful_steps == 1
+    assert scheduler._idle_worker_batch_estimate_sec == pytest.approx(0.8)
     assert state.status is DrafterRuntimeStatus.IDLE
 
 

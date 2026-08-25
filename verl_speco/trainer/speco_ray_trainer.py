@@ -1142,6 +1142,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             DrafterRuntimeStatus.SUBMITTED,
             DrafterRuntimeStatus.RUNNING,
         }:
+            active_plan = runtime_state.active_plan
+            logger.info(
+                "[BubbleTime] skip idle launch: pending_training status=%s "
+                "plan_id=%s workers=%s",
+                runtime_state.status.name,
+                getattr(active_plan, "plan_id", ""),
+                getattr(active_plan, "target_worker_ids", ()),
+            )
             return {"scheduler/pending_training_count": 1}
         with self._speco_bubble_training_lock():
             runtime_state = self._speco_get_drafter_runtime_state()
@@ -1149,6 +1157,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 DrafterRuntimeStatus.SUBMITTED,
                 DrafterRuntimeStatus.RUNNING,
             }:
+                active_plan = runtime_state.active_plan
+                logger.info(
+                    "[BubbleTime] skip idle launch: pending_training status=%s "
+                    "plan_id=%s workers=%s",
+                    runtime_state.status.name,
+                    getattr(active_plan, "plan_id", ""),
+                    getattr(active_plan, "target_worker_ids", ()),
+                )
                 return {"scheduler/pending_training_count": 1}
             event = self._speco_on_before_actor_update(allow_sync_fallback=False)
             plan = event.training_plan
@@ -1172,12 +1188,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_start_rollout_idle_event_loop(self):
         if not self._speco_rollout_idle_worker_enabled():
             return None, None
-        if not self._speco_rollout_idle_event_bus_name():
+        bus_name = self._speco_rollout_idle_event_bus_name()
+        if not bus_name:
+            logger.warning(
+                "[BubbleTime] rollout idle event loop not started: missing event bus"
+            )
             return None, None
+        poll_interval = self._speco_rollout_idle_poll_interval_sec()
+        logger.info(
+            "[BubbleTime] starting rollout idle event loop: bus=%s poll_interval_s=%.3f",
+            bus_name,
+            poll_interval,
+        )
         stop_event = threading.Event()
 
         def run_loop() -> None:
-            while not stop_event.wait(self._speco_rollout_idle_poll_interval_sec()):
+            while not stop_event.wait(poll_interval):
                 try:
                     self._speco_service_rollout_idle_events()
                 except Exception:  # noqa: BLE001
@@ -1225,12 +1251,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_rollout_idle_deadline_ts(self) -> float:
         config = self._speco_drafter_schedule_config()
+        if config.idle_worker_initial_batch_estimate_sec is None:
+            return time.time() + 30.0
+        max_batches_per_window = config.idle_worker_max_batches_per_window or 1
+        deadline_guard_sec = config.idle_worker_deadline_guard_sec or 0.05
+        min_idle_window_sec = config.idle_worker_min_idle_window_sec or 0.05
         window_sec = (
             config.idle_worker_initial_batch_estimate_sec
-            * max(config.idle_worker_max_batches_per_window, 1)
-            + config.idle_worker_deadline_guard_sec
+            * max(max_batches_per_window, 1)
+            + deadline_guard_sec
         )
-        return time.time() + max(window_sec, config.idle_worker_min_idle_window_sec)
+        return time.time() + max(window_sec, min_idle_window_sec)
 
     def _speco_emit_rollout_generation_started(self) -> dict[str, Any]:
         if not self._speco_rollout_idle_worker_enabled():
@@ -1276,6 +1307,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 worker_ids = observed
         scheduler = self._speco_get_drafter_scheduler()
         deadline_ts = self._speco_rollout_idle_deadline_ts()
+        logger.info(
+            "[BubbleTime] rollout generation completed: worker_ids=%s samples=%s "
+            "deadline_in_s=%.3f deadline_source=%s",
+            worker_ids,
+            len(samples),
+            max(deadline_ts - time.time(), 0.0),
+            (
+                "auto"
+                if self._speco_drafter_schedule_config().idle_worker_initial_batch_estimate_sec
+                is None
+                else "config"
+            ),
+        )
         metrics: dict[str, Any] = {}
         for index, worker_id in enumerate(worker_ids):
             metrics.update(
@@ -1346,6 +1390,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "[DrafterScheduler] step=%s strategy=%s launch=%s reason=%s "
             "interval_matched=%s max_batches=%s publish_after_success=%s "
             "training_group=%s target_worker_ids=%s deadline_ts=%s "
+            "window_s=%s usable_window_s=%s window_batches=%s "
+            "batch_estimate_s=%s trainable_batches_for_group=%s "
             "starvation_steps=%s fallback_requested=%s fallback_launched=%s",
             plan.source_global_step,
             plan.execution_strategy.value,
@@ -1357,6 +1403,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             plan.training_group_id,
             plan.target_worker_ids,
             plan.deadline_ts,
+            plan.idle_window_sec,
+            plan.idle_usable_window_sec,
+            plan.idle_window_batches,
+            plan.idle_batch_estimate_sec,
+            plan.idle_trainable_batches,
             metrics.get("bubble/starvation_steps", 0),
             metrics.get("bubble/sync_fallback_requested", 0),
             metrics.get("bubble/sync_fallback_launched", 0),
@@ -2331,6 +2382,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> tuple[bool, dict[str, Any]]:
         runtime_state = self._speco_get_drafter_runtime_state()
         try:
+            logger.info(
+                "[DrafterRuntime] submitting training: step=%s strategy=%s "
+                "plan_id=%s workers=%s max_batches=%s deadline_ts=%s",
+                training_plan.source_global_step,
+                training_plan.execution_strategy.value,
+                training_plan.plan_id,
+                training_plan.target_worker_ids,
+                training_plan.max_batches,
+                training_plan.deadline_ts,
+            )
             event = self._speco_get_drafter_scheduler().on_after_actor_update(
                 AfterActorUpdateContext(
                     training_plan=training_plan,

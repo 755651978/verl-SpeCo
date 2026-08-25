@@ -189,10 +189,6 @@ actor_rollout_ref:
             # sync | rollout_idle_worker
             strategy: sync
           idle_worker:
-            min_idle_window_sec: 0.25
-            max_batches_per_window: 2
-            initial_batch_estimate_sec: 1.0
-            deadline_guard_sec: 0.1
             require_memory_released: true
             drain_before_next_rollout: true
             fallback_to_sync: false

@@ -105,10 +105,10 @@ class DrafterScheduleConfig:
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
     execution_strategy: DrafterExecutionStrategy = DrafterExecutionStrategy.SYNC
-    idle_worker_min_idle_window_sec: float = 0.25
-    idle_worker_max_batches_per_window: int = 2
-    idle_worker_initial_batch_estimate_sec: float = 1.0
-    idle_worker_deadline_guard_sec: float = 0.1
+    idle_worker_min_idle_window_sec: float | None = None
+    idle_worker_max_batches_per_window: int | None = None
+    idle_worker_initial_batch_estimate_sec: float | None = None
+    idle_worker_deadline_guard_sec: float | None = None
     idle_worker_require_memory_released: bool = True
     idle_worker_drain_before_next_rollout: bool = True
     idle_worker_fallback_to_sync: bool = False
@@ -168,16 +168,18 @@ class DrafterScheduleConfig:
             require_full_batch=bool(get("require_full_batch", False)),
             sample_last_n_steps=int(get("sample_last_n_steps", 2)),
             execution_strategy=DrafterExecutionStrategy(strategy_value),
-            idle_worker_min_idle_window_sec=float(
-                idle_get("min_idle_window_sec", 0.25)
+            idle_worker_min_idle_window_sec=_optional_float(
+                idle_get("min_idle_window_sec", None)
             ),
-            idle_worker_max_batches_per_window=int(
-                idle_get("max_batches_per_window", 2)
+            idle_worker_max_batches_per_window=_optional_int(
+                idle_get("max_batches_per_window", None)
             ),
-            idle_worker_initial_batch_estimate_sec=float(
-                idle_get("initial_batch_estimate_sec", 1.0)
+            idle_worker_initial_batch_estimate_sec=_optional_float(
+                idle_get("initial_batch_estimate_sec", None)
             ),
-            idle_worker_deadline_guard_sec=float(idle_get("deadline_guard_sec", 0.1)),
+            idle_worker_deadline_guard_sec=_optional_float(
+                idle_get("deadline_guard_sec", None)
+            ),
             idle_worker_require_memory_released=bool(
                 idle_get("require_memory_released", True)
             ),
@@ -461,6 +463,11 @@ class TrainingPlan:
     worker_snapshots: dict[str, dict[str, object]] | None = None
     target_worker_ids: tuple[str, ...] = ()
     training_group_id: str = ""
+    idle_window_sec: float | None = None
+    idle_usable_window_sec: float | None = None
+    idle_window_batches: int | None = None
+    idle_batch_estimate_sec: float | None = None
+    idle_trainable_batches: int | None = None
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
