@@ -176,6 +176,13 @@ class DrafterScheduler:
             context.training_mode == "collect_only"
             or context.pending_training_count > 0
             or not interval_matched
+            or (
+                context.collected_samples_this_step <= 0
+                and (
+                    context.oldlogprob_collection_requested
+                    or not config.use_data_buffer
+                )
+            )
         ):
             return self.plan_training(context, config)
         data_status = context.data_status or self.inspect_training_data(

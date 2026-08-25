@@ -119,17 +119,27 @@ caller has not already set `ASCEND_RT_VISIBLE_DEVICES`. If the caller provides
 NPU vLLM smoke jobs use lightweight fallback settings for pull requests, pushes,
 and manual runs:
 
-- `SPECO_TOTAL_TRAINING_STEPS=1`
-- `SPECO_TRAIN_BATCH_SIZE=8`
-- `SPECO_TRAIN_MAX_SAMPLES=32`
+- `SPECO_TOTAL_TRAINING_STEPS=2`
+- `SPECO_MAX_RESPONSE_LENGTH=512`
+- `SPECO_TRAIN_BATCH_SIZE=16`
+- `SPECO_TRAIN_MAX_SAMPLES=64`
 - `SPECO_VAL_MAX_SAMPLES=32`
 - `SPECO_PPO_MINI_BATCH_SIZE=8`
+- `SPECO_DRAFTER_TRAINING_STEPS=1`
+- `SPECO_DRAFTER_BATCH_SIZE_PER_GPU=1`
+- `SPECO_TRAIN_BATCHES_PER_CYCLE=1`
+- `SPECO_COLLECT_INTERVAL_STEPS=1`
+- `SPECO_TRAINING_INTERVAL_STEPS=1`
+- `SPECO_PUBLISH_INTERVAL_STEPS=1`
+- `SPECO_REQUIRE_DRAFTER_TRAINED=true`
 - `SPECO_DATALOADER_NUM_WORKERS=0`
 
-The NPU vLLM smoke batch uses eight samples so the generation batch can be
-split evenly across the eight NPU agent-loop workers. The PPO mini-batch also
-uses eight samples so actor updates split evenly across the eight data-parallel
-workers.
+The NPU vLLM smoke batch uses sixteen samples so the generation batch can be
+split evenly across the eight NPU agent-loop workers while giving the drafter
+owner buckets enough candidates to form at least one training batch. The PPO
+mini-batch uses eight samples so actor updates split evenly across the eight
+data-parallel workers. When drafter training is enabled, the runner checks the
+example log and fails if no positive `drafter/trained` metric is emitted.
 
 The runner image is responsible for providing the matching verl, vLLM/SGLang,
 PyTorch accelerator runtime, and model files. Hardware workflows deliberately

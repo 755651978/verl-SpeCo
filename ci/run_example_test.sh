@@ -131,6 +131,7 @@ total_epochs="${SPECO_TOTAL_EPOCHS:-1}"
 if [[ "${enable_training}" != "true" ]]; then
   total_epochs="${SPECO_GENERATION_ONLY_EPOCHS:-1}"
 fi
+require_drafter_trained="${SPECO_REQUIRE_DRAFTER_TRAINED:-false}"
 
 export PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -222,9 +223,41 @@ if [[ "${SPECO_DRY_RUN:-false}" == "true" ]]; then
   echo "example=${example}"
   echo "draft_algorithm=${draft_algorithm}"
   echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-}"
+  echo "require_drafter_trained=${require_drafter_trained}"
   printf 'Hydra overrides:\n'
   printf '  %q\n' "${overrides[@]}"
   exit 0
 fi
 
-bash "${example}" "${overrides[@]}"
+if [[ "${require_drafter_trained}" == "true" && "${enable_training}" == "true" ]]; then
+  log_file="${SPECO_EXAMPLE_LOG_FILE:-$(mktemp -t speco-example-log.XXXXXX)}"
+  set +e
+  bash "${example}" "${overrides[@]}" 2>&1 | tee "${log_file}"
+  example_status=${PIPESTATUS[0]}
+  set -e
+  if (( example_status != 0 )); then
+    exit "${example_status}"
+  fi
+  python - "${log_file}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+log_path = Path(sys.argv[1])
+text = log_path.read_text(encoding="utf-8", errors="replace")
+values = [
+    float(value)
+    for value in re.findall(r"drafter/trained\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", text)
+]
+if not any(value > 0 for value in values):
+    print(
+        "SPECO_REQUIRE_DRAFTER_TRAINED=true but no positive "
+        "drafter/trained metric was found in the example log.",
+        file=sys.stderr,
+    )
+    print(f"checked log: {log_path}", file=sys.stderr)
+    sys.exit(1)
+PY
+else
+  bash "${example}" "${overrides[@]}"
+fi

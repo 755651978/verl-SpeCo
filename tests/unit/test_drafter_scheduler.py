@@ -234,12 +234,12 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
         (
             _context(samples=0, oldlogprob_requested=True),
             DrafterScheduleConfig(training_interval_steps=5, use_data_buffer=True),
-            "no_trainable_batch",
+            "no_current_step_oldlogprob_samples",
         ),
         (
             _context(samples=0),
             DrafterScheduleConfig(training_interval_steps=5),
-            "no_trainable_batch",
+            "no_current_step_samples",
         ),
     ],
 )
@@ -262,6 +262,34 @@ def test_sync_plan_preserves_data_buffer_fallback() -> None:
     assert plan.reason == "training_ready"
     assert plan.max_batches == 9
     assert plan.publish_after_success
+
+
+def test_oldlogprob_collection_does_not_fallback_to_old_buffer_data() -> None:
+    plan = DrafterScheduler().plan_training(
+        _context(samples=0, oldlogprob_requested=True, trainable_batches=4),
+        DrafterScheduleConfig(
+            training_interval_steps=5,
+            use_data_buffer=True,
+            train_batches_per_trigger=4,
+        ),
+    )
+
+    assert not plan.launch
+    assert plan.reason == "no_current_step_oldlogprob_samples"
+
+
+def test_training_without_data_buffer_requires_current_step_samples() -> None:
+    plan = DrafterScheduler().plan_training(
+        _context(samples=0, trainable_batches=4),
+        DrafterScheduleConfig(
+            training_interval_steps=5,
+            use_data_buffer=False,
+            train_batches_per_trigger=4,
+        ),
+    )
+
+    assert not plan.launch
+    assert plan.reason == "no_current_step_samples"
 
 
 def test_sync_plan_uses_configured_steps_when_pool_has_fewer_batches() -> None:

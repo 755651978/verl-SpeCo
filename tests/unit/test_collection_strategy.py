@@ -331,6 +331,62 @@ def test_collection_executor_sends_control_request_for_empty_worker_bucket() -> 
         assert submitted[phase] == expected_control_requests
 
 
+def test_collection_strategy_accepts_zero_sample_result_for_empty_bucket() -> None:
+    payload = CollectionPayload(
+        source=DrafterCollectionSource.SGLANG,
+        buckets=[[{"input_ids": [1, 2]}], []],
+        collected_samples=1,
+        raw_samples=1,
+        collection_id="collection-4",
+    )
+    executor = _executor(
+        stage_results=[
+            _staged_result(worker_id="0", staged_samples=1),
+            _staged_result(worker_id="1", staged_samples=0),
+        ],
+        commit_results=[
+            _worker_result(worker_id="0", accepted_samples=1),
+            _worker_result(worker_id="1", accepted_samples=0),
+        ],
+    )
+
+    outcome = DrafterScheduler(
+        collection_executor=executor
+    ).execute_collection_plan(_plan(), payload)
+
+    assert outcome.collected
+    assert outcome.collected_samples == 1
+    assert outcome.reason == "collection_completed"
+
+
+def test_collection_strategy_rejects_missing_nonempty_owner_result() -> None:
+    events = []
+    payload = CollectionPayload(
+        source=DrafterCollectionSource.SGLANG,
+        buckets=[[{"input_ids": [1, 2]}], []],
+        collected_samples=1,
+        raw_samples=1,
+        collection_id="collection-4",
+    )
+    executor = CallbackDrafterCollectionExecutor(
+        set_step=lambda step: None,
+        stage_submit=lambda buckets: [None, _staged_result(worker_id="1", staged_samples=0)],
+        commit_submit=lambda buckets: events.append("commit") or [],
+        abort_submit=lambda buckets: events.append("abort") or [],
+        rollback_submit=lambda buckets: events.append("rollback") or [],
+        finalize_submit=lambda buckets: events.append("finalize") or [],
+        resolve=lambda value: value,
+    )
+
+    outcome = DrafterScheduler(
+        collection_executor=executor
+    ).execute_collection_plan(_plan(), payload)
+
+    assert not outcome.collected
+    assert outcome.reason == "collection_stage_failed"
+    assert events == ["abort"]
+
+
 def test_collection_rejects_payload_from_another_source() -> None:
     executor = _executor()
 

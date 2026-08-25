@@ -475,6 +475,8 @@ class SpecoWorker(Worker):
         batch: dict,
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor] = None,
+        *,
+        collection_id: Optional[str] = None,
     ) -> bool:
         if (
             not self.enable_drafter
@@ -484,7 +486,10 @@ class SpecoWorker(Worker):
             return False
         if self._drafter_training_mode() == "collect_only":
             return self._write_rollout_feature_sample(
-                batch, hidden_states, target_logprobs
+                batch,
+                hidden_states,
+                target_logprobs,
+                collection_id=collection_id,
             )
         if hidden_states is None:
             raise RuntimeError(
@@ -574,6 +579,8 @@ class SpecoWorker(Worker):
         batch: dict,
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor],
+        *,
+        collection_id: Optional[str] = None,
     ) -> bool:
         writer = self._get_feature_writer()
         if writer is None:
@@ -666,7 +673,20 @@ class SpecoWorker(Worker):
             position_ids=position_ids,
             metadata=metadata,
         )
-        writer.write_many([feature_sample])
+        if collection_id is None:
+            writer.write_many([feature_sample])
+            return True
+        journal = self._collection_commit_journals.get(collection_id)
+        if journal is None:
+            raise RuntimeError(
+                f"Missing collection journal for Feature Store transaction {collection_id}"
+            )
+        pending = journal.setdefault("feature_store_samples", [])
+        if not isinstance(pending, list):
+            raise RuntimeError(
+                f"Invalid Feature Store transaction journal for {collection_id}"
+            )
+        pending.append(feature_sample)
         return True
 
     @staticmethod
@@ -760,6 +780,20 @@ class SpecoWorker(Worker):
         )
         flush_interval = int(feature_store_cfg.get("flush_interval_steps", 1))
         self.feature_writer.flush_on_step(self.last_global_step, flush_interval)
+
+    def _finalize_feature_store_collection(self, journal: dict[str, object]) -> None:
+        samples = journal.get("feature_store_samples")
+        if not samples:
+            return
+        if not isinstance(samples, list):
+            raise RuntimeError("Invalid staged Feature Store collection")
+        writer = self._get_feature_writer()
+        if writer is None:
+            raise RuntimeError(
+                "Cannot finalize collect_only samples without a Feature Store writer"
+            )
+        writer.write_many(samples)
+        self._flush_rollout_features_for_step()
 
     def _collection_worker_result(
         self,
@@ -955,7 +989,10 @@ class SpecoWorker(Worker):
     def finalize_rollout_features(self, requests: list[dict]):
         request = self._collection_request(requests)
         collection_id = str(request.get("collection_id", ""))
-        journal = self._collection_commit_journals.pop(collection_id, None)
+        journal = self._collection_commit_journals.get(collection_id)
+        if journal is not None:
+            self._finalize_feature_store_collection(journal)
+            self._collection_commit_journals.pop(collection_id, None)
         return self._collection_worker_result(
             collection_id=collection_id,
             reason=(
@@ -1038,12 +1075,12 @@ class SpecoWorker(Worker):
                 batch=batch,
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
+                collection_id=collection_id,
             )
             if stored:
                 result["accepted_samples"] += 1
             else:
                 result["rejected_samples"] += 1
-        self._flush_rollout_features_for_step()
         result["buffer_version_after"] = int(
             self.trainer.buffer_version if self.trainer is not None else 0
         )

@@ -117,16 +117,22 @@ class SyncCollectionStrategy:
             executor.abort(payload)
             raise
 
-        expected_by_owner = {
+        expected_nonempty_by_owner = {
             str(owner): len(bucket)
             for owner, bucket in enumerate(payload.buckets)
             if bucket
         }
         staged_by_owner = {result.worker_id: result.staged_samples for result in staged}
         stage_ids = [result.worker_id for result in staged]
+        routing_complete = all(
+            staged_by_owner.get(owner) == expected
+            for owner, expected in expected_nonempty_by_owner.items()
+        ) and all(
+            result.worker_id in expected_nonempty_by_owner or result.staged_samples == 0
+            for result in staged
+        )
         stage_valid = (
             len(stage_ids) == len(set(stage_ids))
-            and set(stage_ids) == set(expected_by_owner)
             and all(
                 result.collection_id == plan.collection_id
                 and result.worker_incarnation
@@ -135,7 +141,7 @@ class SyncCollectionStrategy:
                 and result.reason == "collection_staged"
                 for result in staged
             )
-            and staged_by_owner == expected_by_owner
+            and routing_complete
         )
         if not stage_valid:
             executor.abort(payload)
