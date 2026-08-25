@@ -49,7 +49,7 @@ def test_pipeline_config_derives_transport_identity_from_training_args() -> None
     assert config.tokenizer_path == "/models/Qwen3-8B"
     assert config.algorithm == "DSPARK"
     assert config.target_layer_ids == (1, 9, 17, 25, 33)
-    assert config.vllm_endpoint == "http://127.0.0.1:8000/v1"
+    assert config.vllm_endpoints == ("http://127.0.0.1:8000/v1",)
     assert config.run_id.startswith("dspark-")
 
 
@@ -60,6 +60,34 @@ def test_pipeline_config_accepts_one_hydra_list_train_file() -> None:
     config = resolve_pipeline_config(args, environ={})
 
     assert config.input_path == "/data/train.jsonl"
+
+
+def test_pipeline_config_allows_missing_drafter_path_for_fresh_training() -> None:
+    args = [
+        item
+        for item in _training_args()
+        if not item.startswith("actor_rollout_ref.rollout.drafter.model_path=")
+    ]
+
+    config = resolve_pipeline_config(args, environ={})
+
+    assert config.model_path == "/models/Qwen3-8B"
+
+
+def test_pipeline_config_accepts_multiple_vllm_endpoints() -> None:
+    config = resolve_pipeline_config(
+        _training_args(),
+        environ={
+            "SPECO_VLLM_ENDPOINTS": (
+                "[http://127.0.0.1:8000/v1,http://127.0.0.1:8001/v1]"
+            )
+        },
+    )
+
+    assert config.vllm_endpoints == (
+        "http://127.0.0.1:8000/v1",
+        "http://127.0.0.1:8001/v1",
+    )
 
 
 def test_target_final_layer_id_uses_local_model_config(tmp_path) -> None:
@@ -130,7 +158,7 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     assert commands.vllm is not None
     assert commands.vllm[:3] == ["vllm", "serve", "/models/Qwen3-8B"]
     assert "ExampleHiddenStatesConnector" in " ".join(commands.vllm)
-    assert commands.vllm_endpoint == "http://127.0.0.1:8000/v1"
+    assert commands.vllm_endpoints == ("http://127.0.0.1:8000/v1",)
     assert commands.producer[:3] == [
         "python",
         "-m",
@@ -148,6 +176,53 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         "vllm_endpoints=[http://127.0.0.1:8000/v1]" in item
         for item in commands.producer
     )
+    assert any("max_samples=40" in item for item in commands.producer)
+
+
+def test_pipeline_commands_pass_all_external_vllm_endpoints_to_producer() -> None:
+    endpoints = "[http://127.0.0.1:8000/v1,http://127.0.0.1:8001/v1]"
+    config = resolve_pipeline_config(
+        _training_args(), environ={"SPECO_VLLM_ENDPOINTS": endpoints}
+    )
+
+    commands = build_pipeline_commands(
+        config,
+        _training_args(),
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+    )
+
+    # Multiple services are started by the dedicated shell script. The unified
+    # launcher only verifies them and passes both URLs into the Producer pool.
+    assert commands.vllm is None
+    assert any(f"vllm_endpoints={endpoints}" in item for item in commands.producer)
+
+
+def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
+    args = [
+        *_training_args(),
+        "speco.standalone_tq_producer.max_inflight_requests=32",
+        "speco.standalone_tq_producer.per_endpoint_concurrency=8",
+        "speco.standalone_tq_producer.max_feature_length=384",
+    ]
+    config = resolve_pipeline_config(args, environ={})
+
+    commands = build_pipeline_commands(
+        config,
+        args,
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+    )
+
+    assert (
+        "speco.standalone_tq_producer.max_inflight_requests=32"
+        in commands.producer
+    )
+    assert (
+        "speco.standalone_tq_producer.per_endpoint_concurrency=8"
+        in commands.producer
+    )
+    assert "speco.standalone_tq_producer.max_feature_length=384" in commands.producer
 
 
 class _FakeRuntimeContext:

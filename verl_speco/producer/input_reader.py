@@ -75,8 +75,8 @@ def iter_input_records(path: str | os.PathLike[str]) -> Iterator[InputRecord]:
             raise ValueError(
                 f"Producer input at {location} must be a JSON-style object"
             )
-        prompt = _normalize_prompt(payload.get("prompt"), location)
-        response = payload.get("response")
+        prompt_value, response = _prompt_response_from_payload(payload, location)
+        prompt = _normalize_prompt(prompt_value, location)
         if response is not None and (not isinstance(response, str) or not response):
             raise ValueError(
                 f"Producer input at {location} field 'response' must be a non-empty "
@@ -90,7 +90,8 @@ def iter_input_records(path: str | os.PathLike[str]) -> Iterator[InputRecord]:
         source_metadata = {
             key: value
             for key, value in payload.items()
-            if key not in {"prompt", "response", "sample_id"}
+            if key
+            not in {"prompt", "response", "conversation", "conversations", "sample_id"}
         }
         yield InputRecord(
             sequence_no=sequence_no,
@@ -100,6 +101,82 @@ def iter_input_records(path: str | os.PathLike[str]) -> Iterator[InputRecord]:
             source_metadata=source_metadata,
         )
         sequence_no += 1
+
+
+def _prompt_response_from_payload(
+    payload: Mapping[str, Any], location: str
+) -> tuple[Any, Any]:
+    """Normalize supported row schemas to Producer ``prompt``/``response``."""
+
+    if "prompt" in payload:
+        return payload.get("prompt"), payload.get("response")
+
+    conversation = payload.get("conversation")
+    if conversation is not None:
+        messages = _normalize_conversation_messages(
+            conversation,
+            location,
+            role_key="role",
+            content_key="content",
+        )
+        return _split_final_assistant(messages)
+
+    conversations = payload.get("conversations")
+    if conversations is not None:
+        messages = _normalize_conversation_messages(
+            conversations,
+            location,
+            role_key="from",
+            content_key="value",
+        )
+        return _split_final_assistant(messages)
+
+    return None, payload.get("response")
+
+
+def _normalize_conversation_messages(
+    value: Any,
+    location: str,
+    *,
+    role_key: str,
+    content_key: str,
+) -> tuple[dict[str, str], ...]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"Producer input at {location} conversation must be non-empty")
+    role_mapping = {"human": "user", "gpt": "assistant"}
+    messages: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                f"Producer input at {location} conversation item {index} must be an object"
+            )
+        role = item.get(role_key)
+        content = item.get(content_key)
+        if not isinstance(role, str) or not role:
+            raise ValueError(
+                f"Producer input at {location} conversation item {index} requires "
+                f"string field {role_key!r}"
+            )
+        if not isinstance(content, str) or not content:
+            raise ValueError(
+                f"Producer input at {location} conversation item {index} requires "
+                f"non-empty string field {content_key!r}"
+            )
+        messages.append(
+            {"role": role_mapping.get(role.strip().lower(), role), "content": content}
+        )
+    return tuple(messages)
+
+
+def _split_final_assistant(
+    messages: tuple[dict[str, str], ...],
+) -> tuple[tuple[dict[str, str], ...], str | None]:
+    if messages[-1]["role"] != "assistant":
+        return messages, None
+    prompt = messages[:-1]
+    if not prompt:
+        raise ValueError("Conversation cannot contain only an assistant response")
+    return prompt, messages[-1]["content"]
 
 
 def _normalize_prompt(value: Any, location: str) -> str | tuple[dict[str, str], ...]:
@@ -332,6 +409,40 @@ def finalize_generated_request(
     )
 
 
+def prepare_generated_prefill_request(
+    request: GenerationRequest,
+    response_token_ids: Any,
+    config: Mapping[str, Any] | Any,
+) -> TokenizedRequest:
+    """Build the full-sequence prefill request after target generation.
+
+    The final sampled token has not itself passed through a model forward, so
+    target features are requested for ``prompt + completion[:-1]`` while the
+    full completion remains in ``input_ids`` as the next-token label sequence.
+    This matches the existing non-TQ vLLM replay path and does not require the
+    connector to capture decode-step hidden states.
+    """
+
+    response_ids = _token_ids(response_token_ids)
+    if not response_ids:
+        raise ValueError(
+            f"vLLM generated no response tokens for sample {request.sample_id!r}"
+        )
+    prompt_ids = list(request.prompt_token_ids)
+    full_ids = [*prompt_ids, *response_ids]
+    hidden_input_ids = full_ids[:-1]
+    return _build_tokenized_request(
+        sequence_no=request.sequence_no,
+        sample_id=request.sample_id,
+        prompt_length=len(prompt_ids),
+        full_ids=full_ids,
+        source_metadata=request.source_metadata,
+        config=config,
+        vllm_prompt_token_ids=hidden_input_ids,
+        feature_end_limit=len(hidden_input_ids),
+    )
+
+
 def _prompt_ids(prompt: str | tuple[dict[str, str], ...], tokenizer: Any) -> list[int]:
     if isinstance(prompt, str):
         return _token_ids(tokenizer(prompt, add_special_tokens=False))
@@ -364,12 +475,6 @@ def _build_tokenized_request(
     if int(input_ids.numel()) <= 0:
         raise ValueError(f"Producer sample {sample_id!r} produced no input tokens")
 
-    max_sequence_length = int(_config_value(config, "max_sequence_length", 0) or 0)
-    if max_sequence_length > 0 and int(input_ids.numel()) > max_sequence_length:
-        raise ValueError(
-            f"Producer sample {sample_id!r} has {int(input_ids.numel())} tokens, "
-            f"exceeding max_sequence_length={max_sequence_length}"
-        )
     loss_mask = build_loss_mask(input_ids, prompt_length)
     position_ids = torch.arange(int(input_ids.numel()), dtype=torch.int64)
 
@@ -382,6 +487,23 @@ def _build_tokenized_request(
         raise ValueError("max_feature_length must be 0 or at least 2")
     if max_feature_length > 1:
         feature_end = min(feature_start + max_feature_length, feature_end)
+    request_prompt_token_ids = (
+        list(vllm_prompt_token_ids)
+        if vllm_prompt_token_ids is not None
+        else full_ids[:feature_end]
+    )
+    max_sequence_length = int(_config_value(config, "max_sequence_length", 0) or 0)
+    if (
+        max_sequence_length > 0
+        and len(request_prompt_token_ids) > max_sequence_length
+    ):
+        raise ValueError(
+            f"Producer sample {sample_id!r} requires a vLLM prefill of "
+            f"{len(request_prompt_token_ids)} tokens after selecting its training "
+            f"window, exceeding max_sequence_length={max_sequence_length} "
+            f"(full_sequence_length={int(input_ids.numel())}, "
+            f"prompt_length={prompt_length})"
+        )
     feature_positions = torch.arange(feature_start, feature_end, dtype=torch.int64)
     if int(feature_positions.numel()) <= 0:
         raise ValueError(f"Producer sample {sample_id!r} has an empty feature window")
@@ -395,11 +517,7 @@ def _build_tokenized_request(
         feature_positions=feature_positions,
         draft_position_ids=draft_position_ids,
         source_metadata=dict(source_metadata),
-        vllm_prompt_token_ids=tuple(
-            vllm_prompt_token_ids
-            if vllm_prompt_token_ids is not None
-            else full_ids[:feature_end]
-        ),
+        vllm_prompt_token_ids=tuple(request_prompt_token_ids),
     )
 
 
@@ -439,5 +557,6 @@ __all__ = [
     "finalize_generated_request",
     "iter_input_records",
     "prepare_generation_request",
+    "prepare_generated_prefill_request",
     "tokenize_record",
 ]

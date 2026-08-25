@@ -101,16 +101,13 @@ async def request_generate(
     max_tokens: int,
     timeout: float,
 ) -> VllmResponse:
-    """Generate a response and request hidden states for prompt and output tokens."""
+    """Generate response tokens; hidden states are collected by a later prefill."""
 
     response = await client.completions.create(
         model=model,
         prompt=prompt_token_ids,
         max_tokens=max_tokens,
-        extra_body={
-            "return_token_ids": True,
-            "kv_transfer_params": {"include_output_tokens": True},
-        },
+        extra_body={"return_token_ids": True},
         timeout=timeout,
     )
     choices = getattr(response, "choices", None) or []

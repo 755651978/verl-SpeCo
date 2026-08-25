@@ -41,6 +41,9 @@ speco:
     input_queue_size: 32
     publish_queue_size: 16
     max_pending_samples: 1024
+    # Zero means one input-file pass. The unified launcher sets this to the
+    # exact number of samples required by max_steps and the global batch size.
+    max_samples: 0
     pending_poll_interval_seconds: 0.5
     owner_ready_timeout_seconds: 120
     max_sequence_length: 8192

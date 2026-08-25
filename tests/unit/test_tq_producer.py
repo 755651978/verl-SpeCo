@@ -148,11 +148,13 @@ class _Pool:
         self.started = False
         self.closed = False
         self.generate_calls = 0
+        self.prefill_calls = 0
 
     async def start(self) -> None:
         self.started = True
 
     async def prefill(self, request: Any) -> RawVllmFeature:
+        self.prefill_calls += 1
         path = self.root / f"{request.sample_id}.safetensors"
         path.write_bytes(b"temporary")
         self.paths.append(path)
@@ -242,6 +244,35 @@ def test_run_producer_publishes_samples_then_eos(tmp_path: Path) -> None:
     assert tuple(first_fields["hidden_states"].shape) == (3, 6)
 
 
+def test_run_producer_restarts_input_until_max_samples(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 5
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sample_tags = [
+        tag
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    ]
+    eos_tags = [tag for tag in transport.records.values() if tag.get("status") == "eos"]
+    assert stats.input_count == stats.published_count == 5
+    assert sorted(tag["sequence_no"] for tag in sample_tags) == [0, 1, 2, 3, 4]
+    assert pool.prefill_calls == 5
+    assert eos_tags[0]["total_samples"] == 5
+
+
 def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) -> None:
     input_path = tmp_path / "dapo.jsonl"
     input_path.write_text(
@@ -274,6 +305,7 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     ]
     assert stats.input_count == stats.published_count == 1
     assert pool.generate_calls == 1
+    assert pool.prefill_calls == 1
     assert len(sample_keys) == 1
     fields = transport.payloads[sample_keys[0]]
     assert fields["input_ids"].tolist() == [10, 11]

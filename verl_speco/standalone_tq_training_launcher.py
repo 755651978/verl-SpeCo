@@ -52,9 +52,40 @@ _TOKENIZER_PATH_KEY = (
 _DSPARK_LAYER_IDS_KEY = (
     "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids"
 )
+_MAX_STEPS_KEY = "actor_rollout_ref.rollout.drafter.training.max_steps"
+_BATCH_SIZE_PER_GPU_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu"
+)
+_NPROC_KEYS = (
+    "speco.draft_training.nproc_per_node",
+    "speco.draft_training.num_gpus_per_node",
+    "actor_rollout_ref.rollout.drafter.training.nproc_per_node",
+    "actor_rollout_ref.rollout.drafter.training.num_gpus_per_node",
+)
+_NNODES_KEYS = (
+    "speco.draft_training.nnodes",
+    "speco.draft_training.num_nodes",
+    "actor_rollout_ref.rollout.drafter.training.nnodes",
+    "actor_rollout_ref.rollout.drafter.training.num_nodes",
+)
 
 _TQ_PREFIX = "actor_rollout_ref.rollout.drafter.training.transfer_queue"
 _FEATURE_STORE_PREFIX = "actor_rollout_ref.rollout.drafter.training.feature_store"
+_PRODUCER_PREFIX = "speco.standalone_tq_producer"
+_PRODUCER_TUNING_KEYS = frozenset(
+    {
+        f"{_PRODUCER_PREFIX}.request_timeout",
+        f"{_PRODUCER_PREFIX}.max_inflight_requests",
+        f"{_PRODUCER_PREFIX}.per_endpoint_concurrency",
+        f"{_PRODUCER_PREFIX}.input_queue_size",
+        f"{_PRODUCER_PREFIX}.publish_queue_size",
+        f"{_PRODUCER_PREFIX}.max_pending_samples",
+        f"{_PRODUCER_PREFIX}.pending_poll_interval_seconds",
+        f"{_PRODUCER_PREFIX}.max_sequence_length",
+        f"{_PRODUCER_PREFIX}.max_feature_length",
+        f"{_PRODUCER_PREFIX}.generation_max_tokens",
+    }
+)
 _INTERNAL_OVERRIDE_KEYS = frozenset(
     {
         f"{_FEATURE_STORE_PREFIX}.type",
@@ -88,14 +119,14 @@ class PipelineConfig:
     tokenizer_path: str
     algorithm: str
     target_layer_ids: tuple[int, ...]
-    vllm_endpoint: str
+    vllm_endpoints: tuple[str, ...]
     run_id: str
 
 
 @dataclass(frozen=True)
 class PipelineCommands:
     vllm: list[str] | None
-    vllm_endpoint: str
+    vllm_endpoints: tuple[str, ...]
     owner: list[str]
     producer: list[str]
     consumer: list[str]
@@ -122,6 +153,14 @@ def _find_override(overrides: Sequence[str], key: str) -> str | None:
         parsed = _split_override(item)
         if parsed is not None and parsed[0] == key:
             return parsed[1]
+    return None
+
+
+def _find_first_override(overrides: Sequence[str], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        value = _find_override(overrides, key)
+        if value is not None:
+            return value
     return None
 
 
@@ -161,12 +200,69 @@ def _parse_layer_ids(value: str | None) -> tuple[int, ...]:
     return result
 
 
+def _parse_vllm_endpoints(env: Mapping[str, str]) -> tuple[str, ...]:
+    """Read a Hydra-style endpoint list while preserving the singular fallback."""
+
+    configured = str(env.get("SPECO_VLLM_ENDPOINTS", "")).strip()
+    if configured:
+        text = _strip_quotes(configured)
+        if not (text.startswith("[") and text.endswith("]")):
+            raise ValueError(
+                "SPECO_VLLM_ENDPOINTS must be a Hydra-style list, for example "
+                "[http://127.0.0.1:8000/v1,http://127.0.0.1:8001/v1]"
+            )
+        endpoints = tuple(
+            _strip_quotes(item).rstrip("/")
+            for item in text[1:-1].split(",")
+            if item.strip()
+        )
+    else:
+        endpoint = str(
+            env.get("SPECO_VLLM_ENDPOINT", _DEFAULT_VLLM_ENDPOINT)
+        ).strip()
+        endpoints = (endpoint.rstrip("/"),) if endpoint else ()
+    if not endpoints:
+        raise ValueError("At least one hidden-state vLLM endpoint is required")
+    for endpoint in endpoints:
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(f"Invalid vLLM endpoint: {endpoint!r}")
+    return endpoints
+
+
 def _required_override(overrides: Sequence[str], key: str) -> str:
     value = _find_override(overrides, key)
     normalized = _strip_quotes(value or "")
     if not normalized or normalized.startswith("/path/to/"):
         raise ValueError(f"Standalone TQ training requires a real {key}")
     return normalized
+
+
+def _positive_int_override(
+    overrides: Sequence[str], keys: Sequence[str], *, default: int
+) -> int:
+    raw = _find_first_override(overrides, keys)
+    value = int(_strip_quotes(raw)) if raw is not None else int(default)
+    if value <= 0:
+        raise ValueError(f"{keys[0]} must be positive, got {value}")
+    return value
+
+
+def _producer_max_samples(training_args: Sequence[str]) -> int:
+    """Return samples needed for exactly max_steps complete global batches."""
+
+    raw_max_steps = _find_override(training_args, _MAX_STEPS_KEY)
+    max_steps = int(_strip_quotes(raw_max_steps)) if raw_max_steps is not None else 1000
+    if max_steps <= 0:
+        # An unbounded training run cannot have a finite Producer target. Keep
+        # the direct Producer's one-pass behavior instead of looping forever.
+        return 0
+    batch_size = _positive_int_override(
+        training_args, (_BATCH_SIZE_PER_GPU_KEY,), default=4
+    )
+    nproc = _positive_int_override(training_args, _NPROC_KEYS, default=1)
+    nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
+    return max_steps * batch_size * nproc * nnodes
 
 
 def _stable_path_identity(kind: str, path: str) -> str:
@@ -204,7 +300,6 @@ def resolve_pipeline_config(
 
     env = os.environ if environ is None else environ
     model_path = _required_override(training_args, _MODEL_PATH_KEY)
-    _required_override(training_args, _DRAFTER_PATH_KEY)
     input_path = _single_train_file(_find_override(training_args, _TRAIN_FILES_KEY))
     tokenizer_path = _strip_quotes(
         _find_override(training_args, _TOKENIZER_PATH_KEY) or model_path
@@ -217,16 +312,14 @@ def resolve_pipeline_config(
     target_layer_ids = _parse_layer_ids(
         _find_override(training_args, _DSPARK_LAYER_IDS_KEY)
     )
-    endpoint = str(env.get("SPECO_VLLM_ENDPOINT", _DEFAULT_VLLM_ENDPOINT)).strip()
-    if not endpoint:
-        raise ValueError("SPECO_VLLM_ENDPOINT must not be empty")
+    endpoints = _parse_vllm_endpoints(env)
     return PipelineConfig(
         input_path=input_path,
         model_path=model_path,
         tokenizer_path=tokenizer_path,
         algorithm=algorithm,
         target_layer_ids=target_layer_ids,
-        vllm_endpoint=endpoint.rstrip("/"),
+        vllm_endpoints=endpoints,
         run_id=f"dspark-{uuid.uuid4().hex}",
     )
 
@@ -303,9 +396,7 @@ def build_pipeline_commands(
         f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size=17179869184",
         f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units=8",
     ]
-    parsed_endpoint = urlparse(config.vllm_endpoint)
-    if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.hostname:
-        raise ValueError(f"Invalid vLLM endpoint: {config.vllm_endpoint!r}")
+    parsed_endpoint = urlparse(config.vllm_endpoints[0])
     vllm_port = parsed_endpoint.port or (
         443 if parsed_endpoint.scheme == "https" else 80
     )
@@ -334,7 +425,11 @@ def build_pipeline_commands(
         },
     }
     vllm = None
-    if parsed_endpoint.hostname in {"127.0.0.1", "localhost", "0.0.0.0"}:
+    if len(config.vllm_endpoints) == 1 and parsed_endpoint.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "0.0.0.0",
+    }:
         vllm = [
             "vllm",
             "serve",
@@ -357,12 +452,19 @@ def build_pipeline_commands(
         "verl_speco.tq_owner",
         *tq_overrides,
     ]
+    producer_tuning_overrides = [
+        item
+        for item in training_args
+        if (parsed := _split_override(item)) is not None
+        and parsed[0] in _PRODUCER_TUNING_KEYS
+    ]
     producer = [
         python_executable,
         "-m",
         "verl_speco.standalone_tq_producer",
         f"{_ALGORITHM_KEY}={config.algorithm}",
         *tq_overrides,
+        *producer_tuning_overrides,
         f"speco.standalone_tq_producer.input_path={config.input_path}",
         f"speco.standalone_tq_producer.tokenizer_path={config.tokenizer_path}",
         "speco.standalone_tq_producer.tokenizer_fingerprint="
@@ -373,8 +475,10 @@ def build_pipeline_commands(
         "speco.standalone_tq_producer.target_layer_ids="
         + _hydra_list(config.target_layer_ids),
         "speco.standalone_tq_producer.vllm_endpoints="
-        + _hydra_list((config.vllm_endpoint,)),
+        + _hydra_list(config.vllm_endpoints),
         f"speco.standalone_tq_producer.vllm_model={config.model_path}",
+        "speco.standalone_tq_producer.max_samples="
+        + str(_producer_max_samples(training_args)),
     ]
     consumer_internal = [
         f"{_FEATURE_STORE_PREFIX}.type=tq",
@@ -392,7 +496,7 @@ def build_pipeline_commands(
     ]
     return PipelineCommands(
         vllm=vllm,
-        vllm_endpoint=config.vllm_endpoint,
+        vllm_endpoints=config.vllm_endpoints,
         owner=owner,
         producer=producer,
         consumer=consumer,
@@ -489,13 +593,18 @@ def run_pipeline(
                 prefix="speco-vllm-hidden-states-"
             )
             hidden_states_dir = Path(hidden_states_temp.name)
-            config_endpoint = commands.vllm_endpoint
-            if not endpoint_ready(config_endpoint):
+            unavailable_endpoints = [
+                endpoint
+                for endpoint in commands.vllm_endpoints
+                if not endpoint_ready(endpoint)
+            ]
+            if unavailable_endpoints:
                 if commands.vllm is None:
                     raise RuntimeError(
-                        "The configured remote hidden-state vLLM is unavailable at "
-                        f"{config_endpoint}"
+                        "The configured hidden-state vLLM endpoints are unavailable: "
+                        + ", ".join(unavailable_endpoints)
                     )
+                config_endpoint = commands.vllm_endpoints[0]
                 vllm_command = [
                     part.replace(_VLLM_HIDDEN_STATES_DIR, str(hidden_states_dir))
                     for part in commands.vllm
@@ -517,10 +626,17 @@ def run_pipeline(
                     timeout_seconds=vllm_ready_timeout_seconds,
                     endpoint_ready=endpoint_ready,
                 )
-            elif not endpoint_ready(config_endpoint):
-                raise RuntimeError(
-                    f"hidden-state vLLM became unavailable at {config_endpoint}"
-                )
+            else:
+                unavailable_endpoints = [
+                    endpoint
+                    for endpoint in commands.vllm_endpoints
+                    if not endpoint_ready(endpoint)
+                ]
+                if unavailable_endpoints:
+                    raise RuntimeError(
+                        "hidden-state vLLM became unavailable at: "
+                        + ", ".join(unavailable_endpoints)
+                    )
             logger.info("Starting standalone DSpark Consumer")
             consumer = popen(commands.consumer, env=base_env)
             logger.info("Starting standalone vLLM Producer")
@@ -600,7 +716,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             ]
             for role, command in printable_commands:
                 if command is None:
-                    print(f"{role}: external service at {commands.vllm_endpoint}")
+                    print(
+                        f"{role}: external services at "
+                        + ", ".join(commands.vllm_endpoints)
+                    )
                     continue
                 print(f"{role}: {_format_command(command)}")
             return 0

@@ -27,6 +27,7 @@ PPO_EXAMPLES = [
     for script in EXAMPLES
     if not script.name.endswith("_separate_training.sh")
     and script.name != "run_dspark_tq_producer.sh"
+    and script.name != "run_qwen3-8b_drafter_hidden_state_vllm.sh"
 ]
 
 
@@ -79,6 +80,24 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     assert "actor_rollout_ref.rollout.drafter.enable_drafter_training=True" in source
     assert "actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH}" in source
     assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK" in source
+    assert "speco.standalone_tq_producer.max_inflight_requests=" in source
+    assert "speco.standalone_tq_producer.per_endpoint_concurrency=" in source
+    assert "actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=" in source
+    assert "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=" in source
+
+
+def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_drafter_hidden_state_vllm.sh"
+    ).read_text(encoding="utf-8")
+
+    assert 'VLLM_DEVICES_0=${VLLM_DEVICES_0:-0}' in source
+    assert 'VLLM_DEVICES_1=${VLLM_DEVICES_1:-1}' in source
+    assert 'env "${DEVICE_ENV}=${devices}" vllm serve "${MODEL_PATH}"' in source
+    assert '--tensor-parallel-size "${VLLM_TP}"' in source
+    assert '--max-num-seqs "${VLLM_MAX_NUM_SEQS}"' in source
+    assert '"${VLLM_HIDDEN_STATE_LAYER_IDS}"' in source
+    assert '"kv_connector":"ExampleHiddenStatesConnector"' in source
 
 
 def test_standalone_tq_compatibility_example_delegates_to_formal_entry() -> None:

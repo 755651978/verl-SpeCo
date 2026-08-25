@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import torch
@@ -29,9 +29,9 @@ from verl_speco.integration.oldlogprob_layer_ids import (
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     TokenizedRequest,
-    finalize_generated_request,
     iter_input_records,
     prepare_generation_request,
+    prepare_generated_prefill_request,
     tokenize_record,
 )
 from verl_speco.producer.vllm_feature_client import (
@@ -145,6 +145,10 @@ def validate_producer_config(config: Any) -> None:
         raise ValueError(f"standalone_tq_producer fields must be positive: {invalid}")
 
 
+def _should_log_sample_progress(count: int) -> bool:
+    return count <= 3 or count % 50 == 0
+
+
 async def run_producer(
     config: Any,
     *,
@@ -161,24 +165,43 @@ async def run_producer(
     connected = False
     pool = client_pool
     try:
+        logger.info(
+            "Standalone TQ Producer starting run_id=%s input=%s endpoints=%s",
+            run_id,
+            producer_cfg["input_path"],
+            producer_cfg["vllm_endpoints"],
+        )
         if not transport.configure_transfer_queue(tq_cfg):
             raise RuntimeError("Standalone TQ Producer requires TransferQueue==0.1.7")
         ray_cfg = tq_cfg["ray"]
+        logger.info(
+            "Standalone TQ Producer connecting Ray address=%s namespace=%s",
+            ray_cfg["address"],
+            ray_cfg.get("namespace"),
+        )
         transport.connect_ray_cluster(
             str(ray_cfg["address"]),
             str(ray_cfg["namespace"]) if ray_cfg.get("namespace") else None,
         )
+        logger.info("Standalone TQ Producer connected Ray; initializing TQ client")
         transport.connect_transfer_queue_client()
         connected = True
+        logger.info("Standalone TQ Producer connected TQ; waiting for owner_ready")
         await _wait_for_owner_ready(
             transport,
             run_id,
             timeout=float(producer_cfg["owner_ready_timeout_seconds"]),
             poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
         )
+        logger.info("Standalone TQ Producer observed owner_ready run_id=%s", run_id)
 
         if tokenizer is None:
+            logger.info(
+                "Standalone TQ Producer loading tokenizer path=%s",
+                producer_cfg["tokenizer_path"],
+            )
             tokenizer = await asyncio.to_thread(_load_tokenizer, producer_cfg)
+            logger.info("Standalone TQ Producer tokenizer loaded")
         if pool is None:
             endpoint_concurrency = int(producer_cfg["per_endpoint_concurrency"])
             pool = VllmFeatureClientPool(
@@ -191,6 +214,7 @@ async def run_producer(
                 request_timeout=float(producer_cfg["request_timeout"]),
             )
         await pool.start()
+        logger.info("Standalone TQ Producer vLLM client pool started")
 
         feature_contract = FeatureContract(
             algorithm="DSPARK",
@@ -213,16 +237,56 @@ async def run_producer(
         )
 
         async def read_inputs() -> None:
-            for record in iter_input_records(str(producer_cfg["input_path"])):
-                request = (
-                    prepare_generation_request(record, tokenizer, producer_cfg)
-                    if record.response is None
-                    else tokenize_record(record, tokenizer, producer_cfg)
+            max_samples = int(producer_cfg.get("max_samples", 0) or 0)
+            epoch = 0
+            while True:
+                epoch_count = 0
+                for source_record in iter_input_records(
+                    str(producer_cfg["input_path"])
+                ):
+                    if max_samples > 0 and stats.input_count >= max_samples:
+                        break
+                    # iter_input_records restarts sequence_no at zero on every
+                    # pass. TQ keys require a run-global sequence number so a
+                    # repeated sample never overwrites an earlier pending copy.
+                    record = replace(
+                        source_record,
+                        sequence_no=stats.input_count,
+                    )
+                    request = (
+                        prepare_generation_request(record, tokenizer, producer_cfg)
+                        if record.response is None
+                        else tokenize_record(record, tokenizer, producer_cfg)
+                    )
+                    await input_queue.put(request)
+                    stats.input_count += 1
+                    epoch_count += 1
+                    if _should_log_sample_progress(stats.input_count):
+                        logger.info(
+                            "Standalone TQ Producer queued input count=%s epoch=%s "
+                            "sample_id=%s has_response=%s",
+                            stats.input_count,
+                            epoch,
+                            record.sample_id,
+                            record.response is not None,
+                        )
+                if epoch_count == 0 and stats.input_count == 0:
+                    raise ValueError("Standalone TQ Producer input contains no samples")
+                if max_samples <= 0 or stats.input_count >= max_samples:
+                    break
+                epoch += 1
+                logger.info(
+                    "Standalone TQ Producer restarting input epoch=%s "
+                    "queued=%s target=%s",
+                    epoch,
+                    stats.input_count,
+                    max_samples,
                 )
-                await input_queue.put(request)
-                stats.input_count += 1
             for _ in range(worker_count):
                 await input_queue.put(_INPUT_DONE)
+            logger.info(
+                "Standalone TQ Producer input exhausted total=%s", stats.input_count
+            )
 
         async def request_worker() -> None:
             while True:
@@ -236,14 +300,30 @@ async def run_producer(
                     max_pending_samples=int(producer_cfg["max_pending_samples"]),
                     poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
                 )
-                if isinstance(request, GenerationRequest):
-                    raw = await pool.generate(request)
-                    request = finalize_generated_request(
-                        request,
-                        raw.payload.get("token_ids"),
-                        producer_cfg,
-                        expected_response_token_ids=raw.generated_token_ids,
+                if _should_log_sample_progress(int(request.sequence_no) + 1):
+                    logger.info(
+                        "Standalone TQ Producer requesting vLLM sequence_no=%s "
+                        "sample_id=%s mode=%s",
+                        request.sequence_no,
+                        request.sample_id,
+                        "generate_then_prefill"
+                        if isinstance(request, GenerationRequest)
+                        else "prefill",
                     )
+                if isinstance(request, GenerationRequest):
+                    generated = await pool.generate(request)
+                    try:
+                        request = prepare_generated_prefill_request(
+                            request,
+                            generated.generated_token_ids,
+                            producer_cfg,
+                        )
+                    finally:
+                        # The generation request may still produce a prompt-only
+                        # connector file. It is not the training payload; the
+                        # following full-sequence prefill produces that payload.
+                        await asyncio.to_thread(delete_temporary_result, generated)
+                    raw = await pool.prefill(request)
                 else:
                     raw = await pool.prefill(request)
                 stats.pending_bytes += int(raw.byte_size)
@@ -268,6 +348,14 @@ async def run_producer(
                     continue
                 await publish_one(result, transport)
                 stats.published_count += 1
+                if _should_log_sample_progress(stats.published_count):
+                    logger.info(
+                        "Standalone TQ Producer published count=%s sequence_no=%s "
+                        "sample_id=%s",
+                        stats.published_count,
+                        result.request.sequence_no,
+                        result.request.sample_id,
+                    )
                 stats.pending_bytes = max(
                     stats.pending_bytes - int(result.raw.byte_size), 0
                 )

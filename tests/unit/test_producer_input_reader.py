@@ -194,6 +194,99 @@ def test_finalize_generated_request_aligns_connector_excluding_final_token() -> 
     assert finalized.draft_position_ids.tolist() == [3, 4]
 
 
+def test_prefilled_response_limits_vllm_prefix_after_selecting_training_window() -> None:
+    prepared = input_reader._build_tokenized_request(
+        sequence_no=0,
+        sample_id="long-response",
+        prompt_length=3,
+        full_ids=list(range(20)),
+        source_metadata={},
+        config={"max_sequence_length": 8, "max_feature_length": 4},
+    )
+
+    assert prepared.input_ids.numel() == 20
+    assert prepared.feature_positions.tolist() == [2, 3, 4, 5]
+    assert prepared.prompt_token_ids == [0, 1, 2, 3, 4, 5]
+
+
+def test_prefilled_response_rejects_prompt_prefix_beyond_vllm_limit() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"vLLM prefill of 13 tokens.*max_sequence_length=8",
+    ):
+        input_reader._build_tokenized_request(
+            sequence_no=0,
+            sample_id="long-prompt",
+            prompt_length=10,
+            full_ids=list(range(20)),
+            source_metadata={},
+            config={"max_sequence_length": 8, "max_feature_length": 4},
+        )
+
+
+def test_iter_jsonl_conversation_splits_final_assistant_response(tmp_path: Path) -> None:
+    input_path = tmp_path / "conversation.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "conversation": [
+                    {"role": "human", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = next(input_reader.iter_input_records(input_path))
+
+    assert record.prompt == ({"role": "user", "content": "Question"},)
+    assert record.response == "Answer"
+
+
+def test_iter_jsonl_legacy_conversations_normalizes_from_value(tmp_path: Path) -> None:
+    input_path = tmp_path / "conversations.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "conversations": [
+                    {"from": "human", "value": "Question"},
+                    {"from": "gpt", "value": "Answer"},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    record = next(input_reader.iter_input_records(input_path))
+
+    assert record.prompt == ({"role": "user", "content": "Question"},)
+    assert record.response == "Answer"
+
+
+def test_prepare_generated_prefill_request_uses_full_sequence_without_final_token() -> None:
+    request = input_reader.GenerationRequest(
+        sequence_no=0,
+        sample_id="generated-row",
+        prompt_token_ids=(10, 11, 12),
+        max_tokens=4,
+        source_metadata={},
+    )
+
+    prepared = input_reader.prepare_generated_prefill_request(
+        request,
+        [20, 21],
+        {"max_sequence_length": 16, "max_feature_length": 8},
+    )
+
+    assert prepared.input_ids.tolist() == [10, 11, 12, 20, 21]
+    assert prepared.loss_mask.tolist() == [0, 0, 0, 1, 1]
+    assert prepared.prompt_token_ids == [10, 11, 12, 20]
+    assert prepared.feature_positions.tolist() == [2, 3]
+
+
 def test_finalize_generated_request_rejects_misaligned_connector_tokens() -> None:
     request = input_reader.GenerationRequest(
         sequence_no=0,

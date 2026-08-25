@@ -23,7 +23,7 @@ from verl_speco.producer.vllm_feature_client import (
 )
 
 
-def test_request_generate_includes_output_tokens_in_hidden_states() -> None:
+def test_request_generate_only_requests_generated_token_ids() -> None:
     calls = []
 
     class Completions:
@@ -54,7 +54,4 @@ def test_request_generate_includes_output_tokens_in_hidden_states() -> None:
 
     assert response.generated_token_ids == (3, 4)
     assert calls[0]["max_tokens"] == 128
-    assert calls[0]["extra_body"] == {
-        "return_token_ids": True,
-        "kv_transfer_params": {"include_output_tokens": True},
-    }
+    assert calls[0]["extra_body"] == {"return_token_ids": True}
