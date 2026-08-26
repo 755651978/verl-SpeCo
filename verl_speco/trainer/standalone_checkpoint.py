@@ -161,6 +161,30 @@ def _normalize_dspark_runtime_architecture(
         runtime_config["architectures"] = [architecture]
 
 
+def _normalize_eagle3_runtime_config(
+    runtime_config: dict[str, Any],
+    target_runtime_config: dict[str, Any] | None,
+) -> None:
+    runtime_config["model_type"] = "llama"
+    runtime_config["architectures"] = ["LlamaForCausalLMEagle3"]
+    runtime_config.setdefault("draft_model_type", "eagle3")
+    runtime_config.setdefault("speculative_algorithm", "EAGLE3")
+    runtime_config.setdefault("pretraining_tp", 1)
+    runtime_config["num_hidden_layers"] = 1
+    runtime_config["tie_word_embeddings"] = False
+    if (
+        "draft_vocab_size" not in runtime_config
+        and runtime_config.get("vocab_size") is not None
+    ):
+        runtime_config["draft_vocab_size"] = int(runtime_config["vocab_size"])
+    if (
+        "target_hidden_size" not in runtime_config
+        and isinstance(target_runtime_config, dict)
+        and target_runtime_config.get("hidden_size") is not None
+    ):
+        runtime_config["target_hidden_size"] = int(target_runtime_config["hidden_size"])
+
+
 _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
     "domino": (
         "dflash_config",
@@ -209,7 +233,7 @@ def rewrite_standalone_runtime_config(
     """
 
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dspark", "domino"}:
+    if backend_type not in {"dflash", "dspark", "domino", "eagle3"}:
         return None
 
     if completed_future is not None:
@@ -261,6 +285,8 @@ def rewrite_standalone_runtime_config(
     _normalize_block_runtime_model_type(runtime_config, target_model_type, backend_type)
     if backend_type == "dspark":
         _normalize_dspark_runtime_architecture(runtime_config, target_model_type)
+    elif backend_type == "eagle3":
+        _normalize_eagle3_runtime_config(runtime_config, target_runtime_config)
 
     runtime_config["speco_training_model_type"] = backend_type
     target_runtime_keys = ("head_dim", "rope_theta", "max_position_embeddings")

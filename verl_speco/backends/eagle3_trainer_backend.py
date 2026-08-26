@@ -689,6 +689,8 @@ class Eagle3TrainerBackend:
             drafter_config.tie_word_embeddings = False
             drafter_config.architectures = ["LlamaForCausalLMEagle3"]
 
+        if not hasattr(drafter_config, "pretraining_tp"):
+            drafter_config.pretraining_tp = 1
         if not hasattr(drafter_config, "draft_vocab_size"):
             drafter_config.draft_vocab_size = drafter_config.vocab_size
         if not hasattr(drafter_config, "target_hidden_size"):

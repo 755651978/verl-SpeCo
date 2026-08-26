@@ -564,6 +564,70 @@ def test_standalone_block_checkpoint_uses_target_model_type_without_source_confi
     assert saved_training_config == training_config
 
 
+def test_standalone_eagle3_checkpoint_exports_vllm_llama_runtime_config(tmp_path):
+    checkpoint_dir = tmp_path / "draft_step_5"
+    checkpoint_dir.mkdir()
+    target_dir = tmp_path / "target_qwen3"
+    target_dir.mkdir()
+    missing_source_dir = tmp_path / "missing_source_eagle3"
+    (target_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "hidden_size": 4096,
+                "head_dim": 128,
+                "rope_theta": 1000000,
+                "max_position_embeddings": 40960,
+            }
+        ),
+        encoding="utf-8",
+    )
+    training_config = {
+        "model_type": "qwen3",
+        "architectures": ["LlamaForCausalLMEagle3"],
+        "num_hidden_layers": 1,
+        "hidden_size": 4096,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+    }
+    (checkpoint_dir / "config.json").write_text(
+        json.dumps(training_config), encoding="utf-8"
+    )
+    trainer = SimpleNamespace(
+        backend=SimpleNamespace(model_type="eagle3"),
+        config=SimpleNamespace(
+            model=SimpleNamespace(path=str(target_dir)),
+            rollout=SimpleNamespace(
+                drafter=SimpleNamespace(model_path=str(missing_source_dir))
+            ),
+        ),
+    )
+
+    source_model_path = rewrite_standalone_runtime_config(trainer, str(checkpoint_dir))
+
+    runtime_config = json.loads(
+        (checkpoint_dir / "config.json").read_text(encoding="utf-8")
+    )
+    saved_training_config = json.loads(
+        (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
+    )
+    assert source_model_path == str(missing_source_dir)
+    assert runtime_config["model_type"] == "llama"
+    assert runtime_config["architectures"] == ["LlamaForCausalLMEagle3"]
+    assert runtime_config["draft_model_type"] == "eagle3"
+    assert runtime_config["speculative_algorithm"] == "EAGLE3"
+    assert runtime_config["speco_training_model_type"] == "eagle3"
+    assert runtime_config["pretraining_tp"] == 1
+    assert runtime_config["num_hidden_layers"] == 1
+    assert runtime_config["tie_word_embeddings"] is False
+    assert runtime_config["draft_vocab_size"] == 151936
+    assert runtime_config["target_hidden_size"] == 4096
+    assert runtime_config["head_dim"] == 128
+    assert runtime_config["rope_theta"] == 1000000
+    assert runtime_config["max_position_embeddings"] == 40960
+    assert saved_training_config == training_config
+
+
 def test_standalone_dflash_checkpoint_preserves_source_lm_head(tmp_path):
     safetensors_torch = pytest.importorskip("safetensors.torch")
     checkpoint_dir = tmp_path / "draft_step_5"
