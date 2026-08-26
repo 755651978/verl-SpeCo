@@ -147,6 +147,26 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                     "include"
                 ]
             } == {"eagle3", "dflash", "dspark"}
+            assert {
+                (entry["drafter"], entry["enable_training"])
+                for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
+                    "include"
+                ]
+            } == {
+                ("eagle3", "true"),
+                ("dflash", "true"),
+                ("dspark", "true"),
+            }
+            assert {
+                (entry["drafter"], entry["disable_eagle3_torch_compile"])
+                for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
+                    "include"
+                ]
+            } == {
+                ("eagle3", "true"),
+                ("dflash", "false"),
+                ("dspark", "false"),
+            }
             assert workflow["jobs"]["example"]["container"]["image"] == (
                 "swr.cn-north-4.myhuaweicloud.com/"
                 "mindspeed/verl0.8.0_vllm_910b_speco:v1"
@@ -171,6 +191,8 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             assert "SPECO_TRAIN_MAX_SAMPLES: ${{ vars.SPECO_TRAIN_MAX_SAMPLES || '128' }}" in source
             assert "SPECO_VAL_MAX_SAMPLES: ${{ vars.SPECO_VAL_MAX_SAMPLES || '32' }}" in source
             assert "SPECO_PPO_MINI_BATCH_SIZE: ${{ vars.SPECO_PPO_MINI_BATCH_SIZE || '8' }}" in source
+            assert "matrix.enable_training" in source
+            assert "SPECO_EAGLE3_DISABLE_TORCH_COMPILE" in source
         assert "SPECO_ACCELERATOR_COUNT" in source
         assert "SPECO_TENSOR_PARALLEL_SIZE" in source
         assert "SPECO_SEQUENCE_PARALLEL_SIZE" in source

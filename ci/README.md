@@ -32,6 +32,11 @@ Push, scheduled, and manual NPU runs use the broader matrix:
 - SGLang + EAGLE3
 - SGLang + DFlash
 
+Online drafter training is enabled for all NPU vLLM drafters. The EAGLE3 job
+sets `SPECO_EAGLE3_DISABLE_TORCH_COMPILE=true` to avoid the EAGLE3 NPU
+`torch.compile` training path that can fail with Ascend vector-core exceptions,
+while still exercising online drafter collect/train/publish in CI.
+
 Like verl's CI, the hardware workflows assume the runner image has the runtime
 stack and a small default model cache. Most workflows default to:
 
@@ -94,6 +99,7 @@ environments, or pass them as manual workflow inputs where available:
 - `SPECO_TENSOR_PARALLEL_SIZE`
 - `SPECO_SEQUENCE_PARALLEL_SIZE`
 - `SPECO_ENABLE_TRAINING`
+- `SPECO_EAGLE3_DISABLE_TORCH_COMPILE`
 - `SPECO_SPEC_STEPS`
 - `SPECO_SPEC_TOPK`
 - `SPECO_SPEC_VERIFY_TOKENS`
@@ -138,7 +144,8 @@ split evenly across the eight NPU agent-loop workers while giving the drafter
 owner buckets enough candidates to form at least one training batch even when
 only a subset of rollout samples pass the hidden-state collection filters. The
 PPO mini-batch uses eight samples so actor updates split evenly across the
-eight data-parallel workers.
+eight data-parallel workers. These training-oriented defaults apply to the NPU
+vLLM jobs that enable online drafter training.
 
 The runner image is responsible for providing the matching verl, vLLM/SGLang,
 PyTorch accelerator runtime, and model files. Hardware workflows deliberately
