@@ -49,9 +49,12 @@ _TRAIN_FILES_KEY = "data.train_files"
 _TOKENIZER_PATH_KEY = (
     "actor_rollout_ref.rollout.drafter.training.feature_store.tokenizer_path"
 )
-_DSPARK_LAYER_IDS_KEY = (
-    "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids"
-)
+_PRODUCER_TARGET_LAYER_IDS_KEY = "speco.standalone_tq_producer.target_layer_ids"
+_ALGORITHM_TARGET_LAYER_IDS_KEYS = {
+    "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
+    "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
+    "DOMINO": "actor_rollout_ref.rollout.drafter.training.domino_target_layer_ids",
+}
 _MAX_STEPS_KEY = "actor_rollout_ref.rollout.drafter.training.max_steps"
 _BATCH_SIZE_PER_GPU_KEY = (
     "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu"
@@ -185,19 +188,34 @@ def _single_train_file(value: str | None) -> str:
     return text
 
 
-def _parse_layer_ids(value: str | None) -> tuple[int, ...]:
+def _parse_layer_ids(value: str | None, *, config_key: str) -> tuple[int, ...]:
     if value is None or _strip_quotes(value).lower() in {"", "null", "none"}:
         return _DEFAULT_TARGET_LAYER_IDS
     text = _strip_quotes(value)
     if not (text.startswith("[") and text.endswith("]")):
-        raise ValueError(f"{_DSPARK_LAYER_IDS_KEY} must be a Hydra integer list")
+        raise ValueError(f"{config_key} must be a Hydra integer list")
     try:
         result = tuple(int(item.strip()) for item in text[1:-1].split(","))
     except ValueError as exc:
-        raise ValueError(f"{_DSPARK_LAYER_IDS_KEY} must contain only integers") from exc
+        raise ValueError(f"{config_key} must contain only integers") from exc
     if not result or any(value < 0 for value in result):
-        raise ValueError(f"{_DSPARK_LAYER_IDS_KEY} must contain non-negative IDs")
+        raise ValueError(f"{config_key} must contain non-negative IDs")
     return result
+
+
+def _resolve_target_layer_ids(
+    training_args: Sequence[str], algorithm: str
+) -> tuple[int, ...]:
+    """Resolve Producer layers without making the launcher DSpark-specific."""
+
+    algorithm_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(algorithm)
+    candidate_keys = (
+        (_PRODUCER_TARGET_LAYER_IDS_KEY, algorithm_key)
+        if algorithm_key is not None
+        else (_PRODUCER_TARGET_LAYER_IDS_KEY,)
+    )
+    raw = _find_first_override(training_args, candidate_keys)
+    return _parse_layer_ids(raw, config_key=candidate_keys[0])
 
 
 def _parse_vllm_endpoints(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -307,11 +325,9 @@ def resolve_pipeline_config(
     algorithm = _strip_quotes(
         _find_override(training_args, _ALGORITHM_KEY) or "DSPARK"
     ).upper()
-    if algorithm != "DSPARK":
-        raise ValueError("Standalone Producer/TQ/Consumer launcher requires DSPARK")
-    target_layer_ids = _parse_layer_ids(
-        _find_override(training_args, _DSPARK_LAYER_IDS_KEY)
-    )
+    if not algorithm:
+        raise ValueError(f"{_ALGORITHM_KEY} must not be empty")
+    target_layer_ids = _resolve_target_layer_ids(training_args, algorithm)
     endpoints = _parse_vllm_endpoints(env)
     return PipelineConfig(
         input_path=input_path,
@@ -320,7 +336,7 @@ def resolve_pipeline_config(
         algorithm=algorithm,
         target_layer_ids=target_layer_ids,
         vllm_endpoints=endpoints,
-        run_id=f"dspark-{uuid.uuid4().hex}",
+        run_id=f"{algorithm.lower()}-{uuid.uuid4().hex}",
     )
 
 
@@ -486,8 +502,12 @@ def build_pipeline_commands(
         f"{_FEATURE_STORE_PREFIX}.shuffle=false",
         f"{_FEATURE_STORE_PREFIX}.repeat=false",
         *tq_overrides,
-        f"{_DSPARK_LAYER_IDS_KEY}={_hydra_list(config.target_layer_ids)}",
     ]
+    algorithm_layer_ids_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(config.algorithm)
+    if algorithm_layer_ids_key is not None:
+        consumer_internal.append(
+            f"{algorithm_layer_ids_key}={_hydra_list(config.target_layer_ids)}"
+        )
     consumer = [
         python_executable,
         "-m",

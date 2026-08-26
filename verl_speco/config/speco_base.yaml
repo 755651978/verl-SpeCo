@@ -233,7 +233,7 @@ actor_rollout_ref:
             namespace: speco-drafter
           partition_id: speco_drafter_features
           run_id: null
-          schema_version: 1
+          schema_version: 2
           connect_timeout_seconds: 120
           poll_interval_seconds: 0.5
           drop_last: true

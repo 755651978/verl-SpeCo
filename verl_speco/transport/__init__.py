@@ -20,9 +20,11 @@ from verl_speco.transport.drafter_sample_protocol import (
     SampleMetadata,
     decode_sample,
     encode_sample,
+    is_ready_sample_tag,
     make_eos_record,
     make_ready_tag,
     make_sample_key,
+    parse_ready_tag,
 )
 
 __all__ = [
@@ -32,7 +34,9 @@ __all__ = [
     "SampleMetadata",
     "decode_sample",
     "encode_sample",
+    "is_ready_sample_tag",
     "make_eos_record",
     "make_ready_tag",
     "make_sample_key",
+    "parse_ready_tag",
 ]

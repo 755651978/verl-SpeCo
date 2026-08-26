@@ -53,6 +53,34 @@ def test_pipeline_config_derives_transport_identity_from_training_args() -> None
     assert config.run_id.startswith("dspark-")
 
 
+def test_pipeline_config_reads_non_dspark_algorithm_from_training_args() -> None:
+    args = [
+        item.replace("speculative_algorithm=DSPARK", "speculative_algorithm=DFLASH")
+        for item in _training_args()
+    ]
+    args.append(
+        "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids=[2,10,20]"
+    )
+
+    config = resolve_pipeline_config(args, environ={})
+
+    assert config.algorithm == "DFLASH"
+    assert config.target_layer_ids == (2, 10, 20)
+    assert config.run_id.startswith("dflash-")
+
+
+def test_pipeline_config_prefers_generic_producer_layer_ids() -> None:
+    args = [
+        *_training_args(),
+        "speco.standalone_tq_producer.target_layer_ids=[3,11,21]",
+        "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids=[1,9,17]",
+    ]
+
+    config = resolve_pipeline_config(args, environ={})
+
+    assert config.target_layer_ids == (3, 11, 21)
+
+
 def test_pipeline_config_accepts_one_hydra_list_train_file() -> None:
     args = _training_args()
     args[0] = "data.train_files=['/data/train.jsonl']"

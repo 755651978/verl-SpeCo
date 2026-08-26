@@ -29,6 +29,7 @@ from verl_speco.trainer.tq_sample_source import (
     build_assignments,
 )
 from verl_speco.transport.drafter_sample_protocol import (
+    PROTOCOL_SCHEMA_VERSION,
     SampleMetadata,
     encode_sample,
     make_ready_tag,
@@ -42,29 +43,16 @@ def _config() -> dict:
         "ray": {"address": "ray-head:6379", "namespace": "speco-drafter"},
         "partition_id": "speco_drafter_features",
         "run_id": "run-a",
-        "schema_version": 1,
+        "schema_version": PROTOCOL_SCHEMA_VERSION,
     }
 
 
 def _metadata(sequence_no: int = 0) -> SampleMetadata:
     return SampleMetadata(
-        schema_version=1,
+        schema_version=PROTOCOL_SCHEMA_VERSION,
         run_id="run-a",
         sample_id=f"sample-{sequence_no}",
         sequence_no=sequence_no,
-        algorithm="DSPARK",
-        target_model_id="producer-model-is-not-strictly-checked",
-        target_model_revision="producer-revision",
-        tokenizer_fingerprint="producer-tokenizer",
-        target_layer_ids=[2, 8, 14],
-        hidden_states_layout="dflash_aux_plus_last",
-        hidden_dtype="float32",
-        hidden_shape=[3, 4],
-        feature_length=3,
-        full_sequence_length=3,
-        feature_start=0,
-        feature_end=3,
-        use_logits=False,
     )
 
 
@@ -75,6 +63,7 @@ def _sample() -> DraftFeatureSample:
         loss_mask=torch.tensor([1.0, 1.0, 1.0]),
         position_ids=torch.tensor([0, 1, 2]),
         hidden_states=torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        metadata={"target_model_revision": "producer-revision"},
     )
 
 
@@ -123,10 +112,10 @@ def test_tq_store_connect_filter_sort_and_minimal_decode(monkeypatch) -> None:
             entries[0].key: entries[0].tag,
             unrelated.key: unrelated.tag,
             entries[1].key: entries[1].tag,
-            "control:v1:run-a:eos": {
+            "control:v2:run-a:eos": {
                 "record_type": "control",
                 "status": "eos",
-                "schema_version": 1,
+                "schema_version": PROTOCOL_SCHEMA_VERSION,
                 "run_id": "run-a",
                 "total_samples": 2,
             },

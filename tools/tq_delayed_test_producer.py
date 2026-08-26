@@ -32,6 +32,7 @@ from verl_speco.integration.transferqueue_bridge import (
 )
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.transport.drafter_sample_protocol import (
+    PROTOCOL_SCHEMA_VERSION,
     SampleMetadata,
     encode_sample,
     make_eos_record,
@@ -47,7 +48,7 @@ def _tq_config(args: argparse.Namespace) -> dict[str, Any]:
         "ray": {"address": args.ray_address, "namespace": args.namespace},
         "partition_id": args.partition_id,
         "run_id": args.run_id,
-        "schema_version": 1,
+        "schema_version": PROTOCOL_SCHEMA_VERSION,
         "controller": {"polling_mode": True},
         "backend": {
             "storage_backend": "SimpleStorage",
@@ -71,7 +72,7 @@ def _model_dimensions(model_path: str) -> tuple[int, int, int]:
 
 
 def _wait_for_owner(args: argparse.Namespace) -> None:
-    owner_ready_key = f"control:v1:{args.run_id}:owner-ready"
+    owner_ready_key = f"control:v{PROTOCOL_SCHEMA_VERSION}:{args.run_id}:owner-ready"
     deadline = time.monotonic() + args.timeout
     while time.monotonic() < deadline:
         tag = list_samples().get(owner_ready_key)
@@ -128,23 +129,10 @@ def _sample(
     )
     sample_id = f"consumer-test-{sequence_no:08d}"
     metadata = SampleMetadata(
-        schema_version=1,
+        schema_version=PROTOCOL_SCHEMA_VERSION,
         run_id=args.run_id,
         sample_id=sample_id,
         sequence_no=sequence_no,
-        algorithm="DSPARK",
-        target_model_id=str(Path(args.model_path).resolve()),
-        target_model_revision="local-test",
-        tokenizer_fingerprint="synthetic-consumer-test",
-        target_layer_ids=target_layer_ids,
-        hidden_states_layout="dflash_aux_plus_last",
-        hidden_dtype="bfloat16",
-        hidden_shape=[args.sequence_length, hidden_dim],
-        feature_length=args.sequence_length,
-        full_sequence_length=args.sequence_length,
-        feature_start=0,
-        feature_end=args.sequence_length,
-        use_logits=False,
     )
     sample = DraftFeatureSample(
         algorithm="DSPARK",

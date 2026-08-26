@@ -31,6 +31,7 @@ from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.transport.drafter_sample_protocol import (
     ExpectedFeatureConfig,
     decode_sample,
+    parse_ready_tag,
 )
 
 
@@ -101,16 +102,12 @@ class TQFeatureStore:
         ready: list[ReadyEntry] = []
         for key, raw_tag in list_samples().items():
             tag = dict(raw_tag)
-            if tag.get("record_type") != "sample" or tag.get("status") != "ready":
-                continue
-            if str(tag.get("run_id") or "") != expected_run_id:
-                continue
-            if int(tag.get("schema_version", -1)) != self.schema_version:
-                continue
-            try:
-                int(tag["sequence_no"])
-                str(tag["sample_id"])
-            except (KeyError, TypeError, ValueError):
+            meta = parse_ready_tag(
+                tag,
+                run_id=expected_run_id,
+                schema_version=self.schema_version,
+            )
+            if meta is None:
                 continue
             ready.append(ReadyEntry(key=str(key), tag=tag))
         ready.sort(key=lambda entry: (int(entry.tag["sequence_no"]), entry.key))

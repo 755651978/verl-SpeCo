@@ -37,6 +37,7 @@ from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.tq_feature_store import TQFeatureStore
 from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader
 from verl_speco.transport.drafter_sample_protocol import (
+    PROTOCOL_SCHEMA_VERSION,
     SampleMetadata,
     encode_sample,
     make_eos_record,
@@ -52,7 +53,7 @@ def _config(args) -> dict:
         "ray": {"address": args.ray_address, "namespace": args.namespace},
         "partition_id": "speco_drafter_features",
         "run_id": args.run_id,
-        "schema_version": 1,
+        "schema_version": PROTOCOL_SCHEMA_VERSION,
         "controller": {"polling_mode": True},
         "backend": {
             "storage_backend": "SimpleStorage",
@@ -66,23 +67,10 @@ def _config(args) -> dict:
 
 def _record(run_id: str, sequence_no: int):
     meta = SampleMetadata(
-        schema_version=1,
+        schema_version=PROTOCOL_SCHEMA_VERSION,
         run_id=run_id,
         sample_id=f"smoke-{sequence_no:04d}",
         sequence_no=sequence_no,
-        algorithm="DSPARK",
-        target_model_id="smoke-target",
-        target_model_revision="smoke-revision",
-        tokenizer_fingerprint="smoke-tokenizer",
-        target_layer_ids=[0],
-        hidden_states_layout="dflash_aux",
-        hidden_dtype="float32",
-        hidden_shape=[3, 4],
-        feature_length=3,
-        full_sequence_length=3,
-        feature_start=0,
-        feature_end=3,
-        use_logits=False,
     )
     sample = DraftFeatureSample(
         algorithm="DSPARK",
@@ -114,14 +102,14 @@ def run_owner(args) -> None:
     records = [_record(args.run_id, sequence_no) for sequence_no in range(2)]
     keys = [make_sample_key(meta) for meta, _ in records]
     try:
-        owner_ready_key = f"control:v1:{args.run_id}:owner-ready"
+        owner_ready_key = f"control:v{PROTOCOL_SCHEMA_VERSION}:{args.run_id}:owner-ready"
         put_sample(
             owner_ready_key,
             {"marker": torch.tensor([1], dtype=torch.uint8)},
             tag={
                 "record_type": "control",
                 "status": "owner_ready",
-                "schema_version": 1,
+                "schema_version": PROTOCOL_SCHEMA_VERSION,
                 "run_id": args.run_id,
             },
         )

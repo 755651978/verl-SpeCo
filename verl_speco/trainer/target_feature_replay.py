@@ -38,6 +38,10 @@ from verl_speco.trainer.feature_store import DraftFeatureSample, DraftReplaySamp
 logger = logging.getLogger(__name__)
 
 
+class HiddenStateAlignmentError(ValueError):
+    """The returned hidden states cannot cover the requested training sample."""
+
+
 @dataclass(frozen=True)
 class MooncakeReplayDescriptor:
     sample: DraftReplaySample
@@ -59,6 +63,7 @@ class FeatureContract:
     use_logits: bool = False
     target_config_fingerprint: str | None = None
     source: str = "standalone_tq_producer"
+    require_full_alignment: bool = False
 
 
 @dataclass
@@ -397,7 +402,9 @@ def feature_from_vllm_payload(
         else request.input_ids[:feature_end_for_request].detach().cpu().long().tolist()
     )
     if token_ids.detach().cpu().long().tolist() != expected_prompt_ids:
-        raise ValueError("vLLM hidden-states token_ids do not match replay input")
+        raise HiddenStateAlignmentError(
+            "vLLM hidden-states token_ids do not match replay input"
+        )
     if hidden.dim() != 3:
         raise ValueError(
             "vLLM hidden_states must have shape [seq, layers, hidden], "
@@ -425,7 +432,7 @@ def feature_from_vllm_payload(
     }
     required_layers = len(target_layer_ids) + (1 if include_final else 0)
     if int(hidden.size(1)) < required_layers:
-        raise ValueError(
+        raise HiddenStateAlignmentError(
             "vLLM hidden_states layer count is too small: "
             f"got {int(hidden.size(1))}, need at least {required_layers}. "
             "Start vLLM with target layer ids plus the final layer when the "
@@ -435,6 +442,15 @@ def feature_from_vllm_payload(
     keep_mask = (relative_positions >= 0) & (relative_positions < int(hidden.size(0)))
     filtered = not bool(keep_mask.all().item())
     if filtered:
+        if feature_config.require_full_alignment:
+            raise HiddenStateAlignmentError(
+                "vLLM hidden-state rows do not cover the complete feature window: "
+                f"hidden_rows={int(hidden.size(0))}, "
+                f"hidden_position_offset={hidden_position_offset}, "
+                f"dropped={int((~keep_mask).sum().item())}, "
+                f"feature_min={int(feature_positions.min().item())}, "
+                f"feature_max={int(feature_positions.max().item())}"
+            )
         logger.warning(
             "Dropping vLLM feature positions outside hidden rows dropped=%s "
             "hidden_rows=%s hidden_offset=%s feature_min=%s feature_max=%s",
@@ -447,7 +463,7 @@ def feature_from_vllm_payload(
         feature_positions = feature_positions[keep_mask]
         relative_positions = relative_positions[keep_mask]
         if int(feature_positions.numel()) <= 0:
-            raise ValueError(
+            raise HiddenStateAlignmentError(
                 "vLLM hidden_states contain no rows for replay feature positions: "
                 f"hidden_rows={int(hidden.size(0))}, "
                 f"hidden_position_offset={hidden_position_offset}"

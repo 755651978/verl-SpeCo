@@ -33,6 +33,7 @@ from verl_speco.integration.transferqueue_bridge import (
     put_sample,
     start_transfer_queue_owner,
 )
+from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
 
 
 logger = logging.getLogger(__name__)
@@ -97,7 +98,7 @@ def run_owner(config: Any, *, stop_event: threading.Event | None = None) -> int:
         started = True
         ready_key = publish_owner_ready(
             str(tq_cfg.get("run_id") or ""),
-            int(tq_cfg.get("schema_version", 1)),
+            int(tq_cfg.get("schema_version", PROTOCOL_SCHEMA_VERSION)),
         )
         logger.info("TQ owner ready key=%s", ready_key)
         ready_file = os.environ.get("SPECO_TQ_OWNER_READY_FILE")

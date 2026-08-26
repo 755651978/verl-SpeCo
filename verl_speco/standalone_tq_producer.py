@@ -43,6 +43,7 @@ from verl_speco.producer.vllm_feature_client import (
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
+    HiddenStateAlignmentError,
     feature_from_vllm_payload,
 )
 from verl_speco.transport.drafter_sample_protocol import (
@@ -50,6 +51,7 @@ from verl_speco.transport.drafter_sample_protocol import (
     PROTOCOL_SCHEMA_VERSION,
     SampleMetadata,
     encode_sample,
+    is_ready_sample_tag,
     make_eos_record,
     make_ready_tag,
     make_sample_key,
@@ -66,6 +68,7 @@ class ProducerStats:
     input_count: int = 0
     published_count: int = 0
     failed_count: int = 0
+    dropped_count: int = 0
     pending_bytes: int = 0
 
 
@@ -111,8 +114,9 @@ def validate_producer_config(config: Any) -> None:
         raise ValueError(
             "standalone_tq_producer.target_layer_ids must be a non-empty list"
         )
-    if str(training_cfg.get("speculative_algorithm", "DSPARK")).upper() != "DSPARK":
-        raise ValueError("Standalone TQ Producer currently supports only DSPARK")
+    algorithm = str(training_cfg.get("speculative_algorithm", "") or "").strip()
+    if not algorithm:
+        raise ValueError("drafter.speculative_algorithm must not be empty")
     if bool(training_cfg.get("use_logits", False)):
         raise ValueError("Standalone TQ Producer does not support use_logits=true")
     if int(tq_cfg.get("schema_version", 0)) != PROTOCOL_SCHEMA_VERSION:
@@ -216,17 +220,19 @@ async def run_producer(
         await pool.start()
         logger.info("Standalone TQ Producer vLLM client pool started")
 
+        algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
         feature_contract = FeatureContract(
-            algorithm="DSPARK",
+            algorithm=algorithm,
             target_layer_ids=[int(value) for value in producer_cfg["target_layer_ids"]],
             hidden_states_layout=resolve_drafter_hidden_states_layout(
-                "DSPARK", drafter_cfg
+                algorithm, drafter_cfg
             ),
             dtype=_parse_dtype(producer_cfg["hidden_dtype"]),
             target_model_id=str(producer_cfg["target_model_id"]),
             target_model_revision=str(producer_cfg["target_model_revision"]),
             tokenizer_fingerprint=str(producer_cfg["tokenizer_fingerprint"]),
             use_logits=False,
+            require_full_alignment=True,
         )
         worker_count = int(producer_cfg["max_inflight_requests"])
         input_queue: asyncio.Queue[Any] = asyncio.Queue(
@@ -327,7 +333,25 @@ async def run_producer(
                 else:
                     raw = await pool.prefill(request)
                 stats.pending_bytes += int(raw.byte_size)
-                sample = feature_from_vllm_payload(raw, request, feature_contract)
+                try:
+                    sample = feature_from_vllm_payload(
+                        raw, request, feature_contract
+                    )
+                except HiddenStateAlignmentError as exc:
+                    stats.dropped_count += 1
+                    stats.pending_bytes = max(
+                        stats.pending_bytes - int(raw.byte_size), 0
+                    )
+                    await asyncio.to_thread(delete_temporary_result, raw)
+                    logger.warning(
+                        "Standalone TQ Producer dropped misaligned sample "
+                        "sequence_no=%s sample_id=%s dropped=%s reason=%s",
+                        request.sequence_no,
+                        request.sample_id,
+                        stats.dropped_count,
+                        exc,
+                    )
+                    continue
                 await publish_queue.put(
                     PreparedFeature(
                         request=request,
@@ -378,9 +402,10 @@ async def run_producer(
         eos_key, eos_fields, eos_tag = make_eos_record(run_id, stats.published_count)
         await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)
         logger.info(
-            "Standalone TQ Producer completed inputs=%s published=%s",
+            "Standalone TQ Producer completed inputs=%s published=%s dropped=%s",
             stats.input_count,
             stats.published_count,
+            stats.dropped_count,
         )
         return stats
     finally:
@@ -428,9 +453,11 @@ async def _wait_for_pending_capacity(
         ready_count = sum(
             1
             for tag in records.values()
-            if tag.get("record_type") == "sample"
-            and tag.get("status") == "ready"
-            and tag.get("run_id") == run_id
+            if is_ready_sample_tag(
+                tag,
+                run_id=run_id,
+                schema_version=PROTOCOL_SCHEMA_VERSION,
+            )
         )
         if ready_count < max_pending_samples:
             return
@@ -444,32 +471,12 @@ def _sample_metadata(
     run_id: str,
     tq_cfg: Mapping[str, Any],
 ) -> SampleMetadata:
-    hidden = sample.hidden_states
-    if not torch.is_tensor(hidden):
-        raise TypeError("Standalone TQ Producer requires dense hidden_states")
-    feature_start = int(sample.metadata["feature_start"])
-    feature_end = int(sample.metadata["feature_end"])
-    wire_layer_ids = list(contract.target_layer_ids)
-    if contract.hidden_states_layout == "dflash_aux_plus_last":
-        wire_layer_ids.append(-1)
+    del sample, contract
     return SampleMetadata(
         schema_version=int(tq_cfg["schema_version"]),
         run_id=run_id,
         sample_id=request.sample_id,
         sequence_no=request.sequence_no,
-        algorithm=contract.algorithm,
-        target_model_id=contract.target_model_id,
-        target_model_revision=str(contract.target_model_revision or ""),
-        tokenizer_fingerprint=contract.tokenizer_fingerprint,
-        target_layer_ids=wire_layer_ids,
-        hidden_states_layout=contract.hidden_states_layout,
-        hidden_dtype=str(hidden.dtype).removeprefix("torch."),
-        hidden_shape=[int(value) for value in hidden.shape],
-        feature_length=int(hidden.size(0)),
-        full_sequence_length=int(request.input_ids.numel()),
-        feature_start=feature_start,
-        feature_end=feature_end,
-        use_logits=contract.use_logits,
     )
 
 

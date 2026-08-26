@@ -11,12 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wire protocol for standalone drafter samples stored in TransferQueue.
-
-One TQ key represents one training sample.  Tensor payloads live in TQ fields;
-small discovery attributes live in the TQ tag; richer metadata is JSON encoded
-as a uint8 tensor so Producer and Consumer use one versioned contract.
-"""
+"""Algorithm-neutral TransferQueue codec for ``DraftFeatureSample``."""
 
 from __future__ import annotations
 
@@ -29,46 +24,31 @@ import torch
 from verl_speco.trainer.feature_store import DraftFeatureSample
 
 
-PROTOCOL_SCHEMA_VERSION = 1
+PROTOCOL_SCHEMA_VERSION = 2
 DRAFTER_TQ_PARTITION = "speco_drafter_features"
-_REQUIRED_FIELDS = (
-    "input_ids",
-    "loss_mask",
-    "position_ids",
-    "hidden_states",
-    "metadata_json",
-)
+_MANIFEST_FIELD = "sample__manifest_json"
+_REQUIRED_SAMPLE_FIELDS = ("input_ids", "loss_mask", "hidden_states")
 _OPTIONAL_TENSOR_FIELDS = (
     "last_hidden_states",
     "target",
     "target_logprobs",
+    "position_ids",
 )
 
 
 @dataclass(frozen=True)
 class SampleMetadata:
+    """Small control-plane envelope; training metadata belongs to the sample."""
+
     schema_version: int
     run_id: str
     sample_id: str
     sequence_no: int
-    algorithm: str
-    target_model_id: str
-    target_model_revision: str
-    tokenizer_fingerprint: str
-    target_layer_ids: list[int]
-    hidden_states_layout: str
-    hidden_dtype: str
-    hidden_shape: list[int]
-    feature_length: int
-    full_sequence_length: int
-    feature_start: int
-    feature_end: int
-    use_logits: bool
 
     def validate(self) -> None:
         if self.schema_version != PROTOCOL_SCHEMA_VERSION:
             raise ValueError(
-                f"Unsupported drafter sample schema_version={self.schema_version}; "
+                f"Unsupported drafter protocol schema_version={self.schema_version}; "
                 f"expected {PROTOCOL_SCHEMA_VERSION}"
             )
         if not self.run_id:
@@ -77,35 +57,10 @@ class SampleMetadata:
             raise ValueError("SampleMetadata.sample_id must not be empty")
         if self.sequence_no < 0:
             raise ValueError("SampleMetadata.sequence_no must be non-negative")
-        if not self.algorithm.strip():
-            raise ValueError("SampleMetadata.algorithm must not be empty")
-        if len(self.hidden_shape) != 2:
-            raise ValueError(
-                f"SampleMetadata.hidden_shape must be [rows, hidden_dim], got {self.hidden_shape!r}"
-            )
-        if self.feature_length <= 0:
-            raise ValueError("SampleMetadata.feature_length must be positive")
-        if self.hidden_shape[0] != self.feature_length:
-            raise ValueError(
-                "SampleMetadata hidden_shape/feature_length mismatch: "
-                f"{self.hidden_shape[0]} vs {self.feature_length}"
-            )
-        if not (0 <= self.feature_start < self.feature_end <= self.full_sequence_length):
-            raise ValueError(
-                "SampleMetadata feature window must satisfy "
-                "0 <= feature_start < feature_end <= full_sequence_length"
-            )
-        if self.feature_end - self.feature_start != self.feature_length:
-            raise ValueError(
-                "SampleMetadata feature window length does not match feature_length: "
-                f"{self.feature_end - self.feature_start} vs {self.feature_length}"
-            )
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
-        payload = asdict(self)
-        payload["algorithm"] = self.algorithm.strip().upper()
-        return payload
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "SampleMetadata":
@@ -115,39 +70,19 @@ class SampleMetadata:
                 run_id=str(payload["run_id"]),
                 sample_id=str(payload["sample_id"]),
                 sequence_no=int(payload["sequence_no"]),
-                algorithm=str(payload["algorithm"]),
-                target_model_id=str(payload["target_model_id"]),
-                target_model_revision=str(payload["target_model_revision"]),
-                tokenizer_fingerprint=str(payload["tokenizer_fingerprint"]),
-                target_layer_ids=[int(v) for v in payload["target_layer_ids"]],
-                hidden_states_layout=str(payload["hidden_states_layout"]),
-                hidden_dtype=str(payload["hidden_dtype"]),
-                hidden_shape=[int(v) for v in payload["hidden_shape"]],
-                feature_length=int(payload["feature_length"]),
-                full_sequence_length=int(payload["full_sequence_length"]),
-                feature_start=int(payload["feature_start"]),
-                feature_end=int(payload["feature_end"]),
-                use_logits=bool(payload["use_logits"]),
             )
         except KeyError as exc:
-            raise ValueError(f"metadata_json missing required field {exc.args[0]!r}") from exc
+            raise ValueError(f"ready tag missing required field {exc.args[0]!r}") from exc
         meta.validate()
         return meta
 
 
 @dataclass(frozen=True)
 class ExpectedFeatureConfig:
-    """Consumer-side contract.  ``None`` fields are intentionally unchecked."""
+    """Consumer-side transport contract."""
 
     run_id: str
     schema_version: int = PROTOCOL_SCHEMA_VERSION
-    algorithm: str | None = None
-    target_model_id: str | None = None
-    target_model_revision: str | None = None
-    tokenizer_fingerprint: str | None = None
-    target_layer_ids: list[int] | None = None
-    hidden_states_layout: str | None = None
-    hidden_dtype: str | None = None
 
 
 def make_sample_key(meta: SampleMetadata) -> str:
@@ -160,21 +95,45 @@ def make_sample_key(meta: SampleMetadata) -> str:
 
 def make_ready_tag(meta: SampleMetadata) -> dict[str, Any]:
     meta.validate()
-    return {
-        "record_type": "sample",
-        "status": "ready",
-        "schema_version": meta.schema_version,
-        "run_id": meta.run_id,
-        "sequence_no": meta.sequence_no,
-        "sample_id": meta.sample_id,
-        "algorithm": meta.algorithm.strip().upper(),
-    }
+    return {"record_type": "sample", "status": "ready", **meta.to_dict()}
+
+
+def parse_ready_tag(
+    tag: Mapping[str, Any],
+    *,
+    run_id: str | None = None,
+    schema_version: int = PROTOCOL_SCHEMA_VERSION,
+) -> SampleMetadata | None:
+    """Return one valid ready envelope, or ``None`` when it is not consumable."""
+
+    if tag.get("record_type") != "sample" or tag.get("status") != "ready":
+        return None
+    try:
+        meta = SampleMetadata.from_dict(tag)
+    except (TypeError, ValueError):
+        return None
+    if meta.schema_version != int(schema_version):
+        return None
+    if run_id is not None and meta.run_id != str(run_id):
+        return None
+    return meta
+
+
+def is_ready_sample_tag(
+    tag: Mapping[str, Any],
+    *,
+    run_id: str,
+    schema_version: int = PROTOCOL_SCHEMA_VERSION,
+) -> bool:
+    return parse_ready_tag(
+        tag, run_id=run_id, schema_version=schema_version
+    ) is not None
 
 
 def encode_sample(
     sample: DraftFeatureSample | Mapping[str, Any], meta: SampleMetadata
 ) -> dict[str, torch.Tensor]:
-    """Encode one normalized feature sample into TQ tensor fields."""
+    """Losslessly encode one normalized feature sample into TQ tensor fields."""
 
     meta.validate()
     normalized = (
@@ -183,29 +142,48 @@ def encode_sample(
         else DraftFeatureSample.from_dict(dict(sample), strict=True)
     )
     normalized.validate(strict=True)
-    if isinstance(normalized.hidden_states, (list, tuple)):
-        raise TypeError("TQ drafter protocol requires hidden_states to be one dense tensor")
-    hidden = _cpu_contiguous(normalized.hidden_states)
-    input_ids = _cpu_contiguous(normalized.input_ids, dtype=torch.int64).reshape(-1)
-    loss_mask = _cpu_contiguous(normalized.loss_mask, dtype=torch.float32).reshape(-1)
-    if normalized.position_ids is None:
-        position_ids = torch.arange(input_ids.numel(), dtype=torch.int64)
-    else:
-        position_ids = _cpu_contiguous(normalized.position_ids, dtype=torch.int64).reshape(-1)
-
-    _validate_primary_tensors(input_ids, loss_mask, position_ids, hidden, meta)
-    metadata_json = _json_to_tensor(meta.to_dict())
-    fields: dict[str, torch.Tensor] = {
-        "input_ids": input_ids,
-        "loss_mask": loss_mask,
-        "position_ids": position_ids,
-        "hidden_states": hidden,
-        "metadata_json": metadata_json,
+    payload = normalized.to_dict()
+    fields: dict[str, torch.Tensor] = {}
+    manifest: dict[str, Any] = {
+        "draft_feature_schema_version": int(normalized.schema_version),
+        "algorithm": str(normalized.algorithm),
+        "present_fields": [],
     }
-    for field_name in _OPTIONAL_TENSOR_FIELDS:
-        value = getattr(normalized, field_name)
-        if value is not None:
+
+    for name in ("input_ids", "loss_mask", *_OPTIONAL_TENSOR_FIELDS):
+        value = payload.get(name)
+        if value is None:
+            continue
+        if not torch.is_tensor(value):
+            raise TypeError(f"DraftFeatureSample.{name} must be a torch.Tensor")
+        fields[f"sample__{name}"] = _cpu_contiguous(value)
+        manifest["present_fields"].append(name)
+
+    hidden = payload["hidden_states"]
+    if torch.is_tensor(hidden):
+        fields["sample__hidden_states"] = _cpu_contiguous(hidden)
+        manifest["hidden_states_kind"] = "tensor"
+    elif isinstance(hidden, (list, tuple)):
+        hidden_fields: list[str] = []
+        for index, value in enumerate(hidden):
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"DraftFeatureSample.hidden_states[{index}] must be a torch.Tensor"
+                )
+            field_name = f"sample__hidden_states__{index:06d}"
             fields[field_name] = _cpu_contiguous(value)
+            hidden_fields.append(field_name)
+        if not hidden_fields:
+            raise ValueError("DraftFeatureSample.hidden_states list must not be empty")
+        manifest["hidden_states_kind"] = "list"
+        manifest["hidden_states_fields"] = hidden_fields
+    else:
+        raise TypeError("DraftFeatureSample.hidden_states must be a tensor or tensor list")
+    manifest["present_fields"].append("hidden_states")
+    manifest["metadata"] = _encode_metadata_tree(
+        payload.get("metadata", {}), fields, path="metadata"
+    )
+    fields[_MANIFEST_FIELD] = _json_to_tensor(manifest)
     return fields
 
 
@@ -215,41 +193,47 @@ def decode_sample(
     fields: Mapping[str, Any],
     expected_config: ExpectedFeatureConfig | Mapping[str, Any],
 ) -> DraftFeatureSample:
-    """Validate a TQ record and restore the existing training sample type."""
+    """Validate one queue record and restore the complete training sample."""
 
     expected = (
         expected_config
         if isinstance(expected_config, ExpectedFeatureConfig)
         else ExpectedFeatureConfig(**dict(expected_config))
     )
-    missing = [name for name in _REQUIRED_FIELDS if name not in fields]
-    if missing:
-        raise ValueError(f"TQ sample {key!r} missing required fields: {missing}")
-    metadata = SampleMetadata.from_dict(_tensor_to_json(fields["metadata_json"]))
-    expected_key = make_sample_key(metadata)
+    meta = parse_ready_tag(
+        tag, run_id=expected.run_id, schema_version=expected.schema_version
+    )
+    if meta is None:
+        raise ValueError(f"TQ sample {key!r} has an invalid or unexpected ready tag")
+    expected_key = make_sample_key(meta)
     if key != expected_key:
         raise ValueError(f"TQ sample key mismatch: got {key!r}, expected {expected_key!r}")
-    _validate_tag(tag, metadata)
-    _validate_expected(metadata, expected)
+    if _MANIFEST_FIELD not in fields:
+        raise ValueError(f"TQ sample {key!r} missing field {_MANIFEST_FIELD!r}")
+    manifest = _tensor_to_json(fields[_MANIFEST_FIELD], name=_MANIFEST_FIELD)
+    present = manifest.get("present_fields")
+    if not isinstance(present, list):
+        raise ValueError("sample manifest present_fields must be a list")
+    missing = [name for name in _REQUIRED_SAMPLE_FIELDS if name not in present]
+    if missing:
+        raise ValueError(f"TQ sample {key!r} missing required sample fields: {missing}")
 
-    input_ids = _require_tensor(fields, "input_ids").detach().cpu().to(torch.int64).reshape(-1)
-    loss_mask = _require_tensor(fields, "loss_mask").detach().cpu().to(torch.float32).reshape(-1)
-    position_ids = _require_tensor(fields, "position_ids").detach().cpu().to(torch.int64).reshape(-1)
-    hidden = _require_tensor(fields, "hidden_states").detach().cpu().contiguous()
-    _validate_primary_tensors(input_ids, loss_mask, position_ids, hidden, metadata)
-
+    try:
+        sample_schema_version = int(manifest["draft_feature_schema_version"])
+        algorithm = str(manifest["algorithm"])
+    except KeyError as exc:
+        raise ValueError(f"sample manifest missing field {exc.args[0]!r}") from exc
     payload: dict[str, Any] = {
-        "schema_version": metadata.schema_version,
-        "algorithm": metadata.algorithm,
-        "input_ids": input_ids,
-        "loss_mask": loss_mask,
-        "position_ids": position_ids,
-        "hidden_states": hidden,
-        "metadata": metadata.to_dict(),
+        "schema_version": sample_schema_version,
+        "algorithm": algorithm,
+        "metadata": _decode_metadata_tree(
+            manifest.get("metadata", {}), fields, path="metadata"
+        ),
     }
-    for field_name in _OPTIONAL_TENSOR_FIELDS:
-        if field_name in fields and fields[field_name] is not None:
-            payload[field_name] = _require_tensor(fields, field_name).detach().cpu().contiguous()
+    for name in ("input_ids", "loss_mask", *_OPTIONAL_TENSOR_FIELDS):
+        if name in present:
+            payload[name] = _require_tensor(fields, f"sample__{name}")
+    payload["hidden_states"] = _decode_hidden_states(fields, manifest)
     return DraftFeatureSample.from_dict(payload, strict=True)
 
 
@@ -272,75 +256,78 @@ def make_eos_record(
     return key, fields, tag
 
 
-def _validate_tag(tag: Mapping[str, Any], meta: SampleMetadata) -> None:
-    expected = make_ready_tag(meta)
-    for name, expected_value in expected.items():
-        if tag.get(name) != expected_value:
-            raise ValueError(
-                f"TQ sample tag mismatch for {name}: got {tag.get(name)!r}, "
-                f"expected {expected_value!r}"
-            )
+def _encode_metadata_tree(
+    value: Any, fields: dict[str, torch.Tensor], *, path: str
+) -> Any:
+    if torch.is_tensor(value):
+        field_name = f"sample__metadata_tensor__{len(fields):06d}"
+        fields[field_name] = _cpu_contiguous(value)
+        return {"__tq_tensor_ref__": field_name}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        encoded: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"DraftFeatureSample metadata key at {path} must be str")
+            encoded[key] = _encode_metadata_tree(item, fields, path=f"{path}.{key}")
+        return {"__tq_mapping__": encoded}
+    if isinstance(value, (list, tuple)):
+        items = [
+            _encode_metadata_tree(item, fields, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+        return {
+            "__tq_sequence__": "tuple" if isinstance(value, tuple) else "list",
+            "items": items,
+        }
+    raise TypeError(
+        f"Unsupported DraftFeatureSample metadata value at {path}: {type(value).__name__}"
+    )
 
 
-def _validate_expected(meta: SampleMetadata, expected: ExpectedFeatureConfig) -> None:
-    checks = {
-        "run_id": expected.run_id,
-        "schema_version": expected.schema_version,
-        "algorithm": (
-            expected.algorithm.strip().upper()
-            if expected.algorithm is not None
-            else None
-        ),
-        "target_model_id": expected.target_model_id,
-        "target_model_revision": expected.target_model_revision,
-        "tokenizer_fingerprint": expected.tokenizer_fingerprint,
-        "target_layer_ids": expected.target_layer_ids,
-        "hidden_states_layout": expected.hidden_states_layout,
-        "hidden_dtype": expected.hidden_dtype,
-    }
-    for name, expected_value in checks.items():
-        if expected_value is None:
-            continue
-        actual = getattr(meta, name)
-        if name == "algorithm":
-            actual = str(actual).strip().upper()
-        if actual != expected_value:
-            raise ValueError(
-                f"TQ sample metadata mismatch for {name}: got {actual!r}, "
-                f"expected {expected_value!r}"
-            )
+def _decode_metadata_tree(value: Any, fields: Mapping[str, Any], *, path: str) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Invalid metadata manifest node at {path}")
+    if "__tq_tensor_ref__" in value:
+        return _require_tensor(fields, str(value["__tq_tensor_ref__"]))
+    if "__tq_mapping__" in value:
+        mapping = value["__tq_mapping__"]
+        if not isinstance(mapping, Mapping):
+            raise ValueError(f"Invalid metadata mapping node at {path}")
+        return {
+            str(key): _decode_metadata_tree(item, fields, path=f"{path}.{key}")
+            for key, item in mapping.items()
+        }
+    if "__tq_sequence__" in value:
+        items = value.get("items")
+        if not isinstance(items, list):
+            raise ValueError(f"Invalid metadata sequence node at {path}")
+        decoded = [
+            _decode_metadata_tree(item, fields, path=f"{path}[{index}]")
+            for index, item in enumerate(items)
+        ]
+        if value["__tq_sequence__"] == "tuple":
+            return tuple(decoded)
+        if value["__tq_sequence__"] == "list":
+            return decoded
+    raise ValueError(f"Unknown metadata manifest node at {path}")
 
 
-def _validate_primary_tensors(
-    input_ids: torch.Tensor,
-    loss_mask: torch.Tensor,
-    position_ids: torch.Tensor,
-    hidden: torch.Tensor,
-    meta: SampleMetadata,
-) -> None:
-    if hidden.dim() == 3 and hidden.size(0) == 1:
-        hidden = hidden.squeeze(0)
-    if hidden.dim() != 2:
-        raise ValueError(f"hidden_states must have shape [L,D], got {tuple(hidden.shape)}")
-    lengths = {
-        "input_ids": int(input_ids.numel()),
-        "loss_mask": int(loss_mask.numel()),
-        "position_ids": int(position_ids.numel()),
-        "hidden_states": int(hidden.size(0)),
-    }
-    if any(value != meta.feature_length for value in lengths.values()):
-        raise ValueError(
-            f"TQ sample tensor lengths must equal feature_length={meta.feature_length}: {lengths}"
-        )
-    if list(hidden.shape) != meta.hidden_shape:
-        raise ValueError(
-            f"hidden_states shape mismatch: got {list(hidden.shape)}, expected {meta.hidden_shape}"
-        )
-    actual_dtype = _dtype_name(hidden.dtype)
-    if actual_dtype != meta.hidden_dtype:
-        raise ValueError(
-            f"hidden_states dtype mismatch: got {actual_dtype!r}, expected {meta.hidden_dtype!r}"
-        )
+def _decode_hidden_states(
+    fields: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> torch.Tensor | list[torch.Tensor]:
+    kind = manifest.get("hidden_states_kind")
+    if kind == "tensor":
+        return _require_tensor(fields, "sample__hidden_states")
+    if kind == "list":
+        names = manifest.get("hidden_states_fields")
+        if not isinstance(names, list) or not names:
+            raise ValueError("sample manifest hidden_states_fields must be non-empty")
+        return [_require_tensor(fields, str(name)) for name in names]
+    raise ValueError(f"Unsupported hidden_states_kind={kind!r}")
 
 
 def _json_to_tensor(payload: Mapping[str, Any]) -> torch.Tensor:
@@ -348,17 +335,16 @@ def _json_to_tensor(payload: Mapping[str, Any]) -> torch.Tensor:
     return torch.tensor(list(raw), dtype=torch.uint8)
 
 
-def _tensor_to_json(value: Any) -> dict[str, Any]:
-    tensor = value
-    if not torch.is_tensor(tensor):
-        raise TypeError("metadata_json must be a torch.Tensor")
-    tensor = tensor.detach().cpu().to(torch.uint8).reshape(-1)
+def _tensor_to_json(value: Any, *, name: str) -> dict[str, Any]:
+    if not torch.is_tensor(value):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    tensor = value.detach().cpu().to(torch.uint8).reshape(-1)
     try:
         decoded = json.loads(bytes(tensor.tolist()).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("metadata_json is not valid UTF-8 JSON") from exc
+        raise ValueError(f"{name} is not valid UTF-8 JSON") from exc
     if not isinstance(decoded, dict):
-        raise ValueError("metadata_json must decode to a JSON object")
+        raise ValueError(f"{name} must decode to a JSON object")
     return decoded
 
 
@@ -366,20 +352,13 @@ def _require_tensor(fields: Mapping[str, Any], name: str) -> torch.Tensor:
     value = fields.get(name)
     if not torch.is_tensor(value):
         raise TypeError(f"TQ field {name!r} must be a torch.Tensor")
-    return value
+    return value.detach().cpu().contiguous()
 
 
-def _cpu_contiguous(value: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+def _cpu_contiguous(value: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(value):
         raise TypeError(f"Expected torch.Tensor, got {type(value)!r}")
-    result = value.detach().cpu()
-    if dtype is not None:
-        result = result.to(dtype)
-    return result.contiguous()
-
-
-def _dtype_name(dtype: torch.dtype) -> str:
-    return str(dtype).removeprefix("torch.")
+    return value.detach().cpu().contiguous()
 
 
 __all__ = [
@@ -389,7 +368,9 @@ __all__ = [
     "SampleMetadata",
     "decode_sample",
     "encode_sample",
+    "is_ready_sample_tag",
     "make_eos_record",
     "make_ready_tag",
     "make_sample_key",
+    "parse_ready_tag",
 ]
