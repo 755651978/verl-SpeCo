@@ -245,6 +245,32 @@ def test_commit_validation_failure_rolls_back_all_workers() -> None:
     assert events == ["rollback"]
 
 
+def test_finalize_failure_rolls_back_and_fails_collection() -> None:
+    events = []
+    executor = CallbackDrafterCollectionExecutor(
+        set_step=lambda step: None,
+        stage_submit=lambda buckets: [_staged_result()],
+        commit_submit=lambda buckets: [_worker_result()],
+        abort_submit=lambda buckets: events.append("abort") or [],
+        rollback_submit=lambda buckets: events.append("rollback") or [],
+        finalize_submit=lambda buckets: (_ for _ in ()).throw(
+            RuntimeError("finalize failed")
+        ),
+        resolve=lambda value: value,
+    )
+
+    outcome = DrafterScheduler(
+        collection_executor=executor
+    ).execute_collection_plan(_plan(), _payload())
+
+    assert outcome.attempted
+    assert not outcome.collected
+    assert outcome.collected_samples == 0
+    assert not outcome.finalized
+    assert outcome.reason == "collection_finalize_failed"
+    assert events == ["rollback"]
+
+
 def test_inactive_collection_plan_does_not_call_executor() -> None:
     executor = CallbackDrafterCollectionExecutor(
         set_step=lambda step: (_ for _ in ()).throw(AssertionError("unexpected")),

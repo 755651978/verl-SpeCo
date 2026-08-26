@@ -43,6 +43,7 @@ class CollectionOutcome:
         "collection_version_mismatch": 5,
         "collection_stage_failed": 6,
         "collection_id_mismatch": 7,
+        "collection_finalize_failed": 8,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -223,6 +224,8 @@ class SyncCollectionStrategy:
                     "Failed to finalize committed drafter collection %s",
                     plan.collection_id,
                 )
+                executor.rollback(payload)
+                reason = "collection_finalize_failed"
         else:
             executor.rollback(payload)
         return CollectionOutcome(
