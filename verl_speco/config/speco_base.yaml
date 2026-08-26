@@ -166,6 +166,8 @@ actor_rollout_ref:
         dspark_debug_log: false
         dspark_debug_log_first_n: 2
         dspark_debug_log_interval: 100
+        # EAGLE3 target layers whose hidden states are concatenated as drafter input.
+        eagle3_target_layer_ids: null
         # P-EAGLE (parallel drafting: COD-subsampled multi-depth forward + KL loss).
         peagle_num_draft_layers: 4
         peagle_num_aux_hidden_states: 3

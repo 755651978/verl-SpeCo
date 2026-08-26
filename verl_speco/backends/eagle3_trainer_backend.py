@@ -13,7 +13,6 @@
 # limitations under the License.
 import logging
 import os
-from copy import deepcopy
 from typing import Any, Optional, cast
 
 import torch
@@ -23,7 +22,11 @@ from transformers import AutoConfig
 
 from verl.utils.device import get_device_id, get_device_name
 from verl_speco.backends.lr_scheduler import build_drafter_lr_scheduler
-from verl_speco.models.auto import AutoDraftModelConfig, AutoEagle3DraftModel
+from verl_speco.models.auto import (
+    AutoDraftModelConfig,
+    AutoEagle3DraftModel,
+    eagle3_draft_config_from_target,
+)
 from verl_speco.models.eagle.llama_eagle import resolve_eagle3_num_aux_hidden_states
 from verl_speco.models.target.target_head import TargetHead
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
@@ -678,16 +681,17 @@ class Eagle3TrainerBackend:
         spec_model_path = self.config.rollout.drafter.model_path
         config_path = os.path.join(spec_model_path, "config.json")
         target_hf_config = self._get_target_hf_config()
+        training_cfg = self.config.rollout.drafter.training
 
         # 1. Load config
         if os.path.exists(config_path):
             drafter_config = AutoDraftModelConfig.from_file(config_path)
         else:
-            drafter_config = deepcopy(target_hf_config)
-            drafter_config.num_hidden_layers = 1
-            drafter_config.torch_dtype = torch.bfloat16
-            drafter_config.tie_word_embeddings = False
-            drafter_config.architectures = ["LlamaForCausalLMEagle3"]
+            drafter_config = eagle3_draft_config_from_target(
+                target_hf_config,
+                training_cfg.get("eagle3_target_layer_ids"),
+            )
+            drafter_config.dtype = torch.bfloat16
 
         if not hasattr(drafter_config, "pretraining_tp"):
             drafter_config.pretraining_tp = 1
@@ -740,7 +744,6 @@ class Eagle3TrainerBackend:
         drafter_module.load_embedding(target_model_path)
         drafter_module.freeze_embedding()
 
-        training_cfg = self.config.rollout.drafter.training
         if drafter_module.draft_vocab_size != drafter_module.vocab_size:
             if checkpoint_has_vocab_mapping and self._has_valid_vocab_mapping(
                 drafter_module

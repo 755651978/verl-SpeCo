@@ -296,6 +296,14 @@ def tokenize_record(
         full_ids = _token_ids(
             tokenizer(record.prompt + record.response, add_special_tokens=False)
         )
+        if full_ids[: len(prompt_ids)] != prompt_ids:
+            # Some tokenizers merge text across the prompt/response boundary.
+            # Keep that boundary explicit so the response-only loss mask and the
+            # exact token IDs sent to vLLM remain aligned.
+            response_ids = _token_ids(
+                tokenizer(record.response, add_special_tokens=False)
+            )
+            full_ids = [*prompt_ids, *response_ids]
     else:
         full_ids = _token_ids(
             tokenizer.apply_chat_template(
@@ -304,6 +312,12 @@ def tokenize_record(
                 add_generation_prompt=False,
             )
         )
+        if full_ids[: len(prompt_ids)] != prompt_ids:
+            prompt_ids, full_ids = _tokenize_chat_response_with_explicit_boundary(
+                record.prompt,
+                record.response,
+                tokenizer,
+            )
     if full_ids[: len(prompt_ids)] != prompt_ids:
         raise ValueError(
             f"Producer sample {record.sample_id!r} has an unstable tokenizer boundary "
@@ -458,6 +472,40 @@ def _prompt_ids(prompt: str | tuple[dict[str, str], ...], tokenizer: Any) -> lis
             add_generation_prompt=True,
         )
     )
+
+
+def _tokenize_chat_response_with_explicit_boundary(
+    prompt: tuple[dict[str, str], ...],
+    response: str,
+    tokenizer: Any,
+) -> tuple[list[int], list[int]]:
+    """Render a chat response while keeping its loss boundary deterministic.
+
+    Qwen-family templates may render a generation prompt differently from an
+    existing assistant message (for example by inserting a thinking preamble).
+    A marker lets us retain the template's assistant header and suffix while
+    tokenizing the response as a separate loss-bearing region.
+    """
+
+    marker = "__VERL_SPECO_ASSISTANT_RESPONSE_BOUNDARY_8F7C2D91__"
+    while marker in response or any(marker in message["content"] for message in prompt):
+        marker += "_"
+    rendered = tokenizer.apply_chat_template(
+        [*prompt, {"role": "assistant", "content": marker}],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    if not isinstance(rendered, str) or rendered.count(marker) != 1:
+        raise ValueError(
+            "Tokenizer chat template did not preserve the assistant response marker"
+        )
+    prompt_text, suffix_text = rendered.split(marker, 1)
+    explicit_prompt_ids = _token_ids(
+        tokenizer(prompt_text, add_special_tokens=False)
+    )
+    response_ids = _token_ids(tokenizer(response, add_special_tokens=False))
+    suffix_ids = _token_ids(tokenizer(suffix_text, add_special_tokens=False))
+    return explicit_prompt_ids, [*explicit_prompt_ids, *response_ids, *suffix_ids]
 
 
 def _build_tokenized_request(
