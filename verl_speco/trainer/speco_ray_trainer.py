@@ -484,7 +484,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics = self._speco_get_drafter_scheduler().register_idle_training_resource_metadata(
                 metadata
             )
-            logger.info(
+            logger.warning(
                 "[BubbleTime] registered training resource metadata: groups=%s "
                 "workers=%s replica_groups=%s",
                 metrics.get("bubble/registered_training_groups", 0),
@@ -1112,7 +1112,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics.update(self._speco_get_drafter_scheduler().on_worker_event(event))
         if metrics:
             metrics["bubble/runtime_worker_events_drained"] = len(events)
-            logger.info(
+            logger.warning(
                 "[BubbleTime] drained rollout idle events: count=%s idle_workers=%s",
                 len(events),
                 metrics.get("bubble/idle_workers", 0),
@@ -1194,7 +1194,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             return None, None
         poll_interval = self._speco_rollout_idle_poll_interval_sec()
-        logger.info(
+        logger.warning(
             "[BubbleTime] starting rollout idle event loop: bus=%s poll_interval_s=%.3f",
             bus_name,
             poll_interval,

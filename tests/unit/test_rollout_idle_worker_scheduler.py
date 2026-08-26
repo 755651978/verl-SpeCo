@@ -311,6 +311,48 @@ def test_metadata_idle_worker_groups_wait_for_all_collective_replicas() -> None:
     assert plan.training_group_id == "idle-group-0"
 
 
+def test_metadata_replica_groups_merge_multiple_ranks_for_same_replica() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler.register_idle_training_resource_metadata(
+        [
+            {
+                "rank": 0,
+                "worker_id": "0",
+                "in_drafter_train_group": True,
+                "replica_rank": 0,
+                "training_group_ranks": [0],
+                "full_collective_ranks": [0, 1],
+            },
+            {
+                "rank": 1,
+                "worker_id": "1",
+                "in_drafter_train_group": True,
+                "replica_rank": 0,
+                "training_group_ranks": [1],
+                "full_collective_ranks": [0, 1],
+            },
+        ]
+    )
+    deadline_ts = time.time() + 2.8
+    scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="0",
+            replica_rank=0,
+            memory_released=True,
+            must_be_ready_at=deadline_ts,
+        )
+    )
+
+    plan = scheduler.prepare_training_plan(
+        _context(),
+        replace(_auto_idle_config(2), idle_worker_group_size=None),
+    )
+
+    assert plan.launch
+    assert plan.target_worker_ids == ("0", "1")
+
+
 def test_auto_idle_worker_without_metadata_or_group_size_fails_closed() -> None:
     scheduler = DrafterScheduler()
     scheduler.on_worker_event(

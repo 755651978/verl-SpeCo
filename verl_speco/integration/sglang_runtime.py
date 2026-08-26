@@ -230,7 +230,7 @@ def _emit_rollout_idle_worker_event(
             "event_ts": event_ts,
         },
     )
-    logger.info(
+    logger.warning(
         "[BubbleTime] emit_rollout_idle_event runtime=sglang bus=%s type=%s "
         "worker_id=%s replica_rank=%s memory_released=%s deadline_in_s=%s "
         "deadline_source=%s emitted=%s",

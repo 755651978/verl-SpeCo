@@ -363,7 +363,7 @@ class DrafterScheduler:
             worker_ids = (event.worker_id,)
         for worker_id in worker_ids:
             self._record_worker_event_state(event, worker_id, event_ts)
-        logger.info(
+        logger.warning(
             "[BubbleTime] worker_event type=%s worker_id=%s replica_rank=%s "
             "expanded_worker_ids=%s memory_released=%s must_be_ready_at=%s "
             "event_ts=%s idle_state=%s",
@@ -422,7 +422,7 @@ class DrafterScheduler:
         """
 
         records = _flatten_metadata_records(metadata)
-        replica_groups: dict[int, tuple[str, ...]] = {}
+        replica_group_members: dict[int, set[str]] = {}
         full_groups: list[tuple[str, ...]] = []
         seen_groups: set[tuple[str, ...]] = set()
         for record in records:
@@ -433,7 +433,9 @@ class DrafterScheduler:
                 record.get("training_group_ranks", ())
             )
             if replica_rank is not None and training_ranks:
-                replica_groups[int(replica_rank)] = training_ranks
+                replica_group_members.setdefault(int(replica_rank), set()).update(
+                    training_ranks
+                )
             full_group = _normalize_worker_id_group(
                 record.get("full_collective_ranks", ())
             )
@@ -442,13 +444,31 @@ class DrafterScheduler:
             if full_group and full_group not in seen_groups:
                 full_groups.append(full_group)
                 seen_groups.add(full_group)
+        replica_groups = {
+            replica_rank: tuple(sorted(worker_ids, key=_natural_worker_sort_key))
+            for replica_rank, worker_ids in sorted(replica_group_members.items())
+        }
         self._replica_idle_worker_groups = replica_groups
         self._metadata_idle_training_groups = tuple(full_groups)
-        logger.info(
-            "[BubbleTime] resource_metadata groups=%s replica_groups=%s records=%s",
+        metadata_summary = [
+            {
+                "rank": record.get("rank"),
+                "worker_id": record.get("worker_id"),
+                "replica_rank": record.get("replica_rank"),
+                "in_group": bool(record.get("in_drafter_train_group", False)),
+                "training_group_ranks": record.get("training_group_ranks", ()),
+                "full_collective_ranks": record.get("full_collective_ranks", ()),
+                "reason": record.get("reason", ""),
+            }
+            for record in records
+        ]
+        logger.warning(
+            "[BubbleTime] resource_metadata groups=%s replica_groups=%s records=%s "
+            "record_summary=%s",
             self._metadata_idle_training_groups,
             self._replica_idle_worker_groups,
             len(records),
+            metadata_summary,
         )
         return {
             "bubble/registered_training_groups": len(full_groups),
@@ -533,7 +553,7 @@ class DrafterScheduler:
                 return AvailableTrainingResources(
                     False, "missing_training_group_metadata"
                 )
-            logger.info(
+            logger.warning(
                 "[BubbleTime] idle_resource_skip reason=no_idle_worker "
                 "groups=%s known_state=%s require_memory_released=%s",
                 groups,
@@ -547,7 +567,7 @@ class DrafterScheduler:
             missing = [worker_id for worker_id in group if worker_id not in idle_states]
             if missing:
                 incomplete_seen = True
-                logger.info(
+                logger.warning(
                     "[BubbleTime] idle_group_incomplete group_id=idle-group-%s "
                     "group=%s missing=%s idle_workers=%s known_state=%s",
                     index,
@@ -585,7 +605,7 @@ class DrafterScheduler:
                     worker_ids=group,
                     minimum_idle_window_sec=minimum_window,
                 )
-            logger.info(
+            logger.warning(
                 "[BubbleTime] idle_resource_ready group_id=idle-group-%s group=%s "
                 "minimum_window_s=%.3f min_required_s=%.3f now=%.3f",
                 index,
@@ -601,7 +621,7 @@ class DrafterScheduler:
                 worker_ids=group,
                 minimum_idle_window_sec=minimum_window,
             )
-        logger.info(
+        logger.warning(
             "[BubbleTime] idle_resource_skip reason=%s groups=%s idle_workers=%s "
             "known_state=%s",
             "incomplete_training_group" if incomplete_seen else "no_idle_worker",
