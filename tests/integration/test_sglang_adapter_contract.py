@@ -13,10 +13,12 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 import sys
 from types import SimpleNamespace
 
 import pytest
+import verl_speco.integration.sglang_runtime as sglang_runtime
 
 from verl_speco.integration.sglang_adapter import (
     DFLASH_RETURN_AUX_HIDDEN_PARAM,
@@ -140,6 +142,49 @@ def test_sglang_rollout_idle_event_config_ignores_sync_strategy() -> None:
     }
 
     assert _rollout_idle_event_bus_name(drafter_cfg) == ""
+
+
+def test_sglang_idle_event_waits_for_all_replica_requests(monkeypatch) -> None:
+    server = _SpecoSGLangHttpServerMixin()
+    server.replica_rank = 0
+    server._speco_drafter_config = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    }
+    events = []
+    gates = {"a": asyncio.Event(), "b": asyncio.Event()}
+
+    async def generate_request(*args, **kwargs):
+        del args, kwargs
+        request_id = current_request.pop(0)
+        await gates[request_id].wait()
+        return request_id
+
+    current_request = ["a", "b"]
+    server._speco_generate_request = generate_request
+    monkeypatch.setattr(
+        sglang_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs["event_type"]) or True,
+    )
+
+    async def scenario():
+        first = asyncio.create_task(server.generate(None, {}, "a"))
+        second = asyncio.create_task(server.generate(None, {}, "b"))
+        await asyncio.sleep(0)
+        assert events == ["GENERATION_STARTED"]
+        gates["a"].set()
+        await first
+        assert events == ["GENERATION_STARTED"]
+        gates["b"].set()
+        await second
+
+    asyncio.run(scenario())
+    assert events == ["GENERATION_STARTED", "WORKER_IDLE"]
 
 
 def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(

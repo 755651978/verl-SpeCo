@@ -124,7 +124,9 @@ def _preflight_ready(plan: TrainingPlan, readiness: list[Any]) -> bool:
         ready_worker_ids == expected_worker_ids
         and len(participants) == len(expected_worker_ids)
         and all(bool(result.get("ready", False)) for result in participants)
-        and all(result.get("data_version") == plan.data_version for result in participants)
+        and all(
+            result.get("data_version") == plan.data_version for result in participants
+        )
         and all(
             plan.required_target_version is None
             or result.get("target_version") == plan.required_target_version
@@ -192,6 +194,28 @@ class RolloutIdleWorkerExecutionStrategy:
             return None
         try:
             results = executor.resolve_training(submission)
+        except Exception as error:
+            runtime_state.mark_failed(error)
+            raise
+        elapsed_sec = (
+            time.perf_counter() - runtime_state.started_at
+            if runtime_state.started_at is not None
+            else 0.0
+        )
+        return ExecutionOutcome(raw_results=results, elapsed_sec=elapsed_sec)
+
+    def wait(
+        self,
+        *,
+        executor: DrafterWorkerExecutor,
+        runtime_state: DrafterRuntimeState,
+    ) -> ExecutionOutcome | None:
+        """Drain an in-flight batch after reclaim before PPO reuses resources."""
+
+        if runtime_state.status is not DrafterRuntimeStatus.RUNNING:
+            return None
+        try:
+            results = executor.resolve_training(runtime_state.training_ref)
         except Exception as error:
             runtime_state.mark_failed(error)
             raise

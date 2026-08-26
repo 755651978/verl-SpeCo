@@ -210,9 +210,7 @@ def _emit_rollout_idle_worker_event(
         return False
     event_ts = time.time()
     must_be_ready_at = (
-        _rollout_idle_deadline_ts(drafter_cfg)
-        if event_type == "WORKER_IDLE"
-        else None
+        _rollout_idle_deadline_ts(drafter_cfg) if event_type == "WORKER_IDLE" else None
     )
     worker_id = _rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank)
     deadline_source = (
@@ -1550,30 +1548,58 @@ class _SpecoSGLangHttpServerMixin:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
     ):
-        from sglang.srt.managers.io_struct import GenerateReqInput
-        from verl.workers.rollout.replica import TokenOutput
-        from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
-
-        drafter_cfg = self._speco_drafter_cfg()
-        training_cfg = drafter_cfg.get("training") or {}
         skip_rollout_idle_event = bool(
             sampling_params.get("_verl_skip_drafter_collection", False)
         )
+        drafter_cfg = self._speco_drafter_cfg()
+        active_requests = int(getattr(self, "_speco_rollout_active_requests", 0) or 0)
+        self._speco_rollout_active_requests = active_requests + 1
         if not skip_rollout_idle_event:
+            self._speco_rollout_cycle_reported = True
+        if not skip_rollout_idle_event and active_requests == 0:
             _emit_rollout_idle_worker_event(
                 drafter_cfg=drafter_cfg,
                 replica_rank=int(self.replica_rank),
                 event_type="GENERATION_STARTED",
             )
-
-        def emit_idle_event() -> None:
-            if not skip_rollout_idle_event:
+        try:
+            return await self._speco_generate_request(
+                prompt_ids,
+                sampling_params,
+                request_id,
+                image_data=image_data,
+                video_data=video_data,
+            )
+        finally:
+            remaining_requests = max(
+                int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
+                0,
+            )
+            self._speco_rollout_active_requests = remaining_requests
+            cycle_reported = bool(getattr(self, "_speco_rollout_cycle_reported", False))
+            if cycle_reported and remaining_requests == 0:
                 _emit_rollout_idle_worker_event(
                     drafter_cfg=drafter_cfg,
                     replica_rank=int(self.replica_rank),
                     event_type="WORKER_IDLE",
                     memory_released=True,
                 )
+                self._speco_rollout_cycle_reported = False
+
+    async def _speco_generate_request(
+        self,
+        prompt_ids: torch.Tensor,
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+        video_data: Optional[list[Any]] = None,
+    ):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        from verl.workers.rollout.replica import TokenOutput
+        from verl.workers.rollout.sglang_rollout.utils import SGLANG_LORA_NAME
+
+        drafter_cfg = self._speco_drafter_cfg()
+        training_cfg = drafter_cfg.get("training") or {}
 
         uses_dflash_aux_hidden = _drafter_uses_dflash_aux_hidden(drafter_cfg)
         if not bool(
@@ -1588,7 +1614,6 @@ class _SpecoSGLangHttpServerMixin:
                 image_data=image_data,
                 video_data=video_data,
             )
-            emit_idle_event()
             return output
 
         original_sampling_params = sampling_params
@@ -1629,7 +1654,6 @@ class _SpecoSGLangHttpServerMixin:
                 image_data=image_data,
                 video_data=video_data,
             )
-            emit_idle_event()
             return output
 
         sampling_params = self._speco_strip_internal_sampling_params(
@@ -1693,7 +1717,6 @@ class _SpecoSGLangHttpServerMixin:
                 image_data=image_data,
                 video_data=video_data,
             )
-            emit_idle_event()
             return output
         request["return_hidden_states"] = True
 
@@ -2214,7 +2237,6 @@ class _SpecoSGLangHttpServerMixin:
                 stop_reason=finish_reason,
                 extra_fields=extra_fields,
             )
-            emit_idle_event()
             return output
 
         output = TokenOutput(
@@ -2224,7 +2246,6 @@ class _SpecoSGLangHttpServerMixin:
             stop_reason=finish_reason,
             extra_fields={"global_steps": collection_global_steps},
         )
-        emit_idle_event()
         return output
 
 

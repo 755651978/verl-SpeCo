@@ -29,6 +29,22 @@ class _FakeTrainer:
         self.optimizer_steps_total = 0
         self.data_version = data_version
         self.activation_calls = 0
+        self.reserved_plan_id = None
+
+    def select_target_lm_head_version(self, global_step: int) -> bool:
+        self._target_lm_head_weight_step = global_step
+        return True
+
+    def reserve_training_data(self, *, plan_id: str, **kwargs):
+        del kwargs
+        self.reserved_plan_id = plan_id
+        return {"reserved_samples": 4}
+
+    def release_training_data_reservation(self, plan_id: str) -> int:
+        if self.reserved_plan_id != plan_id:
+            return 0
+        self.reserved_plan_id = None
+        return 4
 
     def get_training_data_status(self, **kwargs):
         del kwargs
@@ -69,6 +85,7 @@ def _plan() -> dict[str, object]:
         "sample_last_n_steps": 2,
         "require_full_batch": False,
         "min_batches": 1,
+        "max_batches": 1,
         "worker_snapshots": {
             "0": {
                 "worker_incarnation": "worker-0",

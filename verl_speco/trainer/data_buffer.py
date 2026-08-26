@@ -77,6 +77,66 @@ class DataBuffer:
         """
         return list(self.buffer)
 
+    def get_available_data(
+        self,
+        *,
+        target_version: Optional[int] = None,
+        reservation_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Return unconsumed samples available to a plan.
+
+        A plan may continue to see samples it already reserved, while samples
+        reserved by another in-flight plan are hidden.
+        """
+
+        result: list[dict[str, Any]] = []
+        for sample in self.buffer:
+            reserved_by = sample.get("_drafter_reserved_by")
+            if reserved_by is not None and reserved_by != reservation_id:
+                continue
+            if target_version is not None and int(
+                sample.get("target_version", sample.get("step", -1))
+            ) != int(target_version):
+                continue
+            result.append(sample)
+        return result
+
+    def reserve(
+        self,
+        reservation_id: str,
+        *,
+        target_version: int,
+        max_samples: int,
+    ) -> list[dict[str, Any]]:
+        candidates = self.get_available_data(target_version=target_version)
+        selected = candidates[: max(int(max_samples), 0)]
+        for sample in selected:
+            sample["_drafter_reserved_by"] = str(reservation_id)
+        return selected
+
+    def release_reservation(self, reservation_id: str) -> int:
+        released = 0
+        for sample in self.buffer:
+            if sample.get("_drafter_reserved_by") == str(reservation_id):
+                sample.pop("_drafter_reserved_by", None)
+                released += 1
+        return released
+
+    def consume(self, reservation_id: str, samples: list[dict[str, Any]]) -> int:
+        consumed_ids = {
+            id(sample)
+            for sample in samples
+            if sample.get("_drafter_reserved_by") == str(reservation_id)
+        }
+        if not consumed_ids:
+            return 0
+        before = len(self.buffer)
+        self.buffer = deque(
+            (sample for sample in self.buffer if id(sample) not in consumed_ids),
+            maxlen=self.max_size,
+        )
+        return before - len(self.buffer)
+
     def get_data_from_last_n_steps(self, n: int) -> list[dict[str, torch.Tensor]]:
         """Get data from the last n RL steps.
 
@@ -88,7 +148,9 @@ class DataBuffer:
         """
         current_step = self._current_step or 0
         min_step = max(0, current_step - n)
-        return [sample for sample in self.buffer if sample["step"] >= min_step]
+        return [
+            sample for sample in self.get_available_data() if sample["step"] >= min_step
+        ]
 
     def get_data_count(self) -> int:
         """Get the current number of samples in the buffer."""

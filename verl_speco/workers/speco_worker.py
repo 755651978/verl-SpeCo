@@ -1305,7 +1305,10 @@ class SpecoWorker(Worker):
         target_worker_ids = {
             str(worker_id) for worker_id in training_plan.get("target_worker_ids", ())
         }
-        if execution_strategy == "rollout_idle_worker" and str(self.rank) not in target_worker_ids:
+        if (
+            execution_strategy == "rollout_idle_worker"
+            and str(self.rank) not in target_worker_ids
+        ):
             result["participating"] = False
             result["reason"] = "not_in_training_group"
             return result
@@ -1324,6 +1327,26 @@ class SpecoWorker(Worker):
             result["reason"] = "buffer_version_changed"
             return result
         required_target_version = training_plan.get("required_target_version")
+        if (
+            required_target_version is not None
+            and not self.trainer.select_target_lm_head_version(
+                int(required_target_version)
+            )
+        ):
+            logger.warning(
+                "[BubbleTime] preflight rejected: rank=%s reason=target_version_unavailable "
+                "required=%s cached=%s",
+                self.rank,
+                required_target_version,
+                sorted(getattr(self.trainer, "_target_lm_head_snapshots", {})),
+            )
+            result.update(
+                {
+                    "reason": "target_version_unavailable",
+                    "required_target_version": required_target_version,
+                }
+            )
+            return result
         current_target_version = getattr(
             self.trainer, "_target_lm_head_weight_step", None
         )
@@ -1357,6 +1380,28 @@ class SpecoWorker(Worker):
             result["reason"] = "insufficient_worker_data"
             return result
 
+        if execution_strategy == "rollout_idle_worker":
+            reservation = self.trainer.reserve_training_data(
+                plan_id=str(training_plan.get("plan_id", "")),
+                target_version=int(
+                    required_target_version
+                    if required_target_version is not None
+                    else actual_data_version
+                ),
+                max_batches=int(training_plan.get("max_batches", 0)),
+                require_full_batch=bool(training_plan.get("require_full_batch", False)),
+            )
+            if int(reservation.get("reserved_samples", 0)) <= 0:
+                logger.warning(
+                    "[BubbleTime] preflight rejected: rank=%s plan_id=%s "
+                    "reason=data_reservation_failed target_version=%s",
+                    self.rank,
+                    training_plan.get("plan_id", ""),
+                    required_target_version,
+                )
+                result["reason"] = "data_reservation_failed"
+                return result
+
         self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
         self._prepared_training_data_version = actual_data_version
         self._prepared_training_target_version = current_target_version
@@ -1365,6 +1410,9 @@ class SpecoWorker(Worker):
             activated = bool(await self.trainer.activate_training_model())
         result["activated"] = activated
         if not activated:
+            self.trainer.release_training_data_reservation(
+                str(training_plan.get("plan_id", ""))
+            )
             result["reason"] = "activation_failed"
             return result
         result.update(
@@ -1385,6 +1433,7 @@ class SpecoWorker(Worker):
         self._prepared_training_data_version = None
         self._prepared_training_target_version = None
         if was_prepared and self.trainer is not None:
+            self.trainer.release_training_data_reservation(str(plan_id))
             await self.trainer.cleanup_training(clear_data=False)
         return {"aborted": was_prepared, "rank": self.rank}
 
@@ -1420,7 +1469,10 @@ class SpecoWorker(Worker):
                 else ()
             )
         }
-        if execution_strategy == "rollout_idle_worker" and str(self.rank) not in target_worker_ids:
+        if (
+            execution_strategy == "rollout_idle_worker"
+            and str(self.rank) not in target_worker_ids
+        ):
             result["reason"] = "not_in_training_group"
             return result
         plan_id = (
@@ -1497,9 +1549,8 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
-                await self.trainer.cleanup_training(
-                    clear_data=result["successful_steps"] > 0
-                )
+                self.trainer.release_training_data_reservation(plan_id)
+                await self.trainer.cleanup_training(clear_data=False)
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0

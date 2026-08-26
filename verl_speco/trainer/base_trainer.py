@@ -477,8 +477,16 @@ class DrafterBaseTrainer:
                 if data_parallel_process_group is not None
                 else 0
             )
+        training_cfg = config.rollout.drafter.training
+        scheduler_cfg = training_cfg.get("scheduler", {}) or {}
+        execution_cfg = scheduler_cfg.get("execution", {}) or {}
+        self._bubble_time_enabled = (
+            str(execution_cfg.get("strategy", "sync")) == "rollout_idle_worker"
+        )
+        # Bubble Time intentionally trains step N data during the step N+1
+        # rollout.  Keep that data across RL-step boundaries automatically.
         self.use_data_buffer = bool(
-            config.rollout.drafter.training.get("use_data_buffer", False)
+            training_cfg.get("use_data_buffer", False) or self._bubble_time_enabled
         )
         self.current_rl_step = 0
         self.buffer_version = 0
@@ -492,7 +500,6 @@ class DrafterBaseTrainer:
         )
         self.copy_stream = self._create_copy_stream()
 
-        training_cfg = config.rollout.drafter.training
         self.is_offload_param = bool(training_cfg.get("is_offload_param", False))
         self.is_offload_optimizer = bool(
             training_cfg.get("is_offload_optimizer", False)
@@ -560,6 +567,11 @@ class DrafterBaseTrainer:
         self._pending_target_lm_head_source_vocab_size: int | None = None
         self._pending_target_lm_head_chunked_apply = False
         self._target_lm_head_weight_step: int | None = None
+        self._target_lm_head_snapshots: dict[int, dict[str, Any]] = {}
+        self._target_lm_head_snapshot_limit = 2
+        self._active_training_reservation_id: str | None = None
+        self._active_training_target_version: int | None = None
+        self._last_prepared_training_items: list[dict[str, Any]] = []
         self._cached_target_lm_head_row_indices: dict[str, Any] | None = None
         self._training_timing_accumulator: dict[str, float] = {}
         self._training_timing_steps = 0
@@ -2020,6 +2032,20 @@ class DrafterBaseTrainer:
         )
         self._pending_target_lm_head_chunked_apply = bool(defer_device_apply)
         self._target_lm_head_weight_step = global_step
+        if global_step is not None:
+            version = int(global_step)
+            self._target_lm_head_snapshots[version] = {
+                "weight": self._pending_target_lm_head_weight,
+                "row_indices": self._pending_target_lm_head_row_indices,
+                "source_vocab_size": self._pending_target_lm_head_source_vocab_size,
+                "chunked_apply": self._pending_target_lm_head_chunked_apply,
+            }
+            while (
+                len(self._target_lm_head_snapshots)
+                > self._target_lm_head_snapshot_limit
+            ):
+                oldest_version = min(self._target_lm_head_snapshots)
+                self._target_lm_head_snapshots.pop(oldest_version, None)
         selected_rows = (
             int(self._pending_target_lm_head_row_indices.numel())
             if self._pending_target_lm_head_row_indices is not None
@@ -2039,6 +2065,26 @@ class DrafterBaseTrainer:
             "selected_rows": selected_rows,
             "source_vocab_size": pending_source_vocab_size,
         }
+
+    def select_target_lm_head_version(self, global_step: int) -> bool:
+        """Stage the exact cached actor head required by buffered samples."""
+
+        version = int(global_step)
+        snapshot = self._target_lm_head_snapshots.get(version)
+        if snapshot is None:
+            return False
+        self._pending_target_lm_head_weight = snapshot["weight"]
+        self._pending_target_lm_head_row_indices = snapshot["row_indices"]
+        self._pending_target_lm_head_source_vocab_size = snapshot["source_vocab_size"]
+        self._pending_target_lm_head_chunked_apply = bool(snapshot["chunked_apply"])
+        self._target_lm_head_weight_step = version
+        logger.info(
+            "[BubbleTime] selected cached target lm_head: rank=%s target_version=%s cached_versions=%s",
+            self.rank,
+            version,
+            sorted(self._target_lm_head_snapshots),
+        )
+        return True
 
     def get_target_lm_head_row_indices(self) -> Optional[dict[str, Any]]:
         """Return target lm_head row indices needed by the current drafter loss."""
@@ -3298,6 +3344,8 @@ class DrafterBaseTrainer:
                         )
 
             # 同步 DataBuffer
+            data_item["step"] = int(self.current_rl_step)
+            data_item["target_version"] = int(self.current_rl_step)
             if self.use_data_buffer:
                 self.data_buffer.add_batch(data_item)
 
@@ -3533,14 +3581,33 @@ class DrafterBaseTrainer:
 
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         same_step_target_head_required = (
-            self.backend.model_type == "eagle3" and not use_logits
+            self.backend.model_type == "eagle3"
+            and not use_logits
+            and not self._bubble_time_enabled
         )
 
-        # Determine data source: DataBuffer (cross-step) or collected_data (current step only).
+        self._last_prepared_training_items = []
+
+        # A Bubble Time plan owns an exact, version-homogeneous reservation.
+        if self._active_training_reservation_id is not None:
+            available_data = self.data_buffer.get_available_data(
+                target_version=self._active_training_target_version,
+                reservation_id=self._active_training_reservation_id,
+            )
+            available_data = [
+                item
+                for item in available_data
+                if item.get("_drafter_reserved_by")
+                == self._active_training_reservation_id
+            ]
+            if not available_data:
+                return None
+            items = available_data[:effective_batch_size]
+
         # last-hidden supervision can only be reconstructed with the exact target
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
-        if self.use_data_buffer and len(self.data_buffer) > 0:
+        elif self.use_data_buffer and len(self.data_buffer) > 0:
             if same_step_target_head_required:
                 buffer_steps = 0
             else:
@@ -3600,6 +3667,8 @@ class DrafterBaseTrainer:
                 f"(need at least {min_items_for_batch}), cannot prepare batch"
             )
             return None
+
+        self._last_prepared_training_items = list(items)
 
         dev = next(self.model.parameters()).device
         if self._is_block_drafter_backend() and self.use_ulysses_sp:
@@ -4398,6 +4467,70 @@ class DrafterBaseTrainer:
         with self._ulysses_group_context():
             return self._prepare_training_batch()
 
+    def reserve_training_data(
+        self,
+        *,
+        plan_id: str,
+        target_version: int,
+        max_batches: int,
+        require_full_batch: bool = False,
+    ) -> dict[str, Any]:
+        """Reserve version-matched samples so concurrent plans cannot reuse them."""
+
+        max_samples = max(int(max_batches), 0) * max(int(self.batch_size), 1)
+        reserved = self.data_buffer.reserve(
+            str(plan_id),
+            target_version=int(target_version),
+            max_samples=max_samples,
+        )
+        if require_full_batch and len(reserved) < max(int(self.batch_size), 1):
+            self.data_buffer.release_reservation(str(plan_id))
+            reserved = []
+        self._active_training_reservation_id = str(plan_id) if reserved else None
+        self._active_training_target_version = int(target_version) if reserved else None
+        logger.warning(
+            "[BubbleTime] reserve training data: rank=%s plan_id=%s target_version=%s "
+            "reserved_samples=%s max_samples=%s",
+            self.rank,
+            plan_id,
+            target_version,
+            len(reserved),
+            max_samples,
+        )
+        return {"reserved_samples": len(reserved), "target_version": target_version}
+
+    def release_training_data_reservation(self, plan_id: str) -> int:
+        released = self.data_buffer.release_reservation(str(plan_id))
+        if self._active_training_reservation_id == str(plan_id):
+            self._active_training_reservation_id = None
+            self._active_training_target_version = None
+            self._last_prepared_training_items = []
+        if released:
+            logger.info(
+                "[BubbleTime] released training reservation: rank=%s plan_id=%s samples=%s",
+                self.rank,
+                plan_id,
+                released,
+            )
+        return released
+
+    def _consume_last_training_batch(self) -> int:
+        plan_id = self._active_training_reservation_id
+        if plan_id is None or not self._last_prepared_training_items:
+            return 0
+        consumed = self.data_buffer.consume(plan_id, self._last_prepared_training_items)
+        self._last_prepared_training_items = []
+        if consumed:
+            self._mark_buffer_changed()
+            logger.info(
+                "[BubbleTime] consumed training samples: rank=%s plan_id=%s samples=%s remaining=%s",
+                self.rank,
+                plan_id,
+                consumed,
+                len(self.data_buffer),
+            )
+        return consumed
+
     def get_training_data_status(
         self,
         *,
@@ -4408,18 +4541,42 @@ class DrafterBaseTrainer:
 
         current_step = int(self.current_rl_step)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
-        same_step_data_required = self.backend.model_type == "eagle3" and not use_logits
+        same_step_data_required = (
+            self.backend.model_type == "eagle3"
+            and not use_logits
+            and not self._bubble_time_enabled
+        )
         current_step_data = [
             item
             for item in self.collected_data
             if int(item.get("step", current_step)) == current_step
         ]
-        buffer_data = self.data_buffer.get_all_data() if self.use_data_buffer else []
+        buffer_data = (
+            self.data_buffer.get_available_data() if self.use_data_buffer else []
+        )
         if self.use_data_buffer and buffer_data:
             recent_steps = 0 if same_step_data_required else int(sample_last_n_steps)
-            trainable_data = self.data_buffer.get_data_from_last_n_steps(recent_steps)
+            recent_data = self.data_buffer.get_data_from_last_n_steps(recent_steps)
+            target_versions = [
+                int(item.get("target_version", item.get("step", current_step)))
+                for item in recent_data
+            ]
+            if self._bubble_time_enabled and not use_logits:
+                cached_versions = set(self._target_lm_head_snapshots)
+                target_versions = [
+                    version for version in target_versions if version in cached_versions
+                ]
+            selected_target_version = max(target_versions) if target_versions else None
+            trainable_data = [
+                item
+                for item in recent_data
+                if selected_target_version is not None
+                and int(item.get("target_version", item.get("step", current_step)))
+                == selected_target_version
+            ]
         else:
             trainable_data = current_step_data
+            selected_target_version = current_step if trainable_data else None
 
         batch_size = max(int(self.batch_size), 1)
         trainable_samples = len(trainable_data)
@@ -4445,7 +4602,7 @@ class DrafterBaseTrainer:
             "oldest_sample_step": min(sample_steps) if sample_steps else None,
             "newest_sample_step": max(sample_steps) if sample_steps else None,
             "same_step_data_required": same_step_data_required,
-            "target_version": getattr(self, "_target_lm_head_weight_step", None),
+            "target_version": selected_target_version,
             "buffer_version": self.buffer_version,
             "data_version": max(sample_steps) if sample_steps else None,
         }
@@ -4464,7 +4621,11 @@ class DrafterBaseTrainer:
         item["step"] = int(
             item.get("step", self.current_rl_step) or self.current_rl_step
         )
-        self.collected_data.append(item)
+        item["target_version"] = int(item.get("target_version", item["step"]))
+        if self.use_data_buffer:
+            self.data_buffer.add_batch(item)
+        else:
+            self.collected_data.append(item)
         self._mark_buffer_changed()
 
     def prepare_training_batch_from_samples(
@@ -4477,12 +4638,19 @@ class DrafterBaseTrainer:
         current_step = int(self.current_rl_step if step is None else step)
         previous_collected_data = self.collected_data
         previous_current_step = self.current_rl_step
+        previous_use_data_buffer = self.use_data_buffer
+        previous_reservation_id = self._active_training_reservation_id
+        previous_target_version = self._active_training_target_version
+        previous_prepared_items = self._last_prepared_training_items
         maxlen = max(
             len(samples),
             int(self.config.rollout.drafter.training.get("current_max_samples", 2000)),
         )
         self.collected_data = deque(maxlen=maxlen)
         self.current_rl_step = current_step
+        self.use_data_buffer = False
+        self._active_training_reservation_id = None
+        self._active_training_target_version = None
         try:
             for sample in samples:
                 if isinstance(sample, DraftFeatureSample):
@@ -4502,6 +4670,10 @@ class DrafterBaseTrainer:
         finally:
             self.collected_data = previous_collected_data
             self.current_rl_step = previous_current_step
+            self.use_data_buffer = previous_use_data_buffer
+            self._active_training_reservation_id = previous_reservation_id
+            self._active_training_target_version = previous_target_version
+            self._last_prepared_training_items = previous_prepared_items
 
     async def training_step_from_batch(
         self, batch: dict[str, torch.Tensor], step: int
@@ -4577,7 +4749,10 @@ class DrafterBaseTrainer:
             )
             return False
 
-        return await self._training_step_on_batch(batch, step)
+        step_ok = await self._training_step_on_batch(batch, step)
+        if step_ok:
+            self._consume_last_training_batch()
+        return step_ok
 
     def _reduce_loss_metrics(
         self, l_v: torch.Tensor, l_p: torch.Tensor, l_n: torch.Tensor

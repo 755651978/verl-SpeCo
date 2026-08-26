@@ -27,9 +27,7 @@ def _worker() -> SpecoWorker:
     )
     worker.config = SimpleNamespace(
         rollout=SimpleNamespace(
-            drafter=SimpleNamespace(
-                training={"collection_stage_ttl_sec": 1.0}
-            )
+            drafter=SimpleNamespace(training={"collection_stage_ttl_sec": 1.0})
         )
     )
     worker._staged_rollout_features = {}
@@ -63,3 +61,24 @@ def test_expired_collection_stages_are_removed() -> None:
 
     assert removed == 1
     assert set(worker._staged_rollout_features) == {"active"}
+
+
+def test_data_buffer_reservation_is_versioned_and_consume_once() -> None:
+    buffer = DataBuffer(max_size=8)
+    buffer.update_rl_step(4)
+    step_three = {"value": "old", "target_version": 3}
+    step_four_a = {"value": "new-a", "target_version": 4}
+    step_four_b = {"value": "new-b", "target_version": 4}
+    for sample in (step_three, step_four_a, step_four_b):
+        buffer.add_batch(sample)
+
+    reserved = buffer.reserve("plan-4", target_version=4, max_samples=2)
+
+    assert reserved == [step_four_a, step_four_b]
+    assert buffer.get_available_data(target_version=4) == []
+    assert (
+        buffer.get_available_data(target_version=4, reservation_id="plan-4") == reserved
+    )
+    assert buffer.consume("plan-4", [step_four_a]) == 1
+    assert buffer.release_reservation("plan-4") == 1
+    assert buffer.get_available_data(target_version=4) == [step_four_b]

@@ -484,9 +484,7 @@ class DrafterScheduler:
             return self._metadata_idle_training_groups
         if config.idle_worker_group_mode != "auto":
             return ()
-        known_workers = tuple(
-            sorted(self._idle_workers, key=_natural_worker_sort_key)
-        )
+        known_workers = tuple(sorted(self._idle_workers, key=_natural_worker_sort_key))
         if not known_workers:
             return ()
         if config.idle_worker_group_size is None:
@@ -513,8 +511,7 @@ class DrafterScheduler:
             for worker_id, state in self._idle_workers.items()
             if state.status == "idle"
             and (
-                not config.idle_worker_require_memory_released
-                or state.memory_released
+                not config.idle_worker_require_memory_released or state.memory_released
             )
         }
         groups = self._idle_training_groups(config)
@@ -663,9 +660,8 @@ class DrafterScheduler:
     ) -> TrainingPlan:
         resources = self.select_idle_training_resources(config)
         if not resources.available:
-            if (
-                allow_sync_fallback
-                and self._should_sync_fallback(context.global_step, config)
+            if allow_sync_fallback and self._should_sync_fallback(
+                context.global_step, config
             ):
                 return self._plan_sync_fallback_training(context, config)
             return self._skip_idle_worker_plan(context, config, resources)
@@ -701,6 +697,7 @@ class DrafterScheduler:
             ),
             config,
             resources=resources,
+            require_interval=False,
         )
 
     def _steps_without_training(self, global_step: object) -> int:
@@ -801,7 +798,13 @@ class DrafterScheduler:
             sample_last_n_steps=config.sample_last_n_steps,
             publish_after_success=False,
             required_target_version=(
-                None if config.use_logits else _as_int(context.global_step)
+                None
+                if config.use_logits
+                else (
+                    context.data_status.target_version
+                    if context.data_status is not None
+                    else _as_int(context.global_step)
+                )
             ),
             plan_id=uuid4().hex,
             target_worker_ids=resources.worker_ids,
@@ -814,6 +817,11 @@ class DrafterScheduler:
 
     def prepare_training_execution(self, plan: TrainingPlan) -> dict[str, Any]:
         if not plan.launch:
+            return {"drafter/target_lm_head_synced": 0}
+        if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+            # The exact head for buffered step N data is cached before the step
+            # N actor update.  Fetching the live actor head inside step N+1
+            # rollout would both block the bubble and select the wrong version.
             return {"drafter/target_lm_head_synced": 0}
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
@@ -1007,6 +1015,8 @@ class DrafterScheduler:
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
         resources: AvailableTrainingResources | None = None,
+        *,
+        require_interval: bool = True,
     ) -> TrainingPlan:
         interval_matched = self.training_interval_matched(context.global_step, config)
         execution_strategy = (
@@ -1017,18 +1027,15 @@ class DrafterScheduler:
         trigger = self.trigger_policy.should_train(
             context,
             config,
-            interval_matched=interval_matched,
+            interval_matched=interval_matched if require_interval else True,
         )
         budget = self.sync_budget_policy.make_budget(context, config)
         if resources is not None and budget.max_batches > 0:
             deadline_guard_sec = self._effective_idle_deadline_guard_sec(config)
             batch_estimate = self._effective_idle_batch_estimate_sec(config)
-            max_batches_per_window = self._effective_idle_max_batches_per_window(
-                config
-            )
+            max_batches_per_window = self._effective_idle_max_batches_per_window(config)
             usable_window = max(
-                resources.minimum_idle_window_sec
-                - deadline_guard_sec,
+                resources.minimum_idle_window_sec - deadline_guard_sec,
                 0.0,
             )
             window_batches = int(math.floor(usable_window / batch_estimate))
@@ -1092,7 +1099,13 @@ class DrafterScheduler:
                 context.data_status.data_version if context.data_status else None
             ),
             "required_target_version": (
-                None if config.use_logits else _as_int(context.global_step)
+                None
+                if config.use_logits
+                else (
+                    context.data_status.target_version
+                    if context.data_status is not None
+                    else _as_int(context.global_step)
+                )
             ),
             "plan_id": uuid4().hex,
             "worker_snapshots": (
@@ -1209,6 +1222,26 @@ class DrafterScheduler:
         self._record_training_outcome(plan, outcome)
         return outcome
 
+    def wait_pending_training(self, *, runtime_state) -> TrainingOutcome | None:
+        plan = runtime_state.active_plan
+        if plan is None:
+            return None
+        if self._worker_executor is None:
+            raise RuntimeError("Drafter worker executor has not been bound")
+        execution = self.rollout_idle_execution_strategy.wait(
+            executor=self._worker_executor,
+            runtime_state=runtime_state,
+        )
+        if execution is None:
+            return None
+        outcome = TrainingOutcome.from_execution(
+            execution,
+            runtime_state=runtime_state,
+            plan=plan,
+        )
+        self._record_training_outcome(plan, outcome)
+        return outcome
+
     def _record_training_outcome(
         self,
         plan: TrainingPlan,
@@ -1254,7 +1287,10 @@ class DrafterScheduler:
         for worker_id in worker_ids:
             if worker_id in self._idle_workers:
                 self._idle_workers[worker_id].status = "reclaiming"
-        return self._worker_executor.request_reclaim(tuple(str(worker_id) for worker_id in worker_ids))
+        request = self._worker_executor.request_reclaim(
+            tuple(str(worker_id) for worker_id in worker_ids)
+        )
+        return self._worker_executor.resolve(request)
 
     @staticmethod
     def _publish_interval_matched(

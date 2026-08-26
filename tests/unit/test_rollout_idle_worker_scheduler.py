@@ -358,6 +358,87 @@ def test_idle_worker_auto_budget_bootstraps_one_batch_without_manual_estimate() 
     assert plan.idle_batch_estimate_sec == pytest.approx(0.25)
 
 
+def test_idle_worker_training_does_not_wait_for_training_interval() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    deadline_ts = time.time() + 30.0
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=deadline_ts,
+            )
+        )
+    config = replace(
+        _auto_idle_config(2),
+        training_interval_steps=5,
+        idle_worker_min_idle_window_sec=None,
+        idle_worker_max_batches_per_window=None,
+        idle_worker_initial_batch_estimate_sec=None,
+        idle_worker_deadline_guard_sec=None,
+    )
+    context = DrafterScheduleContext(
+        global_step=6,
+        training_mode="online",
+        collected_samples_this_step=0,
+        oldlogprob_collection_requested=False,
+    )
+
+    plan = scheduler.prepare_training_plan(context, config)
+
+    assert not plan.interval_matched
+    assert plan.launch
+    assert plan.reason == "training_ready"
+    assert plan.max_batches == 1
+
+
+def test_idle_worker_plan_uses_buffered_data_target_version() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    deadline_ts = time.time() + 30.0
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=deadline_ts,
+            )
+        )
+    buffered_status = replace(
+        _status("group"),
+        current_step=11,
+        newest_sample_step=10,
+        data_version=10,
+        target_version=10,
+        worker_snapshots={
+            worker_id: {
+                "buffer_version": 1,
+                "data_version": 10,
+                "worker_incarnation": f"worker-{worker_id}",
+                "trainable_samples": 5,
+            }
+            for worker_id in ("0", "1")
+        },
+    )
+    context = DrafterScheduleContext(
+        global_step=11,
+        training_mode="online",
+        collected_samples_this_step=0,
+        oldlogprob_collection_requested=False,
+        data_status=buffered_status,
+    )
+
+    plan = scheduler.prepare_training_plan(context, _idle_config())
+
+    assert plan.launch
+    assert plan.source_global_step == 11
+    assert plan.data_version == 10
+    assert plan.required_target_version == 10
+
+
 def test_idle_worker_starvation_guard_launches_sync_fallback_at_safe_point() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler.on_worker_event(
@@ -493,7 +574,7 @@ def test_idle_worker_starvation_guard_config_from_nested_mapping() -> None:
                     "fallback_to_sync": True,
                     "max_seconds_without_training": 60.5,
                 },
-            }
+            },
         }
     )
 
@@ -733,7 +814,7 @@ def _trainer_with_idle_config() -> SpecoRayPPOTrainer:
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
-def test_trainer_generation_events_mark_idle_workers_without_popping_samples() -> None:
+def test_trainer_generation_completion_does_not_create_synthetic_idle_window() -> None:
     trainer = _trainer_with_idle_config()
     output = _FakeGenerationOutput(
         [{"replica_rank": 0, "id": "a"}, {"replica_rank": 1, "id": "b"}]
@@ -743,7 +824,8 @@ def test_trainer_generation_events_mark_idle_workers_without_popping_samples() -
     complete_metrics = trainer._speco_emit_rollout_generation_completed(output)
 
     assert start_metrics["bubble/idle_workers"] == 0
-    assert complete_metrics["bubble/idle_workers"] == 2
+    assert complete_metrics == {}
+    assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 0
     assert output.non_tensor_batch["drafter_sample"][0]["id"] == "a"
 
 

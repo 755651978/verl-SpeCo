@@ -943,9 +943,7 @@ def _emit_rollout_idle_worker_event(
         return False
     event_ts = time.time()
     must_be_ready_at = (
-        _rollout_idle_deadline_ts(drafter_cfg)
-        if event_type == "WORKER_IDLE"
-        else None
+        _rollout_idle_deadline_ts(drafter_cfg) if event_type == "WORKER_IDLE" else None
     )
     worker_id = _rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank)
     deadline_source = (
@@ -2137,18 +2135,29 @@ class _SpecoVLLMHttpServerMixin:
     async def generate(self, *args, **kwargs):
         drafter_cfg = _load_env_drafter_config()
         replica_rank = int(getattr(self, "replica_rank", 0) or 0)
-        _emit_rollout_idle_worker_event(
-            drafter_cfg=drafter_cfg,
-            replica_rank=replica_rank,
-            event_type="GENERATION_STARTED",
-        )
-        output = await super().generate(*args, **kwargs)
-        _emit_rollout_idle_worker_event(
-            drafter_cfg=drafter_cfg,
-            replica_rank=replica_rank,
-            event_type="WORKER_IDLE",
-            memory_released=True,
-        )
+        active_requests = int(getattr(self, "_speco_rollout_active_requests", 0) or 0)
+        self._speco_rollout_active_requests = active_requests + 1
+        if active_requests == 0:
+            _emit_rollout_idle_worker_event(
+                drafter_cfg=drafter_cfg,
+                replica_rank=replica_rank,
+                event_type="GENERATION_STARTED",
+            )
+        try:
+            output = await super().generate(*args, **kwargs)
+        finally:
+            remaining_requests = max(
+                int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
+                0,
+            )
+            self._speco_rollout_active_requests = remaining_requests
+            if remaining_requests == 0:
+                _emit_rollout_idle_worker_event(
+                    drafter_cfg=drafter_cfg,
+                    replica_rank=replica_rank,
+                    event_type="WORKER_IDLE",
+                    memory_released=True,
+                )
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
