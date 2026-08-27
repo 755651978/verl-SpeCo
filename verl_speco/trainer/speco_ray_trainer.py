@@ -64,7 +64,11 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
 )
-from verl_speco.integration.sglang_adapter import pop_drafter_samples
+from verl_speco.integration.sglang_adapter import (
+    DRAFTER_SAMPLE_KEY,
+    normalize_drafter_samples,
+    pop_drafter_samples,
+)
 from verl_speco.integration.sglang_runtime import (
     clear_sglang_runtime_config,
     configure_sglang_runtime_from_config,
@@ -1286,6 +1290,85 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             active_plan.target_worker_ids,
         )
         return {"bubble/reclaim_requested": 1}
+
+    @staticmethod
+    def _speco_generation_output_replica_ranks(gen_batch_output: Any) -> tuple[int, ...]:
+        non_tensor_batch = getattr(gen_batch_output, "non_tensor_batch", None)
+        if not isinstance(non_tensor_batch, dict):
+            return ()
+        samples = normalize_drafter_samples(non_tensor_batch.get(DRAFTER_SAMPLE_KEY))
+        ranks: set[int] = set()
+        for sample in samples:
+            replica_rank = sample.get("replica_rank")
+            if replica_rank is None:
+                continue
+            try:
+                ranks.add(int(replica_rank))
+            except (TypeError, ValueError):
+                continue
+        return tuple(sorted(ranks))
+
+    def _speco_rollout_idle_fallback_deadline_ts(self) -> float:
+        scheduler = self._speco_get_drafter_scheduler()
+        config = self._speco_drafter_schedule_config()
+        batch_estimate = scheduler._effective_idle_batch_estimate_sec(config)
+        guard = scheduler._effective_idle_deadline_guard_sec(config)
+        min_window = scheduler._effective_idle_min_window_sec(config)
+        max_batches = scheduler._effective_idle_max_batches_per_window(config)
+        return time.time() + max(batch_estimate * max(max_batches, 1) + guard, min_window)
+
+    def _speco_emit_rollout_idle_from_generation_output(
+        self,
+        gen_batch_output: Any,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        if not self._speco_rollout_idle_worker_enabled():
+            return {}
+        replica_ranks = self._speco_generation_output_replica_ranks(gen_batch_output)
+        if not replica_ranks:
+            logger.warning(
+                "[BubbleTime] fallback idle events skipped: reason=%s "
+                "no drafter_sample replica ranks in generation output",
+                reason,
+            )
+            return {"bubble/fallback_idle_events_skipped": 1}
+        worker_ids = self._speco_rollout_idle_worker_ids()
+        deadline_ts = self._speco_rollout_idle_fallback_deadline_ts()
+        emitted_worker_ids: list[str] = []
+        scheduler = self._speco_get_drafter_scheduler()
+        for replica_rank in replica_ranks:
+            worker_id = (
+                worker_ids[replica_rank]
+                if 0 <= replica_rank < len(worker_ids)
+                else str(replica_rank)
+            )
+            emitted_worker_ids.append(worker_id)
+            scheduler.on_worker_event(
+                RolloutWorkerEvent(
+                    RolloutWorkerEventType.WORKER_IDLE,
+                    worker_id=worker_id,
+                    replica_rank=replica_rank,
+                    memory_released=True,
+                    must_be_ready_at=deadline_ts,
+                )
+            )
+        logger.warning(
+            "[BubbleTime] fallback idle events emitted: reason=%s "
+            "replica_ranks=%s worker_ids=%s deadline_in_s=%.3f",
+            reason,
+            replica_ranks,
+            tuple(emitted_worker_ids),
+            max(deadline_ts - time.time(), 0.0),
+        )
+        metrics = scheduler.idle_worker_metrics()
+        metrics.update(
+            {
+                "bubble/fallback_idle_events": len(emitted_worker_ids),
+                "bubble/fallback_idle_replica_count": len(replica_ranks),
+            }
+        )
+        return metrics
 
     def _speco_reclaim_rollout_idle_workers_before_generation(self) -> dict[str, Any]:
         if not self._speco_rollout_idle_worker_enabled():
@@ -2716,6 +2799,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 generation_metrics.update(
                     self._speco_emit_rollout_generation_completed(gen_batch_output)
                 )
+                if (
+                    self._speco_rollout_idle_worker_enabled()
+                    and not generation_metrics.get("bubble/runtime_worker_events_drained")
+                ):
+                    generation_metrics.update(
+                        self._speco_emit_rollout_idle_from_generation_output(
+                            gen_batch_output,
+                            reason="no_runtime_idle_events",
+                        )
+                    )
+                    generation_metrics.update(
+                        self._speco_try_launch_rollout_idle_training()
+                    )
                 self._speco_store_rollout_metrics(gen_batch_output)
                 collected = self._speco_collect_generation_samples(gen_batch_output)
                 if collected:

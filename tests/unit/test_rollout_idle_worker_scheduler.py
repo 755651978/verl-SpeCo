@@ -872,6 +872,25 @@ def test_trainer_generation_completion_does_not_create_synthetic_idle_window() -
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_trainer_fallback_idle_events_from_generation_output() -> None:
+    trainer = _trainer_with_idle_config()
+    output = _FakeGenerationOutput(
+        [{"replica_rank": 0, "id": "a"}, {"replica_rank": 1, "id": "b"}]
+    )
+
+    trainer._speco_emit_rollout_generation_started()
+    metrics = trainer._speco_emit_rollout_idle_from_generation_output(
+        output,
+        reason="test_no_runtime_events",
+    )
+
+    assert metrics["bubble/fallback_idle_events"] == 2
+    assert metrics["bubble/idle_workers"] == 2
+    assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 2
+    assert output.non_tensor_batch["drafter_sample"][0]["id"] == "a"
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
 def test_trainer_reclaims_active_idle_workers_before_next_generation() -> None:
     trainer = _trainer_with_idle_config()
     events = []

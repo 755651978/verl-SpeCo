@@ -2181,6 +2181,7 @@ def install_upstream_vllm_runtime_bridge() -> bool:
     global _VLLM_REPLICA_PATCHED
     install_vllm_runtime_observability()
     if _VLLM_REPLICA_PATCHED:
+        logger.warning("[BubbleTime] vLLM runtime bridge already installed")
         return True
 
     try:
@@ -2189,11 +2190,19 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         from verl.workers.rollout import replica as replica_module
         from verl.workers.rollout.vllm_rollout import vllm_async_server
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Unable to install SPECO vLLM runtime bridge: %s", exc)
+        logger.warning(
+            "[BubbleTime] unable to install SPECO vLLM runtime bridge: %s",
+            exc,
+            exc_info=True,
+        )
         return False
 
     upstream_replica = getattr(vllm_async_server, "vLLMReplica", None)
     if upstream_replica is None:
+        logger.warning(
+            "[BubbleTime] unable to install SPECO vLLM runtime bridge: "
+            "vLLMReplica not found"
+        )
         return False
 
     speco_http_server_cls = _build_speco_vllm_http_server_class(vllm_async_server)
@@ -2219,6 +2228,12 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         registry._registry["vllm"] = lambda: SpecoVLLMReplica
     patch_vllm_server_adapter_update()
     _VLLM_REPLICA_PATCHED = True
+    logger.warning(
+        "[BubbleTime] installed SPECO vLLM runtime bridge: replica_cls=%s "
+        "server_cls=%s",
+        getattr(SpecoVLLMReplica, "__name__", type(SpecoVLLMReplica).__name__),
+        getattr(speco_http_server_cls, "__name__", type(speco_http_server_cls).__name__),
+    )
     return True
 
 
@@ -2240,7 +2255,25 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     speculative_config = build_vllm_speculative_config_from_drafter(
         drafter_cfg, rollout_cfg=rollout_cfg
     )
-    install_upstream_vllm_runtime_bridge()
+    bridge_installed = install_upstream_vllm_runtime_bridge()
+    idle_bus_name = _get_nested(
+        drafter_cfg,
+        ("training", "scheduler", "idle_worker", "event_bus_name"),
+        "",
+    )
+    idle_strategy = _get_nested(
+        drafter_cfg,
+        ("training", "scheduler", "execution", "strategy"),
+        "",
+    )
+    logger.warning(
+        "[BubbleTime] configured vLLM SPECO runtime: bridge_installed=%s "
+        "idle_strategy=%s idle_event_bus=%s drafter_enabled=%s",
+        bridge_installed,
+        idle_strategy,
+        idle_bus_name or os.getenv(SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV) or "",
+        enabled,
+    )
 
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
