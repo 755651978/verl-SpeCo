@@ -504,7 +504,7 @@ def _configure_device(local_rank: int) -> None:
 
 
 def _optional_int(value: object) -> int | None:
-    return None if value is None else int(value)
+    return None if value is None else int(cast(Any, value))
 
 
 def _barrier() -> None:
