@@ -1180,6 +1180,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             event = self._speco_on_before_actor_update(allow_sync_fallback=False)
             plan = event.training_plan
             metrics = dict(event.metrics or {})
+            print(
+                "[BubbleTime] idle_launch_decision: "
+                f"launch={getattr(plan, 'launch', False)} "
+                f"reason={getattr(plan, 'reason', None)} "
+                f"max_batches={getattr(plan, 'max_batches', 0)} "
+                f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
+                f"idle_groups={metrics.get('bubble/idle_training_groups', 0)}",
+                flush=True,
+            )
             if plan is None or not plan.launch:
                 if plan is not None:
                     self._speco_log_drafter_training_plan(plan, metrics)
@@ -1192,6 +1201,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_service_rollout_idle_events(self) -> dict[str, Any]:
         metrics = self._speco_drain_rollout_idle_events()
         if metrics:
+            print(
+                "[BubbleTime] idle_event_service: "
+                f"metrics={metrics}",
+                flush=True,
+            )
+        if metrics:
             metrics.update(self._speco_try_launch_rollout_idle_training())
         self._speco_record_rollout_idle_metrics(metrics)
         return metrics
@@ -1201,11 +1216,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return None, None
         bus_name = self._speco_rollout_idle_event_bus_name()
         if not bus_name:
+            print(
+                "[BubbleTime] idle_event_loop: not_started reason=missing_event_bus",
+                flush=True,
+            )
             logger.warning(
                 "[BubbleTime] rollout idle event loop not started: missing event bus"
             )
             return None, None
         poll_interval = self._speco_rollout_idle_poll_interval_sec()
+        print(
+            "[BubbleTime] idle_event_loop: starting "
+            f"bus={bus_name} poll_interval_s={poll_interval:.3f}",
+            flush=True,
+        )
         logger.warning(
             "[BubbleTime] starting rollout idle event loop: bus=%s poll_interval_s=%.3f",
             bus_name,
@@ -1335,6 +1359,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return {}
         replica_ranks = self._speco_generation_output_replica_ranks(gen_batch_output)
         if not replica_ranks:
+            print(
+                "[BubbleTime] fallback_idle: skipped "
+                f"reason={reason} no_replica_ranks",
+                flush=True,
+            )
             logger.warning(
                 "[BubbleTime] fallback idle events skipped: reason=%s "
                 "no drafter_sample replica ranks in generation output",
@@ -1368,6 +1397,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             replica_ranks,
             tuple(emitted_worker_ids),
             max(deadline_ts - time.time(), 0.0),
+        )
+        print(
+            "[BubbleTime] fallback_idle: emitted "
+            f"reason={reason} replica_ranks={replica_ranks} "
+            f"worker_ids={tuple(emitted_worker_ids)}",
+            flush=True,
         )
         metrics = scheduler.idle_worker_metrics()
         metrics.update(
