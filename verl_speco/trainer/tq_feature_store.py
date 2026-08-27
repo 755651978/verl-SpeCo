@@ -90,7 +90,7 @@ class TQFeatureStore:
             return
         if not configure_transfer_queue(self.config):
             raise RuntimeError(
-                "TQ Consumer requires transfer_queue.enable=true and TransferQueue==0.1.7"
+                "TQ Consumer requires transfer_queue.enable=true and TransferQueue==0.1.10"
             )
         connect_ray_cluster(self.ray_address, self.ray_namespace)
         connect_transfer_queue_client()

@@ -63,7 +63,7 @@ def _config(input_path: Path) -> dict[str, Any]:
                         "dspark_l1_loss_alpha": 0.9,
                         "transfer_queue": {
                             "enable": True,
-                            "package_version": "0.1.7",
+                            "package_version": "0.1.10",
                             "ray": {
                                 "address": "ray-head:6379",
                                 "namespace": "speco-drafter",

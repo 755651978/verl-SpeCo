@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-transfer-queue = ["TransferQueue==0.1.7"]
+transfer-queue = ["TransferQueue==0.1.10"]
 
 [project.urls]
 Repository = "https://github.com/verl-project/verl-SpeCo"

@@ -123,8 +123,8 @@ def validate_producer_config(config: Any) -> None:
         raise ValueError(
             f"transfer_queue.schema_version must be {PROTOCOL_SCHEMA_VERSION}"
         )
-    if tq_cfg.get("package_version") != "0.1.7":
-        raise ValueError("transfer_queue.package_version must be '0.1.7'")
+    if tq_cfg.get("package_version") != "0.1.10":
+        raise ValueError("transfer_queue.package_version must be '0.1.10'")
     if tq_cfg.get("partition_id") != DRAFTER_TQ_PARTITION:
         raise ValueError(
             f"transfer_queue.partition_id must be {DRAFTER_TQ_PARTITION!r}"
@@ -176,7 +176,7 @@ async def run_producer(
             producer_cfg["vllm_endpoints"],
         )
         if not transport.configure_transfer_queue(tq_cfg):
-            raise RuntimeError("Standalone TQ Producer requires TransferQueue==0.1.7")
+            raise RuntimeError("Standalone TQ Producer requires TransferQueue==0.1.10")
         ray_cfg = tq_cfg["ray"]
         logger.info(
             "Standalone TQ Producer connecting Ray address=%s namespace=%s",

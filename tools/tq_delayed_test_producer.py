@@ -44,7 +44,7 @@ from verl_speco.transport.drafter_sample_protocol import (
 def _tq_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "enable": True,
-        "package_version": "0.1.7",
+        "package_version": "0.1.10",
         "ray": {"address": args.ray_address, "namespace": args.namespace},
         "partition_id": args.partition_id,
         "run_id": args.run_id,

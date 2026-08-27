@@ -38,7 +38,7 @@ remaining ranks. Garbage collection is therefore deferred to task teardown; a
 finer-grained leader-clears-after-barrier is future work.
 
 Note: the TQ call sites follow the documented KV API (``kv_put`` /
-``kv_batch_get`` / ``kv_close``) of TransferQueue 0.1.7. The exact signatures
+``kv_batch_get`` / ``kv_close``) of TransferQueue 0.1.10. The exact signatures
 (keyword names, return shapes) must be verified against the installed TQ
 version on first run; the bridge fails loud, never silently.
 """
@@ -77,7 +77,7 @@ except ImportError:
             def _raise(*args: Any, **kwargs: Any) -> Any:
                 raise RuntimeError(
                     f"transfer_queue is not installed. Cannot call tq.{name}(). "
-                    "Install with `pip install TransferQueue==0.1.7` or disable "
+                    "Install with `pip install TransferQueue==0.1.10` or disable "
                     "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable."
                 )
 
@@ -174,14 +174,14 @@ def connect_ray_cluster(
 
     PR #48 workers are already Ray actors and therefore do not call this
     function.  Standalone owner, Producer and torchrun ranks must call it
-    before ``tq.init`` so TQ 0.1.7 can discover its named Controller actor.
+    before ``tq.init`` so TQ 0.1.10 can discover its named Controller actor.
     """
 
     try:
         import ray
     except ImportError as exc:  # pragma: no cover - depends on optional package
         raise RuntimeError(
-            "Ray is required by TransferQueue 0.1.7. Install TransferQueue==0.1.7 "
+            "Ray is required by TransferQueue 0.1.10. Install TransferQueue==0.1.10 "
             "and connect all standalone processes to the same Ray cluster."
         ) from exc
 
@@ -207,7 +207,7 @@ def start_transfer_queue_owner(tq_config: Any) -> None:
     if not bool(plain.get("enable", True)):
         raise ValueError("TransferQueue owner requires transfer_queue.enable=true")
     if not _TQ_IMPORTABLE:
-        raise RuntimeError("TransferQueue==0.1.7 is required to start the TQ owner")
+        raise RuntimeError("TransferQueue==0.1.10 is required to start the TQ owner")
     with _state_lock:
         if _state["initialized"]:
             raise RuntimeError("TransferQueue is already initialized in this process")
@@ -225,7 +225,7 @@ def connect_transfer_queue_client() -> None:
     """Attach this process to the named TQ Controller on its Ray cluster."""
 
     if not _TQ_IMPORTABLE:
-        raise RuntimeError("TransferQueue==0.1.7 is required to connect a TQ client")
+        raise RuntimeError("TransferQueue==0.1.10 is required to connect a TQ client")
     if not bool(_state["enabled"]):
         raise RuntimeError(
             "configure_transfer_queue() must enable TQ before client connect"
@@ -269,7 +269,7 @@ def _drafter_training_cfg(config: Any) -> Any:
 def _ensure_initialized() -> None:
     """Lazily ``tq.init(config)`` once per worker process.
 
-    TransferQueue 0.1.7 first tries to discover the named controller and ignores
+    TransferQueue 0.1.10 first tries to discover the named controller and ignores
     the supplied configuration when one already exists. Supplying the same
     native configuration in every process is therefore safe for ordinary
     clients and also prevents an unexpectedly early client from creating a
@@ -308,7 +308,7 @@ def _native_tq_config(tq_cfg: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _as_tq_config(value: Mapping[str, Any]) -> Any:
-    """TQ 0.1.7 annotates its config as DictConfig; keep tests dependency-light."""
+    """TQ 0.1.10 annotates its config as DictConfig; keep tests dependency-light."""
 
     try:
         from omegaconf import OmegaConf
@@ -361,7 +361,7 @@ def put_sample(
     _ensure_initialized()
     # Pass a plain single-sample dict of columns. TQ's kv_put adds its required
     # batch dimension internally; constructing a scalar TensorDict here would be
-    # incorrect. (Exact kwarg names verified against TQ 0.1.7 on first run.)
+    # incorrect. (Exact kwarg names verified against TQ 0.1.10 on first run.)
     tq.kv_put(
         key=key,
         partition_id=_partition_id(),
@@ -401,7 +401,7 @@ def list_samples() -> dict[str, dict[str, Any]]:
         return {}
     if not isinstance(result, Mapping):
         raise TypeError(f"tq.kv_list returned unsupported type {type(result)!r}")
-    # 0.1.7 returns key -> tag when partition_id is supplied.  Accept the
+    # 0.1.10 returns key -> tag when partition_id is supplied.  Accept the
     # partition -> (key -> tag) wrapper as well to keep the bridge version-safe.
     nested = result.get(_partition_id())
     if isinstance(nested, Mapping) and all(

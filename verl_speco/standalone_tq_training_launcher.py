@@ -354,7 +354,7 @@ def start_ray_session(
             ray_runtime = importlib.import_module("ray")
         except ImportError as exc:
             raise RuntimeError(
-                "Standalone TQ training requires Ray and TransferQueue==0.1.7"
+                "Standalone TQ training requires Ray and TransferQueue==0.1.10"
             ) from exc
     # ``ray.init()`` consults RAY_ADDRESS when no explicit address is supplied.
     # This launcher owns the complete Producer/TQ/Consumer lifetime, so an

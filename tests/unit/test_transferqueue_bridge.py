@@ -106,7 +106,7 @@ def fake_runtime(monkeypatch):
 def _config():
     return {
         "enable": True,
-        "package_version": "0.1.7",
+        "package_version": "0.1.10",
         "partition_id": "speco_drafter_features",
         "run_id": "run-a",
         "schema_version": 1,

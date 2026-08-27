@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Real two-process smoke test for Ray + TransferQueue 0.1.7.
+"""Real two-process smoke test for Ray + TransferQueue 0.1.10.
 
 Start a Ray head first, then run ``owner`` and ``client`` in separate shells.
 The owner publishes one protocol-valid sample; the client list/get/decodes and
@@ -49,7 +49,7 @@ from verl_speco.transport.drafter_sample_protocol import (
 def _config(args) -> dict:
     return {
         "enable": True,
-        "package_version": "0.1.7",
+        "package_version": "0.1.10",
         "ray": {"address": args.ray_address, "namespace": args.namespace},
         "partition_id": "speco_drafter_features",
         "run_id": args.run_id,

@@ -223,11 +223,11 @@ actor_rollout_ref:
         # rollout server writes hidden states directly to TQ and the drafter
         # worker reads them by key, bypassing the RayPPOTrainer driver and the
         # Ray object store for the dominant tensor. Default off -> unchanged
-        # Ray path. Requires `pip install TransferQueue==0.1.7`.
+        # Ray path. Requires `pip install TransferQueue==0.1.10`.
         transfer_queue:
           enable: false
-          package_version: "0.1.7"
-          # TQ 0.1.7 discovers its named TransferQueueController through Ray.
+          package_version: "0.1.10"
+          # TQ 0.1.10 discovers its named TransferQueueController through Ray.
           # Standalone owner, Producer and every torchrun rank must use the same
           # address and namespace. PR #48 Ray actors already have this context.
           ray:

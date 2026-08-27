@@ -79,7 +79,7 @@ def run_owner(config: Any, *, stop_event: threading.Event | None = None) -> int:
     # and enable only this process's copied configuration.
     tq_cfg["enable"] = True
     if not configure_transfer_queue(tq_cfg):
-        raise RuntimeError("Standalone TQ owner requires TransferQueue==0.1.7")
+        raise RuntimeError("Standalone TQ owner requires TransferQueue==0.1.10")
     ray_cfg = tq_cfg.get("ray", {})
     ray_address = ray_cfg.get("address")
     if not ray_address:
