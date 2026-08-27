@@ -1313,6 +1313,8 @@ class SpecoWorker(Worker):
         data_status = self.trainer.get_training_data_status(
             sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
             require_full_batch=bool(training_plan.get("require_full_batch", False)),
+            min_sample_step=training_plan.get("min_sample_step"),
+            max_sample_step=training_plan.get("max_sample_step"),
         )
         actual_data_version = data_status.get("data_version")
         planned_data_version = training_plan.get("data_version")
@@ -1424,7 +1426,11 @@ class SpecoWorker(Worker):
                 self.trainer.reset_training_metrics()
                 for _ in range(max_batches):
                     result["attempted_steps"] += 1
-                    step_ok = await self.trainer.training_step(self.last_global_step)
+                    step_ok = await self.trainer.training_step(
+                        self.last_global_step,
+                        min_sample_step=training_plan.get("min_sample_step"),
+                        max_sample_step=training_plan.get("max_sample_step"),
+                    )
                     if step_ok:
                         result["successful_steps"] += 1
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
@@ -1463,6 +1469,8 @@ class SpecoWorker(Worker):
             data_status_after = self.trainer.get_training_data_status(
                 sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
+                min_sample_step=training_plan.get("min_sample_step"),
+                max_sample_step=training_plan.get("max_sample_step"),
             )
             result["buffer_size_after"] = int(data_status_after["trainable_samples"])
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)

@@ -253,6 +253,8 @@ class TrainingDataStatus:
     worker_incarnation: str = ""
     worker_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
+    min_sample_step: int | None = None
+    max_sample_step: int | None = None
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
@@ -278,6 +280,8 @@ class TrainingDataStatus:
             buffer_version=_as_int(value.get("buffer_version", 0)),
             worker_incarnation=str(value.get("worker_incarnation", "")),
             worker_id=str(value.get("worker_id", value.get("rank", ""))),
+            min_sample_step=_optional_int(value.get("min_sample_step")),
+            max_sample_step=_optional_int(value.get("max_sample_step")),
         )
 
     def metrics(self) -> dict[str, int]:
@@ -328,6 +332,9 @@ class TrainingPlan:
     sample_last_n_steps: int = 2
     data_version: int | None = None
     required_target_version: int | None = None
+    min_sample_step: int | None = None
+    max_sample_step: int | None = None
+    data_filter_reason: str = ""
     plan_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
 
@@ -364,6 +371,9 @@ class TrainingPlan:
             "sample_last_n_steps": self.sample_last_n_steps,
             "data_version": self.data_version,
             "required_target_version": self.required_target_version,
+            "min_sample_step": self.min_sample_step,
+            "max_sample_step": self.max_sample_step,
+            "data_filter_reason": self.data_filter_reason,
             "plan_id": self.plan_id,
             "worker_snapshots": self.worker_snapshots or {},
         }

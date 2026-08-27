@@ -369,6 +369,11 @@ class DrafterScheduler:
             interval_matched=interval_matched,
         )
         budget = self.sync_budget_policy.make_budget(context, config)
+        min_sample_step, max_sample_step, data_filter_reason = (
+            self._training_data_filter_window(
+                context, config, budget.sample_last_n_steps
+            )
+        )
         common: Any = {
             "interval_matched": interval_matched,
             "execution_strategy": DrafterExecutionStrategy.SYNC,
@@ -384,6 +389,9 @@ class DrafterScheduler:
             "required_target_version": (
                 None if config.use_logits else _as_int(context.global_step)
             ),
+            "min_sample_step": min_sample_step,
+            "max_sample_step": max_sample_step,
+            "data_filter_reason": data_filter_reason,
             "plan_id": uuid4().hex,
             "worker_snapshots": (
                 context.data_status.worker_snapshots if context.data_status else None
@@ -418,6 +426,36 @@ class DrafterScheduler:
             ),
             **common,
         )
+
+    @staticmethod
+    def _training_data_filter_window(
+        context: DrafterScheduleContext,
+        config: DrafterScheduleConfig,
+        sample_last_n_steps: int,
+    ) -> tuple[int | None, int | None, str]:
+        """Return the sample-step window workers must apply when training.
+
+        The scheduler owns the filtering decision, while workers/base trainers
+        only execute this window against their local buffer or Feature Store
+        replay source.
+        """
+
+        try:
+            current_step = _as_int(context.global_step)
+        except Exception:  # noqa: BLE001
+            return None, None, "invalid_global_step"
+
+        max_sample_step = current_step
+        if (
+            context.data_status is not None
+            and context.data_status.same_step_data_required
+        ):
+            return current_step, max_sample_step, "same_step_required"
+        if not config.use_data_buffer:
+            return current_step, max_sample_step, "current_step_only"
+
+        min_sample_step = max(0, current_step - max(int(sample_last_n_steps), 0))
+        return min_sample_step, max_sample_step, "recent_buffer_window"
 
     def execute_training_plan(self, plan: TrainingPlan, *, runtime_state):
         """Execute through the strategy selected by the generated plan."""

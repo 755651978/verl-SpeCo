@@ -29,9 +29,10 @@ class _FakeTrainer:
         self.optimizer_steps_total = 0
         self.data_version = data_version
         self.activation_calls = 0
+        self.status_kwargs = []
 
     def get_training_data_status(self, **kwargs):
-        del kwargs
+        self.status_kwargs.append(kwargs)
         return {
             "trainable_batches": 1,
             "trainable_samples": 4,
@@ -68,6 +69,9 @@ def _plan() -> dict[str, object]:
         "required_target_version": 4,
         "sample_last_n_steps": 2,
         "require_full_batch": False,
+        "min_sample_step": 2,
+        "max_sample_step": 4,
+        "data_filter_reason": "recent_buffer_window",
         "min_batches": 1,
         "worker_snapshots": {
             "0": {
@@ -102,3 +106,5 @@ def test_worker_preflight_records_actual_versions_for_training_result() -> None:
     assert worker._prepared_training_plan_id == "plan-4"
     assert worker._prepared_training_data_version == 4
     assert worker._prepared_training_target_version == 4
+    assert worker.trainer.status_kwargs[-1]["min_sample_step"] == 2
+    assert worker.trainer.status_kwargs[-1]["max_sample_step"] == 4

@@ -44,6 +44,8 @@ class ConservativeTrainingDataStatusPolicy:
                 ),
                 "worker_incarnation": s.worker_incarnation,
                 "trainable_samples": s.trainable_samples,
+                "min_sample_step": s.min_sample_step,
+                "max_sample_step": s.max_sample_step,
             }
             for s in statuses
         }
@@ -73,4 +75,12 @@ class ConservativeTrainingDataStatusPolicy:
             data_version_consistent=data_version_consistent,
             buffer_version=min(s.buffer_version for s in statuses),
             worker_snapshots=worker_snapshots,
+            min_sample_step=min(
+                (s.min_sample_step for s in statuses if s.min_sample_step is not None),
+                default=None,
+            ),
+            max_sample_step=max(
+                (s.max_sample_step for s in statuses if s.max_sample_step is not None),
+                default=None,
+            ),
         )

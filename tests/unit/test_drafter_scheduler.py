@@ -205,8 +205,13 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
     assert plan.interval_matched
     assert plan.execution_strategy is DrafterExecutionStrategy.SYNC
     assert plan.source_global_step == 5
+    assert plan.min_sample_step == 5
+    assert plan.max_sample_step == 5
+    assert plan.data_filter_reason == "current_step_only"
     assert plan.publish_after_success
     assert plan.to_worker_payload()["execution_strategy"] == "sync"
+    assert plan.to_worker_payload()["min_sample_step"] == 5
+    assert plan.to_worker_payload()["max_sample_step"] == 5
     assert plan.metrics() == {
         "drafter/scheduler_used": 1,
         "drafter/schedule_launch": 1,
@@ -245,17 +250,51 @@ def test_sync_plan_preserves_skip_conditions(context, config, reason) -> None:
 
 def test_sync_plan_preserves_data_buffer_fallback() -> None:
     plan = DrafterScheduler().plan_training(
-        _context(samples=0, trainable_batches=9),
+        _context(step=5, samples=0, trainable_batches=9),
         DrafterScheduleConfig(
             training_interval_steps=5,
             use_data_buffer=True,
             train_batches_per_trigger=9,
+            sample_last_n_steps=2,
         ),
     )
     assert plan.launch
     assert plan.reason == "training_ready"
     assert plan.max_batches == 9
+    assert plan.min_sample_step == 3
+    assert plan.max_sample_step == 5
+    assert plan.data_filter_reason == "recent_buffer_window"
     assert plan.publish_after_success
+
+
+def test_sync_plan_forces_current_step_when_worker_requires_same_step_data() -> None:
+    context = _context(step=7, samples=1, trainable_batches=2)
+    context = DrafterScheduleContext(
+        global_step=context.global_step,
+        training_mode=context.training_mode,
+        collected_samples_this_step=context.collected_samples_this_step,
+        oldlogprob_collection_requested=context.oldlogprob_collection_requested,
+        data_status=TrainingDataStatus(
+            **{
+                **context.data_status.__dict__,
+                "same_step_data_required": True,
+            }
+        ),
+    )
+
+    plan = DrafterScheduler().plan_training(
+        context,
+        DrafterScheduleConfig(
+            training_interval_steps=1,
+            use_data_buffer=True,
+            sample_last_n_steps=4,
+        ),
+    )
+
+    assert plan.launch
+    assert plan.min_sample_step == 7
+    assert plan.max_sample_step == 7
+    assert plan.data_filter_reason == "same_step_required"
 
 
 def test_oldlogprob_collection_does_not_fallback_to_old_buffer_data() -> None:
