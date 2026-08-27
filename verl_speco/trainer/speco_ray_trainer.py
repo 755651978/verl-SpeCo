@@ -2846,14 +2846,29 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             is_validation_generation = _speco_is_validation_generation(
                 args, kwargs, gen_batch_output
             )
+            print(
+                "[BubbleTime] generation_complete: "
+                f"validation={is_validation_generation} "
+                f"metrics_keys={tuple(sorted(generation_metrics))} "
+                f"runtime_events_drained={generation_metrics.get('bubble/runtime_worker_events_drained', 0)}",
+                flush=True,
+            )
             if not is_validation_generation:
                 generation_metrics.update(
                     self._speco_emit_rollout_generation_completed(gen_batch_output)
                 )
-                if (
+                use_fallback_idle = (
                     self._speco_rollout_idle_worker_enabled()
                     and not generation_metrics.get("bubble/runtime_worker_events_drained")
-                ):
+                )
+                print(
+                    "[BubbleTime] fallback_idle_decision: "
+                    f"enabled={self._speco_rollout_idle_worker_enabled()} "
+                    f"use_fallback={use_fallback_idle} "
+                    f"runtime_events_drained={generation_metrics.get('bubble/runtime_worker_events_drained', 0)}",
+                    flush=True,
+                )
+                if use_fallback_idle:
                     generation_metrics.update(
                         self._speco_emit_rollout_idle_from_generation_output(
                             gen_batch_output,
