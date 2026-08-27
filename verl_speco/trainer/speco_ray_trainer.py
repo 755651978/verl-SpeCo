@@ -598,6 +598,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def init_workers(self):
         drafter_rollout_enabled = self.is_drafter_rollout_enabled(self.config)
         online_drafter_enabled = self.is_drafter_training_enabled(self.config)
+        print(
+            "[BubbleTime] init_workers: "
+            f"rollout_enabled={drafter_rollout_enabled} "
+            f"training_enabled={online_drafter_enabled} "
+            f"rollout_name={_get_nested(self.config, ('actor_rollout_ref', 'rollout', 'name'), None)} "
+            f"strategy={self._speco_drafter_schedule_config().execution_strategy.value}",
+            flush=True,
+        )
         if online_drafter_enabled:
             self._speco_prepare_drafter_checkpoint_for_worker_init()
         if drafter_rollout_enabled:
@@ -2778,6 +2786,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_wait_pending_drafter_publish()
             input_is_validation = _speco_is_validation_generation(args, kwargs)
             generation_metrics = {}
+            print(
+                "[BubbleTime] generation_hook: "
+                f"validation={input_is_validation} "
+                f"online_enabled={self._speco_online_enabled()} "
+                f"idle_enabled={self._speco_rollout_idle_worker_enabled()} "
+                f"event_bus={self._speco_rollout_idle_event_bus_name() or ''}",
+                flush=True,
+            )
             if not input_is_validation:
                 generation_metrics.update(
                     self._speco_reclaim_rollout_idle_workers_before_generation()
