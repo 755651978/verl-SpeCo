@@ -425,7 +425,9 @@ class SpecoWorker(Worker):
         # collect_rollout_features can branch without re-reading config.
         from verl_speco.integration.transferqueue_bridge import configure_transfer_queue
 
-        self._speco_tq_enabled = configure_transfer_queue(self.config.rollout.drafter.training)
+        self._speco_tq_enabled = configure_transfer_queue(
+            self.config.rollout.drafter.training
+        )
 
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
@@ -937,7 +939,7 @@ class SpecoWorker(Worker):
         # Per-step cross-sample cache for chunk fetches. Reset every collect
         # call so keys (which carry global_step) never stale and the cache
         # cannot grow unbounded. Shared across all samples in this step.
-        self._tq_chunk_cache = {}
+        self._tq_chunk_cache: dict[str, Any] = {}
         for sample in samples:
             if not sample:
                 continue

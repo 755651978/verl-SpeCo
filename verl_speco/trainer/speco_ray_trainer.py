@@ -2228,7 +2228,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
             # Stamp the global step so the actor-worker producer can build
             # step-unique TransferQueue keys for old-logprob hidden chunks (P1).
-            tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_GLOBAL_STEP_KEY, self.global_steps)
+            tu.assign_non_tensor_data(
+                batch_td, OLD_LOGPROB_GLOBAL_STEP_KEY, self.global_steps
+            )
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = (
                 time.perf_counter() - prepare_started

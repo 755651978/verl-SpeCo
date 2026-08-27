@@ -843,9 +843,7 @@ class JsonlTokenReplayFeatureStore:
             raise ValueError(
                 "jsonl_token_replay conversations produced no assistant tokens"
             )
-        loss_mask = [0.0] * len(prompt_ids) + [1.0] * (
-            len(full_ids) - len(prompt_ids)
-        )
+        loss_mask = [0.0] * len(prompt_ids) + [1.0] * (len(full_ids) - len(prompt_ids))
         return (
             torch.tensor(full_ids, dtype=torch.long).reshape(-1),
             torch.tensor(loss_mask, dtype=torch.float32).reshape(-1),
@@ -969,16 +967,16 @@ class VllmSafetensorsFeatureStore(TorchShardFeatureStore):
             raise ValueError(
                 f"Invalid vllm_safetensors key {key!r}; expected sample index 0"
             )
-        entries = {
-            str(entry.get("path")): entry for entry in self._load_manifest()
-        }
+        entries = {str(entry.get("path")): entry for entry in self._load_manifest()}
         entry = entries.get(file_name)
         if entry is None:
             raise KeyError(f"Missing vllm_safetensors manifest entry for {file_name}")
         tensors = load_file(str(self.path / file_name), device="cpu")
         manifest_sample = dict(entry.get("sample") or {})
         payload: dict[str, Any] = {
-            "schema_version": int(manifest_sample.get("schema_version", SCHEMA_VERSION)),
+            "schema_version": int(
+                manifest_sample.get("schema_version", SCHEMA_VERSION)
+            ),
             "algorithm": manifest_sample.get("algorithm", "EAGLE3"),
             "input_ids": tensors["input_ids"],
             "loss_mask": tensors["loss_mask"],
@@ -1026,11 +1024,11 @@ class VllmSafetensorsFeatureStore(TorchShardFeatureStore):
             "position_ids",
         ):
             value = payload.get(optional_key)
-            if torch.is_tensor(value):
+            if value is not None and torch.is_tensor(value):
                 tensors[optional_key] = value.contiguous()
         metadata = payload.get("metadata") or {}
         hidden_positions = metadata.get("hidden_positions")
-        if torch.is_tensor(hidden_positions):
+        if hidden_positions is not None and torch.is_tensor(hidden_positions):
             tensors["metadata.hidden_positions"] = hidden_positions.long().contiguous()
         return tensors
 
@@ -1057,7 +1055,9 @@ def build_feature_store_from_config(
     )
     if store_type == "tq":
         if not read_only:
-            raise ValueError("feature_store.type=tq is a read-only Consumer data source")
+            raise ValueError(
+                "feature_store.type=tq is a read-only Consumer data source"
+            )
         from verl_speco.trainer.tq_feature_store import TQFeatureStore
 
         tq_cfg = transfer_queue_cfg
@@ -1089,8 +1089,7 @@ def build_feature_store_from_config(
             tokenizer_path=feature_store_cfg.get("tokenizer_path"),
             trust_remote_code=bool(feature_store_cfg.get("trust_remote_code", False)),
             train_on=str(
-                feature_store_cfg.get("train_on", "last_assistant")
-                or "last_assistant"
+                feature_store_cfg.get("train_on", "last_assistant") or "last_assistant"
             ),
         )
     else:
@@ -1198,9 +1197,7 @@ def _load_jsonl_offset(path: Path, offset: int) -> dict[str, Any]:
         raise ValueError(f"JSONL offset {offset} in {path} points to an empty line")
     payload = json.loads(line)
     if not isinstance(payload, dict):
-        raise TypeError(
-            f"JSONL offset {offset} in {path} must contain a JSON object"
-        )
+        raise TypeError(f"JSONL offset {offset} in {path} must contain a JSON object")
     return payload
 
 
@@ -1238,9 +1235,7 @@ def _normalize_conversation_role(value: Any) -> str:
 
 def _conversation_item_to_message(item: Any) -> dict[str, str]:
     if not isinstance(item, dict):
-        raise TypeError(
-            "jsonl_token_replay conversations entries must be JSON objects"
-        )
+        raise TypeError("jsonl_token_replay conversations entries must be JSON objects")
     role = _normalize_conversation_role(item.get("role", item.get("from")))
     content = item.get("content", item.get("value", ""))
     if role not in {"system", "user", "assistant"}:

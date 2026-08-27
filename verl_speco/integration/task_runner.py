@@ -314,7 +314,10 @@ class SpecoTaskRunner(TaskRunner):
         # TaskRunner owns shutdown so a failed fit cannot leak the named
         # controller/storage. No-op when transfer_queue.enable=false or the
         # package is not installed.
-        from verl_speco.integration.transferqueue_bridge import close_transfer_queue, init_transfer_queue
+        from verl_speco.integration.transferqueue_bridge import (
+            close_transfer_queue,
+            init_transfer_queue,
+        )
 
         transfer_queue_started = init_transfer_queue(config)
         try:

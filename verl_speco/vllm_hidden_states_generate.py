@@ -75,9 +75,7 @@ def generate_vllm_safetensors_features(config) -> dict[str, Any]:
 
     replay_config = deepcopy(config)
     with open_dict(replay_config):
-        target_feature_replay = (
-            replay_config.actor_rollout_ref.rollout.drafter.training.target_feature_replay
-        )
+        target_feature_replay = replay_config.actor_rollout_ref.rollout.drafter.training.target_feature_replay
         target_feature_replay.backend = "vllm_file"
 
     input_store = build_feature_store_from_config(input_cfg, read_only=True)

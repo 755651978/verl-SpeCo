@@ -102,9 +102,7 @@ class MooncakeTransferConfig:
                     os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", "1GB"),
                 )
             ),
-            protocol=str(
-                value("protocol", os.getenv("MOONCAKE_PROTOCOL", "tcp"))
-            ),
+            protocol=str(value("protocol", os.getenv("MOONCAKE_PROTOCOL", "tcp"))),
             device_name=str(
                 value("device_name", os.getenv("MOONCAKE_DEVICE_NAME", ""))
             ),

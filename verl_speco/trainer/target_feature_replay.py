@@ -388,6 +388,10 @@ def feature_from_vllm_payload(
         raise TypeError("vLLM hidden-states payload must be a mapping")
     token_ids = values.get("token_ids")
     hidden = values.get("hidden_states")
+    if token_ids is None or hidden is None:
+        raise ValueError(
+            "vLLM hidden-states payload must contain token_ids and hidden_states"
+        )
     if not torch.is_tensor(token_ids) or not torch.is_tensor(hidden):
         raise ValueError(
             "vLLM hidden-states payload must contain token_ids and hidden_states"
@@ -1306,6 +1310,8 @@ class TargetFeatureReplayer:
         attempted_endpoints: set[int] = set()
         for attempt in range(self.vllm_max_retries + 1):
             state = self._acquire_vllm_endpoint(attempted_endpoints)
+            if state.client is None:
+                raise RuntimeError(f"vLLM endpoint {state.url} has no client")
             attempt_started = time.perf_counter()
             try:
                 response = state.client.completions.create(
@@ -1355,6 +1361,8 @@ class TargetFeatureReplayer:
         attempted_endpoints: set[int] = set()
         for attempt in range(self.vllm_max_retries + 1):
             state = self._acquire_vllm_endpoint(attempted_endpoints)
+            if state.client is None:
+                raise RuntimeError(f"vLLM endpoint {state.url} has no client")
             try:
                 attempt_started = time.perf_counter()
                 if log_request:
@@ -1390,7 +1398,7 @@ class TargetFeatureReplayer:
                     hidden_states = payload.get("hidden_states")
                     hidden_shape = (
                         tuple(hidden_states.shape)
-                        if torch.is_tensor(hidden_states)
+                        if hidden_states is not None and torch.is_tensor(hidden_states)
                         else None
                     )
                     logger.info(

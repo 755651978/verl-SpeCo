@@ -1326,17 +1326,11 @@ class LlamaMLP(nn.Module):
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
 
             gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(pretraining_tp)
-                ],
+                [F.linear(x, gate_proj_slices[i]) for i in range(pretraining_tp)],
                 dim=-1,
             )
             up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(pretraining_tp)
-                ],
+                [F.linear(x, up_proj_slices[i]) for i in range(pretraining_tp)],
                 dim=-1,
             )
 

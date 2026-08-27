@@ -334,9 +334,7 @@ async def run_producer(
                     raw = await pool.prefill(request)
                 stats.pending_bytes += int(raw.byte_size)
                 try:
-                    sample = feature_from_vllm_payload(
-                        raw, request, feature_contract
-                    )
+                    sample = feature_from_vllm_payload(raw, request, feature_contract)
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
                     stats.pending_bytes = max(

@@ -27,7 +27,6 @@ Last updated: 08/21/2026
 |---|---|---|
 | `verl_speco/trainer/tq_feature_store.py` | `TQFeatureStore`、`ReadyEntry`、`EosMetadata` | 将公共 TQ bridge 包装成 Consumer 数据访问层，负责连接、发现、批量读取、解码、删除和读取 EOS |
 | `verl_speco/trainer/tq_sample_source.py` | `TQFeatureDataLoader`、`TQLocalBatch`、`build_assignments()` | 实现多 rank 流式取数：rank 0 发现样本并分配 key，各 rank 自己从 TQ 取 Tensor |
-| `tools/run_dspark_tq_consumer.sh` | Consumer 测试启动工具 | 给出一套完整的 DSpark、offline、TQ 配置和 `torchrun` 启动方式 |
 | `tests/unit/test_tq_consumer.py` | Consumer 单元测试 | 覆盖 store 构建、ready 过滤排序、协议解码、rank 分配、EOS、清理和非 rank 0 行为 |
 
 ### 2.2 本次修改的既有文件
@@ -38,7 +37,6 @@ Last updated: 08/21/2026
 | `verl_speco/trainer/draft_training_loop.py` | 接入 TQ store/loader、跨 rank 连接检查、训练成功后清理 | 将流式取数接入原训练循环，同时保留原 DSpark trainer、loss、optimizer、metric 和 checkpoint 逻辑 |
 | `verl_speco/draft_train_launcher.py` | 增加 TQ 启动参数的 fail-fast 检查 | 在启动多个 torchrun 子进程前检查 `enable`、Ray address 和 `run_id`，避免各 rank 启动后才失败 |
 | `verl_speco/config/speco_base.yaml` | 标注 `feature_store.type=tq` 为无路径流式数据源 | 保留统一 Hydra 配置入口；TQ 的公共配置仍位于 sibling `training.transfer_queue` |
-| `tools/tq_connection_smoke.py` | 将原连接 smoke 扩展为真实 Consumer 路径测试 | 验证 owner、真实 TQ、Consumer 读取、EOS、清理和仅关闭本地 client |
 | `tests/unit/test_draft_train_launcher.py` | 增加 TQ 参数检查测试 | 验证必要配置缺失时 launcher 直接拒绝启动 |
 | `tests/unit/test_draft_training_loop.py` | 增加连接和 clear 时序测试 | 验证只由 rank 0 清理、clear 失败会报告、连接失败会传播 |
 
@@ -612,29 +610,11 @@ TQ 会保留 Producer 写入的 `SampleMetadata.algorithm`，但不使用它选�
 
 ## 11. 如何启动和检查
 
-推荐启动顺序：
-
-1. 启动 Ray head。
-2. 启动 TQ Owner，并保持该进程存活。
-3. 启动 Producer，使用相同 Ray address、namespace、partition 和 run ID。
-4. 启动 `tools/run_dspark_tq_consumer.sh`。
-5. Producer 完成全部样本后发布 EOS。
-6. Consumer 消费完成并退出后，再停止 Owner/Ray。
-
-示例：
+正式运行统一使用端到端 launcher；它负责 Ray、TQ Owner、Producer 和 Consumer 的启动与清理：
 
 ```bash
-MODEL_PATH=/models/Qwen3-8B \
-DRAFTER_PATH=/models/dspark-drafter \
-DRAFT_CKPTS_DIR=/checkpoints/dspark-tq \
-TRAIN_DEVICES=0,1,2,3 \
-TRAIN_GPUS=4 \
-RAY_ADDRESS=127.0.0.1:6379 \
-SPECO_TQ_RUN_ID=dspark-run-001 \
-bash tools/run_dspark_tq_consumer.sh
+bash examples/run_qwen3-8b_drafter_separate_training.sh
 ```
-
-脚本中的 namespace 固定为 `speco-drafter`，默认 partition 来自公共配置 `speco_drafter_features`。Owner 和 Producer 必须使用相同值。
 
 ## 12. 已完成的测试
 
@@ -656,7 +636,7 @@ python -m pytest \
 
 ### 12.2 真实 TQ 0.1.7 跨进程 smoke
 
-`tools/tq_connection_smoke.py` 使用真实 Ray + TQ Owner 和另一个 Consumer 进程验证了：
+早期临时跨进程工具验证过以下行为，当前回归由协议、bridge、Consumer和launcher单元测试承担：
 
 - Owner 发布 owner-ready；
 - 两条 sample 写入 TQ；

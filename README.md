@@ -400,8 +400,6 @@ only while vLLM throughput rises.
 `prefetch_depth` of 2 normally hides transfer latency without retaining too
 many large hidden-state batches. The standalone metrics include producer queue
 depth, consumer wait time, vLLM request time, and Mooncake GET time.
-The complete three-process launcher is
-[`tools/run_qwen3-4b_drafter_dspark_mooncake.sh`](./tools/run_qwen3-4b_drafter_dspark_mooncake.sh).
 
 ## Configuration
 

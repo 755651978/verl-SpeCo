@@ -11,8 +11,6 @@ verl_speco/transport/drafter_sample_protocol.py
 verl_speco/integration/transferqueue_bridge.py
 verl_speco/config/speco_base.yaml
 verl_speco/tq_owner.py
-tools/run_dspark_tq_owner.sh
-tools/tq_connection_smoke.py
 tests/unit/test_drafter_sample_protocol.py
 tests/unit/test_transferqueue_bridge.py
 pyproject.toml
@@ -871,8 +869,6 @@ Owner 命令：
 verl-speco-tq-owner
 ```
 
-也可以使用 `tools/run_dspark_tq_owner.sh`。
-
 ## 20. 单元测试
 
 协议测试 `tests/unit/test_drafter_sample_protocol.py` 覆盖：
@@ -905,13 +901,8 @@ python -m pytest \
 
 ## 21. 真实双进程 smoke test
 
-程序：
-
-```text
-tools/tq_connection_smoke.py
-```
-
-它使用真实 `TransferQueue==0.1.7`、Ray、SimpleStorage、两个独立 Python进程和两个 batch samples。
+早期用于该验证的临时双进程工具已经移除；正式入口统一由
+`verl_speco.standalone_tq_training_launcher` 管理 Owner、Producer 和 Consumer 生命周期。
 
 Owner 路径：
 

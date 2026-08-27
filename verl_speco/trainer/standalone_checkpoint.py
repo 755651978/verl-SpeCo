@@ -35,7 +35,9 @@ def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def _source_drafter_model_path(trainer: Any) -> str | None:
-    model_path = getattr(getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None)
+    model_path = getattr(
+        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
+    )
     model_path = getattr(model_path, "model_path", None)
     if not model_path:
         return None
@@ -88,13 +90,17 @@ def _target_runtime_model_type(target_config: dict[str, Any] | None) -> str | No
     return str(target_config["model_type"])
 
 
-def _fill_if_missing(dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]) -> None:
+def _fill_if_missing(
+    dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]
+) -> None:
     for key in keys:
         if key in src and key not in dst:
             dst[key] = deepcopy(src[key])
 
 
-def _copy_if_present(dst: dict[str, Any], src: dict[str, Any] | None, keys: tuple[str, ...]) -> None:
+def _copy_if_present(
+    dst: dict[str, Any], src: dict[str, Any] | None, keys: tuple[str, ...]
+) -> None:
     if src is None:
         return
     for key in keys:
@@ -107,7 +113,9 @@ def _drop_keys(config: dict[str, Any], keys: tuple[str, ...]) -> None:
         config.pop(key, None)
 
 
-def _target_rope_parameters(target_config: dict[str, Any] | None) -> dict[str, Any] | None:
+def _target_rope_parameters(
+    target_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if not isinstance(target_config, dict):
         return None
     rope_parameters = target_config.get("rope_parameters")
@@ -240,22 +248,31 @@ def rewrite_standalone_runtime_config(
         try:
             completed_future.result()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Skip standalone runtime config rewrite because checkpoint save failed: %s", exc)
+            logger.warning(
+                "Skip standalone runtime config rewrite because checkpoint save failed: %s",
+                exc,
+            )
             return None
 
     config_path = os.path.join(checkpoint_path, "config.json")
     if not os.path.exists(config_path):
-        logger.warning("Cannot rewrite standalone runtime config: missing %s", config_path)
+        logger.warning(
+            "Cannot rewrite standalone runtime config: missing %s", config_path
+        )
         return None
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             training_config = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Cannot rewrite standalone runtime config %s: %s", config_path, exc)
+        logger.warning(
+            "Cannot rewrite standalone runtime config %s: %s", config_path, exc
+        )
         return None
     if not isinstance(training_config, dict):
-        logger.warning("Cannot rewrite standalone runtime config %s: expected object", config_path)
+        logger.warning(
+            "Cannot rewrite standalone runtime config %s: expected object", config_path
+        )
         return None
 
     training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
@@ -263,7 +280,11 @@ def rewrite_standalone_runtime_config(
         with open(training_config_path, "w", encoding="utf-8") as f:
             json.dump(training_config, f, indent=2, sort_keys=True)
     except OSError as exc:
-        logger.warning("Failed to write standalone training config copy %s: %s", training_config_path, exc)
+        logger.warning(
+            "Failed to write standalone training config copy %s: %s",
+            training_config_path,
+            exc,
+        )
 
     source_model_path = _source_drafter_model_path(trainer)
     source_runtime_config = _load_source_drafter_config(trainer)
@@ -290,7 +311,13 @@ def rewrite_standalone_runtime_config(
 
     runtime_config["speco_training_model_type"] = backend_type
     target_runtime_keys = ("head_dim", "rope_theta", "max_position_embeddings")
-    common_alias_keys = ("head_dim", "rope_theta", "target_layer_ids", "mask_token_id", "num_context_layers")
+    common_alias_keys = (
+        "head_dim",
+        "rope_theta",
+        "target_layer_ids",
+        "mask_token_id",
+        "num_context_layers",
+    )
     _fill_if_missing(runtime_config, training_config, common_alias_keys)
     _copy_if_present(runtime_config, target_runtime_config, target_runtime_keys)
 
@@ -322,7 +349,9 @@ def rewrite_standalone_runtime_config(
                 "mask_token_id",
             ),
         )
-        _copy_if_present(dspark_config, target_runtime_config, ("head_dim", "rope_theta"))
+        _copy_if_present(
+            dspark_config, target_runtime_config, ("head_dim", "rope_theta")
+        )
     else:
         dspark_config = {}
 
@@ -340,8 +369,15 @@ def rewrite_standalone_runtime_config(
             training_config.get("projector_type", "domino") or "domino"
         )
 
-    source_has_rope_theta = isinstance(source_runtime_config, dict) and "rope_theta" in source_runtime_config
-    if backend_type == "dspark" and str(target_model_type or "").lower().startswith("qwen3") and not source_has_rope_theta:
+    source_has_rope_theta = (
+        isinstance(source_runtime_config, dict)
+        and "rope_theta" in source_runtime_config
+    )
+    if (
+        backend_type == "dspark"
+        and str(target_model_type or "").lower().startswith("qwen3")
+        and not source_has_rope_theta
+    ):
         _drop_keys(runtime_config, ("rope_theta",))
         _drop_keys(dflash_config, ("rope_theta",))
         _drop_keys(dspark_config, ("rope_theta",))
@@ -355,18 +391,28 @@ def rewrite_standalone_runtime_config(
         or dflash_config.get("target_layer_ids")
         or dspark_config.get("target_layer_ids")
     )
-    if target_layer_ids is not None and "eagle_aux_hidden_state_layer_ids" not in runtime_config:
+    if (
+        target_layer_ids is not None
+        and "eagle_aux_hidden_state_layer_ids" not in runtime_config
+    ):
         try:
-            runtime_config["eagle_aux_hidden_state_layer_ids"] = [int(layer_id) + 1 for layer_id in target_layer_ids]
+            runtime_config["eagle_aux_hidden_state_layer_ids"] = [
+                int(layer_id) + 1 for layer_id in target_layer_ids
+            ]
         except (TypeError, ValueError):
-            logger.warning("Invalid target_layer_ids in standalone exported config: %r", target_layer_ids)
+            logger.warning(
+                "Invalid target_layer_ids in standalone exported config: %r",
+                target_layer_ids,
+            )
 
     try:
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(runtime_config, f, indent=2, sort_keys=True)
             f.write("\n")
     except OSError as exc:
-        logger.warning("Failed to write standalone runtime config %s: %s", config_path, exc)
+        logger.warning(
+            "Failed to write standalone runtime config %s: %s", config_path, exc
+        )
         return None
 
     return source_model_path

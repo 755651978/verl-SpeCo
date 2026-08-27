@@ -430,7 +430,6 @@ transfer_queue:
 
 ```text
 verl_speco/tq_owner.py
-tools/run_dspark_tq_owner.sh
 ```
 
 `tq_owner.py` 建议明确实现：
@@ -557,7 +556,6 @@ InputReader
 | `verl_speco/producer/input_reader.py` | 流式读输入、分配 `sequence_no/sample_id`、tokenize、构造 loss mask |
 | `verl_speco/producer/vllm_feature_client.py` | endpoint pool、并发控制、HTTP 请求、临时结果读取和删除 |
 | `verl_speco/trainer/target_feature_replay.py` | 提取可复用的 vLLM payload → `DraftFeatureSample` 纯转换函数 |
-| `examples/run_dspark_tq_producer.sh` | Producer 配置和启动命令 |
 | `tests/unit/test_drafter_sample_protocol.py` | 协议编码、字段和 shape 测试（两人共同） |
 | `tests/integration/test_tq_producer_smoke.py` | fake/短 vLLM → TQ sample + EOS |
 
@@ -644,9 +642,9 @@ def feature_from_vllm_payload(
 
 它不进行 HTTP、不访问 TQ、不删除文件，只完成 shape/layout/layer 校验、feature-position 选择、aux layer flatten 和可选 L1 final hidden 拼接。现有 file replay backend 和新 Producer 都调用这一函数，避免两套转换规则。
 
-#### `examples/run_dspark_tq_producer.sh`
+#### Producer 启动配置
 
-负责提供同一套：
+统一 launcher 向 `verl_speco.standalone_tq_producer` 提供同一套：
 
 ```text
 RAY_ADDRESS / Ray namespace
@@ -657,7 +655,7 @@ vLLM endpoint 列表
 max_inflight_requests / per_endpoint_concurrency
 ```
 
-脚本只启动 Producer，不启动 TQ owner 或 Consumer，便于两位开发者独立调试。
+正式运行不再保留单独的角色 shell wrapper。
 
 ## 5. Consumer 要实现什么
 
@@ -875,7 +873,6 @@ checkpoint 仍使用现有 `save_interval_steps` 和 final checkpoint；第一�
 | `verl_speco/trainer/draft_training_loop.py` | 保持 `mode=offline`；`type=tq` 时跳过 `feature_store.path` 必填检查并选择专用 loader；调用现有 prepare/train，global success 后 clear，final checkpoint |
 | `verl_speco/draft_train_launcher.py` | `feature_store.type=tq` 时不要求 feature-store path，透传 torchrun/TQ 配置 |
 | `verl_speco/config/speco_base.yaml` | 新增 TQ connection、run、poll、batch 等默认配置 |
-| `tools/run_dspark_tq_consumer.sh` | Consumer GPU、batch、checkpoint 和共享 TQ 配置 |
 | `tests/unit/test_tq_sample_source.py` | key 过滤/排序/分 rank、EOS、decode 调用测试 |
 | `tests/integration/test_dspark_tq_consumer_smoke.py` | 两 rank 取不同样本，完成训练并 clear |
 

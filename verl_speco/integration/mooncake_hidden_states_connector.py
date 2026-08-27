@@ -276,9 +276,7 @@ class SpeCoMooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._active_requests[request.req_id] = request
             self._request_blocks[request.req_id] = blocks
             self._response_metadata[request.req_id] = {
-                "mooncake_key": (
-                    f"{self._key_prefix}_{_safe_key(request.req_id)}"
-                ),
+                "mooncake_key": (f"{self._key_prefix}_{_safe_key(request.req_id)}"),
                 "input_ids_list": token_ids,
                 "tensor_shapes": {
                     "hidden_states": (

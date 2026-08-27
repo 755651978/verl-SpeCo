@@ -19,20 +19,20 @@ set -x
 # Run this script in its own terminal before starting the training script.
 #
 # Ascend example:
-#   DEVICE_ENV=ASCEND_RT_VISIBLE_DEVICES VLLM_DEVICES_0=0,1 VLLM_DEVICES_1=2,3 VLLM_TP=2 \
-#     bash examples/run_qwen3-8b_drafter_hidden_state_vllm.sh
+#   Set DEVICE_ENV=ASCEND_RT_VISIBLE_DEVICES, VLLM_DEVICES and VLLM_TP below,
+#   then run: bash tools/run_qwen3-8b_drafter_hidden_state_vllm.sh
 # CUDA example:
-#   DEVICE_ENV=CUDA_VISIBLE_DEVICES VLLM_DEVICES_0=0,1 VLLM_DEVICES_1=2,3 VLLM_TP=2 \
-#     bash examples/run_qwen3-8b_drafter_hidden_state_vllm.sh
+#   Set DEVICE_ENV=CUDA_VISIBLE_DEVICES, VLLM_DEVICES and VLLM_TP below,
+#   then run: bash tools/run_qwen3-8b_drafter_hidden_state_vllm.sh
 
 MODEL_PATH=${MODEL_PATH:-/path/to/Qwen3-8B}
 DEVICE_ENV=${DEVICE_ENV:-ASCEND_RT_VISIBLE_DEVICES}
-VLLM_DEVICES_0=${VLLM_DEVICES_0:-0}
-VLLM_DEVICES_1=${VLLM_DEVICES_1:-1}
+# Devices assigned to target-model vLLM. The script splits this list into
+# consecutive groups of VLLM_TP devices and starts one service per group.
+VLLM_DEVICES=${VLLM_DEVICES:-0,1,2,3,4,5}
 VLLM_TP=${VLLM_TP:-1}
 VLLM_HOST=${VLLM_HOST:-127.0.0.1}
-VLLM_PORT_0=${VLLM_PORT_0:-8000}
-VLLM_PORT_1=${VLLM_PORT_1:-8001}
+VLLM_BASE_PORT=${VLLM_BASE_PORT:-8000}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-256}
 # Auxiliary training layers followed by the target model's final hidden-state
@@ -41,7 +41,32 @@ VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-256}
 VLLM_HIDDEN_STATE_LAYER_IDS=${VLLM_HIDDEN_STATE_LAYER_IDS:-'[1,9,17,25,33,36]'}
 HIDDEN_STATES_DIR=${HIDDEN_STATES_DIR:-/tmp/speco-vllm-hidden-states}
 
-mkdir -p "${HIDDEN_STATES_DIR}/service-0" "${HIDDEN_STATES_DIR}/service-1"
+if ! [[ "${VLLM_TP}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "VLLM_TP must be a positive integer, got: ${VLLM_TP}" >&2
+    exit 2
+fi
+if ! [[ "${VLLM_BASE_PORT}" =~ ^[0-9]+$ ]]; then
+    echo "VLLM_BASE_PORT must be an integer, got: ${VLLM_BASE_PORT}" >&2
+    exit 2
+fi
+
+visible_devices=${VLLM_DEVICES}
+
+IFS=',' read -r -a DEVICE_IDS <<< "${visible_devices}"
+for index in "${!DEVICE_IDS[@]}"; do
+    DEVICE_IDS[index]=${DEVICE_IDS[index]//[[:space:]]/}
+    if [[ -z "${DEVICE_IDS[index]}" ]]; then
+        echo "Visible device list contains an empty item: ${visible_devices}" >&2
+        exit 2
+    fi
+done
+
+device_count=${#DEVICE_IDS[@]}
+if (( device_count % VLLM_TP != 0 )); then
+    echo "Visible device count (${device_count}) must be divisible by VLLM_TP (${VLLM_TP}): ${visible_devices}" >&2
+    exit 2
+fi
+service_count=$((device_count / VLLM_TP))
 
 SPECULATIVE_CONFIG=$(printf '{"method":"extract_hidden_states","num_speculative_tokens":1,"draft_model_config":{"hf_config":{"eagle_aux_hidden_state_layer_ids":%s}}}' "${VLLM_HIDDEN_STATE_LAYER_IDS}")
 
@@ -65,24 +90,40 @@ start_vllm() {
     STARTED_PID=$!
 }
 
-PID_0=""
-PID_1=""
+PIDS=()
+ENDPOINTS=()
 cleanup() {
-    [[ -n "${PID_0}" ]] && kill "${PID_0}" 2>/dev/null || true
-    [[ -n "${PID_1}" ]] && kill "${PID_1}" 2>/dev/null || true
-    [[ -n "${PID_0}" ]] && wait "${PID_0}" 2>/dev/null || true
-    [[ -n "${PID_1}" ]] && wait "${PID_1}" 2>/dev/null || true
+    if (( ${#PIDS[@]} > 0 )); then
+        kill "${PIDS[@]}" 2>/dev/null || true
+        wait "${PIDS[@]}" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
-start_vllm "${VLLM_DEVICES_0}" "${VLLM_PORT_0}" "${HIDDEN_STATES_DIR}/service-0" "$@"
-PID_0=${STARTED_PID}
-start_vllm "${VLLM_DEVICES_1}" "${VLLM_PORT_1}" "${HIDDEN_STATES_DIR}/service-1" "$@"
-PID_1=${STARTED_PID}
+for ((service_index = 0; service_index < service_count; service_index++)); do
+    first_device=$((service_index * VLLM_TP))
+    service_devices=${DEVICE_IDS[first_device]}
+    for ((tp_index = 1; tp_index < VLLM_TP; tp_index++)); do
+        service_devices+=",${DEVICE_IDS[first_device + tp_index]}"
+    done
 
-echo "VLLM_SERVICES_STARTED pid_0=${PID_0} endpoint_0=http://${VLLM_HOST}:${VLLM_PORT_0}/v1 pid_1=${PID_1} endpoint_1=http://${VLLM_HOST}:${VLLM_PORT_1}/v1"
+    service_port=$((VLLM_BASE_PORT + service_index))
+    service_hidden_states_dir="${HIDDEN_STATES_DIR}/service-${service_index}"
+    mkdir -p "${service_hidden_states_dir}"
+    start_vllm \
+        "${service_devices}" \
+        "${service_port}" \
+        "${service_hidden_states_dir}" \
+        "$@"
+    PIDS+=("${STARTED_PID}")
+    ENDPOINTS+=("http://${VLLM_HOST}:${service_port}/v1")
+done
+
+endpoint_list=$(IFS=,; echo "[${ENDPOINTS[*]}]")
+echo "VLLM_SERVICES_STARTED count=${service_count} tp=${VLLM_TP} devices=${visible_devices} endpoints=${endpoint_list} pids=${PIDS[*]}"
+echo "Use this for standalone training: SPECO_VLLM_ENDPOINTS='${endpoint_list}'"
 set +e
-wait -n "${PID_0}" "${PID_1}"
+wait -n "${PIDS[@]}"
 status=$?
 set -e
 exit "${status}"

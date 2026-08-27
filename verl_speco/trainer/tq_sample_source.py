@@ -151,10 +151,15 @@ class TQFeatureDataLoader:
                 return
             if command.get("kind") != "batch":
                 raise RuntimeError(f"Unsupported TQ loader command: {command!r}")
-            assignments = command.get("assignments")
-            if not isinstance(assignments, list) or len(assignments) != self.world_size:
+            wire_assignments = command.get("assignments")
+            if (
+                not isinstance(wire_assignments, list)
+                or len(wire_assignments) != self.world_size
+            ):
                 raise RuntimeError("TQ loader received malformed rank assignments")
-            local_entries = [_entry_from_wire(item) for item in assignments[self.rank]]
+            local_entries = [
+                _entry_from_wire(item) for item in wire_assignments[self.rank]
+            ]
             samples = self.store.get_many(local_entries)
             global_keys = (
                 [str(key) for key in command.get("global_keys", [])]
@@ -171,7 +176,9 @@ class TQFeatureDataLoader:
         if self.rank != 0:
             return
         if not global_keys:
-            raise ValueError("rank 0 requires global_keys to clear a completed TQ batch")
+            raise ValueError(
+                "rank 0 requires global_keys to clear a completed TQ batch"
+            )
         self.store.clear_many(global_keys)
 
     def _broadcast_command(self, command: dict[str, Any] | None) -> dict[str, Any]:

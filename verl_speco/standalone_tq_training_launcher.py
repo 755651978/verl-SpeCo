@@ -235,9 +235,7 @@ def _parse_vllm_endpoints(env: Mapping[str, str]) -> tuple[str, ...]:
             if item.strip()
         )
     else:
-        endpoint = str(
-            env.get("SPECO_VLLM_ENDPOINT", _DEFAULT_VLLM_ENDPOINT)
-        ).strip()
+        endpoint = str(env.get("SPECO_VLLM_ENDPOINT", _DEFAULT_VLLM_ENDPOINT)).strip()
         endpoints = (endpoint.rstrip("/"),) if endpoint else ()
     if not endpoints:
         raise ValueError("At least one hidden-state vLLM endpoint is required")

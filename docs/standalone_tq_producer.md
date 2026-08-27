@@ -176,11 +176,7 @@ vLLM 请求会暂停，等待 Consumer 清理已成功训练的 key。
 | `schema_version` | `1` |
 | `run_id`、Ray address、Ray namespace | 三个进程必须相同 |
 
-使用 [run_dspark_tq_producer.sh](../examples/run_dspark_tq_producer.sh) 启动。它要求
-显式提供 `RAY_ADDRESS`、`SPECO_TQ_RUN_ID`、输入、target/tokenizer 身份、layers 和
-vLLM endpoints，并且只启动 Producer。
-
-也可以通过安装后的命令入口运行：
+单独调试时可以通过安装后的命令入口运行；正式训练由统一launcher启动Producer：
 
 ```bash
 verl-speco-tq-producer \

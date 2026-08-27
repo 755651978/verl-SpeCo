@@ -59,7 +59,7 @@ def main() -> int:
     args = parser.parse_args()
 
     path = Path(args.path)
-    summaries = []
+    summaries: list[dict[str, Any]] = []
     key_counts: Counter[str] = Counter()
     schema_counts: Counter[str] = Counter()
     issues_by_schema: dict[str, list[str]] = defaultdict(list)
@@ -230,7 +230,7 @@ def _shape(value: Any) -> list[Any]:
     if not isinstance(value, list):
         return ["scalar", type(value).__name__]
     shape = []
-    current = value
+    current: Any = value
     while isinstance(current, list):
         shape.append(len(current))
         current = current[0] if current else None

@@ -189,7 +189,9 @@ class TQFeatureStore:
 
     def _require_connected(self) -> None:
         if not self._connected:
-            raise RuntimeError("TQFeatureStore.connect() must be called before data access")
+            raise RuntimeError(
+                "TQFeatureStore.connect() must be called before data access"
+            )
 
 
 def _plain_dict(value: Any) -> dict[str, Any]:
@@ -206,10 +208,7 @@ def _plain_dict(value: Any) -> dict[str, Any]:
     except ImportError:  # pragma: no cover - the project depends on OmegaConf
         pass
     if isinstance(value, Mapping):
-        return {
-            str(key): _plain_value(item)
-            for key, item in value.items()
-        }
+        return {str(key): _plain_value(item) for key, item in value.items()}
     raise TypeError(f"Expected a mapping configuration, got {type(value)!r}")
 
 

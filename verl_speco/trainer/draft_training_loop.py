@@ -91,7 +91,9 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             "actor_rollout_ref.rollout.drafter.training.feature_store.path is required"
         )
     if feature_store_type == "tq" and training_mode != "offline":
-        raise ValueError("feature_store.type=tq requires standalone training.mode=offline")
+        raise ValueError(
+            "feature_store.type=tq requires standalone training.mode=offline"
+        )
     if feature_store_type in replay_feature_store_types and training_mode != "offline":
         raise ValueError(
             f"feature_store.type={feature_store_type} is supported only by "
@@ -281,9 +283,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                 transfer_concurrency=int(
                     max(
                         math.ceil(
-                            int(
-                                pipeline_cfg.get("transfer_concurrency", 8) or 8
-                            )
+                            int(pipeline_cfg.get("transfer_concurrency", 8) or 8)
                             / world_size
                         ),
                         1,
@@ -480,9 +480,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         logger.info("[standalone rank=%s] cleaning trainer resources", rank)
         await trainer.cleanup_training(clear_data=True)
         if dist.is_initialized():
-            logger.info("[standalone rank=%s] entering final process-group barrier", rank)
+            logger.info(
+                "[standalone rank=%s] entering final process-group barrier", rank
+            )
             dist.barrier()
-            logger.info("[standalone rank=%s] final process-group barrier complete", rank)
+            logger.info(
+                "[standalone rank=%s] final process-group barrier complete", rank
+            )
             dist.destroy_process_group()
         logger.info("[standalone rank=%s] cleanup complete", rank)
 
@@ -1137,7 +1141,9 @@ def _clear_tq_batch_across_ranks(
         dist.all_reduce(failed, op=dist.ReduceOp.MAX)
     if bool(failed.item()):
         if local_error is not None:
-            raise RuntimeError("rank 0 failed to clear a completed TQ batch") from local_error
+            raise RuntimeError(
+                "rank 0 failed to clear a completed TQ batch"
+            ) from local_error
         raise RuntimeError("rank 0 failed to clear a completed TQ batch")
 
 
@@ -1153,7 +1159,9 @@ def _connect_tq_store_across_ranks(store, *, rank: int, device: torch.device) ->
     if connected:
         return
     if local_error is not None:
-        raise RuntimeError(f"TQ Consumer failed to connect on rank={rank}") from local_error
+        raise RuntimeError(
+            f"TQ Consumer failed to connect on rank={rank}"
+        ) from local_error
     raise RuntimeError(
         f"TQ Consumer failed to connect on another rank; rank={rank} is stopping"
     )

@@ -214,7 +214,9 @@ def _oldlogprob_global_step(micro_batch: Any) -> int:
     try:
         from verl.utils import tensordict_utils as tu
 
-        value = tu.get_non_tensor_data(data=micro_batch, key=OLD_LOGPROB_GLOBAL_STEP_KEY, default=0)
+        value = tu.get_non_tensor_data(
+            data=micro_batch, key=OLD_LOGPROB_GLOBAL_STEP_KEY, default=0
+        )
     except Exception:  # noqa: BLE001
         try:
             value = micro_batch.get(OLD_LOGPROB_GLOBAL_STEP_KEY, 0)
@@ -539,7 +541,10 @@ def _put_oldlogprob_hidden_refs(
             # resolves "speco:" keys via TQ instead of ray.get. Falls back to
             # ray.put otherwise (unchanged behavior).
             if _speco_tq_enabled_for_oldlogprob():
-                from verl_speco.integration.transferqueue_bridge import make_sample_key, put_sample
+                from verl_speco.integration.transferqueue_bridge import (
+                    make_sample_key,
+                    put_sample,
+                )
 
                 tq_key = make_sample_key(
                     _oldlogprob_global_step(micro_batch),
@@ -549,7 +554,10 @@ def _put_oldlogprob_hidden_refs(
                 put_sample(
                     tq_key,
                     {"hidden": hidden_chunk},
-                    tag={"global_step": _oldlogprob_global_step(micro_batch), "owner": int(owner)},
+                    tag={
+                        "global_step": _oldlogprob_global_step(micro_batch),
+                        "owner": int(owner),
+                    },
                 )
                 chunk_ref = tq_key
             else:

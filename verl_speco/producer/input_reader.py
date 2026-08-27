@@ -500,9 +500,7 @@ def _tokenize_chat_response_with_explicit_boundary(
             "Tokenizer chat template did not preserve the assistant response marker"
         )
     prompt_text, suffix_text = rendered.split(marker, 1)
-    explicit_prompt_ids = _token_ids(
-        tokenizer(prompt_text, add_special_tokens=False)
-    )
+    explicit_prompt_ids = _token_ids(tokenizer(prompt_text, add_special_tokens=False))
     response_ids = _token_ids(tokenizer(response, add_special_tokens=False))
     suffix_ids = _token_ids(tokenizer(suffix_text, add_special_tokens=False))
     return explicit_prompt_ids, [*explicit_prompt_ids, *response_ids, *suffix_ids]
@@ -541,10 +539,7 @@ def _build_tokenized_request(
         else full_ids[:feature_end]
     )
     max_sequence_length = int(_config_value(config, "max_sequence_length", 0) or 0)
-    if (
-        max_sequence_length > 0
-        and len(request_prompt_token_ids) > max_sequence_length
-    ):
+    if max_sequence_length > 0 and len(request_prompt_token_ids) > max_sequence_length:
         raise ValueError(
             f"Producer sample {sample_id!r} requires a vLLM prefill of "
             f"{len(request_prompt_token_ids)} tokens after selecting its training "

@@ -19,11 +19,18 @@ import asyncio
 import errno
 import importlib
 import inspect
+import logging
 import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_RETRIES = 3
+_RETRY_BACKOFF_BASE_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -218,8 +225,29 @@ class VllmFeatureClientPool:
         state.inflight += 1
         try:
             async with self._global_semaphore, state.semaphore:
+                response = await self._request_with_retries(
+                    state,
+                    request,
+                    generate=generate,
+                )
+                raw = await asyncio.to_thread(load_hidden_state_result, response)
+                state.requests += 1
+                return raw
+        finally:
+            state.inflight = max(state.inflight - 1, 0)
+
+    async def _request_with_retries(
+        self,
+        state: _EndpointState,
+        request: Any,
+        *,
+        generate: bool,
+    ) -> VllmResponse:
+        total_attempts = _DEFAULT_MAX_RETRIES + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
                 if generate:
-                    response = await request_generate(
+                    return await request_generate(
                         state.endpoint,
                         state.client,
                         list(request.prompt_token_ids),
@@ -227,19 +255,43 @@ class VllmFeatureClientPool:
                         max_tokens=int(request.max_tokens),
                         timeout=self.request_timeout,
                     )
-                else:
-                    response = await request_prefill(
-                        state.endpoint,
-                        state.client,
-                        list(request.prompt_token_ids),
-                        model=self.model,
-                        timeout=self.request_timeout,
+                return await request_prefill(
+                    state.endpoint,
+                    state.client,
+                    list(request.prompt_token_ids),
+                    model=self.model,
+                    timeout=self.request_timeout,
+                )
+            except ValueError:
+                # Response validation failures are deterministic protocol/data
+                # errors, equivalent to speculators' InvalidResponseError.
+                raise
+            except Exception as exc:
+                if attempt >= total_attempts:
+                    logger.error(
+                        "vLLM request failed after %s attempts endpoint=%s "
+                        "sample_id=%s error=%s",
+                        total_attempts,
+                        state.endpoint.base_url,
+                        getattr(request, "sample_id", None),
+                        exc,
                     )
-                raw = await asyncio.to_thread(load_hidden_state_result, response)
-                state.requests += 1
-                return raw
-        finally:
-            state.inflight = max(state.inflight - 1, 0)
+                    raise
+                backoff = _RETRY_BACKOFF_BASE_SECONDS**attempt
+                logger.warning(
+                    "vLLM request aborted attempt=%s/%s endpoint=%s "
+                    "sample_id=%s error=%s; retrying in %ss",
+                    attempt,
+                    total_attempts,
+                    state.endpoint.base_url,
+                    getattr(request, "sample_id", None),
+                    exc,
+                    backoff,
+                )
+                await asyncio.sleep(backoff)
+        raise RuntimeError(
+            "unreachable: vLLM request retry loop exhausted without returning"
+        )
 
     async def close(self) -> None:
         states, self._states = self._states, []

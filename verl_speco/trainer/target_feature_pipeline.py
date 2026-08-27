@@ -109,7 +109,9 @@ class TargetFeatureProducer:
                     ]
                 else:
                     futures = [
-                        self._request_executor.submit(self.replayer.materialize, [sample])
+                        self._request_executor.submit(
+                            self.replayer.materialize, [sample]
+                        )
                         for sample in samples
                     ]
                 pending.append((started, futures))

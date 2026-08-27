@@ -15,8 +15,12 @@
 set -euo pipefail
 set -x
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "${script_dir}/.." && pwd)
+cd "${repo_root}"
+
 # Standalone DSpark draft-model training using an already-running hidden-state
-# vLLM. Start run_qwen3-8b_drafter_hidden_state_vllm.sh in another terminal
+# vLLM. Start tools/run_qwen3-8b_drafter_hidden_state_vllm.sh in another terminal
 # first. This process owns Ray/TQ, Producer and Consumer, but it must not own
 # the target vLLM so inference and training can use different accelerators.
 
@@ -51,7 +55,7 @@ PRODUCER_MAX_PENDING_SAMPLES=${PRODUCER_MAX_PENDING_SAMPLES:-1024}
 PRODUCER_PENDING_POLL_INTERVAL=${PRODUCER_PENDING_POLL_INTERVAL:-0.5}
 PRODUCER_MAX_SEQUENCE_LENGTH=${PRODUCER_MAX_SEQUENCE_LENGTH:-8192}
 PRODUCER_MAX_FEATURE_LENGTH=${PRODUCER_MAX_FEATURE_LENGTH:-512}
-PRODUCER_GENERATION_MAX_TOKENS=${PRODUCER_GENERATION_MAX_TOKENS:-511}
+PRODUCER_GENERATION_MAX_TOKENS=${PRODUCER_GENERATION_MAX_TOKENS:-512}
 
 # Standalone trainer.
 MAX_STEPS=${MAX_STEPS:-10}
@@ -95,43 +99,12 @@ export SPECO_VLLM_ENDPOINTS
 # Fail before entering the unified launcher when the separately managed vLLM
 # is absent. Otherwise a localhost endpoint would make the launcher start its
 # fallback vLLM inside the training process and on the training devices.
-"${PYTHON_BIN}" - "${SPECO_VLLM_ENDPOINTS}" "${VLLM_READY_TIMEOUT_SECONDS}" <<'PY'
-import sys
-import time
-from urllib.error import URLError
-from urllib.request import urlopen
-
-raw_endpoints = sys.argv[1].strip()
-if not (raw_endpoints.startswith("[") and raw_endpoints.endswith("]")):
-    raise SystemExit("SPECO_VLLM_ENDPOINTS must use [url0,url1] syntax")
-endpoints = [
-    item.strip().strip("'\"").rstrip("/")
-    for item in raw_endpoints[1:-1].split(",")
-    if item.strip()
-]
-if not endpoints:
-    raise SystemExit("SPECO_VLLM_ENDPOINTS must contain at least one URL")
-timeout_seconds = float(sys.argv[2])
-deadline = time.monotonic() + timeout_seconds
-pending = set(endpoints)
-while pending:
-    for endpoint in list(pending):
-        try:
-            with urlopen(f"{endpoint}/models", timeout=2) as response:
-                if 200 <= response.status < 300:
-                    print(f"EXTERNAL_VLLM_READY endpoint={endpoint}", flush=True)
-                    pending.remove(endpoint)
-        except (OSError, URLError):
-            pass
-    if pending and time.monotonic() >= deadline:
-        raise SystemExit(
-            "external hidden-state vLLM is not ready at: "
-            + ", ".join(sorted(pending))
-            + "; start examples/run_qwen3-8b_drafter_hidden_state_vllm.sh first"
-        )
-    if pending:
-        time.sleep(1)
-PY
+if ! "${PYTHON_BIN}" tools/wait_for_vllm_endpoints.py \
+    --endpoints "${SPECO_VLLM_ENDPOINTS}" \
+    --timeout-seconds "${VLLM_READY_TIMEOUT_SECONDS}"; then
+    echo "Start tools/run_qwen3-8b_drafter_hidden_state_vllm.sh first" >&2
+    exit 1
+fi
 
 PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher \
     speco.draft_training.num_gpus_per_node=${draft_train_gpus_per_node} \

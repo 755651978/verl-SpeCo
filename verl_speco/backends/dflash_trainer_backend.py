@@ -573,13 +573,9 @@ class DFlashTrainingModel(nn.Module):
             correct_3d = correct.view(bsz, n_blocks, self.block_size)
             pred_valid_3d = binary_weights[:, :, 1:].bool()
             pred_correct_3d = correct_3d[:, :, 1:] & pred_valid_3d
-            simulated_accept_length_sum = (
-                pred_correct_3d.float().cumprod(dim=-1).sum()
-            )
+            simulated_accept_length_sum = pred_correct_3d.float().cumprod(dim=-1).sum()
             simulated_accept_block_count = pred_valid_3d.any(dim=-1).float().sum()
-            correct_per_position = (
-                correct_3d.float().sum(dim=(0, 1))
-            )
+            correct_per_position = correct_3d.float().sum(dim=(0, 1))
             loss_per_position = loss_sum_per_position / count_per_pos
             acc_per_position = correct_per_position / count_per_pos
             masked_rows = (binary_eval_mask <= 0.5).sum().to(dtype=torch.float32)

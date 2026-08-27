@@ -72,7 +72,9 @@ class SampleMetadata:
                 sequence_no=int(payload["sequence_no"]),
             )
         except KeyError as exc:
-            raise ValueError(f"ready tag missing required field {exc.args[0]!r}") from exc
+            raise ValueError(
+                f"ready tag missing required field {exc.args[0]!r}"
+            ) from exc
         meta.validate()
         return meta
 
@@ -125,9 +127,9 @@ def is_ready_sample_tag(
     run_id: str,
     schema_version: int = PROTOCOL_SCHEMA_VERSION,
 ) -> bool:
-    return parse_ready_tag(
-        tag, run_id=run_id, schema_version=schema_version
-    ) is not None
+    return (
+        parse_ready_tag(tag, run_id=run_id, schema_version=schema_version) is not None
+    )
 
 
 def encode_sample(
@@ -178,7 +180,9 @@ def encode_sample(
         manifest["hidden_states_kind"] = "list"
         manifest["hidden_states_fields"] = hidden_fields
     else:
-        raise TypeError("DraftFeatureSample.hidden_states must be a tensor or tensor list")
+        raise TypeError(
+            "DraftFeatureSample.hidden_states must be a tensor or tensor list"
+        )
     manifest["present_fields"].append("hidden_states")
     manifest["metadata"] = _encode_metadata_tree(
         payload.get("metadata", {}), fields, path="metadata"
@@ -207,7 +211,9 @@ def decode_sample(
         raise ValueError(f"TQ sample {key!r} has an invalid or unexpected ready tag")
     expected_key = make_sample_key(meta)
     if key != expected_key:
-        raise ValueError(f"TQ sample key mismatch: got {key!r}, expected {expected_key!r}")
+        raise ValueError(
+            f"TQ sample key mismatch: got {key!r}, expected {expected_key!r}"
+        )
     if _MANIFEST_FIELD not in fields:
         raise ValueError(f"TQ sample {key!r} missing field {_MANIFEST_FIELD!r}")
     manifest = _tensor_to_json(fields[_MANIFEST_FIELD], name=_MANIFEST_FIELD)
@@ -269,7 +275,9 @@ def _encode_metadata_tree(
         encoded: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
-                raise TypeError(f"DraftFeatureSample metadata key at {path} must be str")
+                raise TypeError(
+                    f"DraftFeatureSample metadata key at {path} must be str"
+                )
             encoded[key] = _encode_metadata_tree(item, fields, path=f"{path}.{key}")
         return {"__tq_mapping__": encoded}
     if isinstance(value, (list, tuple)):
@@ -331,7 +339,9 @@ def _decode_hidden_states(
 
 
 def _json_to_tensor(payload: Mapping[str, Any]) -> torch.Tensor:
-    raw = json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    raw = json.dumps(dict(payload), sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
     return torch.tensor(list(raw), dtype=torch.uint8)
 
 
@@ -350,7 +360,7 @@ def _tensor_to_json(value: Any, *, name: str) -> dict[str, Any]:
 
 def _require_tensor(fields: Mapping[str, Any], name: str) -> torch.Tensor:
     value = fields.get(name)
-    if not torch.is_tensor(value):
+    if value is None or not torch.is_tensor(value):
         raise TypeError(f"TQ field {name!r} must be a torch.Tensor")
     return value.detach().cpu().contiguous()
 

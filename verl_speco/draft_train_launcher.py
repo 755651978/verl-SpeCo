@@ -57,7 +57,9 @@ _STANDALONE_KEYS = (
     "speco.draft_training.standalone",
     "actor_rollout_ref.rollout.drafter.training.standalone",
 )
-_FEATURE_STORE_TYPE_KEY = "actor_rollout_ref.rollout.drafter.training.feature_store.type"
+_FEATURE_STORE_TYPE_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.feature_store.type"
+)
 _TQ_ENABLE_KEY = "actor_rollout_ref.rollout.drafter.training.transfer_queue.enable"
 _TQ_RAY_ADDRESS_KEY = (
     "actor_rollout_ref.rollout.drafter.training.transfer_queue.ray.address"
@@ -190,7 +192,9 @@ def validate_tq_launch_config(overrides: list[str]) -> None:
         )
     run_id = str(_find_override(overrides, (_TQ_RUN_ID_KEY,)) or "").strip()
     if not run_id or run_id.lower() in {"null", "none"}:
-        raise ValueError("feature_store.type=tq requires training.transfer_queue.run_id")
+        raise ValueError(
+            "feature_store.type=tq requires training.transfer_queue.run_id"
+        )
 
 
 def build_torch_distributed_command(

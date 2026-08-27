@@ -733,7 +733,9 @@ class DrafterBaseTrainer:
             if key.startswith(count_prefix) and key.removeprefix(count_prefix).isdigit()
         )
         if not positions:
-            positions = list(range(int(self._block_drafter_config_value("block_size", 16))))
+            positions = list(
+                range(int(self._block_drafter_config_value("block_size", 16)))
+            )
         for pos in positions:
             count_key = f"{prefix}/count_per_position/{pos}"
             count = sums.get(count_key, 0.0)

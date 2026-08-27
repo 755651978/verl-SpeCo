@@ -26,8 +26,6 @@ PPO_EXAMPLES = [
     script
     for script in EXAMPLES
     if not script.name.endswith("_separate_training.sh")
-    and script.name != "run_dspark_tq_producer.sh"
-    and script.name != "run_qwen3-8b_drafter_hidden_state_vllm.sh"
 ]
 
 
@@ -88,11 +86,11 @@ def test_standalone_tq_training_example_uses_unified_launcher() -> None:
 
 def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
     source = (
-        ROOT / "examples" / "run_qwen3-8b_drafter_hidden_state_vllm.sh"
+        ROOT / "tools" / "run_qwen3-8b_drafter_hidden_state_vllm.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'VLLM_DEVICES_0=${VLLM_DEVICES_0:-0}' in source
-    assert 'VLLM_DEVICES_1=${VLLM_DEVICES_1:-1}' in source
+    assert 'VLLM_DEVICES=${VLLM_DEVICES:-0,1,2,3,4,5}' in source
+    assert "service_count=$((device_count / VLLM_TP))" in source
     assert 'env "${DEVICE_ENV}=${devices}" vllm serve "${MODEL_PATH}"' in source
     assert '--tensor-parallel-size "${VLLM_TP}"' in source
     assert '--max-num-seqs "${VLLM_MAX_NUM_SEQS}"' in source
@@ -106,14 +104,6 @@ def test_standalone_tq_compatibility_example_delegates_to_formal_entry() -> None
     ).read_text(encoding="utf-8")
 
     assert 'run_qwen3-8b_drafter_separate_training.sh" "$@"' in source
-
-
-def test_standalone_tq_producer_example_uses_producer_entrypoint() -> None:
-    source = (ROOT / "examples" / "run_dspark_tq_producer.sh").read_text(
-        encoding="utf-8"
-    )
-
-    assert "-m verl_speco.standalone_tq_producer" in source
 
 
 def test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches() -> None:
