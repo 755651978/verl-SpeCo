@@ -69,7 +69,7 @@ def test_example_keeps_speco_entrypoint_and_required_drafter_switches(
 
 def test_standalone_tq_training_example_uses_unified_launcher() -> None:
     source = (
-        ROOT / "examples" / "run_qwen3-8b_drafter_separate_training.sh"
+        ROOT / "examples" / "run_qwen3-8b_drafter_dspark_separate_training.sh"
     ).read_text(encoding="utf-8")
 
     assert "-m verl_speco.standalone_tq_training_launcher" in source
@@ -96,14 +96,6 @@ def test_standalone_tq_hidden_state_vllm_uses_separate_devices() -> None:
     assert '--max-num-seqs "${VLLM_MAX_NUM_SEQS}"' in source
     assert '"${VLLM_HIDDEN_STATE_LAYER_IDS}"' in source
     assert '"kv_connector":"ExampleHiddenStatesConnector"' in source
-
-
-def test_standalone_tq_compatibility_example_delegates_to_formal_entry() -> None:
-    source = (
-        ROOT / "examples" / "run_qwen3-8b_drafter_dspark_separate_training.sh"
-    ).read_text(encoding="utf-8")
-
-    assert 'run_qwen3-8b_drafter_separate_training.sh" "$@"' in source
 
 
 def test_vllm_eagle3_example_keeps_runtime_agnostic_training_switches() -> None:

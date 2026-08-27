@@ -42,7 +42,6 @@ class TargetFeatureProducer:
         *,
         rank: int,
         concurrency: int,
-        transfer_concurrency: int,
         producer_prefetch_depth: int,
         prefetch_depth: int,
         queue_timeout: float,
@@ -51,7 +50,6 @@ class TargetFeatureProducer:
         self.replayer = replayer
         self.rank = int(rank)
         self.concurrency = max(int(concurrency), 1)
-        self.transfer_concurrency = max(int(transfer_concurrency), 1)
         self.producer_prefetch_depth = max(int(producer_prefetch_depth), 1)
         self.prefetch_depth = max(int(prefetch_depth), 1)
         self.queue_timeout = max(float(queue_timeout), 1.0)
@@ -60,10 +58,6 @@ class TargetFeatureProducer:
         self._request_executor = ThreadPoolExecutor(
             max_workers=self.concurrency,
             thread_name_prefix=f"speco-request-r{self.rank}",
-        )
-        self._transfer_executor = ThreadPoolExecutor(
-            max_workers=self.transfer_concurrency,
-            thread_name_prefix=f"speco-transfer-r{self.rank}",
         )
         self._thread = threading.Thread(
             target=self._run,
@@ -80,10 +74,9 @@ class TargetFeatureProducer:
         self._thread.start()
         logger.info(
             "[target producer rank=%s] started request_concurrency=%s "
-            "transfer_concurrency=%s producer_prefetch_depth=%s prefetch_depth=%s",
+            "producer_prefetch_depth=%s prefetch_depth=%s",
             self.rank,
             self.concurrency,
-            self.transfer_concurrency,
             self.producer_prefetch_depth,
             self.prefetch_depth,
         )
@@ -100,20 +93,10 @@ class TargetFeatureProducer:
                 except StopIteration:
                     return False
                 started = time.perf_counter()
-                if self.replayer.backend == "vllm_mooncake":
-                    futures = [
-                        self._request_executor.submit(
-                            self.replayer.produce_mooncake_descriptor, sample
-                        )
-                        for sample in samples
-                    ]
-                else:
-                    futures = [
-                        self._request_executor.submit(
-                            self.replayer.materialize, [sample]
-                        )
-                        for sample in samples
-                    ]
+                futures = [
+                    self._request_executor.submit(self.replayer.materialize, [sample])
+                    for sample in samples
+                ]
                 pending.append((started, futures))
                 return True
 
@@ -127,22 +110,10 @@ class TargetFeatureProducer:
                 self.producer_seconds += time.perf_counter() - started
                 submit_next()
                 transfer_started = time.perf_counter()
-                if self.replayer.backend == "vllm_mooncake":
-                    transfer_futures = [
-                        self._transfer_executor.submit(
-                            self.replayer.consume_pipeline_mooncake_descriptor,
-                            descriptor,
-                        )
-                        for descriptor in produced
-                    ]
-                    batch = [future.result() for future in transfer_futures]
-                else:
-                    batch = [item for group in produced for item in group]
+                batch = [item for group in produced for item in group]
                 self.transfer_seconds += time.perf_counter() - transfer_started
                 self.produced_batches += 1
                 self.produced_samples += len(batch)
-                if self.replayer.backend == "vllm_mooncake":
-                    self.replayer.record_pipeline_materialized(len(batch))
                 self._put(batch)
             self._put(_END)
         except BaseException as exc:  # noqa: BLE001
@@ -169,7 +140,7 @@ class TargetFeatureProducer:
         except queue.Empty as exc:
             raise TimeoutError(
                 "Timed out waiting for target-feature producer; inspect the vLLM "
-                "and Mooncake logs for a stalled request or missing object"
+                "logs for a stalled request or missing hidden-state file"
             ) from exc
         self.consumer_wait_seconds += time.perf_counter() - started
         if value is _END:
@@ -194,5 +165,4 @@ class TargetFeatureProducer:
     def close(self) -> None:
         self._stop.set()
         self._request_executor.shutdown(wait=True, cancel_futures=True)
-        self._transfer_executor.shutdown(wait=True, cancel_futures=True)
         self._thread.join(timeout=5.0)

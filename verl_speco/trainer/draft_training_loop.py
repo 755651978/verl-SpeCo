@@ -264,7 +264,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             ):
                 raise ValueError(
                     "target_feature_pipeline.enabled=true requires a vLLM replay "
-                    "backend (vllm_file or vllm_mooncake)"
+                    "backend (vllm_file)"
                 )
             from verl_speco.trainer.target_feature_pipeline import (
                 TargetFeatureProducer,
@@ -279,15 +279,6 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                         int(pipeline_cfg.get("concurrency", 16) or 16) / world_size
                     ),
                     1,
-                ),
-                transfer_concurrency=int(
-                    max(
-                        math.ceil(
-                            int(pipeline_cfg.get("transfer_concurrency", 8) or 8)
-                            / world_size
-                        ),
-                        1,
-                    )
                 ),
                 producer_prefetch_depth=int(
                     pipeline_cfg.get("producer_prefetch_depth", 4) or 4
@@ -1054,7 +1045,6 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("replay/cache_hit_ratio", "cache_hit"),
         ("replay/target_forward_time_total", "target_forward_total"),
         ("replay/vllm_request_time_total", "vllm_request_total"),
-        ("replay/mooncake_get_time_total", "mooncake_get_total"),
         ("producer/consumer_wait_time_total", "producer_wait_total"),
         ("producer/ready_queue_size", "ready_batches"),
     ):
@@ -1175,7 +1165,7 @@ def _next_batch_across_ranks(
 ) -> Any | None:
     """Fetch one batch and make producer failures visible to every rank.
 
-    Producer and Mooncake errors happen before the FSDP training step.  Every
+    Producer and replay errors happen before the FSDP training step. Every
     rank therefore reports its fetch result through the same collective before
     any rank is allowed to enter model collectives.  This prevents healthy
     ranks from waiting in FSDP after another rank has already started cleanup.

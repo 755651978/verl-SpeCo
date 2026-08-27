@@ -305,7 +305,7 @@ TransferQueue, and a consumer trains the drafter independently of PPO.
 Quickstart:
 
 ```bash
-bash examples/run_qwen3-8b_drafter_separate_training.sh
+bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh
 ```
 
 Set the same model, dataset, drafter, checkpoint, GPU, and optimization values
@@ -354,90 +354,6 @@ python -m verl_speco.inspect_feature_store /path/to/features \
   --show-ok \
   --strict-exit
 ```
-
-### Producer/Mooncake pipeline
-
-For token-only stores, standalone training can overlap target-model inference,
-hidden-state transfer, and drafter optimization. vLLM acts as the producer,
-Mooncake transfers the extracted tensors without per-sample files, and a
-bounded rank-local queue prefetches complete batches while FSDP trains the
-current batch. This path is disabled by default and does not change online
-PPO/drafter training.
-
-Install the Mooncake package for the target hardware and start a Mooncake
-master. For example, use `mooncake-transfer-engine` on CUDA or
-`mooncake-transfer-engine-npu` on Ascend. Export the same connection settings
-in the vLLM and training processes. The connector requires vLLM 0.23 or newer:
-
-```bash
-# CUDA; use mooncake-transfer-engine-npu instead on Ascend.
-pip install 'mooncake-transfer-engine>=0.3.10.post1'
-
-export MOONCAKE_MASTER_SERVER=127.0.0.1:50051
-export MOONCAKE_METADATA_SERVER=http://127.0.0.1:8090/metadata
-export MOONCAKE_PROTOCOL=tcp
-export MOONCAKE_GLOBAL_SEGMENT_SIZE=$((16 * 1024 * 1024 * 1024))
-export MOONCAKE_LOCAL_BUFFER_SIZE=$((2 * 1024 * 1024 * 1024))
-
-mooncake_master \
-  --enable_http_metadata_server=true \
-  --http_metadata_server_host=0.0.0.0 \
-  --http_metadata_server_port=8090
-```
-
-Start vLLM with SpeCo's store-only hidden-state connector. The final layer must
-be appended to the auxiliary layer list when the selected drafter loss needs
-last-hidden-state supervision:
-
-```bash
-vllm serve /path/to/target_model \
-  --port 8000 \
-  --tensor-parallel-size 2 \
-  --speculative-config '{"method":"extract_hidden_states","num_speculative_tokens":1,"draft_model_config":{"hf_config":{"eagle_aux_hidden_state_layer_ids":[1,9,17,25,33,36]}}}' \
-  --kv-transfer-config '{"kv_connector":"SpeCoMooncakeHiddenStatesConnector","kv_connector_module_path":"verl_speco.integration.mooncake_hidden_states_connector","kv_role":"kv_producer"}' \
-  --no-enable-chunked-prefill
-```
-
-Enable the pipeline in the standalone command:
-
-```bash
-python -m verl_speco.draft_train_launcher \
-  speco.draft_training.nproc_per_node=4 \
-  actor_rollout_ref.model.path=/path/to/target_model \
-  actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
-  actor_rollout_ref.rollout.drafter.training.mode=offline \
-  actor_rollout_ref.rollout.drafter.training.feature_store.type=jsonl_token_replay \
-  actor_rollout_ref.rollout.drafter.training.feature_store.path=/path/to/data.jsonl \
-  actor_rollout_ref.rollout.drafter.training.target_feature_replay.backend=vllm_mooncake \
-  actor_rollout_ref.rollout.drafter.training.target_feature_replay.vllm_endpoint=http://127.0.0.1:8000/v1 \
-  actor_rollout_ref.rollout.drafter.training.target_feature_pipeline.enabled=true \
-  actor_rollout_ref.rollout.drafter.training.target_feature_pipeline.concurrency=16 \
-  actor_rollout_ref.rollout.drafter.training.target_feature_pipeline.transfer_concurrency=8 \
-  actor_rollout_ref.rollout.drafter.training.target_feature_pipeline.producer_prefetch_depth=4 \
-  actor_rollout_ref.rollout.drafter.training.target_feature_pipeline.prefetch_depth=2
-```
-
-To spread replay requests across independent vLLM deployments, replace the
-single endpoint override with an endpoint pool:
-
-```bash
-'actor_rollout_ref.rollout.drafter.training.target_feature_replay.vllm_endpoints=["http://host1:8000/v1","http://host2:8000/v1"]' \
-actor_rollout_ref.rollout.drafter.training.target_feature_replay.endpoint_cooldown=5
-```
-
-The standalone producer routes each request to the healthy endpoint with the
-fewest in-flight requests. A failed request is retried on another endpoint when
-the configured retry budget permits it. The original `vllm_endpoint` option
-remains supported and is used when `vllm_endpoints` is unset.
-
-`concurrency` and `transfer_concurrency` are global budgets divided across all
-training ranks. Start with request concurrency between 16 and 32, then increase
-only while vLLM throughput rises.
-`producer_prefetch_depth` bounds batches that have outstanding HTTP work;
-`transfer_concurrency` bounds simultaneous Mooncake GETs. A
-`prefetch_depth` of 2 normally hides transfer latency without retaining too
-many large hidden-state batches. The standalone metrics include producer queue
-depth, consumer wait time, vLLM request time, and Mooncake GET time.
 
 ## Configuration
 

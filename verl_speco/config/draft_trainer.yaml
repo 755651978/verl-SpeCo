@@ -64,18 +64,6 @@ actor_rollout_ref:
           endpoint_cooldown: 5
           on_generate: delete
           require_arange_positions: true
-          mooncake:
-            local_hostname: ${oc.env:MOONCAKE_LOCAL_HOSTNAME,localhost}
-            metadata_server: ${oc.env:MOONCAKE_METADATA_SERVER,http://localhost:8090/metadata}
-            master_server_address: ${oc.env:MOONCAKE_MASTER_SERVER,localhost:50051}
-            # Consumer ranks only need receive buffers. The vLLM producer owns
-            # the large segment through its MOONCAKE_GLOBAL_SEGMENT_SIZE env.
-            global_segment_size: 64MB
-            local_buffer_size: 1GB
-            protocol: tcp
-            device_name: ""
-            get_timeout: 120
-            get_poll_interval: 0.02
           offline_generation:
             input_type: token_replay
             input_path: null
@@ -87,13 +75,12 @@ actor_rollout_ref:
             enabled: false
             path: null
             max_size_gb: 0
-        # Overlap vLLM generation and Mooncake/file transfer with FSDP training.
-        # This pipeline is standalone-only and accepts vLLM replay backends.
+        # Overlap vLLM file replay with FSDP training.
+        # This pipeline is standalone-only.
         target_feature_pipeline:
           enabled: false
           # Global budgets. Standalone divides them across torchrun ranks.
           concurrency: 16
-          transfer_concurrency: 8
           producer_prefetch_depth: 4
           prefetch_depth: 2
           queue_timeout: 300

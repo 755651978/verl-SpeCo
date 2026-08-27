@@ -43,13 +43,6 @@ class HiddenStateAlignmentError(ValueError):
 
 
 @dataclass(frozen=True)
-class MooncakeReplayDescriptor:
-    sample: DraftReplaySample
-    prompt_ids: list[int]
-    key: str
-
-
-@dataclass(frozen=True)
 class FeatureContract:
     """Explicit inputs for converting one vLLM payload into a training sample."""
 
@@ -548,12 +541,10 @@ class TargetFeatureReplayer:
             .strip()
             .lower()
         )
-        if self.backend == "mooncake":
-            self.backend = "vllm_mooncake"
-        if self.backend not in {"torch", "vllm_file", "vllm_mooncake"}:
+        if self.backend not in {"torch", "vllm_file"}:
             raise ValueError(
                 f"Unsupported target_feature_replay.backend={self.backend!r}; "
-                "expected 'torch', 'vllm_file', or 'vllm_mooncake'"
+                "expected 'torch' or 'vllm_file'"
             )
         configured_model_path = _config_value(self.replay_cfg, "model_path", None)
         model_path = configured_model_path or self.draft_config.model.path
@@ -682,20 +673,15 @@ class TargetFeatureReplayer:
             for index, endpoint in enumerate(self.vllm_endpoints)
         ]
         self._vllm_clients_initialized = False
-        self.mooncake_store: Any | None = None
         self._client_lock = threading.Lock()
         self._endpoint_lock = threading.Lock()
         self._metrics_lock = threading.Lock()
-        self._pending_keys_lock = threading.Lock()
-        self._pending_mooncake_keys: set[str] = set()
         self.cache_hits = 0
         self.cache_misses = 0
         self.materialized_samples = 0
         self.target_forward_seconds = 0.0
         self.vllm_request_seconds = 0.0
         self.vllm_requests = 0
-        self.mooncake_get_seconds = 0.0
-        self.mooncake_gets = 0
         self._warned_replay_algorithm_mismatch = False
         self._warned_replay_layer_mismatch = False
         self._warned_replay_layout_mismatch = False
@@ -873,8 +859,6 @@ class TargetFeatureReplayer:
     def _materialize_one(self, sample: DraftReplaySample) -> DraftFeatureSample:
         if self.backend == "vllm_file":
             return self._materialize_one_vllm_file(sample)
-        if self.backend == "vllm_mooncake":
-            return self._materialize_one_vllm_mooncake(sample)
         return self._materialize_one_torch(sample)
 
     def _materialize_one_torch(self, sample: DraftReplaySample) -> DraftFeatureSample:
@@ -1042,117 +1026,6 @@ class TargetFeatureReplayer:
                 except OSError:
                     logger.warning("Failed to delete vLLM hidden-states file %s", path)
         return feature
-
-    def _materialize_one_vllm_mooncake(
-        self, sample: DraftReplaySample
-    ) -> DraftFeatureSample:
-        return self.consume_mooncake_descriptor(
-            self._request_mooncake_descriptor(sample)
-        )
-
-    def produce_mooncake_descriptor(
-        self, sample: DraftReplaySample | DraftFeatureSample
-    ) -> MooncakeReplayDescriptor | DraftFeatureSample:
-        if isinstance(sample, DraftFeatureSample):
-            return sample
-        if not isinstance(sample, DraftReplaySample):
-            raise TypeError(
-                "Mooncake producer expected DraftReplaySample or "
-                f"DraftFeatureSample, got {type(sample)!r}"
-            )
-        if self.use_logits:
-            raise NotImplementedError(
-                "target_feature_replay.backend=vllm_mooncake does not yet "
-                "support training.use_logits=true; use backend=torch."
-            )
-        self._validate_target_path(sample)
-        cache_key = self._cache_key(sample)
-        with self._cache_lock:
-            cached = self.cache.get(cache_key) if self.cache is not None else None
-        if cached is not None:
-            with self._metrics_lock:
-                self.cache_hits += 1
-            return cached
-        with self._metrics_lock:
-            self.cache_misses += 1
-        return self._request_mooncake_descriptor(sample)
-
-    def _request_mooncake_descriptor(
-        self, sample: DraftReplaySample
-    ) -> MooncakeReplayDescriptor:
-        self._validate_vllm_positions(sample)
-        feature_positions = sample.feature_positions.detach().cpu().long()
-        feature_end = int(feature_positions[-1].item()) + 1
-        prompt_ids = sample.input_ids[:feature_end].detach().cpu().long().tolist()
-        response = self._request_vllm_response(prompt_ids)
-        params = getattr(response, "kv_transfer_params", None)
-        if params is None:
-            raise ValueError("vLLM response missing kv_transfer_params")
-        key = params.get("mooncake_key")
-        if not key:
-            raise ValueError(
-                "vLLM response missing mooncake_key; start vLLM with "
-                "SpeCoMooncakeHiddenStatesConnector"
-            )
-        key = str(key)
-        with self._pending_keys_lock:
-            self._pending_mooncake_keys.add(key)
-        return MooncakeReplayDescriptor(sample, prompt_ids, key)
-
-    def consume_mooncake_descriptor(
-        self, descriptor: MooncakeReplayDescriptor | DraftFeatureSample
-    ) -> DraftFeatureSample:
-        if isinstance(descriptor, DraftFeatureSample):
-            return descriptor
-        store = self._ensure_mooncake_store()
-        transfer_started = time.perf_counter()
-        payload = store.get(descriptor.key)
-        with self._metrics_lock:
-            self.mooncake_get_seconds += time.perf_counter() - transfer_started
-            self.mooncake_gets += 1
-        try:
-            feature = self._feature_from_vllm_payload(
-                descriptor.sample,
-                payload,
-                prompt_ids=descriptor.prompt_ids,
-                source="token_replay_vllm_mooncake",
-            )
-            return feature
-        finally:
-            if self.vllm_on_generate == "delete":
-                store.remove(descriptor.key)
-            with self._pending_keys_lock:
-                self._pending_mooncake_keys.discard(descriptor.key)
-
-    def consume_pipeline_mooncake_descriptor(
-        self, descriptor: MooncakeReplayDescriptor | DraftFeatureSample
-    ) -> DraftFeatureSample:
-        feature = self.consume_mooncake_descriptor(descriptor)
-        if isinstance(descriptor, MooncakeReplayDescriptor) and self.cache is not None:
-            with self._cache_lock:
-                self.cache.put(self._cache_key(descriptor.sample), feature)
-        return feature
-
-    def record_pipeline_materialized(self, count: int) -> None:
-        with self._metrics_lock:
-            self.materialized_samples += int(count)
-
-    def _ensure_mooncake_store(self):
-        if self.mooncake_store is not None:
-            return self.mooncake_store
-        with self._client_lock:
-            if self.mooncake_store is None:
-                from verl_speco.trainer.mooncake_transfer import (
-                    MooncakeTensorStore,
-                    MooncakeTransferConfig,
-                )
-
-                mooncake_cfg = _config_value(self.replay_cfg, "mooncake", {}) or {}
-                self.mooncake_store = MooncakeTensorStore(
-                    MooncakeTransferConfig.from_mapping(mooncake_cfg)
-                )
-                self.mooncake_store.setup()
-        return self.mooncake_store
 
     def _validate_vllm_positions(self, sample: DraftReplaySample) -> None:
         if not self.vllm_require_arange_positions:
@@ -1555,9 +1428,6 @@ class TargetFeatureReplayer:
                     metrics[f"{prefix}_request_time_total"] = float(
                         state.request_seconds
                     )
-        if self.backend == "vllm_mooncake":
-            metrics["replay/mooncake_gets_total"] = float(self.mooncake_gets)
-            metrics["replay/mooncake_get_time_total"] = float(self.mooncake_get_seconds)
         total = self.cache_hits + self.cache_misses
         if total > 0:
             metrics["replay/cache_hit_ratio"] = self.cache_hits / float(total)
@@ -1579,15 +1449,6 @@ class TargetFeatureReplayer:
                         exc_info=True,
                     )
             state.client = None
-        if self.mooncake_store is not None:
-            with self._pending_keys_lock:
-                pending_keys = tuple(self._pending_mooncake_keys)
-                self._pending_mooncake_keys.clear()
-            if self.vllm_on_generate == "delete":
-                for key in pending_keys:
-                    self.mooncake_store.remove(key)
-            self.mooncake_store.close()
-            self.mooncake_store = None
         if self.model is None:
             return
         try:

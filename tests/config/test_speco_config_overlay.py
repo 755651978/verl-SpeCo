@@ -87,12 +87,8 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert standalone_training.target_feature_replay.endpoint_cooldown == 5
     assert standalone_training.target_feature_pipeline.enabled is False
     assert standalone_training.target_feature_pipeline.concurrency == 16
-    assert standalone_training.target_feature_pipeline.transfer_concurrency == 8
     assert standalone_training.target_feature_pipeline.producer_prefetch_depth == 4
     assert standalone_training.target_feature_pipeline.prefetch_depth == 2
-    assert (
-        standalone_training.target_feature_replay.mooncake.protocol == "tcp"
-    )
 
 
 def test_overlay_composes_with_release_upstream_verl(tmp_path: Path) -> None:
