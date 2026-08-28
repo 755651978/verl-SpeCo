@@ -40,7 +40,13 @@ from verl_speco.integration.sglang_adapter import (
     SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH,
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
-    speco_step_matches_interval,
+)
+from verl_speco.trainer.scheduler import (
+    CollectionPlan,
+    DrafterCollectionContext,
+    DrafterCollectionSource,
+    DrafterScheduleConfig,
+    DrafterScheduler,
 )
 
 try:
@@ -51,6 +57,29 @@ torch: Any = _torch
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+_DRAFTER_SCHEDULER = DrafterScheduler()
+
+
+def _plan_sglang_drafter_collection(
+    *,
+    global_step: object,
+    drafter_cfg: dict[str, Any],
+    validation: bool,
+) -> CollectionPlan:
+    training_cfg = drafter_cfg.get("training") or {}
+    return _DRAFTER_SCHEDULER.plan_collection(
+        DrafterCollectionContext(
+            global_step=global_step,
+            source=DrafterCollectionSource.SGLANG,
+            drafter_enabled=bool(
+                drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training")
+            ),
+            source_enabled=bool(training_cfg.get("collect_hidden_states_from_sgl")),
+            validation=validation,
+        ),
+        DrafterScheduleConfig.from_mapping(training_cfg),
+    )
+
 
 SPECO_SGLANG_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_SGLANG_RUNTIME_PATCHED_ENV = "VERL_SPECO_SGLANG_RUNTIME_PATCHED"
@@ -1251,45 +1280,43 @@ class _SpecoSGLangHttpServerMixin:
     ) -> bool:
         self._speco_last_collection_skip_reason = None
         drafter_cfg = self._speco_drafter_cfg()
-        if not bool(
-            drafter_cfg.get("enable") and drafter_cfg.get("enable_drafter_training")
-        ):
-            return self._speco_mark_collection_skip("drafter_disabled")
-        training_cfg = drafter_cfg.get("training") or {}
-        if not bool(training_cfg.get("collect_hidden_states_from_sgl")):
-            return self._speco_mark_collection_skip("hidden_collection_disabled")
         skip_drafter_collection = bool(
             getattr(self, "_verl_skip_drafter_collection", False)
         )
-        if skip_drafter_collection:
-            return self._speco_mark_collection_skip("request_skip_flag")
         collection_global_steps = (
             request_global_steps
             if request_global_steps is not None
             else self.global_steps
         )
         self._reset_drafter_collection_budget_if_needed(collection_global_steps)
-        if collection_global_steps is not None and not speco_step_matches_interval(
-            collection_global_steps, training_cfg.get("collect_interval_steps", 1)
-        ):
-            return self._speco_mark_collection_skip("interval_mismatch")
+        collection_plan = _plan_sglang_drafter_collection(
+            global_step=collection_global_steps,
+            drafter_cfg=drafter_cfg,
+            validation=skip_drafter_collection,
+        )
+        self._speco_last_collection_plan = collection_plan
+        if not collection_plan.collect:
+            reason = {
+                "source_disabled": "hidden_collection_disabled",
+                "validation": "request_skip_flag",
+                "interval_not_reached": "interval_mismatch",
+            }.get(collection_plan.reason, collection_plan.reason)
+            return self._speco_mark_collection_skip(reason)
         if estimated_hidden_rows <= 0:
             return self._speco_mark_collection_skip("empty_hidden_window")
-        max_samples = training_cfg.get("max_collect_samples_per_step_per_replica")
+        max_samples = collection_plan.max_samples_per_replica
         if max_samples is not None:
             max_samples = int(max_samples)
             current_samples = int(getattr(self, "_drafter_collection_samples", 0))
             if current_samples >= max_samples:
                 return self._speco_mark_collection_skip("max_samples_budget")
-        max_tokens = training_cfg.get("max_collect_tokens_per_step_per_replica")
+        max_tokens = collection_plan.max_tokens_per_replica
         if max_tokens is not None:
             max_tokens = int(max_tokens)
             current_tokens = int(getattr(self, "_drafter_collection_tokens", 0))
             if current_tokens + int(estimated_hidden_rows) > max_tokens:
                 return self._speco_mark_collection_skip("max_tokens_budget")
-        sample_rate = float(training_cfg.get("collection_sample_rate", 1.0))
-        if sample_rate <= 0:
-            return self._speco_mark_collection_skip("sample_rate_zero")
+        sample_rate = collection_plan.sample_rate
         if sample_rate < 1.0:
             sampling_key = (
                 f"{collection_global_steps}:{self.replica_rank}:{request_id}".encode()
@@ -1436,14 +1463,19 @@ class _SpecoSGLangHttpServerMixin:
             if request_global_steps is not None
             else self.global_steps
         )
-        if skip_drafter_collection or (
-            collection_global_steps is not None
-            and not speco_step_matches_interval(
-                collection_global_steps, training_cfg.get("collect_interval_steps", 1)
-            )
-        ):
+        collection_plan = _plan_sglang_drafter_collection(
+            global_step=collection_global_steps,
+            drafter_cfg=drafter_cfg,
+            validation=skip_drafter_collection,
+        )
+        self._speco_last_collection_plan = collection_plan
+        if not collection_plan.collect:
             self._speco_log_collection_skip_once(
-                "request_skip_flag" if skip_drafter_collection else "interval_mismatch",
+                {
+                    "source_disabled": "hidden_collection_disabled",
+                    "validation": "request_skip_flag",
+                    "interval_not_reached": "interval_mismatch",
+                }.get(collection_plan.reason, collection_plan.reason),
                 collection_global_steps=collection_global_steps,
                 request_global_steps=request_global_steps,
                 prompt_len=len(prompt_ids),
@@ -2020,56 +2052,6 @@ class _SpecoSGLangHttpServerMixin:
                         "global_step": collection_global_steps,
                         "replica_rank": self.replica_rank,
                     }
-                    # P0: offload the dominant hidden_states tensor to
-                    # TransferQueue so it bypasses the RayPPOTrainer driver and
-                    # the Ray object store. The key rides with the sample dict;
-                    # the drafter worker fetches by key. No-op when TQ disabled.
-                    from verl_speco.integration.transferqueue_bridge import (
-                        configure_transfer_queue,
-                        is_transfer_queue_enabled,
-                        make_sample_key,
-                        put_sample,
-                    )
-
-                    configure_transfer_queue(training_cfg)
-                    if is_transfer_queue_enabled():
-                        tq_key = make_sample_key(
-                            collection_global_steps, self.replica_rank, request_id
-                        )
-                        tq_payload = {"hidden_states": hidden_states.unsqueeze(0).cpu()}
-                        # P2: also offload the other large tensors so they bypass
-                        # the driver too. The drafter consumer restores them from
-                        # this same TQ payload.
-                        if target_logprobs is not None:
-                            tq_payload["target_logprobs"] = target_logprobs.unsqueeze(
-                                0
-                            ).cpu()
-                        if torch.is_tensor(hidden_raw_target_logprobs):
-                            tq_payload["hidden_raw_target_logprobs"] = (
-                                hidden_raw_target_logprobs.unsqueeze(0).cpu()
-                            )
-                        if torch.is_tensor(hidden_raw_target_logprobs_positions):
-                            tq_payload["hidden_raw_target_logprobs_positions"] = (
-                                hidden_raw_target_logprobs_positions.unsqueeze(0).cpu()
-                            )
-                        put_sample(
-                            tq_key,
-                            tq_payload,
-                            tag={
-                                "global_step": collection_global_steps,
-                                "replica_rank": self.replica_rank,
-                            },
-                        )
-                        drafter_sample["hidden_states_tq_key"] = tq_key
-                        drafter_sample["hidden_states"] = None
-                        if target_logprobs is not None:
-                            drafter_sample["target_logprobs"] = None
-                        if torch.is_tensor(hidden_raw_target_logprobs):
-                            drafter_sample["hidden_raw_target_logprobs"] = None
-                        if torch.is_tensor(hidden_raw_target_logprobs_positions):
-                            drafter_sample["hidden_raw_target_logprobs_positions"] = (
-                                None
-                            )
             else:
                 self._speco_log_missing_hidden_states_once(
                     collection_global_steps=collection_global_steps,
