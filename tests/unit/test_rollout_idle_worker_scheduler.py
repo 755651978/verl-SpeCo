@@ -668,12 +668,14 @@ def test_idle_worker_starvation_guard_config_from_nested_mapping() -> None:
                 "idle_worker": {
                     "fallback_to_sync": True,
                     "max_seconds_without_training": 60.5,
+                    "require_runtime_idle_events": True,
                 },
             },
         }
     )
 
     assert config.idle_worker_fallback_to_sync is True
+    assert config.idle_worker_require_runtime_idle_events is True
     assert config.max_steps_without_training == 20
     assert config.idle_worker_max_seconds_without_training == 60.5
 
@@ -968,6 +970,23 @@ def test_trainer_fallback_idle_events_from_generation_output() -> None:
     assert metrics["bubble/idle_workers"] == 2
     assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 2
     assert output.non_tensor_batch["drafter_sample"][0]["id"] == "a"
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_trainer_strict_idle_mode_rejects_synthetic_idle_window() -> None:
+    trainer = _trainer_with_idle_config()
+    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
+        "scheduler"
+    ]["idle_worker"]["require_runtime_idle_events"] = True
+    output = _FakeGenerationOutput([{"replica_rank": 0, "id": "a"}])
+
+    metrics = trainer._speco_emit_rollout_idle_from_generation_output(
+        output,
+        reason="test_no_runtime_events",
+    )
+
+    assert metrics == {"bubble/fallback_idle_events_disabled": 1}
+    assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 0
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")

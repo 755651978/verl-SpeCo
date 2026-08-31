@@ -110,6 +110,11 @@ class DrafterScheduleConfig:
     idle_worker_initial_batch_estimate_sec: float | None = None
     idle_worker_deadline_guard_sec: float | None = None
     idle_worker_require_memory_released: bool = True
+    # An estimated idle deadline is useful on backends that cannot expose
+    # worker lifecycle events, but it is best-effort only.  Set this to true
+    # when Bubble Time must fail closed unless the runtime has explicitly
+    # reported that the complete rollout worker group is idle.
+    idle_worker_require_runtime_idle_events: bool = False
     idle_worker_drain_before_next_rollout: bool = True
     idle_worker_fallback_to_sync: bool = False
     idle_worker_max_seconds_without_training: float | None = None
@@ -182,6 +187,9 @@ class DrafterScheduleConfig:
             ),
             idle_worker_require_memory_released=bool(
                 idle_get("require_memory_released", True)
+            ),
+            idle_worker_require_runtime_idle_events=bool(
+                idle_get("require_runtime_idle_events", False)
             ),
             idle_worker_drain_before_next_rollout=bool(
                 idle_get("drain_before_next_rollout", True)

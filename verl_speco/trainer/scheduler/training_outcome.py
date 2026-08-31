@@ -14,6 +14,7 @@ from verl_speco.trainer.scheduler.drafter_runtime_state import (
 )
 from verl_speco.trainer.scheduler.execution_strategy import ExecutionOutcome
 from verl_speco.trainer.scheduler.schedule_types import (
+    DrafterExecutionStrategy,
     TrainingPlan,
     TrainingResult,
     _as_float,
@@ -206,6 +207,12 @@ class TrainingOutcome:
                 metrics[metric_key] = max(values)
 
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
+        if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+            # Separate Bubble worker work from the time the PPO path waited
+            # to reclaim that worker group for a subsequent rollout.
+            metrics["timing_s/drafter_async_training_work"] = float(
+                metrics.get("timing_s/drafter_worker_elapsed", 0.0)
+            )
         if plan.reason.startswith("sync_fallback"):
             metrics.update(
                 {

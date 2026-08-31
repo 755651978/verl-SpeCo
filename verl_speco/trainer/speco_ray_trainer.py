@@ -1385,6 +1385,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> dict[str, Any]:
         if not self._speco_rollout_idle_worker_enabled():
             return {}
+        config = self._speco_drafter_schedule_config()
+        if config.idle_worker_require_runtime_idle_events:
+            # A synthetic deadline is only a timing estimate.  In strict mode
+            # do not start collective drafter training until the runtime has
+            # positively reported every required rollout worker as idle.
+            logger.info(
+                "[BubbleTime] fallback idle disabled: reason=%s; "
+                "require_runtime_idle_events=true",
+                reason,
+            )
+            return {"bubble/fallback_idle_events_disabled": 1}
         replica_ranks = self._speco_fallback_idle_replica_ranks(gen_batch_output)
         if not replica_ranks:
             print(
@@ -1470,6 +1481,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         drain_started = time.perf_counter()
         completed_plan, completed_outcome = self._speco_wait_pending_drafter_training()
         drain_elapsed = time.perf_counter() - drain_started
+        metrics["timing_s/drafter_reclaim_wait"] = drain_elapsed
+        metrics["timing_s/drafter_critical_path_before_generation"] = drain_elapsed
         metrics["bubble/reclaim_drained"] = int(completed_outcome is not None)
         if completed_outcome is not None:
             metrics.update(completed_outcome.metrics)
@@ -2418,15 +2431,37 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and actor_veomni_param_offload
         )
         fetch_started = time.perf_counter()
-        payloads = (
-            self._ray_get_if_needed(
-                get_actor_lm_head_weight(
-                    row_indices,
-                    keep_model_on_device=keep_actor_model_on_device,
-                )
-            )
-            or []
+        payload_refs = get_actor_lm_head_weight(
+            row_indices,
+            keep_model_on_device=keep_actor_model_on_device,
         )
+        # Bubble Time needs the actor head from before the PPO update, but the
+        # transfer itself can overlap that update.  Do not ray.get the head on
+        # the trainer critical path; finish it after ``original_update_actor``
+        # and preserve the captured pre-update ObjectRef/version.
+        if (
+            training_plan is None
+            and self._speco_drafter_schedule_config().execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+        ):
+            return (
+                {
+                    "drafter/target_lm_head_synced": 0,
+                    "drafter/target_lm_head_selected_rows": selected_rows,
+                    "drafter/target_lm_head_source_vocab_size": source_vocab_size,
+                    "timing_s/drafter_target_lm_head_fetch_submit": (
+                        time.perf_counter() - fetch_started
+                    ),
+                },
+                {
+                    "fetch_refs": payload_refs,
+                    "fetch_started": fetch_started,
+                    "sync_started": sync_started,
+                    "selected_rows": selected_rows,
+                    "source_vocab_size": source_vocab_size,
+                },
+            )
+        payloads = self._ray_get_if_needed(payload_refs) or []
         fetch_elapsed = time.perf_counter() - fetch_started
         payload = self._first_non_null(payloads)
         if payload is None:
@@ -2441,6 +2476,34 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 },
                 None,
             )
+
+        metrics, pending = self._speco_dispatch_target_lm_head_payload(
+            payload,
+            sync_started=sync_started,
+            fetch_elapsed=fetch_elapsed,
+            selected_rows=selected_rows,
+            source_vocab_size=source_vocab_size,
+        )
+        if (
+            pending is not None
+            and bool(pending.get("defer_device_apply", False))
+            and pending.get("refs") is not None
+        ):
+            return metrics, pending
+        if pending is not None:
+            metrics.update(self._speco_finish_target_lm_head_weight_sync(pending))
+        return metrics, None
+
+    def _speco_dispatch_target_lm_head_payload(
+        self,
+        payload: Any,
+        *,
+        sync_started: float,
+        fetch_elapsed: float,
+        selected_rows: int,
+        source_vocab_size: int,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Stage a captured actor head on drafter workers without waiting."""
 
         export_strategy = (
             str(payload.get("export_strategy", "unknown"))
@@ -2478,16 +2541,56 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "dispatch_finished": dispatch_started + dispatch_elapsed,
             "dispatch_elapsed": dispatch_elapsed,
             "pre_dispatch_elapsed": dispatch_started - sync_started,
+            "defer_device_apply": defer_device_apply,
         }
-        if defer_device_apply and pending_refs is not None:
-            return metrics, pending
-
-        metrics.update(self._speco_finish_target_lm_head_weight_sync(pending))
-        return metrics, None
+        return metrics, pending
 
     def _speco_finish_target_lm_head_weight_sync(
         self, pending: dict[str, Any]
     ) -> dict[str, Any]:
+        if "fetch_refs" in pending:
+            fetch_wait_started = time.perf_counter()
+            payloads = self._ray_get_if_needed(pending["fetch_refs"]) or []
+            fetch_finished = time.perf_counter()
+            fetch_elapsed = fetch_finished - float(pending["fetch_started"])
+            payload = self._first_non_null(payloads)
+            if payload is None:
+                return {
+                    "drafter/target_lm_head_synced": 0,
+                    "drafter/target_lm_head_selected_rows": int(
+                        pending["selected_rows"]
+                    ),
+                    "drafter/target_lm_head_source_vocab_size": int(
+                        pending["source_vocab_size"]
+                    ),
+                    "timing_s/drafter_sync_target_lm_head": (
+                        fetch_finished - float(pending["sync_started"])
+                    ),
+                    "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
+                    "timing_s/drafter_target_lm_head_fetch_async_work": fetch_elapsed,
+                    "timing_s/drafter_target_lm_head_fetch_critical_path": (
+                        fetch_finished - fetch_wait_started
+                    ),
+                }
+            metrics, dispatch_pending = self._speco_dispatch_target_lm_head_payload(
+                payload,
+                sync_started=float(pending["sync_started"]),
+                fetch_elapsed=fetch_elapsed,
+                selected_rows=int(pending["selected_rows"]),
+                source_vocab_size=int(pending["source_vocab_size"]),
+            )
+            metrics["timing_s/drafter_target_lm_head_fetch_async_work"] = (
+                fetch_elapsed
+            )
+            metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] = (
+                fetch_finished - fetch_wait_started
+            )
+            if dispatch_pending is not None:
+                metrics.update(
+                    self._speco_finish_target_lm_head_weight_sync(dispatch_pending)
+                )
+            return metrics
+
         wait_started = time.perf_counter()
         self._ray_get_if_needed(pending.get("refs"))
         finished = time.perf_counter()
@@ -2880,6 +2983,51 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         pending_drafter_publishes: list[dict[str, Any]] = []
 
+        def drain_deferred_drafter_publishes(
+            *, safe_point: str
+        ) -> dict[str, Any]:
+            """Publish every completed Bubble plan at a rollout-safe boundary.
+
+            ``checkpoint_manager.update_weights`` is an opportunistic early
+            boundary, but some verl runtime variants update rollout weights
+            through a different object.  The next generation invocation is a
+            guaranteed fallback boundary: the preceding PPO iteration has
+            completed its actor/rollout-weight update, while the next rollout
+            has not started yet.
+            """
+
+            metrics: dict[str, Any] = {}
+            while pending_drafter_publishes:
+                pending_publish = pending_drafter_publishes.pop(0)
+                training_plan = pending_publish["training_plan"]
+                print(
+                    "[BubbleTime] deferred_publish_drained: "
+                    f"plan_id={getattr(training_plan, 'plan_id', None)} "
+                    f"safe_point={safe_point}",
+                    flush=True,
+                )
+                publish_started = time.perf_counter()
+                publish_metrics = self._speco_publish_drafter_weights(
+                    pending_publish["drafter_trained"],
+                    training_plan,
+                    after_weight_update=True,
+                )
+                publish_elapsed = time.perf_counter() - publish_started
+                self._speco_update_output_metrics(
+                    pending_publish["actor_output"], publish_metrics
+                )
+                for key, value in publish_metrics.items():
+                    if key in {"drafter/publish_attempted", "drafter/published"}:
+                        metrics[key] = max(int(metrics.get(key, 0)), int(value))
+                    elif key.startswith("timing_s/"):
+                        metrics[key] = float(metrics.get(key, 0.0)) + float(value)
+                    else:
+                        metrics[key] = value
+                metrics["timing_s/drafter_publish_critical_path"] = float(
+                    metrics.get("timing_s/drafter_publish_critical_path", 0.0)
+                ) + publish_elapsed
+            return metrics
+
         def defer_drafter_publish(
             *,
             drafter_trained: bool,
@@ -2896,7 +3044,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 }
             )
             print(
-                "[BubbleTime] publish_deferred: "
+                "[BubbleTime] deferred_publish_enqueued: "
                 f"plan_id={getattr(training_plan, 'plan_id', None)} "
                 "reason=await_upstream_weight_update",
                 flush=True,
@@ -2905,7 +3053,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
             input_is_validation = _speco_is_validation_generation(args, kwargs)
-            generation_metrics = {}
+            generation_metrics = drain_deferred_drafter_publishes(
+                safe_point="before_next_generation"
+            )
             print(
                 "[BubbleTime] generation_hook: "
                 f"validation={input_is_validation} "
@@ -3146,9 +3296,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ),
             }
             metrics.update(self._speco_pop_rollout_idle_metrics())
-            completed_plan, completed_outcome = (
-                self._speco_wait_pending_drafter_training()
-            )
+            completion_wait_started = time.perf_counter()
+            if self._speco_rollout_idle_worker_enabled():
+                # Bubble training is intentionally allowed to continue while
+                # PPO updates the actor.  Only poll here; the next-generation
+                # reclaim boundary performs a cooperative drain if a worker
+                # still needs to be returned to rollout.
+                completed_plan, completed_outcome = (
+                    self._speco_poll_pending_drafter_training()
+                )
+                metrics["bubble/training_completion_polled"] = 1
+                metrics["timing_s/drafter_completion_wait"] = 0.0
+            else:
+                completed_plan, completed_outcome = (
+                    self._speco_wait_pending_drafter_training()
+                )
+                metrics["timing_s/drafter_completion_wait"] = (
+                    time.perf_counter() - completion_wait_started
+                )
             if completed_outcome is not None:
                 metrics.update(completed_outcome.metrics)
                 if defer_publish_until_update_weights:
@@ -3251,20 +3416,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 0.0,
                 metrics["timing_s/drafter"] - known_drafter_timing,
             )
+            metrics["timing_s/drafter_critical_path_update_actor"] = metrics[
+                "timing_s/drafter"
+            ]
+            metrics["timing_s/drafter_control_overhead"] = metrics[
+                "timing_s/drafter_outer_unaccounted"
+            ]
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
             result = original_checkpoint_update_weights(*args, **kwargs)
-            while pending_drafter_publishes:
-                pending_publish = pending_drafter_publishes.pop(0)
-                publish_metrics = self._speco_publish_drafter_weights(
-                    pending_publish["drafter_trained"],
-                    pending_publish["training_plan"],
-                    after_weight_update=True,
-                )
-                self._speco_update_output_metrics(
-                    pending_publish["actor_output"], publish_metrics
-                )
+            drain_deferred_drafter_publishes(
+                safe_point="checkpoint_manager_update_weights"
+            )
             return result
 
         rollout_generation_target.generate_sequences = MethodType(
@@ -3293,6 +3457,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._update_actor = original_update_actor
             if defer_publish_until_update_weights:
                 checkpoint_manager.update_weights = original_checkpoint_update_weights
+            drain_deferred_drafter_publishes(safe_point="fit_teardown")
             self._speco_wait_pending_drafter_publish()
 
     @staticmethod

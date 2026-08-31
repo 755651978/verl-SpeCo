@@ -209,6 +209,59 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     assert output.meta_info["metrics"]["drafter/schedule_reason"] == 3
 
 
+def test_deferred_bubble_publish_drains_before_next_generation() -> None:
+    """Do not require a particular checkpoint-manager update path to publish."""
+
+    trainer = _trainer(
+        {
+            "training_interval_steps": 1,
+            "publish_interval_steps": 0,
+        },
+        step=5,
+    )
+    trainer._speco_last_collected_samples = 1
+    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
+    trainer._compute_old_log_prob = lambda batch: batch
+    trainer.checkpoint_manager = SimpleNamespace(update_weights=lambda: None)
+    events = []
+
+    trainer._speco_set_drafter_global_step = lambda **kwargs: None
+    trainer._speco_sync_target_lm_head_weight = lambda plan: {
+        "drafter/target_lm_head_synced": 1
+    }
+    trainer._update_actor = lambda *args, **kwargs: SimpleNamespace(
+        meta_info={"metrics": {}}
+    )
+    trainer._speco_train_drafter = lambda plan: (
+        True,
+        {"drafter/trained": 1},
+    )
+    trainer._speco_publish_drafter_weights = lambda trained, plan, **kwargs: events.append(
+        ("publish", trained, kwargs.get("after_weight_update"))
+    ) or {"drafter/publish_attempted": 1, "drafter/published": 1}
+    trainer._speco_rollout_idle_worker_enabled = lambda: False
+    trainer._speco_reclaim_rollout_idle_workers_before_generation = lambda: {}
+    trainer._speco_emit_rollout_generation_started = lambda: {}
+    trainer._speco_start_rollout_idle_event_loop = lambda: (None, None)
+    trainer._speco_stop_rollout_idle_event_loop = lambda *args: None
+    trainer._speco_service_rollout_idle_events = lambda: {}
+    trainer._speco_emit_rollout_generation_completed = lambda output: {}
+    trainer._speco_store_rollout_metrics = lambda output: None
+    trainer._speco_collect_generation_samples = lambda output: 0
+
+    with trainer._speco_online_fit_hooks():
+        trainer._update_actor("batch")
+        output = trainer.actor_rollout_wg.generate_sequences()
+
+    assert events == [("publish", True, True)]
+    assert output.meta_info["metrics"]["drafter/publish_attempted"] == 1
+    assert output.meta_info["metrics"]["drafter/published"] == 1
+    assert (
+        output.meta_info["metrics"]["timing_s/drafter_publish_critical_path"]
+        >= 0.0
+    )
+
+
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])
 def test_oldlogprob_collection_accepts_supported_actor_backends(strategy: str) -> None:
     trainer = _trainer(
@@ -480,7 +533,7 @@ def test_target_head_sync_defers_for_all_lm_head_drafters(
     }
     received = []
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
     trainer._speco_build_drafter_target_lm_head_sync_args = (
         lambda value: (value, trainer.global_steps, 1)
     )
@@ -508,7 +561,7 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
     resolved = []
     trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
     trainer._speco_build_drafter_target_lm_head_sync_args = (
         lambda value: (value, trainer.global_steps, 1)
     )
@@ -526,6 +579,39 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
 
     assert resolved == [[payload], pending_refs]
     assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_bubble_target_head_fetch_overlaps_actor_update() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=1,
+    )
+    payload = {"weight": "cpu-weight", "export_strategy": "full"}
+    pending_refs = ["pending-target-sync"]
+    resolved = []
+    trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
+    trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
+    trainer._speco_actor_rollout_method = lambda name: lambda rows, **kwargs: [payload]
+    trainer._speco_build_drafter_target_lm_head_sync_args = (
+        lambda value: (value, trainer.global_steps, 1)
+    )
+    trainer.speco_sync_target_lm_head_weight = (
+        lambda value, global_step=None: pending_refs
+    )
+
+    metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
+
+    assert pending is not None
+    assert "fetch_refs" in pending
+    assert resolved == []
+    assert metrics["timing_s/drafter_target_lm_head_fetch_submit"] >= 0.0
+
+    metrics.update(trainer._speco_finish_target_lm_head_weight_sync(pending))
+
+    assert resolved == [[payload], pending_refs]
+    assert metrics["drafter/target_lm_head_synced"] == 1
+    assert metrics["timing_s/drafter_target_lm_head_fetch_async_work"] >= 0.0
+    assert metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] >= 0.0
 
 
 def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
