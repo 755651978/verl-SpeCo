@@ -117,7 +117,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
             "npu_vllm_unit_tests.yml",
             "npu",
             "vllm",
-            {"eagle3", "dflash", "dspark"},
+            {"eagle3", "megatron-eagle3", "dflash", "dspark"},
         ),
         ("npu_sglang_unit_tests.yml", "npu", "sglang", {"eagle3", "dflash"}),
     ):
@@ -146,7 +146,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
                     "include"
                 ]
-            } == {"eagle3", "dflash", "dspark"}
+            } == expected_drafters
             assert {
                 (entry["drafter"], entry["enable_training"])
                 for entry in workflow["jobs"]["example"]["strategy"]["matrix"][
@@ -154,6 +154,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
+                ("megatron-eagle3", "true"),
                 ("dflash", "true"),
                 ("dspark", "true"),
             }
@@ -164,6 +165,7 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 ]
             } == {
                 ("eagle3", "true"),
+                ("megatron-eagle3", "true"),
                 ("dflash", "false"),
                 ("dspark", "false"),
             }
@@ -345,3 +347,32 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
     assert "actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK" in stdout
     assert "actor_rollout_ref.rollout.drafter.training.dspark_block_size=7" in stdout
     assert "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7" in stdout
+
+
+def test_example_runner_dry_run_omits_ulysses_overrides_for_npu_megatron() -> None:
+    bash = _require_working_bash()
+    env = {
+        "SPECO_DRY_RUN": "true",
+        "SPECO_TARGET_MODEL": "/models/target",
+        "SPECO_EAGLE3_DRAFT_MODEL": "/models/eagle3",
+        "SPECO_TRAIN_FILE": "/data/train.parquet",
+        "SPECO_TEST_FILE": "/data/test.parquet",
+        "SPECO_CKPT_DIR": "/tmp/speco",
+        "SPECO_ACCELERATOR_COUNT": "8",
+    }
+    script = "".join(
+        f"export {name}={shlex.quote(value)}\n" for name, value in env.items()
+    )
+    script += _runner_script()
+    result = subprocess.run(
+        [bash, "-s", "--", "npu", "vllm", "megatron-eagle3"],
+        env=os.environ.copy(),
+        input=script.encode("utf-8"),
+        capture_output=True,
+        check=True,
+    )
+    stdout = result.stdout.decode("utf-8", errors="replace")
+
+    assert "example=examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh" in stdout
+    assert "draft_algorithm=EAGLE3" in stdout
+    assert "ulysses_sequence_parallel_size" not in stdout
