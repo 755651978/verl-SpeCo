@@ -1453,7 +1453,45 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_get_drafter_scheduler().request_reclaim(
             active_plan.target_worker_ids
         )
-        return {"bubble/reclaim_requested": 1}
+        metrics: dict[str, Any] = {"bubble/reclaim_requested": 1}
+        config = self._speco_drafter_schedule_config()
+        if not config.idle_worker_drain_before_next_rollout:
+            logger.info(
+                "[BubbleTime] reclaim requested without drain: plan_id=%s workers=%s",
+                active_plan.plan_id,
+                active_plan.target_worker_ids,
+            )
+            return metrics
+
+        # Reclaim is cooperative: a worker finishes its in-flight batch and
+        # cleans up before it can serve rollout again.  Do not enter the next
+        # generation until that transition has completed, otherwise training
+        # and inference can contend for the same colocated resources.
+        drain_started = time.perf_counter()
+        completed_plan, completed_outcome = self._speco_wait_pending_drafter_training()
+        drain_elapsed = time.perf_counter() - drain_started
+        metrics["bubble/reclaim_drained"] = int(completed_outcome is not None)
+        if completed_outcome is not None:
+            metrics.update(completed_outcome.metrics)
+            if completed_outcome.trained:
+                # This is a generation safe point: the preceding actor update
+                # has completed, and no new rollout has started yet.
+                metrics.update(
+                    self._speco_publish_drafter_weights(
+                        completed_outcome.trained,
+                        completed_plan,
+                    )
+                )
+                self._speco_wait_pending_drafter_publish()
+        logger.warning(
+            "[BubbleTime] reclaim drain before generation: plan_id=%s "
+            "workers=%s completed=%s elapsed_s=%.4f",
+            active_plan.plan_id,
+            active_plan.target_worker_ids,
+            completed_outcome is not None,
+            drain_elapsed,
+        )
+        return metrics
 
     def _speco_drafter_training_mode(self) -> str:
         training_cfg = self._speco_drafter_training_config()

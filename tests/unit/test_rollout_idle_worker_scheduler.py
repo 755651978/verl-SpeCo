@@ -1007,8 +1007,56 @@ def test_trainer_reclaims_active_idle_workers_before_next_generation() -> None:
     )
     trainer._drafter_runtime_state.submit(plan, started_at=time.time())
     trainer._drafter_runtime_state.mark_running()
+    drain_calls = []
+    trainer._speco_wait_pending_drafter_training = lambda: (
+        drain_calls.append(True) or (plan, None)
+    )
+
+    metrics = trainer._speco_reclaim_rollout_idle_workers_before_generation()
+
+    assert metrics == {"bubble/reclaim_requested": 1, "bubble/reclaim_drained": 0}
+    assert events == [("worker-0", "worker-1")]
+    assert drain_calls == [True]
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_trainer_can_skip_reclaim_drain_when_configured() -> None:
+    trainer = _trainer_with_idle_config()
+    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
+        "scheduler"
+    ]["idle_worker"]["drain_before_next_rollout"] = False
+    events = []
+    trainer._drafter_scheduler.bind_worker_executor(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: None,
+            resolve=lambda value: value,
+            inspect_data=lambda sample_last_n_steps, require_full_batch: [],
+            prepare=lambda plan: {},
+            activate=lambda: [],
+            preflight=lambda payload: [],
+            abort_preflight=lambda plan_id: [],
+            reclaim=lambda worker_ids: events.append(worker_ids),
+        )
+    )
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=1,
+        publish_after_success=True,
+        target_worker_ids=("worker-0", "worker-1"),
+    )
+    trainer._drafter_runtime_state.submit(plan, started_at=time.time())
+    trainer._drafter_runtime_state.mark_running()
+    drain_calls = []
+    trainer._speco_wait_pending_drafter_training = lambda: (
+        drain_calls.append(True) or (plan, None)
+    )
 
     metrics = trainer._speco_reclaim_rollout_idle_workers_before_generation()
 
     assert metrics == {"bubble/reclaim_requested": 1}
     assert events == [("worker-0", "worker-1")]
+    assert drain_calls == []

@@ -334,6 +334,31 @@ def test_publish_plan_honors_training_plan_publish_decision() -> None:
     assert plan.reason == "training_plan_publish_disabled"
 
 
+def test_idle_worker_publish_is_asynchronous() -> None:
+    training_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=8,
+        max_batches=1,
+        publish_after_success=True,
+    )
+
+    plan = DrafterScheduler().plan_publish(
+        global_step=8,
+        drafter_trained=True,
+        config=DrafterScheduleConfig(
+            publish_interval_steps=1,
+            publish_async=False,
+        ),
+        training_plan=training_plan,
+    )
+
+    assert plan.publish
+    assert plan.asynchronous
+
+
 def test_budget_smaller_than_minimum_does_not_launch() -> None:
     plan = DrafterScheduler().plan_training(
         _context(trainable_batches=5),
