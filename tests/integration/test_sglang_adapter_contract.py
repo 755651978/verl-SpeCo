@@ -187,6 +187,38 @@ def test_sglang_idle_event_waits_for_all_replica_requests(monkeypatch) -> None:
     assert events == ["GENERATION_STARTED", "WORKER_IDLE"]
 
 
+def test_sglang_failed_request_does_not_claim_memory_release(monkeypatch) -> None:
+    server = _SpecoSGLangHttpServerMixin()
+    server.replica_rank = 0
+    server._speco_drafter_config = {
+        "training": {
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "idle_worker": {"event_bus_name": "bubble-bus"},
+            }
+        }
+    }
+    events = []
+
+    async def fail_request(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("generation failed")
+
+    server._speco_generate_request = fail_request
+    monkeypatch.setattr(
+        sglang_runtime,
+        "_emit_rollout_idle_worker_event",
+        lambda **kwargs: events.append(kwargs) or True,
+    )
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        asyncio.run(server.generate(None, {}, "request-0"))
+
+    assert events[-1]["event_type"] == "WORKER_IDLE"
+    assert events[-1]["memory_released"] is False
+    assert events[-1]["release_source"] == "runtime_request_failed"
+
+
 def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(
     monkeypatch,
 ) -> None:

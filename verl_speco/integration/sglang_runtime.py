@@ -43,6 +43,7 @@ from verl_speco.integration.sglang_adapter import (
 )
 from verl_speco.integration.rollout_idle_events import (
     SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
+    emit_rollout_drafter_sample,
     emit_rollout_idle_event,
 )
 from verl_speco.trainer.scheduler import (
@@ -204,6 +205,7 @@ def _emit_rollout_idle_worker_event(
     replica_rank: int,
     event_type: str,
     memory_released: bool = False,
+    release_source: str = "",
 ) -> bool:
     bus_name = _rollout_idle_event_bus_name(drafter_cfg)
     if not bus_name:
@@ -226,19 +228,21 @@ def _emit_rollout_idle_worker_event(
             "worker_id": worker_id,
             "replica_rank": int(replica_rank),
             "memory_released": memory_released,
+            "release_source": release_source,
             "must_be_ready_at": must_be_ready_at,
             "event_ts": event_ts,
         },
     )
     logger.warning(
         "[BubbleTime] emit_rollout_idle_event runtime=sglang bus=%s type=%s "
-        "worker_id=%s replica_rank=%s memory_released=%s deadline_in_s=%s "
+        "worker_id=%s replica_rank=%s memory_released=%s release_source=%s deadline_in_s=%s "
         "deadline_source=%s emitted=%s",
         bus_name,
         event_type,
         worker_id,
         replica_rank,
         memory_released,
+        release_source,
         (
             None
             if must_be_ready_at is None
@@ -1557,20 +1561,26 @@ class _SpecoSGLangHttpServerMixin:
         if not skip_rollout_idle_event:
             self._speco_rollout_cycle_reported = True
         if not skip_rollout_idle_event and active_requests == 0:
+            self._speco_rollout_release_verified = True
             _emit_rollout_idle_worker_event(
                 drafter_cfg=drafter_cfg,
                 replica_rank=int(self.replica_rank),
                 event_type="GENERATION_STARTED",
             )
+        request_completed = False
         try:
-            return await self._speco_generate_request(
+            output = await self._speco_generate_request(
                 prompt_ids,
                 sampling_params,
                 request_id,
                 image_data=image_data,
                 video_data=video_data,
             )
+            request_completed = True
+            return output
         finally:
+            if not request_completed:
+                self._speco_rollout_release_verified = False
             remaining_requests = max(
                 int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
                 0,
@@ -1578,13 +1588,22 @@ class _SpecoSGLangHttpServerMixin:
             self._speco_rollout_active_requests = remaining_requests
             cycle_reported = bool(getattr(self, "_speco_rollout_cycle_reported", False))
             if cycle_reported and remaining_requests == 0:
+                release_verified = bool(
+                    getattr(self, "_speco_rollout_release_verified", False)
+                )
                 _emit_rollout_idle_worker_event(
                     drafter_cfg=drafter_cfg,
                     replica_rank=int(self.replica_rank),
                     event_type="WORKER_IDLE",
-                    memory_released=True,
+                    memory_released=release_verified,
+                    release_source=(
+                        "runtime_request_finalized"
+                        if release_verified
+                        else "runtime_request_failed"
+                    ),
                 )
                 self._speco_rollout_cycle_reported = False
+                self._speco_rollout_release_verified = False
 
     async def _speco_generate_request(
         self,
@@ -2219,6 +2238,19 @@ class _SpecoSGLangHttpServerMixin:
                         "global_step": collection_global_steps,
                         "replica_rank": self.replica_rank,
                     }
+                    sample_id = (
+                        f"{collection_global_steps}:{self.replica_rank}:{request_id}"
+                    )
+                    drafter_sample["_speco_sample_id"] = sample_id
+                    drafter_sample["_speco_direct_event_emitted"] = (
+                        emit_rollout_drafter_sample(
+                            _rollout_idle_event_bus_name(drafter_cfg),
+                            drafter_sample,
+                            sample_id=sample_id,
+                            replica_rank=int(self.replica_rank),
+                            global_step=collection_global_steps,
+                        )
+                    )
             else:
                 self._speco_log_missing_hidden_states_once(
                     collection_global_steps=collection_global_steps,

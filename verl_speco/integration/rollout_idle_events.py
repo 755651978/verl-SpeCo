@@ -14,6 +14,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV = "VERL_SPECO_ROLLOUT_IDLE_EVENT_BUS"
+DRAFTER_SAMPLE_READY_EVENT = "drafter_sample_ready"
 
 
 def _ray_module():
@@ -77,6 +78,46 @@ def emit_rollout_idle_event(name: str | None, event: dict[str, Any]) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to emit SPECO rollout idle event to %s: %s", name, exc)
+        return False
+
+
+def emit_rollout_drafter_sample(
+    name: str | None,
+    sample: dict[str, Any],
+    *,
+    sample_id: str,
+    replica_rank: int,
+    global_step: object,
+) -> bool:
+    """Publish one SGLang sample without copying it through the final rollout batch.
+
+    The large tensor payload is placed in Ray's object store first.  The event
+    bus only carries the ObjectRef and routing/version metadata.  The original
+    sample remains attached to ``TokenOutput`` as a lossless fallback until the
+    trainer confirms that this event was transactionally committed.
+    """
+
+    if not name:
+        return False
+    ray = _ray_module()
+    if ray is None or not getattr(ray, "is_initialized", lambda: False)():
+        return False
+    try:
+        actor = ray.get_actor(name)
+        sample_ref = ray.put(sample)
+        actor.emit.remote(
+            {
+                "event_type": DRAFTER_SAMPLE_READY_EVENT,
+                "sample_id": str(sample_id),
+                "sample_ref": sample_ref,
+                "replica_rank": int(replica_rank),
+                "global_step": global_step,
+                "event_ts": time.time(),
+            }
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to emit SPECO drafter sample to %s: %s", name, exc)
         return False
 
 

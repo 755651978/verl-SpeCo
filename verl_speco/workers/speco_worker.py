@@ -19,6 +19,7 @@ worker behavior in ``verl_speco`` while importing upstream ``verl`` as a
 dependency.
 """
 
+import asyncio
 import logging
 import os
 import random
@@ -68,16 +69,27 @@ def _is_ray_object_ref(value) -> bool:
     return bool(object_ref_type) and isinstance(value, object_ref_type)
 
 
-def _resolve_ray_object_ref(value):
+async def _resolve_ray_object_ref(value):
+    """Resolve an ObjectRef without blocking this async Ray actor's event loop."""
     if _is_ray_object_ref(value):
-        return ray.get(value)
+        return await value
     return value
 
 
-def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
+async def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
     if not chunks:
         return None
-    resolved_cache = {}
+    unique_refs = {}
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        ref = chunk.get("ref")
+        if ref is not None:
+            unique_refs.setdefault(id(ref), ref)
+    resolved_values = await asyncio.gather(
+        *(_resolve_ray_object_ref(ref) for ref in unique_refs.values())
+    )
+    resolved_cache = dict(zip(unique_refs, resolved_values, strict=True))
     pieces = []
     full_rows = int(expected_rows or 0)
     hidden_size = None
@@ -89,8 +101,6 @@ def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
         if ref is None:
             continue
         cache_key = id(ref)
-        if cache_key not in resolved_cache:
-            resolved_cache[cache_key] = _resolve_ray_object_ref(ref)
         tensor = resolved_cache[cache_key]
         if not torch.is_tensor(tensor):
             continue
@@ -911,7 +921,7 @@ class SpecoWorker(Worker):
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
     )
-    def commit_rollout_features(self, requests: list[dict]):
+    async def commit_rollout_features(self, requests: list[dict]):
         request = self._collection_request(requests)
         collection_id = str(request.get("collection_id", ""))
         staged = self._staged_rollout_features.pop(collection_id, None)
@@ -926,7 +936,7 @@ class SpecoWorker(Worker):
             )
         snapshot = self._snapshot_collection_buffer()
         self._collection_commit_journals[collection_id] = snapshot
-        return self._commit_rollout_features(collection_id, samples)
+        return await self._commit_rollout_features(collection_id, samples)
 
     @register(
         dispatch_mode=make_nd_compute_dispatch_fn(mesh_name=DRAFTER_OWNER_ROUTE_MESH)
@@ -975,7 +985,7 @@ class SpecoWorker(Worker):
             ),
         )
 
-    def _commit_rollout_features(
+    async def _commit_rollout_features(
         self, collection_id: str, samples: list[dict]
     ) -> dict[str, Any]:
         buffer_version_before = int(
@@ -1031,14 +1041,16 @@ class SpecoWorker(Worker):
                     if torch.is_tensor(hidden_positions):
                         hidden_positions = cast(torch.Tensor, hidden_positions)
                         expected_rows = int(hidden_positions.numel())
-                    hidden = _resolve_hidden_state_chunks(
+                    hidden = await _resolve_hidden_state_chunks(
                         hidden_chunks, expected_rows=expected_rows
                     )
                 else:
-                    hidden = _resolve_ray_object_ref(sample.get("hidden_states_ref"))
+                    hidden = await _resolve_ray_object_ref(
+                        sample.get("hidden_states_ref")
+                    )
             target_logprobs = sample.get("target_logprobs")
             if target_logprobs is None:
-                target_logprobs = _resolve_ray_object_ref(
+                target_logprobs = await _resolve_ray_object_ref(
                     sample.get("target_logprobs_ref")
                 )
             if hidden is None:

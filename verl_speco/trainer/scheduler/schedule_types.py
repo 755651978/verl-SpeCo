@@ -61,6 +61,7 @@ class RolloutWorkerEvent:
     worker_id: str
     replica_rank: int
     memory_released: bool = False
+    release_source: str = ""
     must_be_ready_at: float | None = None
     event_ts: float | None = None
 

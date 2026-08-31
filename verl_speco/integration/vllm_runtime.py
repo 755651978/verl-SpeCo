@@ -870,6 +870,57 @@ def _vllm_drafter_env_payload(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
     return dict(drafter_cfg)
 
 
+def _ensure_vllm_server_drafter_env(
+    config: Any,
+    embedded_config_json: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Restore the drafter config inside a remote vLLM HTTP-server process.
+
+    The Trainer mutates the idle-event bus name after Ray actors have started.
+    A vLLM HTTP server is another Ray process and does not reliably inherit that
+    late environment mutation.  Its local server config is therefore the
+    authoritative fallback for the runtime idle callback.
+    """
+
+    server_config = _drafter_config_from_config(config)
+    embedded_config: dict[str, Any] = {}
+    if embedded_config_json:
+        try:
+            loaded = json.loads(embedded_config_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Invalid embedded vLLM drafter runtime config"
+            ) from exc
+        if isinstance(loaded, dict):
+            embedded_config = loaded
+    env_config = _load_env_drafter_config()
+    candidates = (
+        (server_config, "server_config"),
+        (embedded_config, "server_class"),
+        (env_config, "environment"),
+    )
+    for candidate, source in candidates:
+        configured_bus_name = _get_nested(
+            candidate,
+            ("training", "scheduler", "idle_worker", "event_bus_name"),
+            "",
+        )
+        if candidate and configured_bus_name:
+            os.environ[SPECO_DRAFTER_CONFIG_ENV] = json.dumps(
+                _vllm_drafter_env_payload(candidate), sort_keys=True
+            )
+            return candidate, source
+
+    env_bus_name = _rollout_idle_event_bus_name(env_config)
+    server_bus_name = _rollout_idle_event_bus_name(server_config)
+    if server_config and (not env_config or server_bus_name or not env_bus_name):
+        os.environ[SPECO_DRAFTER_CONFIG_ENV] = json.dumps(
+            _vllm_drafter_env_payload(server_config), sort_keys=True
+        )
+        return server_config, "server_config"
+    return env_config, "environment"
+
+
 def _rollout_idle_worker_config(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
     training_cfg = drafter_cfg.get("training") or {}
     scheduler_cfg = training_cfg.get("scheduler") or {}
@@ -937,6 +988,7 @@ def _emit_rollout_idle_worker_event(
     replica_rank: int,
     event_type: str,
     memory_released: bool = False,
+    release_source: str = "",
 ) -> bool:
     bus_name = _rollout_idle_event_bus_name(drafter_cfg)
     if not bus_name:
@@ -959,19 +1011,21 @@ def _emit_rollout_idle_worker_event(
             "worker_id": worker_id,
             "replica_rank": int(replica_rank),
             "memory_released": memory_released,
+            "release_source": release_source,
             "must_be_ready_at": must_be_ready_at,
             "event_ts": event_ts,
         },
     )
     logger.warning(
         "[BubbleTime] emit_rollout_idle_event runtime=vllm bus=%s type=%s "
-        "worker_id=%s replica_rank=%s memory_released=%s deadline_in_s=%s "
+        "worker_id=%s replica_rank=%s memory_released=%s release_source=%s deadline_in_s=%s "
         "deadline_source=%s emitted=%s",
         bus_name,
         event_type,
         worker_id,
         replica_rank,
         memory_released,
+        release_source,
         (
             None
             if must_be_ready_at is None
@@ -2094,6 +2148,22 @@ class _SpecoVLLMHttpServerMixin:
     async def launch_server(self, *args, **kwargs):
         self._speco_vllm_spec_decode_pending_stats = _new_vllm_spec_decode_stats()
         install_vllm_runtime_observability()
+        drafter_cfg, config_source = _ensure_vllm_server_drafter_env(
+            self.config,
+            getattr(type(self), "_speco_drafter_config_env", None),
+        )
+        idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+        logger.warning(
+            "[BubbleTime] vLLM idle hook ready: replica_rank=%s source=%s "
+            "strategy=%s event_bus=%s enabled=%s",
+            getattr(self, "replica_rank", 0),
+            config_source,
+            _get_nested(
+                drafter_cfg, ("training", "scheduler", "execution", "strategy"), "sync"
+            ),
+            _rollout_idle_event_bus_name(drafter_cfg),
+            bool(idle_cfg),
+        )
         _ensure_vllm_drafter_speculative_config_from_env(self.config)
         return await super().launch_server(*args, **kwargs)
 
@@ -2138,26 +2208,40 @@ class _SpecoVLLMHttpServerMixin:
         active_requests = int(getattr(self, "_speco_rollout_active_requests", 0) or 0)
         self._speco_rollout_active_requests = active_requests + 1
         if active_requests == 0:
+            self._speco_rollout_release_verified = True
             _emit_rollout_idle_worker_event(
                 drafter_cfg=drafter_cfg,
                 replica_rank=replica_rank,
                 event_type="GENERATION_STARTED",
             )
+        request_completed = False
         try:
             output = await super().generate(*args, **kwargs)
+            request_completed = True
         finally:
+            if not request_completed:
+                self._speco_rollout_release_verified = False
             remaining_requests = max(
                 int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
                 0,
             )
             self._speco_rollout_active_requests = remaining_requests
             if remaining_requests == 0:
+                release_verified = bool(
+                    getattr(self, "_speco_rollout_release_verified", False)
+                )
                 _emit_rollout_idle_worker_event(
                     drafter_cfg=drafter_cfg,
                     replica_rank=replica_rank,
                     event_type="WORKER_IDLE",
-                    memory_released=True,
+                    memory_released=release_verified,
+                    release_source=(
+                        "runtime_request_finalized"
+                        if release_verified
+                        else "runtime_request_failed"
+                    ),
                 )
+                self._speco_rollout_release_verified = False
         extra_fields = getattr(output, "extra_fields", None)
         if isinstance(extra_fields, dict):
             self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
@@ -2166,12 +2250,18 @@ class _SpecoVLLMHttpServerMixin:
 
 def _build_speco_vllm_http_server_class(upstream_module: Any):
     upstream_cls = upstream_module.vLLMHttpServer
+    drafter_config_env = os.getenv(SPECO_DRAFTER_CONFIG_ENV)
     if issubclass(upstream_cls, _SpecoVLLMHttpServerMixin):
+        if drafter_config_env:
+            upstream_cls._speco_drafter_config_env = drafter_config_env
         return upstream_cls
     return type(
         "SpecoVLLMHttpServer",
         (_SpecoVLLMHttpServerMixin, upstream_cls),
-        {"__module__": __name__},
+        {
+            "__module__": __name__,
+            "_speco_drafter_config_env": drafter_config_env,
+        },
     )
 
 

@@ -24,6 +24,8 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
@@ -77,6 +79,16 @@ logger = logging.getLogger(__name__)
 
 _BOOTSTRAP_IDLE_BATCH_ESTIMATE_SEC = 0.25
 _BOOTSTRAP_IDLE_DEADLINE_GUARD_SEC = 0.05
+
+
+def _conservative_percentile(
+    values: Iterable[float], quantile: float = 0.9
+) -> float:
+    samples = sorted(max(float(value), 0.0) for value in values)
+    if not samples:
+        return 0.0
+    index = max(0, min(int(math.ceil(quantile * len(samples))) - 1, len(samples) - 1))
+    return samples[index]
 
 
 @dataclass
@@ -221,6 +233,10 @@ class DrafterScheduler:
         self._last_successful_training_ts: float | None = None
         self._training_progress_start_ts: float = time.time()
         self._idle_worker_batch_estimate_sec: float | None = None
+        self._idle_worker_batch_samples_sec: deque[float] = deque(maxlen=32)
+        self._idle_worker_reclaim_samples_sec: deque[float] = deque(maxlen=32)
+        self._replica_idle_started_at: dict[int, float] = {}
+        self._replica_idle_window_samples_sec: deque[float] = deque(maxlen=32)
 
     def _effective_idle_batch_estimate_sec(
         self,
@@ -229,7 +245,14 @@ class DrafterScheduler:
         if config.idle_worker_initial_batch_estimate_sec is not None:
             return max(float(config.idle_worker_initial_batch_estimate_sec), 1.0e-9)
         if self._idle_worker_batch_estimate_sec is not None:
-            return max(float(self._idle_worker_batch_estimate_sec), 1.0e-9)
+            conservative_batch_sec = _conservative_percentile(
+                self._idle_worker_batch_samples_sec
+            )
+            return max(
+                float(self._idle_worker_batch_estimate_sec),
+                conservative_batch_sec,
+                1.0e-9,
+            )
         return _BOOTSTRAP_IDLE_BATCH_ESTIMATE_SEC
 
     def _idle_batch_estimate_is_bootstrap(
@@ -246,9 +269,38 @@ class DrafterScheduler:
         config: DrafterScheduleConfig,
     ) -> float:
         if config.idle_worker_deadline_guard_sec is not None:
-            return max(float(config.idle_worker_deadline_guard_sec), 0.0)
-        estimate = self._effective_idle_batch_estimate_sec(config)
-        return max(_BOOTSTRAP_IDLE_DEADLINE_GUARD_SEC, estimate * 0.1)
+            configured_guard = max(float(config.idle_worker_deadline_guard_sec), 0.0)
+        else:
+            estimate = self._effective_idle_batch_estimate_sec(config)
+            configured_guard = max(
+                _BOOTSTRAP_IDLE_DEADLINE_GUARD_SEC, estimate * 0.1
+            )
+        reclaim_guard = _conservative_percentile(
+            self._idle_worker_reclaim_samples_sec
+        )
+        return max(configured_guard, reclaim_guard)
+
+    def record_reclaim_elapsed(self, elapsed_sec: float) -> None:
+        elapsed_sec = max(float(elapsed_sec), 0.0)
+        if elapsed_sec <= 0.0:
+            return
+        self._idle_worker_reclaim_samples_sec.append(elapsed_sec)
+        logger.warning(
+            "[BubbleTime] updated reclaim guard: observed_s=%.3f guard_s=%.3f samples=%s",
+            elapsed_sec,
+            _conservative_percentile(self._idle_worker_reclaim_samples_sec),
+            len(self._idle_worker_reclaim_samples_sec),
+        )
+
+    def _effective_historical_idle_window_sec(self) -> float | None:
+        if not self._replica_idle_window_samples_sec:
+            return None
+        # Use the lower tail.  A deadline based on a long-tail average would
+        # start work that cannot be reclaimed before shorter rollout cycles.
+        return _conservative_percentile(
+            self._replica_idle_window_samples_sec,
+            quantile=0.1,
+        )
 
     def _effective_idle_min_window_sec(
         self,
@@ -337,6 +389,7 @@ class DrafterScheduler:
                 worker_id=str(event.get("worker_id", "")),
                 replica_rank=_as_int(event.get("replica_rank", 0)),
                 memory_released=bool(event.get("memory_released", False)),
+                release_source=str(event.get("release_source", "") or ""),
                 must_be_ready_at=(
                     None
                     if event.get("must_be_ready_at") is None
@@ -354,10 +407,31 @@ class DrafterScheduler:
                 worker_id=event.worker_id,
                 replica_rank=event.replica_rank,
                 memory_released=event.memory_released,
+                release_source=event.release_source,
                 must_be_ready_at=event.must_be_ready_at,
                 event_ts=event.event_ts,
             )
         event_ts = event.event_ts if event.event_ts is not None else time.time()
+        if event.event_type is RolloutWorkerEventType.WORKER_IDLE:
+            if event.memory_released:
+                self._replica_idle_started_at[event.replica_rank] = event_ts
+            else:
+                self._replica_idle_started_at.pop(event.replica_rank, None)
+        elif event.event_type is RolloutWorkerEventType.GENERATION_STARTED:
+            idle_started_at = self._replica_idle_started_at.pop(
+                event.replica_rank, None
+            )
+            if idle_started_at is not None and event_ts > idle_started_at:
+                observed_window = event_ts - idle_started_at
+                self._replica_idle_window_samples_sec.append(observed_window)
+                logger.warning(
+                    "[BubbleTime] observed replica idle window: replica_rank=%s "
+                    "window_s=%.3f conservative_window_s=%.3f samples=%s",
+                    event.replica_rank,
+                    observed_window,
+                    self._effective_historical_idle_window_sec(),
+                    len(self._replica_idle_window_samples_sec),
+                )
         worker_ids = self._replica_idle_worker_groups.get(event.replica_rank)
         if not worker_ids:
             worker_ids = (event.worker_id,)
@@ -365,13 +439,14 @@ class DrafterScheduler:
             self._record_worker_event_state(event, worker_id, event_ts)
         logger.warning(
             "[BubbleTime] worker_event type=%s worker_id=%s replica_rank=%s "
-            "expanded_worker_ids=%s memory_released=%s must_be_ready_at=%s "
+            "expanded_worker_ids=%s memory_released=%s release_source=%s must_be_ready_at=%s "
             "event_ts=%s idle_state=%s",
             event.event_type.value,
             event.worker_id,
             event.replica_rank,
             worker_ids,
             event.memory_released,
+            event.release_source,
             event.must_be_ready_at,
             event_ts,
             _idle_state_summary(self._idle_workers, now=event_ts),
@@ -605,16 +680,28 @@ class DrafterScheduler:
             minimum_window = min(windows, default=math.inf)
             if math.isinf(minimum_window):
                 minimum_window = self._effective_idle_min_window_sec(config)
+            historical_window = self._effective_historical_idle_window_sec()
+            if historical_window is not None:
+                historical_remaining = min(
+                    max(
+                        historical_window - max(now - idle_states[worker_id].event_ts, 0.0),
+                        0.0,
+                    )
+                    for worker_id in group
+                )
+                minimum_window = min(minimum_window, historical_remaining)
             min_idle_window_sec = self._effective_idle_min_window_sec(config)
             if minimum_window < min_idle_window_sec:
                 logger.warning(
                     "[BubbleTime] idle_resource_skip reason=window_too_small "
                     "group_id=idle-group-%s group=%s minimum_window_s=%.3f "
-                    "min_required_s=%.3f now=%.3f idle_state=%s",
+                    "min_required_s=%.3f historical_window_s=%s now=%.3f "
+                    "idle_state=%s",
                     index,
                     group,
                     minimum_window,
                     min_idle_window_sec,
+                    historical_window,
                     now,
                     _idle_state_summary(self._idle_workers, now=now),
                 )
@@ -627,11 +714,13 @@ class DrafterScheduler:
                 )
             logger.warning(
                 "[BubbleTime] idle_resource_ready group_id=idle-group-%s group=%s "
-                "minimum_window_s=%.3f min_required_s=%.3f now=%.3f",
+                "minimum_window_s=%.3f min_required_s=%.3f "
+                "historical_window_s=%s now=%.3f",
                 index,
                 group,
                 minimum_window,
                 min_idle_window_sec,
+                historical_window,
                 now,
             )
             return AvailableTrainingResources(
@@ -1313,6 +1402,7 @@ class DrafterScheduler:
                 / max(int(outcome.successful_steps), 1),
             )
             if batch_sec > 0:
+                self._idle_worker_batch_samples_sec.append(batch_sec)
                 if self._idle_worker_batch_estimate_sec is None:
                     self._idle_worker_batch_estimate_sec = batch_sec
                 else:

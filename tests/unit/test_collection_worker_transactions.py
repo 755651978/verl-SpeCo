@@ -3,16 +3,18 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 from __future__ import annotations
 
+import asyncio
 import time
 from collections import deque
 from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from verl_speco.trainer.data_buffer import DataBuffer
-from verl_speco.workers.speco_worker import SpecoWorker
+from verl_speco.trainer.data_buffer import DataBuffer  # noqa: E402
+from verl_speco.workers import speco_worker  # noqa: E402
+from verl_speco.workers.speco_worker import SpecoWorker  # noqa: E402
 
 
 def _worker() -> SpecoWorker:
@@ -82,3 +84,39 @@ def test_data_buffer_reservation_is_versioned_and_consume_once() -> None:
     assert buffer.consume("plan-4", [step_four_a]) == 1
     assert buffer.release_reservation("plan-4") == 1
     assert buffer.get_available_data(target_version=4) == [step_four_b]
+
+
+def test_collection_ref_resolution_awaits_without_ray_get(monkeypatch) -> None:
+    class AwaitableRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    monkeypatch.setattr(speco_worker.ray, "ObjectRef", AwaitableRef)
+    monkeypatch.setattr(
+        speco_worker.ray,
+        "get",
+        lambda _: pytest.fail("collection ref resolution must not call ray.get"),
+    )
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    resolved = asyncio.run(
+        speco_worker._resolve_hidden_state_chunks(
+            [
+                {
+                    "ref": AwaitableRef(hidden),
+                    "chunk_start": 0,
+                    "chunk_length": 2,
+                    "chunk_row_indices": [0, 1],
+                }
+            ],
+            expected_rows=2,
+        )
+    )
+
+    assert torch.equal(resolved, hidden.unsqueeze(0))

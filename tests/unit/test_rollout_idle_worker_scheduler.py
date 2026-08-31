@@ -430,6 +430,62 @@ def test_idle_worker_auto_budget_bootstraps_one_batch_without_manual_estimate() 
     assert plan.idle_batch_estimate_sec == pytest.approx(0.25)
 
 
+def test_idle_worker_budget_is_capped_by_observed_replica_idle_window() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    for replica_rank, worker_id in enumerate(("0", "1")):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=replica_rank,
+                memory_released=True,
+                event_ts=100.0,
+            )
+        )
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.GENERATION_STARTED,
+                worker_id=worker_id,
+                replica_rank=replica_rank,
+                event_ts=102.0,
+            )
+        )
+
+    now = time.time()
+    for replica_rank, worker_id in enumerate(("0", "1")):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=replica_rank,
+                memory_released=True,
+                must_be_ready_at=now + 30.0,
+                event_ts=now,
+            )
+        )
+    config = replace(
+        _idle_config(),
+        idle_worker_initial_batch_estimate_sec=0.5,
+        idle_worker_deadline_guard_sec=0.1,
+        idle_worker_max_batches_per_window=10,
+    )
+
+    plan = scheduler.prepare_training_plan(_context(), config)
+
+    assert plan.launch
+    assert plan.idle_window_sec == pytest.approx(2.0, abs=0.1)
+    assert plan.max_batches == 3
+
+
+def test_idle_worker_deadline_guard_learns_reclaim_cost() -> None:
+    scheduler = DrafterScheduler()
+    config = replace(_idle_config(), idle_worker_deadline_guard_sec=0.1)
+
+    scheduler.record_reclaim_elapsed(0.7)
+
+    assert scheduler._effective_idle_deadline_guard_sec(config) == pytest.approx(0.7)
+
+
 def test_idle_worker_training_does_not_wait_for_training_interval() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     deadline_ts = time.time() + 30.0
@@ -969,6 +1025,11 @@ def test_trainer_fallback_idle_events_from_generation_output() -> None:
     assert metrics["bubble/fallback_idle_events"] == 2
     assert metrics["bubble/idle_workers"] == 2
     assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 2
+    resources = trainer._drafter_scheduler.select_idle_training_resources(
+        trainer._speco_drafter_schedule_config()
+    )
+    assert resources.available is False
+    assert resources.reason == "incomplete_training_group"
     assert output.non_tensor_batch["drafter_sample"][0]["id"] == "a"
 
 
@@ -1033,9 +1094,13 @@ def test_trainer_reclaims_active_idle_workers_before_next_generation() -> None:
 
     metrics = trainer._speco_reclaim_rollout_idle_workers_before_generation()
 
-    assert metrics == {"bubble/reclaim_requested": 1, "bubble/reclaim_drained": 0}
+    assert metrics["bubble/reclaim_requested"] == 1
+    assert metrics["bubble/reclaim_drained"] == 0
+    assert metrics["timing_s/drafter_reclaim_wait"] >= 0.0
+    assert metrics["timing_s/drafter_critical_path_before_generation"] >= 0.0
     assert events == [("worker-0", "worker-1")]
     assert drain_calls == [True]
+    assert len(trainer._drafter_scheduler._idle_worker_reclaim_samples_sec) == 1
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
