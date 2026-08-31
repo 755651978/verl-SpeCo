@@ -203,6 +203,10 @@ def _drafter_uses_dflash_aux_hidden(drafter_cfg: dict[str, Any]) -> bool:
     algorithm = str(drafter_cfg.get("speculative_algorithm", "") or "").upper()
     training_cfg = drafter_cfg.get("training") or {}
     return bool(
+        # DFLASH2, like DOMINO, never reaches this path: it is not an
+        # engine-level algorithm, so the ServerArgs override below fails loud
+        # for it under the same ``enable`` this check requires. A trained
+        # DFlash2 checkpoint is served as DFLASH.
         algorithm in {"DFLASH", "DSPARK"}
         and drafter_cfg.get("enable")
         and drafter_cfg.get("enable_drafter_training")
@@ -631,6 +635,19 @@ def _server_args_overrides_from_drafter(
             "for the rollout/serve path; the trained checkpoint's dflash_config.projector_type=domino "
             "enables the Domino correction head on engines that support it, keeping DOMINO for "
             "drafter training."
+        )
+    if algorithm == "DFLASH2":
+        # Same story as Domino: DFlash2 is a DFlash variant whose extra modules
+        # (dynamic convolutions + candidate selector) ride in the checkpoint's
+        # dflash_config, not a distinct engine-level method. DFLASH2 is never a
+        # valid SGLang ServerArgs algorithm, so fail loud instead of forwarding
+        # the raw string.
+        raise ValueError(
+            "DFLASH2 is not an engine-level speculative algorithm; DFlash2 is served as a DFlash "
+            "checkpoint. Keep DFLASH2 for drafter training (which this overlay runs offline) and "
+            "set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH to serve a trained "
+            "DFlash2 checkpoint as a frozen rollout drafter; its dflash_config carries the DFlash2 "
+            "convolution and selector hyperparameters."
         )
 
     rollout_cfg = drafter_cfg.get("rollout") or {}

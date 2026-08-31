@@ -812,6 +812,13 @@ def _drafter_algorithm(drafter_cfg: dict[str, Any]) -> str:
     )
 
 
+# Draft architectures vLLM can serve through its DFlash speculative path.
+# Keep in sync with the alias sets in verl_speco/models/auto.py.
+_DFLASH_SERVABLE_ARCHITECTURES = frozenset(
+    {"DFlashDraftModel", "DFlash2DraftModel", "Qwen3DFlash2Model"}
+)
+
+
 def _validate_vllm_dflash_drafter_config(
     spec_model_path: Any, algorithm: str = "DFLASH"
 ) -> None:
@@ -842,10 +849,15 @@ def _validate_vllm_dflash_drafter_config(
             )
         return
 
-    if architectures and "DFlashDraftModel" not in architectures:
+    # DFlash2 is served as a DFlash checkpoint (the engine reads its convolution
+    # and selector hyperparameters out of dflash_config), which is what the
+    # DFLASH2 fail-loud above tells users to do, so its architecture has to be
+    # accepted here or that advice would be unfollowable.
+    if architectures and _DFLASH_SERVABLE_ARCHITECTURES.isdisjoint(architectures):
         raise ValueError(
             "vLLM DFlash requires actor_rollout_ref.rollout.drafter.model_path "
-            "to point to a DFlash drafter checkpoint with architectures=['DFlashDraftModel']; "
+            "to point to a DFlash-family drafter checkpoint with architectures in "
+            f"{sorted(_DFLASH_SERVABLE_ARCHITECTURES)}; "
             f"got architectures={architectures!r} from {config_path}. "
             "Do not use an EAGLE/EAGLE3 drafter path with speculative_algorithm=DFLASH."
         )
@@ -908,6 +920,19 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
             "for the rollout/serve path; the trained checkpoint's dflash_config.projector_type=domino "
             "enables the Domino correction head on engines that support it, keeping DOMINO for "
             "drafter training."
+        )
+    if algorithm == "DFLASH2":
+        # Same story as Domino: DFlash2 is a DFlash variant whose extra modules
+        # (dynamic convolutions + candidate selector) ride in the checkpoint's
+        # dflash_config, not a distinct engine-level method. DFLASH2 is never a
+        # valid vLLM method, so fail loud instead of forwarding the raw string,
+        # mirroring sglang_runtime._server_args_overrides_from_drafter.
+        raise ValueError(
+            "DFLASH2 is not an engine-level speculative algorithm; DFlash2 is served as a DFlash "
+            "checkpoint. Keep DFLASH2 for drafter training (which this overlay runs offline) and "
+            "set actor_rollout_ref.rollout.drafter.speculative_algorithm=DFLASH to serve a trained "
+            "DFlash2 checkpoint as a frozen rollout drafter; its dflash_config carries the DFlash2 "
+            "convolution and selector hyperparameters."
         )
     if algorithm == "DSPARK":
         return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"

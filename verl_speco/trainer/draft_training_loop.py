@@ -307,6 +307,25 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
             "target_num_hidden_layers",
         ),
     ),
+    # DFlash2 is served as a DFlash checkpoint whose dflash_config carries the
+    # selector/conv hyperparameters, matching the released z-lab layout.
+    "dflash2": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "conv_kernel_size",
+            "conv_group_size",
+            "selector_rank",
+            "selector_top_k",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+        ),
+    ),
     "dspark": (
         "dspark_config",
         (
@@ -341,7 +360,7 @@ def _rewrite_standalone_block_runtime_config(
     contract and only merge the alias fields needed by vLLM/SGLang.
     """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dspark", "domino"}:
+    if backend_type not in {"dflash", "dflash2", "dspark", "domino"}:
         return
 
     if completed_future is not None:

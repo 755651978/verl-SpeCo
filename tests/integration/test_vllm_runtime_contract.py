@@ -409,6 +409,21 @@ def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(
         _validate_vllm_dflash_drafter_config(model_path, algorithm="DFLASH")
 
 
+def test_vllm_dflash_validator_accepts_a_dflash2_checkpoint(tmp_path) -> None:
+    """DFLASH2 is rejected as an engine method and served as a DFlash checkpoint.
+
+    That advice is only followable if the DFlash path accepts the DFlash2
+    architecture.
+    """
+    model_path = tmp_path / "dflash2-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["DFlash2DraftModel"]}', encoding="utf-8"
+    )
+
+    _validate_vllm_dflash_drafter_config(model_path, algorithm="DFLASH")
+
+
 def test_vllm_dspark_validator_accepts_markov_head_config(tmp_path) -> None:
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()

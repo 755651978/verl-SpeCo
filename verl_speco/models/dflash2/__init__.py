@@ -11,25 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .configuration_dflash import DFlashConfig, resolve_rope_theta
-from .modeling_dflash import (
-    DFlashAttention,
-    DFlashDecoderLayer,
-    DFlashDraftModel,
-    DFlashMLP,
-    DFlashRMSNorm,
-    DFlashRotaryEmbedding,
-    build_target_layer_ids,
+from verl_speco.models.dflash2.configuration_dflash2 import DFlash2Config
+from verl_speco.models.dflash2.modeling_dflash2 import (
+    CandidateSelector,
+    DFlash2DraftModel,
+    GroupedDynamicCausalConv,
+    grouped_dynamic_convolve,
 )
 
 __all__ = [
-    "DFlashConfig",
-    "DFlashDraftModel",
-    "DFlashAttention",
-    "DFlashDecoderLayer",
-    "DFlashMLP",
-    "DFlashRMSNorm",
-    "DFlashRotaryEmbedding",
-    "build_target_layer_ids",
-    "resolve_rope_theta",
+    "CandidateSelector",
+    "DFlash2Config",
+    "DFlash2DraftModel",
+    "GroupedDynamicCausalConv",
+    "grouped_dynamic_convolve",
 ]
