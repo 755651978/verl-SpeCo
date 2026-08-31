@@ -2878,6 +2878,8 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         cumem-managed memory after sleep/wake_up cycles.
         """
 
+        import os
+
         import torch
         from vllm.platforms import current_platform
 
@@ -2985,7 +2987,35 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 draft_method,
                 [n for n, _ in translated_weights[:5]],
             )
-            inner_model.load_weights(iter(translated_weights))
+            debug_weight_load = os.environ.get("SPECO_DRAFT_WEIGHT_LOAD_DEBUG") == "1"
+            if debug_weight_load:
+                target_params = dict(inner_model.named_parameters())
+
+                def _logged_weights():
+                    for index, (name, tensor) in enumerate(translated_weights):
+                        target = target_params.get(name)
+                        logger.warning(
+                            "[speco draft ipc debug] tp_rank=%s index=%s name=%s "
+                            "source=(shape=%s dtype=%s device=%s contiguous=%s) "
+                            "target=(shape=%s dtype=%s device=%s)",
+                            getattr(self, "rank", getattr(self, "local_rank", "unknown")),
+                            index,
+                            name,
+                            tuple(tensor.shape),
+                            tensor.dtype,
+                            tensor.device,
+                            tensor.is_contiguous(),
+                            tuple(target.shape) if target is not None else None,
+                            target.dtype if target is not None else None,
+                            target.device if target is not None else None,
+                        )
+                        yield name, tensor
+
+                inner_model.load_weights(_logged_weights())
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            else:
+                inner_model.load_weights(iter(translated_weights))
 
             # Rebuild fused KV buffers (torch.cat snapshot, not a view).
             try:

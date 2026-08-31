@@ -353,6 +353,36 @@ def test_metadata_replica_groups_merge_multiple_ranks_for_same_replica() -> None
     assert plan.target_worker_ids == ("0", "1")
 
 
+def test_metadata_replica_worker_mapping_is_available_for_fallback() -> None:
+    scheduler = DrafterScheduler()
+    scheduler.register_idle_training_resource_metadata(
+        [
+            {
+                "rank": 0,
+                "worker_id": "0",
+                "in_drafter_train_group": True,
+                "replica_rank": 0,
+                "training_group_ranks": [0],
+                "full_collective_ranks": [0, 1],
+            },
+            {
+                "rank": 1,
+                "worker_id": "1",
+                "in_drafter_train_group": True,
+                "replica_rank": 0,
+                "training_group_ranks": [1],
+                "full_collective_ranks": [0, 1],
+            },
+        ]
+    )
+
+    assert scheduler.rollout_idle_replica_ranks() == (0,)
+    assert scheduler.rollout_idle_worker_ids_for_replica(0) == ("0", "1")
+    assert scheduler.rollout_idle_worker_ids_for_replica(
+        1, fallback_worker_id="worker-1"
+    ) == ("worker-1",)
+
+
 def test_auto_idle_worker_without_metadata_or_group_size_fails_closed() -> None:
     scheduler = DrafterScheduler()
     scheduler.on_worker_event(
@@ -479,6 +509,29 @@ def test_idle_worker_plan_uses_buffered_data_target_version() -> None:
     assert plan.source_global_step == 11
     assert plan.data_version == 10
     assert plan.required_target_version == 10
+
+
+def test_idle_worker_publish_is_async_after_weight_update() -> None:
+    scheduler = DrafterScheduler()
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=1,
+        publish_after_success=True,
+    )
+
+    publish_plan = scheduler.plan_publish(
+        global_step=10,
+        drafter_trained=True,
+        config=_idle_config(),
+        training_plan=plan,
+    )
+
+    assert publish_plan.publish
+    assert publish_plan.asynchronous
 
 
 def test_idle_worker_starvation_guard_launches_sync_fallback_at_safe_point() -> None:
@@ -855,6 +908,33 @@ def _trainer_with_idle_config() -> SpecoRayPPOTrainer:
     return trainer
 
 
+def _trainer_with_default_idle_budget() -> SpecoRayPPOTrainer:
+    assert SpecoRayPPOTrainer is not None
+    trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    trainer.config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "data_parallel_size": 1,
+                "drafter": {
+                    "enable": True,
+                    "enable_drafter_training": True,
+                    "training": {
+                        "scheduler": {
+                            "execution": {"strategy": "rollout_idle_worker"},
+                            "idle_worker": {
+                                "training_groups": [["worker-0"]],
+                            },
+                        }
+                    },
+                },
+            }
+        }
+    }
+    trainer._drafter_scheduler = DrafterScheduler()
+    trainer._drafter_runtime_state = DrafterRuntimeState()
+    return trainer
+
+
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
 def test_trainer_generation_completion_does_not_create_synthetic_idle_window() -> None:
     trainer = _trainer_with_idle_config()
@@ -888,6 +968,15 @@ def test_trainer_fallback_idle_events_from_generation_output() -> None:
     assert metrics["bubble/idle_workers"] == 2
     assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 2
     assert output.non_tensor_batch["drafter_sample"][0]["id"] == "a"
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_trainer_fallback_idle_uses_bootstrap_window_floor() -> None:
+    trainer = _trainer_with_default_idle_budget()
+
+    deadline_ts = trainer._speco_rollout_idle_fallback_deadline_ts()
+
+    assert deadline_ts - time.time() >= 9.0
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")

@@ -114,6 +114,7 @@ SPECO_VLLM_SPEC_DECODE_MEAN_ACCEPTANCE_METRIC = (
 _SPECO_VLLM_SPEC_DECODE_DRAFTS_KEY = "_speco_vllm_spec_decode_drafts"
 _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_tokens"
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
+_SPECO_BOOTSTRAP_FALLBACK_IDLE_WINDOW_SEC = 10.0
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
@@ -1185,6 +1186,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"launch={getattr(plan, 'launch', False)} "
                 f"reason={getattr(plan, 'reason', None)} "
                 f"max_batches={getattr(plan, 'max_batches', 0)} "
+                f"idle_window_s={getattr(plan, 'idle_window_sec', None)} "
+                f"usable_window_s={getattr(plan, 'idle_usable_window_sec', None)} "
+                f"window_batches={getattr(plan, 'idle_window_batches', None)} "
+                f"trainable_batches={getattr(plan, 'idle_trainable_batches', None)} "
+                f"batch_estimate_s={getattr(plan, 'idle_batch_estimate_sec', None)} "
                 f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
                 f"idle_groups={metrics.get('bubble/idle_training_groups', 0)}",
                 flush=True,
@@ -1340,6 +1346,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 continue
         return tuple(sorted(ranks))
 
+    def _speco_fallback_idle_replica_ranks(
+        self,
+        gen_batch_output: Any,
+    ) -> tuple[int, ...]:
+        replica_ranks = self._speco_generation_output_replica_ranks(gen_batch_output)
+        if replica_ranks:
+            return replica_ranks
+        scheduler = self._speco_get_drafter_scheduler()
+        metadata_ranks = scheduler.rollout_idle_replica_ranks()
+        if metadata_ranks:
+            return metadata_ranks
+        return tuple(
+            self._speco_rollout_replica_rank(worker_id, index)
+            for index, worker_id in enumerate(self._speco_rollout_idle_worker_ids())
+        )
+
     def _speco_rollout_idle_fallback_deadline_ts(self) -> float:
         scheduler = self._speco_get_drafter_scheduler()
         config = self._speco_drafter_schedule_config()
@@ -1347,7 +1369,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         guard = scheduler._effective_idle_deadline_guard_sec(config)
         min_window = scheduler._effective_idle_min_window_sec(config)
         max_batches = scheduler._effective_idle_max_batches_per_window(config)
-        return time.time() + max(batch_estimate * max(max_batches, 1) + guard, min_window)
+        fallback_window = max(batch_estimate * max(max_batches, 1) + guard, min_window)
+        if scheduler._idle_batch_estimate_is_bootstrap(config):
+            fallback_window = max(
+                fallback_window,
+                _SPECO_BOOTSTRAP_FALLBACK_IDLE_WINDOW_SEC,
+            )
+        return time.time() + fallback_window
 
     def _speco_emit_rollout_idle_from_generation_output(
         self,
@@ -1357,7 +1385,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> dict[str, Any]:
         if not self._speco_rollout_idle_worker_enabled():
             return {}
-        replica_ranks = self._speco_generation_output_replica_ranks(gen_batch_output)
+        replica_ranks = self._speco_fallback_idle_replica_ranks(gen_batch_output)
         if not replica_ranks:
             print(
                 "[BubbleTime] fallback_idle: skipped "
@@ -1375,21 +1403,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         emitted_worker_ids: list[str] = []
         scheduler = self._speco_get_drafter_scheduler()
         for replica_rank in replica_ranks:
-            worker_id = (
-                worker_ids[replica_rank]
-                if 0 <= replica_rank < len(worker_ids)
-                else str(replica_rank)
+            fallback_worker_id = (
+                worker_ids[replica_rank] if 0 <= replica_rank < len(worker_ids) else None
             )
-            emitted_worker_ids.append(worker_id)
-            scheduler.on_worker_event(
-                RolloutWorkerEvent(
-                    RolloutWorkerEventType.WORKER_IDLE,
-                    worker_id=worker_id,
-                    replica_rank=replica_rank,
-                    memory_released=True,
-                    must_be_ready_at=deadline_ts,
+            for worker_id in scheduler.rollout_idle_worker_ids_for_replica(
+                replica_rank,
+                fallback_worker_id=fallback_worker_id,
+            ):
+                emitted_worker_ids.append(worker_id)
+                scheduler.on_worker_event(
+                    RolloutWorkerEvent(
+                        RolloutWorkerEventType.WORKER_IDLE,
+                        worker_id=worker_id,
+                        replica_rank=replica_rank,
+                        memory_released=True,
+                        must_be_ready_at=deadline_ts,
+                    )
                 )
-            )
         logger.warning(
             "[BubbleTime] fallback idle events emitted: reason=%s "
             "replica_ranks=%s worker_ids=%s deadline_in_s=%.3f",
@@ -2810,12 +2840,29 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         defer_publish_until_update_weights = callable(
             original_checkpoint_update_weights
         )
-        pending_drafter_publish = {
-            "ready": False,
-            "drafter_trained": False,
-            "actor_output": None,
-            "training_plan": None,
-        }
+        pending_drafter_publishes: list[dict[str, Any]] = []
+
+        def defer_drafter_publish(
+            *,
+            drafter_trained: bool,
+            training_plan: TrainingPlan | None,
+            actor_output: Any,
+        ) -> None:
+            if not drafter_trained:
+                return
+            pending_drafter_publishes.append(
+                {
+                    "drafter_trained": drafter_trained,
+                    "training_plan": training_plan,
+                    "actor_output": actor_output,
+                }
+            )
+            print(
+                "[BubbleTime] publish_deferred: "
+                f"plan_id={getattr(training_plan, 'plan_id', None)} "
+                "reason=await_upstream_weight_update",
+                flush=True,
+            )
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
@@ -2995,10 +3042,28 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 time.perf_counter() - compute_started
             )
             collect_started = time.perf_counter()
-            self._speco_collect_oldlogprob_features(batch, collect_plan, output)
+            collected = self._speco_collect_oldlogprob_features(
+                batch,
+                collect_plan,
+                output,
+            )
             self._speco_last_oldlogprob_collect_elapsed_sec = (
                 time.perf_counter() - collect_started
             )
+            if collected > 0 and self._speco_rollout_idle_worker_enabled():
+                # Bubble Time deliberately consumes buffered data from the
+                # preceding rollout.  Launching here would make the current
+                # rollout wait for old-logprob collection and spend the same
+                # bubble that should be reserved for training.  update_actor
+                # below caches the matching actor head before its update; the
+                # next rollout's generation-complete hook then selects this
+                # immutable data/head pair and trains it asynchronously.
+                print(
+                    "[BubbleTime] pipeline_data_staged: "
+                    f"samples={collected} source_step={self.global_steps} "
+                    "launch_deferred_to_next_generation=True",
+                    flush=True,
+                )
 
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
@@ -3048,12 +3113,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             if completed_outcome is not None:
                 metrics.update(completed_outcome.metrics)
-                metrics.update(
-                    self._speco_publish_drafter_weights(
-                        completed_outcome.trained,
-                        completed_plan,
+                if defer_publish_until_update_weights:
+                    defer_drafter_publish(
+                        drafter_trained=completed_outcome.trained,
+                        training_plan=completed_plan,
+                        actor_output=None,
                     )
-                )
+                else:
+                    metrics.update(
+                        self._speco_publish_drafter_weights(
+                            completed_outcome.trained,
+                            completed_plan,
+                        )
+                    )
             collection_plan = getattr(self, "_speco_last_collection_plan", None)
             if isinstance(collection_plan, CollectionPlan):
                 metrics.update(collection_plan.metrics())
@@ -3114,10 +3186,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 train_metrics.update(self._speco_get_drafter_runtime_state().metrics())
             metrics.update(train_metrics)
             if defer_publish_until_update_weights and drafter_trained:
-                pending_drafter_publish["ready"] = True
-                pending_drafter_publish["drafter_trained"] = drafter_trained
-                pending_drafter_publish["actor_output"] = actor_output
-                pending_drafter_publish["training_plan"] = training_plan
+                defer_drafter_publish(
+                    drafter_trained=drafter_trained,
+                    training_plan=training_plan,
+                    actor_output=actor_output,
+                )
             else:
                 metrics.update(
                     self._speco_publish_drafter_weights(drafter_trained, training_plan)
@@ -3144,19 +3217,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
             result = original_checkpoint_update_weights(*args, **kwargs)
-            if pending_drafter_publish["ready"]:
+            while pending_drafter_publishes:
+                pending_publish = pending_drafter_publishes.pop(0)
                 publish_metrics = self._speco_publish_drafter_weights(
-                    pending_drafter_publish["drafter_trained"],
-                    pending_drafter_publish["training_plan"],
+                    pending_publish["drafter_trained"],
+                    pending_publish["training_plan"],
                     after_weight_update=True,
                 )
                 self._speco_update_output_metrics(
-                    pending_drafter_publish["actor_output"], publish_metrics
+                    pending_publish["actor_output"], publish_metrics
                 )
-                pending_drafter_publish["ready"] = False
-                pending_drafter_publish["drafter_trained"] = False
-                pending_drafter_publish["actor_output"] = None
-                pending_drafter_publish["training_plan"] = None
             return result
 
         rollout_generation_target.generate_sequences = MethodType(

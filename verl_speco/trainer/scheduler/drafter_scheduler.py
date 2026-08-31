@@ -485,6 +485,26 @@ class DrafterScheduler:
             )
         }
 
+    def rollout_idle_replica_ranks(self) -> tuple[int, ...]:
+        """Return rollout replicas with registered drafter training resources."""
+
+        return tuple(sorted(self._replica_idle_worker_groups))
+
+    def rollout_idle_worker_ids_for_replica(
+        self,
+        replica_rank: int,
+        *,
+        fallback_worker_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Resolve drafter worker ids made idle by one rollout replica."""
+
+        worker_ids = self._replica_idle_worker_groups.get(int(replica_rank), ())
+        if worker_ids:
+            return worker_ids
+        if fallback_worker_id is not None:
+            return (str(fallback_worker_id),)
+        return (str(replica_rank),)
+
     def _idle_training_groups(
         self,
         config: DrafterScheduleConfig,
@@ -1065,17 +1085,26 @@ class DrafterScheduler:
                 max_batches_per_window,
                 budget.max_batches,
             )
+            trainable_batches = (
+                context.data_status.trainable_batches if context.data_status else 0
+            )
+            if max_batches > 0:
+                idle_budget_reason = "idle_worker_budget_ready"
+            elif window_batches <= 0:
+                idle_budget_reason = "window_too_small"
+            elif trainable_batches <= 0:
+                idle_budget_reason = "no_trainable_batch"
+            elif max_batches_per_window <= 0 or budget.max_batches <= 0:
+                idle_budget_reason = "no_training_budget"
+            else:
+                idle_budget_reason = "no_training_budget"
             budget = TrainingBudget(
                 max_batches=max_batches,
                 min_batches=budget.min_batches,
                 deadline_ts=time.time() + usable_window,
                 require_full_batch=budget.require_full_batch,
                 sample_last_n_steps=budget.sample_last_n_steps,
-                reason=(
-                    "idle_worker_budget_ready"
-                    if max_batches > 0
-                    else "window_too_small"
-                ),
+                reason=idle_budget_reason,
             )
             logger.info(
                 "[BubbleTime] idle_budget step=%s group=%s workers=%s "
@@ -1328,6 +1357,16 @@ class DrafterScheduler:
         config: DrafterScheduleConfig,
         training_plan: TrainingPlan | None = None,
     ) -> PublishPlan:
+        # A Bubble Time publish is issued only after the upstream actor weight
+        # update has resumed vLLM.  Keep the transfer off that critical path;
+        # the generation hook waits only if it is still pending at its next
+        # safe point.  The legacy synchronous path continues to honor the
+        # explicit publish_async setting.
+        asynchronous = config.publish_async or (
+            training_plan is not None
+            and training_plan.execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+        )
         if not drafter_trained or (
             training_plan is not None and not training_plan.publish_after_success
         ):
@@ -1340,7 +1379,7 @@ class DrafterScheduler:
                 ),
                 interval_matched=False,
                 source_global_step=global_step,
-                asynchronous=config.publish_async,
+                asynchronous=asynchronous,
             )
         # Preserve the released path exactly: invalid publish configuration is
         # an error instead of being silently converted into a skipped publish.
@@ -1356,7 +1395,7 @@ class DrafterScheduler:
             ),
             interval_matched=interval_matched,
             source_global_step=global_step,
-            asynchronous=config.publish_async,
+            asynchronous=asynchronous,
         )
 
     def execute_publish_plan(self, plan: PublishPlan):
