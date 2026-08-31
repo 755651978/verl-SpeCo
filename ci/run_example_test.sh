@@ -15,6 +15,9 @@ case "${platform}/${backend}/${drafter}" in
   gpu/vllm/dspark)
     example="examples/run_qwen3-8b_drafter_dspark_vllm.sh"
     ;;
+  gpu/vllm/peagle|gpu/vllm/domino)
+    example="examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
+    ;;
   gpu/sglang/eagle3)
     example="examples/run_qwen3-8b_drafter_eagle3_sglang.sh"
     ;;
@@ -40,7 +43,7 @@ case "${platform}/${backend}/${drafter}" in
     example="examples/run_qwen3-8b_drafter_dflash_sglang.sh"
     ;;
   *)
-    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|megatron-eagle3|dflash|dspark}" >&2
+    echo "usage: $0 {gpu|npu} {vllm|sglang} {eagle3|megatron-eagle3|dflash|dspark|peagle|domino}" >&2
     exit 2
     ;;
 esac
@@ -58,6 +61,15 @@ for name in "${required_vars[@]}"; do
   fi
 done
 
+# Domino and P-EAGLE are not engine-level speculative algorithms, so neither can
+# be trained inside the rollout loop. They use the two-stage separate-training
+# workflow instead: stage 1 rolls out with the engine algorithm whose
+# hidden-state layout the drafter consumes and writes a feature store, stage 2
+# trains the drafter offline from that same store.
+# The example owns the collect-to-train algorithm pairing; the runner only needs
+# the collect side of it to pick the matching cached draft model.
+separate_training="false"
+
 case "${drafter}" in
   eagle3|megatron-eagle3)
     draft_model="${SPECO_EAGLE3_DRAFT_MODEL:-}"
@@ -71,9 +83,19 @@ case "${drafter}" in
     draft_model="${SPECO_DSPARK_DRAFT_MODEL:-}"
     draft_algorithm="DSPARK"
     ;;
+  peagle)
+    draft_model="${SPECO_EAGLE3_DRAFT_MODEL:-}"
+    draft_algorithm="EAGLE3"
+    separate_training="true"
+    ;;
+  domino)
+    draft_model="${SPECO_DFLASH_DRAFT_MODEL:-}"
+    draft_algorithm="DFLASH"
+    separate_training="true"
+    ;;
 esac
 if [[ -z "${draft_model}" ]]; then
-  echo "required ${drafter} draft model environment variable is not set" >&2
+  echo "required ${drafter} collect-stage draft model environment variable is not set" >&2
   exit 2
 fi
 
@@ -216,9 +238,62 @@ if [[ "${drafter}" == "dspark" ]]; then
   )
 fi
 
+train_overrides=()
+if [[ "${separate_training}" == "true" ]]; then
+  feature_store_dir="${SPECO_CKPT_DIR}/${drafter}_features"
+  # A draft init path that does not exist yet cold-starts the drafter from the
+  # target config, so this lane needs no extra model in the CI cache.
+  draft_init_path="${SPECO_CKPT_DIR}/${drafter}_draft_init"
+
+  # The example already sets the two-stage shape (collect_only/offline modes,
+  # the standalone launcher, the feature-store flags and the per-algorithm
+  # hyperparameters). Override only what CI has to control: where the stages
+  # meet on disk, and the sizes that keep a smoke run cheap.
+  # A configured SPECO_CKPT_DIR persists between jobs on a self-hosted runner,
+  # so drop any earlier shards: otherwise a collect stage that produced nothing
+  # still trains, and the job goes green on stale features.
+  rm -rf "${feature_store_dir}" "${draft_init_path}"
+
+  overrides+=(
+    "actor_rollout_ref.rollout.drafter.training.feature_store.path=${feature_store_dir}"
+    "actor_rollout_ref.rollout.drafter.training.feature_store.max_samples_per_shard=32"
+  )
+
+  train_overrides=(
+    "actor_rollout_ref.model.path=${SPECO_TARGET_MODEL}"
+    "actor_rollout_ref.rollout.drafter.model_path=${draft_init_path}"
+    "actor_rollout_ref.rollout.drafter.checkpoint_path=${SPECO_CKPT_DIR}/${drafter}_draft_ckpts"
+    "actor_rollout_ref.rollout.drafter.training.max_steps=1"
+    "actor_rollout_ref.rollout.drafter.training.save_interval_steps=1"
+    "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=${SPECO_DRAFTER_BATCH_SIZE_PER_GPU:-1}"
+    "actor_rollout_ref.rollout.drafter.training.feature_store.path=${feature_store_dir}"
+  )
+
+  case "${drafter}" in
+    peagle)
+      train_overrides+=(
+        "actor_rollout_ref.rollout.drafter.training.peagle_num_draft_layers=1"
+        "actor_rollout_ref.rollout.drafter.training.peagle_num_depths=2"
+      )
+      ;;
+    domino)
+      train_overrides+=(
+        "actor_rollout_ref.rollout.drafter.training.domino_block_size=4"
+        "actor_rollout_ref.rollout.drafter.training.domino_num_anchors=8"
+        "actor_rollout_ref.rollout.drafter.training.domino_max_window=64"
+        "actor_rollout_ref.rollout.drafter.training.domino_emb_dim=64"
+        "actor_rollout_ref.rollout.drafter.training.domino_gru_hidden_dim=128"
+        "actor_rollout_ref.rollout.drafter.training.domino_lambda_base_decay_steps=10"
+      )
+      ;;
+  esac
+fi
+
 if [[ -n "${SPECO_EXTRA_HYDRA_ARGS:-}" ]]; then
   while IFS= read -r extra_arg; do
     [[ -z "${extra_arg}" ]] && continue
+    # Stage 2 runs a different entrypoint with a different config tree, so these
+    # rollout-oriented overrides stay on the collect stage.
     overrides+=("${extra_arg}")
   done <<< "${SPECO_EXTRA_HYDRA_ARGS}"
 fi
@@ -229,10 +304,26 @@ if [[ "${SPECO_DRY_RUN:-false}" == "true" ]]; then
   echo "drafter=${drafter}"
   echo "example=${example}"
   echo "draft_algorithm=${draft_algorithm}"
+  echo "separate_training=${separate_training}"
   echo "ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-}"
   printf 'Hydra overrides:\n'
   printf '  %q\n' "${overrides[@]}"
+  if [[ "${separate_training}" == "true" ]]; then
+    printf 'Hydra train overrides:\n'
+    printf '  %q\n' "${train_overrides[@]}"
+  fi
   exit 0
 fi
 
-bash "${example}" "${overrides[@]}"
+if [[ "${separate_training}" == "true" ]]; then
+  DRAFT_ALGO="${drafter}" RUN_STAGE=collect bash "${example}" "${overrides[@]}"
+  if [[ "${enable_training}" == "true" ]]; then
+    DRAFT_ALGO="${drafter}" RUN_STAGE=train DRAFT_TRAIN_GPUS_PER_NODE="${accelerator_count}" bash "${example}" "${train_overrides[@]}"
+  else
+    # Generation-only runs capture no hidden states, so the feature store the
+    # offline trainer would read is empty.
+    echo "SPECO_ENABLE_TRAINING is not true; skipping the offline train stage"
+  fi
+else
+  bash "${example}" "${overrides[@]}"
+fi

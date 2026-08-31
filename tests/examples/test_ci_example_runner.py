@@ -13,10 +13,12 @@
 # limitations under the License.
 from __future__ import annotations
 
+import functools
 import os
 import shlex
 import subprocess
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -38,6 +40,7 @@ def _workflow_source(name: str) -> str:
     return (WORKFLOWS / name).read_text(encoding="utf-8")
 
 
+@functools.lru_cache(maxsize=None)
 def _require_working_bash() -> str:
     bash = shutil.which("bash")
     if bash is None:
@@ -58,6 +61,7 @@ def _bash_path(path: Path, bash: str) -> str:
     return path.as_posix()
 
 
+@functools.lru_cache(maxsize=None)
 def _runner_script() -> str:
     return "\n".join(RUNNER.read_text(encoding="utf-8").splitlines()) + "\n"
 
@@ -289,6 +293,15 @@ def test_example_runner_covers_gpu_and_npu_backend_matrix() -> None:
     assert "examples/run_qwen3-8b_drafter_dflash_sglang.sh" in source
     assert "examples/run_qwen3-8b_drafter_dspark_vllm.sh" in source
     assert "examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh" in source
+    assert "gpu/vllm/peagle" in source
+    assert "gpu/vllm/domino" in source
+    assert (
+        "examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh" in source
+    )
+    # P-EAGLE attends through torch flex_attention, which the NPU runtime does
+    # not provide, so the separate-training lane stays GPU-only.
+    assert "npu/vllm/peagle" not in source
+    assert "npu/vllm/domino" not in source
 
 
 def test_example_runner_exposes_required_hydra_overrides() -> None:
@@ -319,28 +332,7 @@ def test_example_runner_exposes_required_hydra_overrides() -> None:
 
 
 def test_example_runner_dry_run_covers_npu_dspark() -> None:
-    bash = _require_working_bash()
-    env = {
-        "SPECO_DRY_RUN": "true",
-        "SPECO_TARGET_MODEL": "/models/target",
-        "SPECO_DSPARK_DRAFT_MODEL": "/models/dspark",
-        "SPECO_TRAIN_FILE": "/data/train.parquet",
-        "SPECO_TEST_FILE": "/data/test.parquet",
-        "SPECO_CKPT_DIR": "/tmp/speco",
-        "SPECO_ACCELERATOR_COUNT": "1",
-    }
-    script = "".join(
-        f"export {name}={shlex.quote(value)}\n" for name, value in env.items()
-    )
-    script += _runner_script()
-    result = subprocess.run(
-        [bash, "-s", "--", "npu", "vllm", "dspark"],
-        env=os.environ.copy(),
-        input=script.encode("utf-8"),
-        capture_output=True,
-        check=True,
-    )
-    stdout = result.stdout.decode("utf-8", errors="replace")
+    stdout = _dry_run("dspark", platform="npu")
 
     assert "example=examples/run_qwen3-8b_drafter_dspark_vllm_npu.sh" in stdout
     assert "draft_algorithm=DSPARK" in stdout
@@ -350,29 +342,148 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
 
 
 def test_example_runner_dry_run_omits_ulysses_overrides_for_npu_megatron() -> None:
+    stdout = _dry_run("megatron-eagle3", platform="npu", accelerator_count="8")
+
+    assert "example=examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh" in stdout
+    assert "draft_algorithm=EAGLE3" in stdout
+    assert "ulysses_sequence_parallel_size" not in stdout
+
+
+@functools.lru_cache(maxsize=None)
+def _dry_run(
+    drafter: str,
+    platform: str = "gpu",
+    backend: str = "vllm",
+    accelerator_count: str = "1",
+    extra_hydra_args: str | None = None,
+) -> str:
+    """Dump the Hydra overrides the runner would pass, without launching a job."""
     bash = _require_working_bash()
     env = {
         "SPECO_DRY_RUN": "true",
         "SPECO_TARGET_MODEL": "/models/target",
         "SPECO_EAGLE3_DRAFT_MODEL": "/models/eagle3",
+        "SPECO_DFLASH_DRAFT_MODEL": "/models/dflash",
+        "SPECO_DSPARK_DRAFT_MODEL": "/models/dspark",
         "SPECO_TRAIN_FILE": "/data/train.parquet",
         "SPECO_TEST_FILE": "/data/test.parquet",
         "SPECO_CKPT_DIR": "/tmp/speco",
-        "SPECO_ACCELERATOR_COUNT": "8",
+        "SPECO_ACCELERATOR_COUNT": accelerator_count,
     }
+    if extra_hydra_args is not None:
+        env["SPECO_EXTRA_HYDRA_ARGS"] = extra_hydra_args
     script = "".join(
         f"export {name}={shlex.quote(value)}\n" for name, value in env.items()
     )
     script += _runner_script()
-    result = subprocess.run(
-        [bash, "-s", "--", "npu", "vllm", "megatron-eagle3"],
-        env=os.environ.copy(),
-        input=script.encode("utf-8"),
-        capture_output=True,
-        check=True,
-    )
-    stdout = result.stdout.decode("utf-8", errors="replace")
 
-    assert "example=examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh" in stdout
-    assert "draft_algorithm=EAGLE3" in stdout
-    assert "ulysses_sequence_parallel_size" not in stdout
+    # Run from a file rather than piping the script into `bash -s`: the runner
+    # exits early in dry-run mode, and on a script this size that races the
+    # writer filling the stdin pipe and can deadlock.
+    with tempfile.TemporaryDirectory() as tmp:
+        entry = Path(tmp) / "dry_run.sh"
+        entry.write_text(script, encoding="utf-8")
+        result = subprocess.run(
+            [bash, _bash_path(entry, bash), platform, backend, drafter],
+            cwd=ROOT,
+            env=os.environ.copy(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=True,
+        )
+    return result.stdout.decode("utf-8", errors="replace")
+
+
+def _sections(stdout: str) -> tuple[str, str]:
+    """Split the dry-run dump into its collect and offline-train override blocks."""
+    marker = "Hydra train overrides:"
+    assert marker in stdout, stdout
+    collect, _, train = stdout.partition(marker)
+    _, _, collect = collect.partition("Hydra overrides:")
+    return collect, train
+
+
+@pytest.mark.parametrize(
+    ("drafter", "collect_algorithm", "shrunk_key"),
+    (
+        ("peagle", "EAGLE3", "training.peagle_num_depths=2"),
+        ("domino", "DFLASH", "training.domino_block_size=4"),
+    ),
+)
+def test_example_runner_dry_run_covers_separate_training_stages(
+    drafter: str, collect_algorithm: str, shrunk_key: str
+) -> None:
+    stdout = _dry_run(drafter)
+
+    assert (
+        "example=examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
+        in stdout
+    )
+    assert "separate_training=true" in stdout
+    # Stage 1 rolls out under the engine-servable algorithm whose hidden-state
+    # layout this drafter consumes, not under the drafter's own algorithm.
+    assert f"draft_algorithm={collect_algorithm}" in stdout
+
+    collect, train = _sections(stdout)
+
+    feature_store = (
+        "actor_rollout_ref.rollout.drafter.training.feature_store.path="
+        f"/tmp/speco/{drafter}_features"
+    )
+    assert (
+        "actor_rollout_ref.rollout.drafter.speculative_algorithm="
+        f"{collect_algorithm}" in collect
+    )
+    assert feature_store in collect
+
+    # Stage 2 reads that same store through the standalone offline trainer.
+    assert feature_store in train
+    assert (
+        f"actor_rollout_ref.rollout.drafter.model_path=/tmp/speco/{drafter}_draft_init"
+        in train
+    )
+    assert (
+        "actor_rollout_ref.rollout.drafter.checkpoint_path="
+        f"/tmp/speco/{drafter}_draft_ckpts" in train
+    )
+    assert "actor_rollout_ref.rollout.drafter.training.max_steps=1" in train
+    assert shrunk_key in train
+
+    # The standalone launcher takes the first matching override, so the device
+    # count has to reach the example through the environment instead.
+    assert "speco.draft_training.num_gpus_per_node" not in train
+    assert "DRAFT_TRAIN_GPUS_PER_NODE" in _runner_script()
+
+
+def test_example_runner_dry_run_keeps_algorithm_knobs_out_of_the_other_lane() -> None:
+    peagle = _sections(_dry_run("peagle"))[1]
+    domino = _sections(_dry_run("domino"))[1]
+
+    assert "domino_" not in peagle
+    assert "peagle_" not in domino
+
+
+def test_example_runner_dry_run_keeps_extra_hydra_args_on_the_collect_stage() -> None:
+    collect, train = _sections(_dry_run("peagle", extra_hydra_args="trainer.nnodes=1"))
+
+    assert "trainer.nnodes=1" in collect
+    # Stage 2 is a different entrypoint with a different config tree.
+    assert "trainer.nnodes=1" not in train
+
+
+def test_example_runner_skips_the_offline_stage_without_training() -> None:
+    source = _runner_script()
+
+    assert 'if [[ "${enable_training}" == "true" ]]; then' in source
+    assert "skipping the offline train stage" in source
+    assert 'rm -rf "${feature_store_dir}"' in source
+
+
+def test_separate_training_example_takes_its_device_count_from_the_env() -> None:
+    example = (
+        ROOT
+        / "examples"
+        / "run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}" in example
