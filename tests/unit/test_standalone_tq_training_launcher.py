@@ -22,6 +22,7 @@ import pytest
 
 from verl_speco.standalone_tq_training_launcher import (
     _preflight_input_file,
+    _producer_max_samples,
     _target_final_layer_id,
     build_pipeline_commands,
     resolve_pipeline_config,
@@ -51,6 +52,17 @@ def test_pipeline_config_derives_transport_identity_from_training_args() -> None
     assert config.target_layer_ids == (1, 9, 17, 25, 33)
     assert config.vllm_endpoints == ("http://127.0.0.1:8000/v1",)
     assert config.run_id.startswith("dspark-")
+
+
+def test_producer_max_samples_uses_remaining_total_steps() -> None:
+    args = [
+        *_training_args(),
+        "actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=2",
+        "speco.draft_training.nproc_per_node=4",
+        "speco.draft_training.nnodes=1",
+    ]
+
+    assert _producer_max_samples(args, resumed_optimizer_step=6) == 32
 
 
 def test_pipeline_config_reads_non_dspark_algorithm_from_training_args() -> None:

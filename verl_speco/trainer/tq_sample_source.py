@@ -36,6 +36,7 @@ class TQLocalBatch:
     local_keys: list[str]
     local_samples: list[DraftFeatureSample]
     global_keys: list[str] | None
+    global_sequence_nos: list[int] | None = None
 
 
 def build_assignments(
@@ -117,6 +118,9 @@ class TQFeatureDataLoader:
                         command = {
                             "kind": "batch",
                             "global_keys": [entry.key for entry in selected],
+                            "global_sequence_nos": [
+                                int(entry.tag["sequence_no"]) for entry in selected
+                            ],
                             "assignments": [
                                 [_entry_to_wire(entry) for entry in rank_entries]
                                 for rank_entries in assignments
@@ -166,10 +170,16 @@ class TQFeatureDataLoader:
                 if self.rank == 0
                 else None
             )
+            global_sequence_nos = (
+                [int(value) for value in command.get("global_sequence_nos", [])]
+                if self.rank == 0
+                else None
+            )
             yield TQLocalBatch(
                 local_keys=[entry.key for entry in local_entries],
                 local_samples=samples,
                 global_keys=global_keys,
+                global_sequence_nos=global_sequence_nos,
             )
 
     def clear_completed_batch(self, global_keys: Sequence[str] | None) -> None:

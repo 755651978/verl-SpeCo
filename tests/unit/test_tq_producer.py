@@ -24,6 +24,7 @@ import torch
 
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
 from verl_speco.standalone_tq_producer import run_producer, validate_producer_config
+from verl_speco.trainer.standalone_resume import save_standalone_resume
 from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
 
 
@@ -279,6 +280,42 @@ def test_run_producer_restarts_input_until_max_samples(tmp_path: Path) -> None:
     assert sorted(tag["sequence_no"] for tag in sample_tags) == [0, 1, 2, 3, 4]
     assert pool.prefill_calls == 5
     assert eos_tags[0]["total_samples"] == 5
+
+
+def test_run_producer_skips_consumed_sequences_before_vllm(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [0],
+        optimizer_step=1,
+        input_path=input_path,
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["resume_checkpoint_path"] = str(checkpoint_path)
+    producer_cfg["max_samples"] = 2
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sequence_nos = sorted(
+        int(tag["sequence_no"])
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    )
+    assert stats.input_count == 2
+    assert pool.prefill_calls == 2
+    assert sequence_nos == [1, 2]
 
 
 def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) -> None:

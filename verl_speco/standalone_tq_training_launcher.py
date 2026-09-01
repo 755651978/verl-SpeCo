@@ -39,6 +39,8 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 import uuid
 
+from verl_speco.trainer.standalone_resume import load_standalone_resume
+
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +266,9 @@ def _positive_int_override(
     return value
 
 
-def _producer_max_samples(training_args: Sequence[str]) -> int:
+def _producer_max_samples(
+    training_args: Sequence[str], *, resumed_optimizer_step: int = 0
+) -> int:
     """Return samples needed for exactly max_steps complete global batches."""
 
     raw_max_steps = _find_override(training_args, _MAX_STEPS_KEY)
@@ -278,7 +282,8 @@ def _producer_max_samples(training_args: Sequence[str]) -> int:
     )
     nproc = _positive_int_override(training_args, _NPROC_KEYS, default=1)
     nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
-    return max_steps * batch_size * nproc * nnodes
+    remaining_steps = max(max_steps - int(resumed_optimizer_step), 0)
+    return remaining_steps * batch_size * nproc * nnodes
 
 
 def _stable_path_identity(kind: str, path: str) -> str:
@@ -399,6 +404,16 @@ def build_pipeline_commands(
 ) -> PipelineCommands:
     """Build the internal commands without exposing transport options."""
 
+    drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
+    _, resume_metadata = load_standalone_resume(
+        drafter_path or None,
+        input_path=config.input_path,
+    )
+    resumed_optimizer_step = (
+        int(resume_metadata.get("optimizer_step", 0))
+        if resume_metadata is not None
+        else 0
+    )
     tq_overrides = [
         f"{_TQ_PREFIX}.enable=true",
         f"{_TQ_PREFIX}.ray.address={ray_address}",
@@ -480,6 +495,8 @@ def build_pipeline_commands(
         *tq_overrides,
         *producer_tuning_overrides,
         f"speco.standalone_tq_producer.input_path={config.input_path}",
+        "speco.standalone_tq_producer.resume_checkpoint_path="
+        + (drafter_path if resume_metadata is not None else "null"),
         f"speco.standalone_tq_producer.tokenizer_path={config.tokenizer_path}",
         "speco.standalone_tq_producer.tokenizer_fingerprint="
         + _stable_path_identity("tokenizer", config.tokenizer_path),
@@ -492,7 +509,12 @@ def build_pipeline_commands(
         + _hydra_list(config.vllm_endpoints),
         f"speco.standalone_tq_producer.vllm_model={config.model_path}",
         "speco.standalone_tq_producer.max_samples="
-        + str(_producer_max_samples(training_args)),
+        + str(
+            _producer_max_samples(
+                training_args,
+                resumed_optimizer_step=resumed_optimizer_step,
+            )
+        ),
     ]
     consumer_internal = [
         f"{_FEATURE_STORE_PREFIX}.type=tq",

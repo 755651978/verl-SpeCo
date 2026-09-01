@@ -40,6 +40,10 @@ from verl_speco.trainer.feature_store import (
     build_feature_store_from_config,
 )
 from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config
+from verl_speco.trainer.standalone_resume import (
+    load_standalone_resume,
+    save_standalone_resume,
+)
 from verl_speco.trainer.tq_sample_source import TQFeatureDataLoader, TQLocalBatch
 
 logger = logging.getLogger(__name__)
@@ -131,6 +135,8 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
     attempted_batches = 0
     last_save_result: dict[str, Any] | None = None
     last_saved_step = 0
+    consumed_sequence_nos: set[int] = set()
+    standalone_input_path = _standalone_input_path(config)
     store = None
     feature_replayer = None
     feature_producer = None
@@ -155,6 +161,22 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         initial_optimizer_step = int(trainer.optimizer_steps_total)
         optimizer_step = initial_optimizer_step
         last_saved_step = optimizer_step
+        if feature_store_type == "tq":
+            consumed_sequence_nos, resume_metadata = load_standalone_resume(
+                drafter_cfg.get("model_path"),
+                input_path=standalone_input_path,
+            )
+            if initial_optimizer_step > 0 and resume_metadata is None:
+                raise ValueError(
+                    "Standalone TQ checkpoint restored optimizer state but has no "
+                    "standalone_resume.json; exact data resume is unavailable"
+                )
+            logger.info(
+                "[standalone rank=%s] resume progress optimizer_step=%s consumed=%s",
+                rank,
+                initial_optimizer_step,
+                len(consumed_sequence_nos),
+            )
 
         current_stage = "open_feature_store"
         stage_started = time.perf_counter()
@@ -294,7 +316,7 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             )
             sample_source = feature_producer
         sample_iterator = iter(sample_source)
-        while max_steps <= 0 or successful_steps < max_steps:
+        while max_steps <= 0 or optimizer_step < max_steps:
             current_stage = "load_next_batch"
             loaded_batch = _next_batch_across_ranks(
                 sample_iterator,
@@ -419,6 +441,10 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
                     rank=rank,
                     device=trainer.runtime_device,
                 )
+                if rank == 0:
+                    consumed_sequence_nos.update(
+                        tq_local_batch.global_sequence_nos or []
+                    )
             successful_steps += 1
             optimizer_step = int(trainer.optimizer_steps_total)
             if optimizer_step <= initial_optimizer_step:
@@ -436,7 +462,14 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
             _log_standalone_step_metrics(step_metrics, rank=rank)
             if save_interval > 0 and optimizer_step % save_interval == 0:
                 current_stage = "save_checkpoint"
-                last_save_result = _save_standalone_checkpoint(trainer, optimizer_step)
+                last_save_result = _save_standalone_checkpoint(
+                    trainer,
+                    optimizer_step,
+                    consumed_sequence_nos=consumed_sequence_nos,
+                    input_path=(
+                        standalone_input_path if feature_store_type == "tq" else None
+                    ),
+                )
                 if _sync_any_rank_saved_checkpoint(last_save_result.get("saved")):
                     last_saved_step = optimizer_step
                 _barrier()
@@ -445,7 +478,13 @@ async def _run_standalone_draft_training_async(config) -> dict[str, Any]:
         if final_save and successful_steps > 0 and optimizer_step != last_saved_step:
             current_stage = "save_final_checkpoint"
             last_save_result = _save_standalone_checkpoint(
-                trainer, optimizer_step, wait=True
+                trainer,
+                optimizer_step,
+                wait=True,
+                consumed_sequence_nos=consumed_sequence_nos,
+                input_path=(
+                    standalone_input_path if feature_store_type == "tq" else None
+                ),
             )
             _barrier()
     except Exception:
@@ -503,8 +542,16 @@ def _build_backend(draft_config):
 
 
 def _save_standalone_checkpoint(
-    trainer: DrafterBaseTrainer, step: int, *, wait: bool = False
+    trainer: DrafterBaseTrainer,
+    step: int,
+    *,
+    wait: bool = False,
+    consumed_sequence_nos: set[int] | None = None,
+    input_path: str | None = None,
 ) -> dict[str, Any]:
+    consumed_snapshot = torch.tensor(
+        sorted(consumed_sequence_nos or ()), dtype=torch.int64
+    )
     save_checkpoint = getattr(trainer, "save_checkpoint", None)
     if callable(save_checkpoint):
         result = save_checkpoint(int(step), wait=wait)
@@ -513,6 +560,12 @@ def _save_standalone_checkpoint(
         if result.get("saved") and checkpoint_path and is_export_leader:
             if wait:
                 _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+                _save_resume_sidecar(
+                    checkpoint_path,
+                    consumed_snapshot,
+                    step=step,
+                    input_path=input_path,
+                )
             else:
                 future = getattr(trainer, "_pending_full_checkpoint_future", None)
                 if future is not None:
@@ -521,6 +574,9 @@ def _save_standalone_checkpoint(
                             trainer,
                             checkpoint_path,
                             completed,
+                            consumed_snapshot=consumed_snapshot,
+                            step=step,
+                            input_path=input_path,
                         )
                     )
         return result
@@ -551,12 +607,21 @@ def _save_standalone_checkpoint(
         future.result()
         trainer._pending_full_checkpoint_future = None
         _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+        _save_resume_sidecar(
+            checkpoint_path,
+            consumed_snapshot,
+            step=step,
+            input_path=input_path,
+        )
     elif future is not None:
         future.add_done_callback(
-            lambda completed: _rewrite_standalone_block_runtime_config(
+            lambda completed: _finalize_standalone_checkpoint(
                 trainer,
                 checkpoint_path,
                 completed,
+                consumed_snapshot=consumed_snapshot,
+                step=step,
+                input_path=input_path,
             )
         )
     return {
@@ -592,6 +657,10 @@ def _finalize_standalone_checkpoint(
     trainer: DrafterBaseTrainer,
     checkpoint_path: str,
     completed_future,
+    *,
+    consumed_snapshot: torch.Tensor | None = None,
+    step: int | None = None,
+    input_path: str | None = None,
 ) -> None:
     try:
         completed_future.result()
@@ -602,6 +671,41 @@ def _finalize_standalone_checkpoint(
         return
 
     _rewrite_standalone_block_runtime_config(trainer, checkpoint_path)
+    _save_resume_sidecar(
+        checkpoint_path,
+        consumed_snapshot,
+        step=step,
+        input_path=input_path,
+    )
+
+
+def _save_resume_sidecar(
+    checkpoint_path: str,
+    consumed_snapshot: torch.Tensor | None,
+    *,
+    step: int | None,
+    input_path: str | None,
+) -> None:
+    if consumed_snapshot is None or step is None or input_path is None:
+        return
+    save_standalone_resume(
+        checkpoint_path,
+        consumed_snapshot,
+        optimizer_step=step,
+        input_path=input_path,
+    )
+
+
+def _standalone_input_path(config: Any) -> str | None:
+    data_cfg = getattr(config, "data", None)
+    train_files = getattr(data_cfg, "train_files", None)
+    if train_files is None and isinstance(data_cfg, dict):
+        train_files = data_cfg.get("train_files")
+    if isinstance(train_files, str):
+        return train_files
+    if train_files is not None and len(train_files) == 1:
+        return str(train_files[0])
+    return None
 
 
 def _torch_load_cpu(path: str) -> Any:

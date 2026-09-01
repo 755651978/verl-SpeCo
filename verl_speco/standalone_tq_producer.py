@@ -41,6 +41,7 @@ from verl_speco.producer.vllm_feature_client import (
     delete_temporary_result,
 )
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.standalone_resume import load_standalone_resume
 from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
     HiddenStateAlignmentError,
@@ -199,6 +200,17 @@ async def run_producer(
         )
         logger.info("Standalone TQ Producer observed owner_ready run_id=%s", run_id)
 
+        consumed_sequence_nos, resume_metadata = load_standalone_resume(
+            producer_cfg.get("resume_checkpoint_path"),
+            input_path=str(producer_cfg["input_path"]),
+        )
+        logger.info(
+            "Standalone TQ Producer resume progress checkpoint=%s consumed=%s step=%s",
+            producer_cfg.get("resume_checkpoint_path"),
+            len(consumed_sequence_nos),
+            None if resume_metadata is None else resume_metadata.get("optimizer_step"),
+        )
+
         if tokenizer is None:
             logger.info(
                 "Standalone TQ Producer loading tokenizer path=%s",
@@ -245,19 +257,26 @@ async def run_producer(
         async def read_inputs() -> None:
             max_samples = int(producer_cfg.get("max_samples", 0) or 0)
             epoch = 0
+            source_sequence_no = 0
             while True:
                 epoch_count = 0
+                scanned_count = 0
                 for source_record in iter_input_records(
                     str(producer_cfg["input_path"])
                 ):
                     if max_samples > 0 and stats.input_count >= max_samples:
                         break
+                    sequence_no = source_sequence_no
+                    source_sequence_no += 1
+                    scanned_count += 1
+                    if sequence_no in consumed_sequence_nos:
+                        continue
                     # iter_input_records restarts sequence_no at zero on every
                     # pass. TQ keys require a run-global sequence number so a
                     # repeated sample never overwrites an earlier pending copy.
                     record = replace(
                         source_record,
-                        sequence_no=stats.input_count,
+                        sequence_no=sequence_no,
                     )
                     request = (
                         prepare_generation_request(record, tokenizer, producer_cfg)
@@ -276,7 +295,7 @@ async def run_producer(
                             record.sample_id,
                             record.response is not None,
                         )
-                if epoch_count == 0 and stats.input_count == 0:
+                if scanned_count == 0 and stats.input_count == 0:
                     raise ValueError("Standalone TQ Producer input contains no samples")
                 if max_samples <= 0 or stats.input_count >= max_samples:
                     break

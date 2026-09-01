@@ -196,6 +196,7 @@ def test_world_size_one_streams_trains_then_clears_and_stops() -> None:
     batch = next(iterator)
     assert batch.local_keys == [entry.key for entry in entries]
     assert batch.global_keys == batch.local_keys
+    assert batch.global_sequence_nos == [0, 1]
     assert store.get_calls == [batch.local_keys]
 
     loader.clear_completed_batch(batch.global_keys)
