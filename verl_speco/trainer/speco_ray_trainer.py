@@ -118,6 +118,11 @@ _SPECO_VLLM_SPEC_DECODE_ACCEPTED_TOKENS_KEY = "_speco_vllm_spec_decode_accepted_
 _SPECO_DRAFTER_TIMING_DEDUCTED_KEY = "_speco_drafter_timing_deducted_from_update_actor"
 _SPECO_BOOTSTRAP_FALLBACK_IDLE_WINDOW_SEC = 10.0
 _DRAFTER_TARGET_SYNC_MESH = "drafter_target_sync"
+# Keep the coordinator's readiness bookkeeping aligned with the worker-side
+# target-head cache (``_target_lm_head_snapshot_limit = 2``).  This is not a
+# tensor cache; it prevents stale readiness markers from authorizing a version
+# that the worker has already evicted.
+_SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT = 2
 
 _DRAFTER_CHECKPOINT_PATH_PLACEHOLDERS = {
     None,
@@ -1404,6 +1409,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"trainable_batches={getattr(plan, 'idle_trainable_batches', None)} "
                 f"batch_estimate_s={getattr(plan, 'idle_batch_estimate_sec', None)} "
                 f"startup_reserve_s={getattr(plan, 'idle_startup_reserve_sec', None)} "
+                f"deadline_ts={getattr(plan, 'deadline_ts', None)} "
                 f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
                 f"idle_groups={metrics.get('bubble/idle_training_groups', 0)}",
                 flush=True,
@@ -2848,14 +2854,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # non-blocking and only surfaces a worker-side exception.
         self._ray_get_if_needed(refs)
         self._pending_target_lm_head_sync = None
-        try:
-            self._speco_ready_target_lm_head_versions.add(int(target_version))
-        except (TypeError, ValueError):
-            pass
+        evicted_versions = self._speco_mark_target_lm_head_version_ready(
+            target_version
+        )
         print(
             "[BubbleTime] target_lm_head_prefetch_ready: "
             f"target_version={target_version} "
-            f"ready_versions={tuple(sorted(self._speco_ready_target_lm_head_versions))}",
+            f"ready_versions={tuple(sorted(self._speco_ready_target_lm_head_versions))} "
+            f"evicted_versions={evicted_versions}",
             flush=True,
         )
         return {
@@ -2865,6 +2871,34 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_ready_target_lm_head_versions
             ),
         }
+
+    def _speco_mark_target_lm_head_version_ready(
+        self,
+        target_version: object,
+    ) -> tuple[int, ...]:
+        """Record only target-head versions that can still exist on workers."""
+
+        try:
+            self._speco_ready_target_lm_head_versions.add(int(target_version))
+        except (TypeError, ValueError):
+            return ()
+        evicted_versions: list[int] = []
+        while (
+            len(self._speco_ready_target_lm_head_versions)
+            > _SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT
+        ):
+            version = min(self._speco_ready_target_lm_head_versions)
+            self._speco_ready_target_lm_head_versions.remove(version)
+            evicted_versions.append(version)
+        if evicted_versions:
+            logger.warning(
+                "[BubbleTime] target_lm_head_ready_versions_pruned: "
+                "evicted=%s retained=%s limit=%s",
+                tuple(evicted_versions),
+                tuple(sorted(self._speco_ready_target_lm_head_versions)),
+                _SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT,
+            )
+        return tuple(evicted_versions)
 
     def _speco_dispatch_target_lm_head_payload(
         self,

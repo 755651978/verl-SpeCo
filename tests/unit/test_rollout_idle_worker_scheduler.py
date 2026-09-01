@@ -486,6 +486,34 @@ def test_idle_worker_deadline_guard_learns_reclaim_cost() -> None:
     assert scheduler._effective_idle_deadline_guard_sec(config) == pytest.approx(0.7)
 
 
+def test_idle_worker_prebatch_reclaim_reserves_full_worker_critical_path() -> None:
+    scheduler = DrafterScheduler()
+    config = _idle_config()
+    outcome = TrainingOutcome(
+        trained=False,
+        successful_steps=0,
+        worker_results=[],
+        raw_results=[],
+        # This is the coordinator-observed RPC time.  The worker also reports
+        # cleanup completed after reclaim, so the admission reserve must retain
+        # the larger end-to-end critical path.
+        elapsed_sec=24.0,
+        reason="submitted_async",
+        metrics={
+            "bubble/train_reclaimed_before_first_batch": 1,
+            "timing_s/drafter_worker_preflight": 22.0,
+            "timing_s/drafter_worker_preflight_to_stop": 1.5,
+            "timing_s/drafter_worker_cleanup": 3.0,
+        },
+    )
+
+    scheduler.record_idle_training_outcome(outcome)
+
+    assert scheduler._effective_idle_startup_reserve_sec(config) == pytest.approx(
+        26.5
+    )
+
+
 def test_idle_worker_training_does_not_wait_for_training_interval() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     deadline_ts = time.time() + 30.0

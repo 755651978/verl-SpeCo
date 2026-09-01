@@ -188,6 +188,9 @@ class TrainingOutcome:
             "timing_s/drafter_optimizer",
             "timing_s/drafter_publish_snapshot",
             "activation_elapsed_sec",
+            "preflight_elapsed_sec",
+            "preflight_to_first_batch_sec",
+            "preflight_to_stop_sec",
             "training_loop_elapsed_sec",
             "cleanup_elapsed_sec",
             "elapsed_sec",
@@ -200,11 +203,25 @@ class TrainingOutcome:
             if values:
                 metric_key = {
                     "activation_elapsed_sec": "timing_s/drafter_worker_activation",
+                    "preflight_elapsed_sec": "timing_s/drafter_worker_preflight",
+                    "preflight_to_first_batch_sec": "timing_s/drafter_worker_preflight_to_first_batch",
+                    "preflight_to_stop_sec": "timing_s/drafter_worker_preflight_to_stop",
                     "training_loop_elapsed_sec": "timing_s/drafter_worker_training_loop",
                     "cleanup_elapsed_sec": "timing_s/drafter_worker_cleanup",
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
                 }.get(key, key)
                 metrics[metric_key] = max(values)
+
+        metrics["bubble/train_reclaimed_before_first_batch"] = int(
+            any(
+                result.get("reason") == "reclaim_requested"
+                and int(result.get("attempted_steps", 0) or 0) == 0
+                for result in normalized_results
+            )
+        )
+        metrics["bubble/train_first_batch_started"] = int(
+            any(bool(result.get("first_batch_started", False)) for result in normalized_results)
+        )
 
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:

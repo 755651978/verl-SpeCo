@@ -346,6 +346,13 @@ class SpecoWorker(Worker):
         self._prepared_training_plan_id: Optional[str] = None
         self._prepared_training_data_version: Optional[int] = None
         self._prepared_training_target_version: Optional[int] = None
+        # These timestamps make the Bubble admission path observable.  In
+        # particular, an idle plan can be reclaimed after activation but before
+        # its first optimizer batch.  That must not be indistinguishable from a
+        # normal zero-batch training result.
+        self._prepared_training_activation_elapsed_sec: float = 0.0
+        self._prepared_training_preflight_elapsed_sec: float = 0.0
+        self._prepared_training_ready_ts: Optional[float] = None
         self._drafter_reclaim_requested = False
         self.training_process_group = None
         self.dp_process_group = None
@@ -1288,6 +1295,7 @@ class SpecoWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def preflight_drafter_training(self, training_plan=None):
+        preflight_started_ts = time.time()
         result = {
             "ready": False,
             "participating": False,
@@ -1300,6 +1308,9 @@ class SpecoWorker(Worker):
         self._prepared_training_plan_id = None
         self._prepared_training_data_version = None
         self._prepared_training_target_version = None
+        self._prepared_training_activation_elapsed_sec = 0.0
+        self._prepared_training_preflight_elapsed_sec = 0.0
+        self._prepared_training_ready_ts = None
         if not self.enable_drafter:
             result["reason"] = "disabled"
             return result
@@ -1418,15 +1429,24 @@ class SpecoWorker(Worker):
         self._prepared_training_data_version = actual_data_version
         self._prepared_training_target_version = current_target_version
         self._drafter_reclaim_requested = False
+        activation_started_ts = time.time()
         with _preserve_process_rng_state(self.device_name):
             activated = bool(await self.trainer.activate_training_model())
         result["activated"] = activated
+        result["activation_elapsed_sec"] = time.time() - activation_started_ts
         if not activated:
             self.trainer.release_training_data_reservation(
                 str(training_plan.get("plan_id", ""))
             )
             result["reason"] = "activation_failed"
             return result
+        ready_ts = time.time()
+        preflight_elapsed_sec = ready_ts - preflight_started_ts
+        self._prepared_training_activation_elapsed_sec = float(
+            result["activation_elapsed_sec"]
+        )
+        self._prepared_training_preflight_elapsed_sec = preflight_elapsed_sec
+        self._prepared_training_ready_ts = ready_ts
         result.update(
             {
                 "ready": True,
@@ -1434,7 +1454,24 @@ class SpecoWorker(Worker):
                 "buffer_version": int(self.trainer.buffer_version),
                 "data_version": actual_data_version,
                 "target_version": current_target_version,
+                "preflight_elapsed_sec": preflight_elapsed_sec,
             }
+        )
+        logger.warning(
+            "[BubbleTime] training_preflight_ready: plan_id=%s worker_id=%s "
+            "rank=%s activation_s=%.3f preflight_s=%.3f",
+            training_plan.get("plan_id", ""),
+            self.rank,
+            self.rank,
+            result["activation_elapsed_sec"],
+            preflight_elapsed_sec,
+        )
+        print(
+            "[BubbleTime] training_preflight_ready: "
+            f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
+            f"rank={self.rank} activation_s={result['activation_elapsed_sec']:.3f} "
+            f"preflight_s={preflight_elapsed_sec:.3f}",
+            flush=True,
         )
         return result
 
@@ -1444,6 +1481,9 @@ class SpecoWorker(Worker):
         self._prepared_training_plan_id = None
         self._prepared_training_data_version = None
         self._prepared_training_target_version = None
+        self._prepared_training_activation_elapsed_sec = 0.0
+        self._prepared_training_preflight_elapsed_sec = 0.0
+        self._prepared_training_ready_ts = None
         if was_prepared and self.trainer is not None:
             self.trainer.release_training_data_reservation(str(plan_id))
             await self.trainer.cleanup_training(clear_data=False)
@@ -1497,9 +1537,15 @@ class SpecoWorker(Worker):
             return result
         prepared_data_version = self._prepared_training_data_version
         prepared_target_version = self._prepared_training_target_version
+        prepared_activation_elapsed_sec = self._prepared_training_activation_elapsed_sec
+        prepared_preflight_elapsed_sec = self._prepared_training_preflight_elapsed_sec
+        prepared_ready_ts = self._prepared_training_ready_ts
         self._prepared_training_plan_id = None
         self._prepared_training_data_version = None
         self._prepared_training_target_version = None
+        self._prepared_training_activation_elapsed_sec = 0.0
+        self._prepared_training_preflight_elapsed_sec = 0.0
+        self._prepared_training_ready_ts = None
         max_batches = max(int(training_plan.get("max_batches", 0)), 0)
         prepare_publish = bool(training_plan.get("publish_after_success", False))
         snapshot = (training_plan.get("worker_snapshots") or {})[str(self.rank)]
@@ -1515,6 +1561,9 @@ class SpecoWorker(Worker):
                 "buffer_size_after": buffer_size_before,
                 "optimizer_step": int(self.trainer.optimizer_steps_total),
                 "publish_snapshot_cached": 0,
+                "activation_elapsed_sec": prepared_activation_elapsed_sec,
+                "preflight_elapsed_sec": prepared_preflight_elapsed_sec,
+                "first_batch_started": 0,
             }
         )
 
@@ -1530,6 +1579,10 @@ class SpecoWorker(Worker):
                     now_ts = time.time()
                     if deadline_ts is not None and now_ts >= float(deadline_ts):
                         result["reason"] = "deadline_reached"
+                        if prepared_ready_ts is not None:
+                            result["preflight_to_stop_sec"] = max(
+                                now_ts - prepared_ready_ts, 0.0
+                            )
                         logger.warning(
                             "[BubbleTime] training_not_started: plan_id=%s "
                             "worker_id=%s rank=%s reason=deadline_reached "
@@ -1555,6 +1608,10 @@ class SpecoWorker(Worker):
                         break
                     if self._drafter_reclaim_requested:
                         result["reason"] = "reclaim_requested"
+                        if prepared_ready_ts is not None:
+                            result["preflight_to_stop_sec"] = max(
+                                now_ts - prepared_ready_ts, 0.0
+                            )
                         logger.warning(
                             "[BubbleTime] training_not_started: plan_id=%s "
                             "worker_id=%s rank=%s reason=reclaim_requested "
@@ -1570,10 +1627,45 @@ class SpecoWorker(Worker):
                             f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
                             "reason=reclaim_requested "
                             f"now_ts={now_ts:.6f} deadline_ts={deadline_ts} "
+                            f"activation_s={prepared_activation_elapsed_sec:.3f} "
+                            f"preflight_s={prepared_preflight_elapsed_sec:.3f} "
+                            "preflight_to_stop_s="
+                            f"{result.get('preflight_to_stop_sec', 0.0):.3f} "
                             "reclaim_requested=True",
                             flush=True,
                         )
                         break
+                    if not result["first_batch_started"]:
+                        result["first_batch_started"] = 1
+                        if prepared_ready_ts is not None:
+                            result["preflight_to_first_batch_sec"] = max(
+                                now_ts - prepared_ready_ts, 0.0
+                            )
+                        logger.warning(
+                            "[BubbleTime] training_first_batch_start: plan_id=%s "
+                            "worker_id=%s rank=%s activation_s=%.3f "
+                            "preflight_s=%.3f preflight_to_first_batch_s=%.3f",
+                            plan_id,
+                            self.rank,
+                            self.rank,
+                            prepared_activation_elapsed_sec,
+                            prepared_preflight_elapsed_sec,
+                            float(
+                                result.get(
+                                    "preflight_to_first_batch_sec", 0.0
+                                )
+                                or 0.0
+                            ),
+                        )
+                        print(
+                            "[BubbleTime] training_first_batch_start: "
+                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
+                            f"activation_s={prepared_activation_elapsed_sec:.3f} "
+                            f"preflight_s={prepared_preflight_elapsed_sec:.3f} "
+                            "preflight_to_first_batch_s="
+                            f"{result.get('preflight_to_first_batch_sec', 0.0):.3f}",
+                            flush=True,
+                        )
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
                     if step_ok:

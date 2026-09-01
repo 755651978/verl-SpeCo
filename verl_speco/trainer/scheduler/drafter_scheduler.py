@@ -307,16 +307,73 @@ class DrafterScheduler:
         )
 
     def record_idle_training_outcome(self, outcome: TrainingOutcome) -> None:
-        """Learn conservative admission overhead, including empty plans."""
+        """Learn conservative admission overhead, including empty plans.
+
+        A reclaim before batch 1 is a particularly important signal: the
+        advertised idle deadline admitted activation, but not the complete
+        preflight-to-reclaim critical path.  Preserve the reclaim semantics and
+        make the next admission conservative instead of launching another plan
+        that can only reserve data and be immediately cancelled.
+        """
 
         if outcome.successful_steps > 0:
             observed_sec = float(
                 outcome.metrics.get("timing_s/drafter_worker_cleanup", 0.0) or 0.0
             )
         else:
-            # An empty plan records exactly the cost that prevented batch 1
-            # from starting (activation, reclaim, and cleanup included).
-            observed_sec = max(float(outcome.elapsed_sec), 0.0)
+            preflight_sec = max(
+                float(
+                    outcome.metrics.get("timing_s/drafter_worker_preflight", 0.0)
+                    or 0.0
+                ),
+                0.0,
+            )
+            until_stop_sec = max(
+                float(
+                    outcome.metrics.get(
+                        "timing_s/drafter_worker_preflight_to_stop", 0.0
+                    )
+                    or 0.0
+                ),
+                0.0,
+            )
+            cleanup_sec = max(
+                float(
+                    outcome.metrics.get("timing_s/drafter_worker_cleanup", 0.0)
+                    or 0.0
+                ),
+                0.0,
+            )
+            # The RPC elapsed time may not include a worker-side cleanup that
+            # completes after the reclaim signal.  Taking the maximum retains
+            # the old safe behaviour while accounting for the explicit stages.
+            observed_sec = max(
+                float(outcome.elapsed_sec),
+                preflight_sec + until_stop_sec + cleanup_sec,
+                0.0,
+            )
+            if outcome.metrics.get("bubble/train_reclaimed_before_first_batch", 0):
+                worker_reasons = tuple(
+                    sorted(
+                        {
+                            result.reason
+                            for result in outcome.worker_results
+                            if result.reason
+                        }
+                    )
+                )
+                logger.warning(
+                    "[BubbleTime] prebatch_reclaim_observed: outcome_reason=%s "
+                    "worker_reasons=%s "
+                    "preflight_s=%.3f ready_to_reclaim_s=%.3f cleanup_s=%.3f "
+                    "admission_reserve_s=%.3f",
+                    outcome.reason,
+                    worker_reasons,
+                    preflight_sec,
+                    until_stop_sec,
+                    cleanup_sec,
+                    observed_sec,
+                )
         if observed_sec <= 0.0:
             return
         self._idle_worker_startup_samples_sec.append(observed_sec)
