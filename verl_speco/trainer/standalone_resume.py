@@ -71,9 +71,7 @@ def save_standalone_resume(
         "input_fingerprint": build_input_fingerprint(input_path),
     }
     metadata_path = checkpoint_dir / RESUME_METADATA_NAME
-    metadata_temporary = metadata_path.with_suffix(
-        metadata_path.suffix + ".incomplete"
-    )
+    metadata_temporary = metadata_path.with_suffix(metadata_path.suffix + ".incomplete")
     metadata_temporary.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
