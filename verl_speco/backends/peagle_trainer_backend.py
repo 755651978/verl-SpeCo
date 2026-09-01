@@ -122,6 +122,25 @@ class PEagleTrainingModel(nn.Module):
 
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        if seq_lengths is not None:
+            # seq_lengths is a flat list of document lengths for ONE packed
+            # sequence, which is what base_trainer builds for P-EAGLE. There is no
+            # per-row structure to index, so a multi-row batch would silently
+            # apply one row's document layout to all of them.
+            if batch_size > 1:
+                raise ValueError(
+                    "P-EAGLE seq_lengths describe a single packed sequence, but the batch "
+                    f"has {batch_size} rows; pack the documents into one row or drop seq_lengths"
+                )
+            # Any tail past sum(seq_lengths) gets document id -1 in the COD mask,
+            # which makes those queries attend to nothing at all rather than
+            # failing, so check the invariant instead of drafting on garbage.
+            total_length = int(seq_lengths.sum())
+            if total_length != seq_len:
+                raise ValueError(
+                    f"P-EAGLE seq_lengths sum to {total_length} but the packed sequence is "
+                    f"{seq_len} tokens long"
+                )
         loss_num = torch.zeros((), device=device, dtype=torch.float32)
         loss_den = torch.zeros((), device=device, dtype=torch.float32)
         correct = torch.zeros((), device=device, dtype=torch.float32)
@@ -137,9 +156,11 @@ class PEagleTrainingModel(nn.Module):
             )
             orig_positions = anchor_pos + depth
             if seq_lengths is not None:
-                row_length = seq_lengths.to(device)
+                document_lengths = seq_lengths.to(device)
             else:
-                row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(device)
+                document_lengths = (
+                    attention_mask[b].sum().clamp_min(1).reshape(1).to(device)
+                )
             loss_positions = row_loss_mask[0, orig_positions].bool()
 
             is_depth0 = depth == 0
@@ -161,7 +182,7 @@ class PEagleTrainingModel(nn.Module):
             block_mask = draft.build_peagle_block_mask(
                 anchor_pos=anchor_pos,
                 depth=depth,
-                lengths=row_length,
+                lengths=document_lengths,
                 total_seq_len=seq_len,
             )
             hidden = draft.forward_peagle(

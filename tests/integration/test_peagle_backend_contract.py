@@ -294,6 +294,57 @@ def test_peagle_compute_loss_calls_the_module_forward() -> None:
     assert float(out["accuracy"]) == pytest.approx(0.75)
 
 
+def _peagle_training_model_and_batch(batch_size: int, seq_len: int, seq_lengths):
+    import torch
+
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainingModel
+    from verl_speco.models.peagle import LlamaForCausalLMPeagle
+
+    config = _tiny_peagle_config()
+    model = PEagleTrainingModel(
+        LlamaForCausalLMPeagle(config), num_depths=2, down_sample_ratio=0.5
+    )
+    kwargs = dict(
+        input_ids=torch.zeros(batch_size, seq_len, dtype=torch.long),
+        aux_hidden=torch.zeros(batch_size, seq_len, config.target_hidden_size * 3),
+        loss_mask=torch.ones(batch_size, seq_len),
+        attention_mask=torch.ones(batch_size, seq_len, dtype=torch.long),
+        target_logits=torch.zeros(batch_size, seq_len, config.vocab_size),
+        seq_lengths=seq_lengths,
+    )
+    return model, kwargs
+
+
+def test_peagle_rejects_packed_lengths_for_a_multi_row_batch() -> None:
+    """seq_lengths describes one packed sequence, so it cannot span rows.
+
+    The forward loops over the batch but applies the whole seq_lengths tensor to
+    every row, which would silently give row 1 row 0's document layout.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    model, kwargs = _peagle_training_model_and_batch(
+        batch_size=2, seq_len=8, seq_lengths=torch.tensor([4, 4])
+    )
+
+    with pytest.raises(ValueError, match="single packed sequence"):
+        model(**kwargs)
+
+
+def test_peagle_rejects_packed_lengths_that_do_not_cover_the_sequence() -> None:
+    """A short seq_lengths silently turns the tail into unattendable padding."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    model, kwargs = _peagle_training_model_and_batch(
+        batch_size=1, seq_len=8, seq_lengths=torch.tensor([3, 2])
+    )
+
+    with pytest.raises(ValueError, match="sum to 5"):
+        model(**kwargs)
+
+
 def test_peagle_checkpoint_export_unwraps_the_training_model() -> None:
     pytest.importorskip("torch")
     from types import SimpleNamespace
