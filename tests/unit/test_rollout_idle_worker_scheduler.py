@@ -1010,6 +1010,41 @@ def test_trainer_generation_completion_does_not_create_synthetic_idle_window() -
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_runtime_idle_events_are_accumulated_across_event_loop_drains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from verl_speco.trainer import speco_ray_trainer
+
+    trainer = _trainer_with_idle_config()
+    trainer._speco_runtime_idle_callback_verified = False
+    trainer._speco_runtime_idle_events_this_generation = 0
+    trainer._speco_runtime_sample_events_this_generation = 0
+    event_batches = [
+        [
+            {
+                "event_type": RolloutWorkerEventType.WORKER_IDLE.value,
+                "worker_id": "worker-0",
+                "replica_rank": 0,
+                "memory_released": True,
+            }
+        ],
+        [],
+    ]
+    monkeypatch.setattr(
+        speco_ray_trainer,
+        "drain_rollout_idle_events",
+        lambda _name: event_batches.pop(0) if event_batches else [],
+    )
+
+    first_metrics = trainer._speco_drain_rollout_idle_events()
+    second_metrics = trainer._speco_drain_rollout_idle_events()
+
+    assert first_metrics["bubble/runtime_worker_events_drained"] == 1
+    assert second_metrics == {}
+    assert trainer._speco_runtime_idle_events_this_generation == 1
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
 def test_trainer_fallback_idle_events_from_generation_output() -> None:
     trainer = _trainer_with_idle_config()
     output = _FakeGenerationOutput(

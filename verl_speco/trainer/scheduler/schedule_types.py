@@ -119,6 +119,9 @@ class DrafterScheduleConfig:
     idle_worker_drain_before_next_rollout: bool = True
     idle_worker_fallback_to_sync: bool = False
     idle_worker_max_seconds_without_training: float | None = None
+    # Retain a small amount of ready data, then stop creating newer target-head
+    # versions until the buffer has been consumed by Bubble training.
+    idle_worker_collection_target_batches: int | None = 2
     idle_worker_group_mode: str = "auto"
     idle_worker_group_size: int | None = None
     idle_worker_training_groups: tuple[tuple[str, ...], ...] = ()
@@ -199,6 +202,9 @@ class DrafterScheduleConfig:
             idle_worker_max_seconds_without_training=_optional_float(
                 idle_get("max_seconds_without_training", None)
             ),
+            idle_worker_collection_target_batches=_optional_int(
+                idle_get("collection_target_batches", 2)
+            ),
             idle_worker_group_mode=str(idle_get("group_mode", "auto") or "auto")
             .strip()
             .lower(),
@@ -262,6 +268,7 @@ class CollectionPlan:
         "training_interval_not_reached": 5,
         "sample_rate_zero": 6,
         "collection_enabled": 7,
+        "buffer_target_reached": 8,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -476,6 +483,7 @@ class TrainingPlan:
     idle_usable_window_sec: float | None = None
     idle_window_batches: int | None = None
     idle_batch_estimate_sec: float | None = None
+    idle_startup_reserve_sec: float | None = None
     idle_trainable_batches: int | None = None
 
     _REASON_CODES: ClassVar[dict[str, int]] = {

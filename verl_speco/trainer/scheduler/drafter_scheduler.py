@@ -79,6 +79,7 @@ logger = logging.getLogger(__name__)
 
 _BOOTSTRAP_IDLE_BATCH_ESTIMATE_SEC = 0.25
 _BOOTSTRAP_IDLE_DEADLINE_GUARD_SEC = 0.05
+_BOOTSTRAP_IDLE_STARTUP_RESERVE_SEC = 2.0
 
 
 def _conservative_percentile(
@@ -235,6 +236,7 @@ class DrafterScheduler:
         self._idle_worker_batch_estimate_sec: float | None = None
         self._idle_worker_batch_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_reclaim_samples_sec: deque[float] = deque(maxlen=32)
+        self._idle_worker_startup_samples_sec: deque[float] = deque(maxlen=32)
         self._replica_idle_started_at: dict[int, float] = {}
         self._replica_idle_window_samples_sec: deque[float] = deque(maxlen=32)
 
@@ -280,6 +282,18 @@ class DrafterScheduler:
         )
         return max(configured_guard, reclaim_guard)
 
+    def _effective_idle_startup_reserve_sec(
+        self, config: DrafterScheduleConfig
+    ) -> float:
+        """Reserve activation/cleanup work before starting a Bubble batch."""
+
+        historical = _conservative_percentile(self._idle_worker_startup_samples_sec)
+        if historical > 0.0:
+            return historical
+        if self._idle_batch_estimate_is_bootstrap(config):
+            return _BOOTSTRAP_IDLE_STARTUP_RESERVE_SEC
+        return 0.0
+
     def record_reclaim_elapsed(self, elapsed_sec: float) -> None:
         elapsed_sec = max(float(elapsed_sec), 0.0)
         if elapsed_sec <= 0.0:
@@ -290,6 +304,29 @@ class DrafterScheduler:
             elapsed_sec,
             _conservative_percentile(self._idle_worker_reclaim_samples_sec),
             len(self._idle_worker_reclaim_samples_sec),
+        )
+
+    def record_idle_training_outcome(self, outcome: TrainingOutcome) -> None:
+        """Learn conservative admission overhead, including empty plans."""
+
+        if outcome.successful_steps > 0:
+            observed_sec = float(
+                outcome.metrics.get("timing_s/drafter_worker_cleanup", 0.0) or 0.0
+            )
+        else:
+            # An empty plan records exactly the cost that prevented batch 1
+            # from starting (activation, reclaim, and cleanup included).
+            observed_sec = max(float(outcome.elapsed_sec), 0.0)
+        if observed_sec <= 0.0:
+            return
+        self._idle_worker_startup_samples_sec.append(observed_sec)
+        logger.warning(
+            "[BubbleTime] updated startup reserve: reason=%s observed_s=%.3f "
+            "reserve_s=%.3f samples=%s",
+            outcome.reason,
+            observed_sec,
+            _conservative_percentile(self._idle_worker_startup_samples_sec),
+            len(self._idle_worker_startup_samples_sec),
         )
 
     def _effective_historical_idle_window_sec(self) -> float | None:
@@ -910,7 +947,8 @@ class DrafterScheduler:
         interval_matched = self.training_interval_matched(context.global_step, config)
         usable_window = max(
             resources.minimum_idle_window_sec
-            - self._effective_idle_deadline_guard_sec(config),
+            - self._effective_idle_deadline_guard_sec(config)
+            - self._effective_idle_startup_reserve_sec(config),
             0.0,
         )
         batch_estimate = self._effective_idle_batch_estimate_sec(config)
@@ -1161,10 +1199,13 @@ class DrafterScheduler:
         budget = self.sync_budget_policy.make_budget(context, config)
         if resources is not None and budget.max_batches > 0:
             deadline_guard_sec = self._effective_idle_deadline_guard_sec(config)
+            startup_reserve_sec = self._effective_idle_startup_reserve_sec(config)
             batch_estimate = self._effective_idle_batch_estimate_sec(config)
             max_batches_per_window = self._effective_idle_max_batches_per_window(config)
             usable_window = max(
-                resources.minimum_idle_window_sec - deadline_guard_sec,
+                resources.minimum_idle_window_sec
+                - deadline_guard_sec
+                - startup_reserve_sec,
                 0.0,
             )
             window_batches = int(math.floor(usable_window / batch_estimate))
@@ -1198,6 +1239,7 @@ class DrafterScheduler:
             logger.info(
                 "[BubbleTime] idle_budget step=%s group=%s workers=%s "
                 "minimum_window_s=%.3f usable_window_s=%.3f guard_s=%.3f "
+                "startup_reserve_s=%.3f "
                 "batch_estimate_s=%.3f window_batches=%s trainable_batches=%s "
                 "max_batches_per_window=%s sync_budget_batches=%s "
                 "planned_batches=%s reason=%s estimate_source=%s",
@@ -1207,6 +1249,7 @@ class DrafterScheduler:
                 resources.minimum_idle_window_sec,
                 usable_window,
                 deadline_guard_sec,
+                startup_reserve_sec,
                 batch_estimate,
                 window_batches,
                 context.data_status.trainable_batches if context.data_status else 0,
@@ -1257,7 +1300,8 @@ class DrafterScheduler:
             "idle_usable_window_sec": (
                 max(
                     resources.minimum_idle_window_sec
-                    - self._effective_idle_deadline_guard_sec(config),
+                    - self._effective_idle_deadline_guard_sec(config)
+                    - self._effective_idle_startup_reserve_sec(config),
                     0.0,
                 )
                 if resources is not None
@@ -1268,7 +1312,8 @@ class DrafterScheduler:
                     math.floor(
                         max(
                             resources.minimum_idle_window_sec
-                            - self._effective_idle_deadline_guard_sec(config),
+                            - self._effective_idle_deadline_guard_sec(config)
+                            - self._effective_idle_startup_reserve_sec(config),
                             0.0,
                         )
                         / self._effective_idle_batch_estimate_sec(config)
@@ -1279,6 +1324,11 @@ class DrafterScheduler:
             ),
             "idle_batch_estimate_sec": (
                 self._effective_idle_batch_estimate_sec(config)
+                if resources is not None
+                else None
+            ),
+            "idle_startup_reserve_sec": (
+                self._effective_idle_startup_reserve_sec(config)
                 if resources is not None
                 else None
             ),
@@ -1385,6 +1435,8 @@ class DrafterScheduler:
         plan: TrainingPlan,
         outcome: TrainingOutcome,
     ) -> None:
+        if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+            self.record_idle_training_outcome(outcome)
         if outcome.trained and outcome.successful_steps > 0:
             try:
                 self._last_successful_training_step = _as_int(plan.source_global_step)

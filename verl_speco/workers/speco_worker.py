@@ -1527,11 +1527,52 @@ class SpecoWorker(Worker):
                 self.trainer.reset_training_metrics()
                 for _ in range(max_batches):
                     deadline_ts = training_plan.get("deadline_ts")
-                    if deadline_ts is not None and time.time() >= float(deadline_ts):
+                    now_ts = time.time()
+                    if deadline_ts is not None and now_ts >= float(deadline_ts):
                         result["reason"] = "deadline_reached"
+                        logger.warning(
+                            "[BubbleTime] training_not_started: plan_id=%s "
+                            "worker_id=%s rank=%s reason=deadline_reached "
+                            "now_ts=%.6f deadline_ts=%.6f remaining_s=%.4f "
+                            "reclaim_requested=%s",
+                            plan_id,
+                            self.rank,
+                            self.rank,
+                            now_ts,
+                            float(deadline_ts),
+                            float(deadline_ts) - now_ts,
+                            self._drafter_reclaim_requested,
+                        )
+                        print(
+                            "[BubbleTime] training_not_started: "
+                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
+                            "reason=deadline_reached "
+                            f"now_ts={now_ts:.6f} deadline_ts={float(deadline_ts):.6f} "
+                            f"remaining_s={float(deadline_ts) - now_ts:.4f} "
+                            f"reclaim_requested={self._drafter_reclaim_requested}",
+                            flush=True,
+                        )
                         break
                     if self._drafter_reclaim_requested:
                         result["reason"] = "reclaim_requested"
+                        logger.warning(
+                            "[BubbleTime] training_not_started: plan_id=%s "
+                            "worker_id=%s rank=%s reason=reclaim_requested "
+                            "now_ts=%.6f deadline_ts=%s reclaim_requested=True",
+                            plan_id,
+                            self.rank,
+                            self.rank,
+                            now_ts,
+                            deadline_ts,
+                        )
+                        print(
+                            "[BubbleTime] training_not_started: "
+                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
+                            "reason=reclaim_requested "
+                            f"now_ts={now_ts:.6f} deadline_ts={deadline_ts} "
+                            "reclaim_requested=True",
+                            flush=True,
+                        )
                         break
                     result["attempted_steps"] += 1
                     step_ok = await self.trainer.training_step(self.last_global_step)
@@ -1588,6 +1629,18 @@ class SpecoWorker(Worker):
         if target_worker_ids and str(self.rank) not in target_worker_ids:
             return {"rank": self.rank, "worker_id": str(self.rank), "requested": False}
         self._drafter_reclaim_requested = True
+        logger.warning(
+            "[BubbleTime] reclaim_requested: worker_id=%s rank=%s target_workers=%s",
+            self.rank,
+            self.rank,
+            tuple(sorted(target_worker_ids)),
+        )
+        print(
+            "[BubbleTime] reclaim_requested: "
+            f"worker_id={self.rank} rank={self.rank} "
+            f"target_workers={tuple(sorted(target_worker_ids))}",
+            flush=True,
+        )
         return {"rank": self.rank, "worker_id": str(self.rank), "requested": True}
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
