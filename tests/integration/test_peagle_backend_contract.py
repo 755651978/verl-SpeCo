@@ -170,6 +170,101 @@ def test_peagle_vllm_guardrail() -> None:
         _speculative_method_from_drafter({"speculative_algorithm": "PEAGLE"})
 
 
+def _peagle_backend_and_target(draft_vocab_size=None):
+    from omegaconf import OmegaConf
+    from transformers import LlamaConfig
+
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
+
+    training: dict = {
+        "peagle_num_draft_layers": 1,
+        "peagle_num_aux_hidden_states": 3,
+        "peagle_num_depths": 2,
+    }
+    if draft_vocab_size is not None:
+        training["peagle_draft_vocab_size"] = draft_vocab_size
+
+    target_hf_config = LlamaConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        vocab_size=32,
+        max_position_embeddings=64,
+    )
+    backend = PEagleTrainerBackend(
+        OmegaConf.create(
+            {
+                "rollout": {"drafter": {"model_path": None, "training": training}},
+                "model": {"path": "/tmp/none"},
+            }
+        ),
+        target_hf_config,
+    )
+    return backend, target_hf_config
+
+
+def test_peagle_rejects_reduced_draft_vocab_without_mapping() -> None:
+    """A reduced draft vocabulary needs a real frequency-derived t2d/d2t pair.
+
+    Without one the model constructor falls back to "the first draft_vocab_size
+    target ids", which is an arbitrary slice of any real tokenizer and leaves the
+    draft unable to ever emit the rest. EAGLE-3 already refuses this
+    configuration; P-EAGLE used to accept it silently.
+    """
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+
+    backend, _ = _peagle_backend_and_target(draft_vocab_size=16)
+
+    with pytest.raises(ValueError) as excinfo:
+        backend.build_model()
+
+    message = str(excinfo.value)
+    assert "draft_vocab_size differs from target vocab_size" in message
+    # Name the algorithm the user configured, not the EAGLE-3 backend it reuses.
+    assert message.startswith("PEAGLE")
+
+
+def test_peagle_identity_vocab_mapping_passes_validation() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from verl_speco.models.peagle import LlamaForCausalLMPeagle
+
+    backend, target_hf_config = _peagle_backend_and_target()
+    draft_config = backend._build_draft_config(None, target_hf_config)
+    assert draft_config.draft_vocab_size == draft_config.vocab_size
+
+    # Must not raise: the full-vocabulary default needs no frequency mapping.
+    backend._validate_vocab_mapping(LlamaForCausalLMPeagle(draft_config))
+
+
+def test_vocab_mapping_validation_names_the_failing_algorithm() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    from verl_speco.backends.eagle3_trainer_backend import Eagle3TrainerBackend
+    from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
+
+    empty_config = OmegaConf.create(
+        {"rollout": {"drafter": {"training": {}}}, "model": {"path": "/tmp/none"}}
+    )
+    drafter_without_mapping = SimpleNamespace(vocab_size=32, draft_vocab_size=32)
+
+    for backend_cls, expected_label in (
+        (Eagle3TrainerBackend, "EAGLE3"),
+        (PEagleTrainerBackend, "PEAGLE"),
+    ):
+        backend = backend_cls(empty_config, OmegaConf.create({}))
+        with pytest.raises(AttributeError) as excinfo:
+            backend._validate_vocab_mapping(drafter_without_mapping)
+        assert str(excinfo.value).startswith(expected_label)
+
+
 def test_peagle_batch_assembly_matches_reference_shift() -> None:
     """base_trainer must apply the reference target-wrapper shift for P-EAGLE:
     row p pairs unshifted aux[p] with token x[p+1], supervised by the

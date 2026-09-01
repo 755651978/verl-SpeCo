@@ -786,26 +786,29 @@ class Eagle3TrainerBackend:
             return False
 
     def _validate_vocab_mapping(self, drafter_module) -> None:
+        # Subclasses share this validator, so name the algorithm that actually
+        # failed instead of always blaming EAGLE3.
+        label = str(self.model_type).upper()
         if not hasattr(drafter_module, "t2d") or not hasattr(drafter_module, "d2t"):
             raise AttributeError(
-                "EAGLE3 draft model does not have t2d/d2t vocab mapping buffers"
+                f"{label} draft model does not have t2d/d2t vocab mapping buffers"
             )
 
         if drafter_module.t2d.numel() != drafter_module.vocab_size:
             raise ValueError(
-                f"EAGLE3 t2d shape mismatch: expected {drafter_module.vocab_size}, "
+                f"{label} t2d shape mismatch: expected {drafter_module.vocab_size}, "
                 f"got {drafter_module.t2d.numel()}"
             )
         if drafter_module.d2t.numel() != drafter_module.draft_vocab_size:
             raise ValueError(
-                f"EAGLE3 d2t shape mismatch: expected {drafter_module.draft_vocab_size}, "
+                f"{label} d2t shape mismatch: expected {drafter_module.draft_vocab_size}, "
                 f"got {drafter_module.d2t.numel()}"
             )
 
         selected_vocab_size = int(drafter_module.t2d.sum().item())
         if selected_vocab_size != drafter_module.draft_vocab_size:
             raise ValueError(
-                f"EAGLE3 vocab mapping selects {selected_vocab_size} tokens, "
+                f"{label} vocab mapping selects {selected_vocab_size} tokens, "
                 f"but draft_vocab_size is {drafter_module.draft_vocab_size}"
             )
 
