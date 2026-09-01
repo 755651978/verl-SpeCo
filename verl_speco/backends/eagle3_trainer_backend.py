@@ -1178,6 +1178,10 @@ class Eagle3TrainerBackend:
             0.0, device=input_ids.device, dtype=torch.float32
         )
         gamma = 0.8
+        # The per-step quality stats below are log-only, and every one of them
+        # forces a device sync. Collect them only when the log will be emitted,
+        # matching how the EAGLE-1/2 backend gates the same diagnostics.
+        diagnostics_enabled = logger.isEnabledFor(logging.DEBUG)
 
         # Preprocess shifted targets
         for idx in range(length):
@@ -1234,7 +1238,7 @@ class Eagle3TrainerBackend:
                     position_mask=position_mask,
                 )
                 target_top1 = target_p.argmax(dim=-1)
-            if (
+            if diagnostics_enabled and (
                 base_valid_position.any()
                 and not valid_position[base_valid_position].all()
             ):
@@ -1244,7 +1248,7 @@ class Eagle3TrainerBackend:
                     int(dropped_tokens.detach().cpu().item()),
                 )
             with torch.no_grad():
-                if valid_position.any():
+                if diagnostics_enabled and valid_position.any():
                     draft_top1 = logits.argmax(dim=-1)
                     step_top1_correct = (
                         (draft_top1[valid_position] == target_top1[valid_position])
@@ -1303,7 +1307,11 @@ class Eagle3TrainerBackend:
             total_local_ploss += (gamma**idx) * step_loss_sum
             total_local_tokens += valid_position.float().sum()
 
-        if use_sparse_restricted_ce and sparse_base_tokens.detach().float().item() > 0:
+        if (
+            diagnostics_enabled
+            and use_sparse_restricted_ce
+            and sparse_base_tokens.detach().float().item() > 0
+        ):
             logger.debug(
                 "[drafter sparse restricted ce] base_tokens=%s valid_tokens=%s dropped=%s "
                 "intersection_mean=%.6f hit_mass_mean=%.6f min_intersection=%s min_hit_mass=%s",
@@ -1326,8 +1334,8 @@ class Eagle3TrainerBackend:
                 logits_sparse_min_mass,
             )
 
-        if quality_tokens.detach().float().item() > 0:
-            logger.warning(
+        if diagnostics_enabled and quality_tokens.detach().float().item() > 0:
+            logger.debug(
                 "[drafter logits quality] valid_tokens=%s top1_acc=%.6f top%s_acc=%.6f "
                 "local_ploss_sum=%.6f local_tokens=%s per_step=%s",
                 int(quality_tokens.detach().cpu().item()),
