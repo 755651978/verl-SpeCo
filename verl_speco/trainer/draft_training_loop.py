@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import math
@@ -39,7 +40,6 @@ from verl_speco.trainer.feature_store import (
     DraftReplaySample,
     build_feature_store_from_config,
 )
-from verl_speco.trainer.standalone_checkpoint import rewrite_standalone_runtime_config
 from verl_speco.trainer.standalone_resume import (
     load_standalone_resume,
     save_standalone_resume,
@@ -708,276 +708,99 @@ def _standalone_input_path(config: Any) -> str | None:
     return None
 
 
-def _torch_load_cpu(path: str) -> Any:
-    try:
-        return torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+def _ensure_dict_child(config: dict[str, Any], key: str) -> dict[str, Any]:
+    value = config.get(key)
+    if isinstance(value, dict):
+        return value
+    value = {}
+    config[key] = value
+    return value
 
 
-def _load_tensor_from_torch(
-    path: str, keys: tuple[str, ...]
-) -> tuple[str, torch.Tensor] | None:
-    try:
-        state = _torch_load_cpu(path)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to load any of %s from %s: %s", keys, path, exc)
-        return None
-    if isinstance(state, dict):
-        for key in keys:
-            value = state.get(key)
-            if isinstance(value, torch.Tensor):
-                return key, value
-    return None
-
-
-def _target_model_path_for_lm_head(trainer: DrafterBaseTrainer) -> str | None:
-    model_path = getattr(getattr(trainer, "config", None), "model", None)
-    model_path = getattr(model_path, "path", None)
+def _load_source_drafter_config(trainer: DrafterBaseTrainer) -> dict[str, Any] | None:
+    model_path = getattr(
+        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
+    )
+    model_path = getattr(model_path, "model_path", None)
     if not model_path:
         return None
-    return os.fspath(model_path)
-
-
-def _model_ties_word_embeddings(model_path: str | None) -> bool:
-    if not model_path:
-        return False
-    config_path = os.path.join(model_path, "config.json")
+    config_path = os.path.join(os.fspath(model_path), "config.json")
     if not os.path.exists(config_path):
-        return False
+        return None
     try:
         with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+            loaded = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "Failed to read model config %s for tied embedding check: %s",
-            config_path,
-            exc,
-        )
-        return False
-    return bool(isinstance(config, dict) and config.get("tie_word_embeddings") is True)
-
-
-def _load_lm_head_weight(
-    model_path: str | None,
-    *,
-    allow_tied_embedding: bool = False,
-) -> tuple[str, torch.Tensor] | None:
-    if not model_path:
+        logger.warning("Failed to load source drafter config %s: %s", config_path, exc)
         return None
-
-    keys = (
-        ("lm_head.weight", "model.embed_tokens.weight")
-        if allow_tied_embedding
-        else ("lm_head.weight",)
-    )
-    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
-        index_path = os.path.join(model_path, index_name)
-        if not os.path.exists(index_path):
-            continue
-        try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                weight_map = json.load(f).get("weight_map", {})
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to read weight index %s: %s", index_path, exc)
-            continue
-        if not isinstance(weight_map, dict):
-            continue
-        for key in keys:
-            shard_name = weight_map.get(key)
-            if not shard_name:
-                continue
-            shard_path = os.path.join(model_path, os.fspath(shard_name))
-            if index_name.endswith(".safetensors.index.json"):
-                loaded = _load_tensor_from_safetensors(shard_path, (key,))
-            else:
-                loaded = _load_tensor_from_torch(shard_path, (key,))
-            if loaded is not None:
-                return loaded
-
-    safetensors_path = os.path.join(model_path, "model.safetensors")
-    if os.path.exists(safetensors_path):
-        loaded = _load_tensor_from_safetensors(safetensors_path, keys)
-        if loaded is not None:
-            return loaded
-
-    torch_path = os.path.join(model_path, "pytorch_model.bin")
-    if os.path.exists(torch_path):
-        return _load_tensor_from_torch(torch_path, keys)
-
-    return None
+    return loaded if isinstance(loaded, dict) else None
 
 
-def _append_lm_head_to_safetensors_index(
-    checkpoint_path: str, lm_head_weight: torch.Tensor
-) -> bool:
-    index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
-    if not os.path.exists(index_path):
-        return False
-    try:
-        from safetensors.torch import save_file
-
-        with open(index_path, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
-        weight_map = index_data.setdefault("weight_map", {})
-        if not isinstance(weight_map, dict):
-            logger.warning(
-                "Cannot append lm_head.weight to %s: expected weight_map object",
-                index_path,
-            )
-            return True
-        if "lm_head.weight" in weight_map:
-            return True
-
-        shard_name = "model-lm-head.safetensors"
-        save_file(
-            {"lm_head.weight": lm_head_weight},
-            os.path.join(checkpoint_path, shard_name),
-        )
-        weight_map["lm_head.weight"] = shard_name
-        metadata = index_data.setdefault("metadata", {})
-        if isinstance(metadata, dict) and "total_size" in metadata:
-            metadata["total_size"] = int(metadata["total_size"]) + (
-                lm_head_weight.numel() * lm_head_weight.element_size()
-            )
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump(index_data, f, indent=2, sort_keys=True)
-            f.write("\n")
-        logger.info(
-            "Added lm_head.weight to standalone sharded checkpoint %s", index_path
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to append lm_head.weight to sharded checkpoint %s: %s",
-            index_path,
-            exc,
-        )
-    return True
-
-
-def _append_lm_head_to_torch_index(
-    checkpoint_path: str, lm_head_weight: torch.Tensor
-) -> bool:
-    index_path = os.path.join(checkpoint_path, "pytorch_model.bin.index.json")
-    if not os.path.exists(index_path):
-        return False
-    try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
-        weight_map = index_data.setdefault("weight_map", {})
-        if not isinstance(weight_map, dict):
-            logger.warning(
-                "Cannot append lm_head.weight to %s: expected weight_map object",
-                index_path,
-            )
-            return True
-        if "lm_head.weight" in weight_map:
-            return True
-
-        shard_name = "pytorch_model-lm-head.bin"
-        torch.save(
-            {"lm_head.weight": lm_head_weight},
-            os.path.join(checkpoint_path, shard_name),
-        )
-        weight_map["lm_head.weight"] = shard_name
-        metadata = index_data.setdefault("metadata", {})
-        if isinstance(metadata, dict) and "total_size" in metadata:
-            metadata["total_size"] = int(metadata["total_size"]) + (
-                lm_head_weight.numel() * lm_head_weight.element_size()
-            )
-        with open(index_path, "w", encoding="utf-8") as f:
-            json.dump(index_data, f, indent=2, sort_keys=True)
-            f.write("\n")
-        logger.info(
-            "Added lm_head.weight to standalone sharded checkpoint %s", index_path
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Failed to append lm_head.weight to sharded checkpoint %s: %s",
-            index_path,
-            exc,
-        )
-    return True
-
-
-def _append_lm_head_weight_if_missing(
-    checkpoint_path: str,
-    source_model_path: str | None,
-    target_model_path: str | None,
-    *,
-    allow_target_fallback: bool,
+def _fill_if_missing(
+    dst: dict[str, Any], src: dict[str, Any], keys: tuple[str, ...]
 ) -> None:
-    loaded = _load_lm_head_weight(source_model_path)
-    source_label = source_model_path
-    if loaded is None and allow_target_fallback:
-        loaded = _load_lm_head_weight(target_model_path)
-        source_label = target_model_path
-        if loaded is None and _model_ties_word_embeddings(target_model_path):
-            loaded = _load_lm_head_weight(target_model_path, allow_tied_embedding=True)
-    if loaded is None:
-        if allow_target_fallback:
-            logger.warning(
-                "Standalone DSpark checkpoint export could not find lm_head.weight in source %s, "
-                "or target lm_head.weight / tied model.embed_tokens.weight in target %s",
-                source_model_path,
-                target_model_path,
-            )
-        return
-    loaded_key, lm_head_weight = loaded
-    lm_head_weight = lm_head_weight.detach().cpu()
-    logger.info(
-        "Using %s from %s as standalone drafter lm_head.weight",
-        loaded_key,
-        source_label,
-    )
+    for key in keys:
+        if key in src and key not in dst:
+            dst[key] = deepcopy(src[key])
 
-    if _append_lm_head_to_safetensors_index(checkpoint_path, lm_head_weight):
-        return
-    if _append_lm_head_to_torch_index(checkpoint_path, lm_head_weight):
-        return
 
-    safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
-    if os.path.exists(safetensors_path):
-        try:
-            from safetensors.torch import load_file, save_file
-
-            state = load_file(safetensors_path, device="cpu")
-            if "lm_head.weight" in state:
-                return
-            state["lm_head.weight"] = lm_head_weight
-            save_file(state, safetensors_path)
-            logger.info(
-                "Added lm_head.weight to standalone checkpoint %s", safetensors_path
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to append lm_head.weight to %s: %s", safetensors_path, exc
-            )
-        return
-
-    torch_path = os.path.join(checkpoint_path, "pytorch_model.bin")
-    if os.path.exists(torch_path):
-        try:
-            state = _torch_load_cpu(torch_path)
-            if not isinstance(state, dict):
-                logger.warning(
-                    "Cannot append lm_head.weight to %s: expected dict state",
-                    torch_path,
-                )
-                return
-            if "lm_head.weight" in state:
-                return
-            state["lm_head.weight"] = lm_head_weight
-            torch.save(state, torch_path)
-            logger.info("Added lm_head.weight to standalone checkpoint %s", torch_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Failed to append lm_head.weight to %s: %s", torch_path, exc)
-        return
-
-    logger.warning(
-        "Standalone checkpoint export found no model.safetensors or pytorch_model.bin under %s",
-        checkpoint_path,
-    )
+# Extra runtime-facing config a DFlash variant needs on top of the shared DFlash
+# aliases, as (config child, keys copied from the training config). Domino writes
+# into dflash_config because engines serve it as a DFlash projector sub-mode
+# (dflash_config.projector_type="domino"), while DSpark is its own serve method.
+_VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "domino": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "emb_dim",
+            "gru_hidden_dim",
+            "pure_draft_prefix_len",
+            "num_target_layers",
+            "target_num_hidden_layers",
+        ),
+    ),
+    # DFlash2 is served as a DFlash checkpoint whose dflash_config carries the
+    # selector/conv hyperparameters, matching the released z-lab layout.
+    "dflash2": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "conv_kernel_size",
+            "conv_group_size",
+            "selector_rank",
+            "selector_top_k",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+        ),
+    ),
+    "dspark": (
+        "dspark_config",
+        (
+            "block_size",
+            "num_anchors",
+            "markov_rank",
+            "markov_head_type",
+            "confidence_head_alpha",
+            "confidence_head_with_markov",
+            "ce_loss_alpha",
+            "l1_loss_alpha",
+            "loss_decay_gamma",
+            "target_layer_ids",
+            "num_context_layers",
+            "num_target_layers",
+            "target_num_hidden_layers",
+            "mask_token_id",
+        ),
+    ),
+}
 
 
 def _rewrite_standalone_block_runtime_config(
@@ -985,23 +808,112 @@ def _rewrite_standalone_block_runtime_config(
     checkpoint_path: str,
     completed_future=None,
 ) -> None:
-    source_model_path = rewrite_standalone_runtime_config(
-        trainer, checkpoint_path, completed_future
-    )
+    """Export standalone DFlash/DSpark/Domino checkpoints with runtime-facing config.
+
+    The training wrapper saves an internal SpeCo config.  For standalone
+    checkpoints we keep the original drafter ``config.json`` as the runtime
+    contract and only merge the alias fields needed by vLLM/SGLang.
+    """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type == "dspark":
-        _append_lm_head_weight_if_missing(
-            checkpoint_path,
-            source_model_path,
-            _target_model_path_for_lm_head(trainer),
-            allow_target_fallback=True,
+    if backend_type not in {"dflash", "dflash2", "dspark", "domino"}:
+        return
+
+    if completed_future is not None:
+        try:
+            completed_future.result()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Skip standalone runtime config rewrite because checkpoint save failed: %s",
+                exc,
+            )
+            return
+
+    config_path = os.path.join(checkpoint_path, "config.json")
+    if not os.path.exists(config_path):
+        logger.warning(
+            "Cannot rewrite standalone runtime config: missing %s", config_path
         )
-    elif backend_type == "dflash":
-        _append_lm_head_weight_if_missing(
-            checkpoint_path,
-            source_model_path,
-            None,
-            allow_target_fallback=False,
+        return
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            training_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Cannot rewrite standalone runtime config %s: %s", config_path, exc
+        )
+        return
+    if not isinstance(training_config, dict):
+        logger.warning(
+            "Cannot rewrite standalone runtime config %s: expected object", config_path
+        )
+        return
+
+    training_config_path = os.path.join(checkpoint_path, "speco_training_config.json")
+    try:
+        with open(training_config_path, "w", encoding="utf-8") as f:
+            json.dump(training_config, f, indent=2, sort_keys=True)
+    except OSError as exc:
+        logger.warning(
+            "Failed to write standalone training config copy %s: %s",
+            training_config_path,
+            exc,
+        )
+
+    runtime_config = _load_source_drafter_config(trainer)
+    if runtime_config is None:
+        runtime_config = deepcopy(training_config)
+        logger.warning(
+            "Source drafter config is unavailable; standalone checkpoint keeps SpeCo training config as runtime config"
+        )
+
+    runtime_config["speco_training_model_type"] = backend_type
+    common_alias_keys = ("target_layer_ids", "mask_token_id", "num_context_layers")
+    _fill_if_missing(runtime_config, training_config, common_alias_keys)
+
+    dflash_config = _ensure_dict_child(runtime_config, "dflash_config")
+    _fill_if_missing(dflash_config, training_config, common_alias_keys)
+
+    variant_child_key, variant_alias_keys = _VARIANT_RUNTIME_ALIASES.get(
+        backend_type, (None, ())
+    )
+    variant_config = (
+        _ensure_dict_child(runtime_config, variant_child_key)
+        if variant_child_key
+        else {}
+    )
+    _fill_if_missing(variant_config, training_config, variant_alias_keys)
+    if backend_type == "domino":
+        variant_config["projector_type"] = str(
+            training_config.get("projector_type", "domino") or "domino"
+        )
+
+    target_layer_ids = (
+        runtime_config.get("target_layer_ids")
+        or dflash_config.get("target_layer_ids")
+        or variant_config.get("target_layer_ids")
+    )
+    if (
+        target_layer_ids is not None
+        and "eagle_aux_hidden_state_layer_ids" not in runtime_config
+    ):
+        try:
+            runtime_config["eagle_aux_hidden_state_layer_ids"] = [
+                int(layer_id) + 1 for layer_id in target_layer_ids
+            ]
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid target_layer_ids in standalone exported config: %r",
+                target_layer_ids,
+            )
+
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(runtime_config, f, indent=2, sort_keys=True)
+            f.write("\n")
+    except OSError as exc:
+        logger.warning(
+            "Failed to write standalone runtime config %s: %s", config_path, exc
         )
 
 

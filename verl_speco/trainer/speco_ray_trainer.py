@@ -49,6 +49,8 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_HIDDEN_REF_META_KEY,
     OLD_LOGPROB_HIDDEN_REFS_KEY,
     OLD_LOGPROB_HIDDEN_STATES_KEY,
+    OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY,
+    OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY,
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
@@ -1048,11 +1050,44 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(self.config, ("actor_rollout_ref", "actor", "strategy"), "")
             or ""
         ).lower()
-        if strategy not in {"fsdp", "fsdp2", "veomni"}:
+        if strategy not in {"fsdp", "fsdp2", "megatron", "veomni"}:
             raise ValueError(
                 "SPECO old-logprob hidden collection supports "
-                "actor.strategy=fsdp/fsdp2/veomni, "
+                "actor.strategy=fsdp/fsdp2/megatron/veomni, "
                 f"got {strategy!r}"
+            )
+        if strategy == "megatron":
+            tp_size = int(
+                _get_nested(
+                    self.config,
+                    (
+                        "actor_rollout_ref",
+                        "actor",
+                        "megatron",
+                        "tensor_model_parallel_size",
+                    ),
+                    1,
+                )
+                or 1
+            )
+            pp_size = int(
+                _get_nested(
+                    self.config,
+                    (
+                        "actor_rollout_ref",
+                        "actor",
+                        "megatron",
+                        "pipeline_model_parallel_size",
+                    ),
+                    1,
+                )
+                or 1
+            )
+            logger.warning(
+                "SPECO old-logprob hidden collection with Megatron backend: "
+                f"TP={tp_size}, PP={pp_size}. "
+                "TP>1 uses Megatron native sequence parallelism for hidden-state gathering. "
+                "PP>1 uses cross-stage dist communication for capture transfer."
             )
         capture_impl = str(
             training_cfg.get("old_logprob_hidden_capture_impl", "forward_hook")
@@ -1061,6 +1096,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if capture_impl not in {"forward_hook", "output_hidden_states"}:
             raise ValueError(
                 f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}"
+            )
+        if strategy == "megatron" and capture_impl != "forward_hook":
+            raise ValueError(
+                "SPECO old-logprob hidden collection with Megatron backend supports "
+                f"forward_hook capture only, got {capture_impl!r}"
             )
         return True
 
@@ -1427,6 +1467,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         chunk_meta = self._speco_flatten_non_tensor_rows(
             tu.get(output, OLD_LOGPROB_HIDDEN_CHUNK_META_KEY)
         )
+        # PP>1 single-put path: the last stage ray.put()s the concatenated
+        # hidden tensor once and returns the ObjectRef.  Materialize it here
+        # (once) and release the ref immediately so the big tensor does not pin
+        # the Ray object store; the rest of this function treats it as an
+        # inline tensor.
+        whole_ref = tu.get(output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY)
+        if hidden_states is None and whole_ref is not None:
+            import ray as _ray
+
+            hidden_states = _ray.get(whole_ref)
+            # Drop every reference to the ObjectRef (local var + the copy held
+            # inside the output TensorDict) so Ray can free the big tensor from
+            # the object store as soon as this materialization completes,
+            # instead of waiting for the whole step output to be GC'd.
+            del whole_ref
+            try:
+                tu.assign_non_tensor_data(
+                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_KEY, None
+                )
+                tu.assign_non_tensor_data(
+                    output, OLD_LOGPROB_HIDDEN_WHOLE_REF_META_KEY, None
+                )
+            except Exception:
+                pass
         if hidden_states is None and hidden_refs is None and chunk_refs is None:
             return 0
         hidden_rows = self._speco_tensor_rows(hidden_states)
@@ -2372,6 +2436,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_oldlogprob_hidden_layout(),
             )
             tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
+            # Pass the user's sequence_parallel setting through the batch,
+            # because MindSpeed repatch may override tf_config.sequence_parallel
+            # back to True even when the user sets it to False.
+            _actor_megatron_cfg = _get_nested(
+                self.config, ("actor_rollout_ref", "actor", "megatron"), {}
+            )
+            _user_seq_parallel = _actor_megatron_cfg.get("sequence_parallel", True)
+            tu.assign_non_tensor_data(
+                batch_td,
+                "speco_oldlogprob_sp_disabled",
+                not bool(_user_seq_parallel),
+            )
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = (
                 time.perf_counter() - prepare_started
@@ -2525,14 +2601,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             generate_sequences_with_speco,
             rollout_generation_target,
         )
-        if self._speco_oldlogprob_collection_requested():
+        if (
+            self._speco_oldlogprob_collection_requested()
+            or self._speco_oldlogprob_entropy_hook_enabled()
+        ):
             self._compute_old_log_prob = MethodType(
                 compute_old_log_prob_with_speco, self
-            )
-        elif self._speco_oldlogprob_entropy_hook_enabled():
-            self._compute_old_log_prob = MethodType(
-                compute_old_log_prob_with_speco,
-                self,
             )
         self._update_actor = MethodType(update_actor_with_speco, self)
         if defer_publish_until_update_weights:

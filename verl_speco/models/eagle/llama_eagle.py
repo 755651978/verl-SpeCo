@@ -1495,10 +1495,14 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         self.post_init()
 
-        # create vocab buffers
+        # Create vocab buffers. d2t holds OFFSETS, not absolute ids: the target id
+        # of draft id i is `i + d2t[i]`. That is what
+        # `preprocessing.process_token_dict_to_mappings` emits (`used_tokens[i] - i`)
+        # and what the serving engines apply, so the identity mapping used when no
+        # frequency mapping is supplied is all zeros.
         t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
         t2d[: self.draft_vocab_size] = True
-        d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
+        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 

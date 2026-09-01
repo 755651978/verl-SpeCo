@@ -109,6 +109,9 @@ jobs:
       max-parallel: 1
       matrix:
         include:
+          - drafter: megatron-eagle3
+            enable_training: true
+            disable_eagle3_torch_compile: true
           - drafter: eagle3
             enable_training: true
             disable_eagle3_torch_compile: true
@@ -156,7 +159,7 @@ jobs:
           SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
         run: |
           case "${{ matrix.drafter }}" in
-            eagle3)
+            eagle3|megatron-eagle3)
               draft_model="${SPECO_EAGLE3_DRAFT_MODEL}"
               ;;
             dflash)
