@@ -956,32 +956,6 @@ def _rollout_idle_worker_id_for_replica(
     return str(replica_rank)
 
 
-def _rollout_idle_deadline_ts(drafter_cfg: dict[str, Any]) -> float:
-    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
-    if idle_cfg.get("initial_batch_estimate_sec") is None:
-        return time.time() + 30.0
-    try:
-        batch_estimate = float(idle_cfg.get("initial_batch_estimate_sec") or 1.0)
-    except (TypeError, ValueError):
-        batch_estimate = 1.0
-    try:
-        max_batches = int(idle_cfg.get("max_batches_per_window") or 1)
-    except (TypeError, ValueError):
-        max_batches = 1
-    try:
-        guard = float(idle_cfg.get("deadline_guard_sec") or 0.05)
-    except (TypeError, ValueError):
-        guard = 0.05
-    try:
-        min_window = float(idle_cfg.get("min_idle_window_sec") or 0.05)
-    except (TypeError, ValueError):
-        min_window = 0.05
-    return time.time() + max(
-        batch_estimate * max(max_batches, 1) + guard,
-        min_window,
-    )
-
-
 def _emit_rollout_idle_worker_event(
     *,
     drafter_cfg: dict[str, Any],
@@ -994,16 +968,13 @@ def _emit_rollout_idle_worker_event(
     if not bus_name:
         return False
     event_ts = time.time()
-    must_be_ready_at = (
-        _rollout_idle_deadline_ts(drafter_cfg) if event_type == "WORKER_IDLE" else None
-    )
+    # Runtime callbacks prove that a replica has released resources, but they
+    # cannot know when the next rollout request will reclaim them.  Leave the
+    # deadline unknown and let the scheduler admit work from observed history;
+    # reclaim remains the hard stop signal.
+    must_be_ready_at = None
     worker_id = _rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank)
-    deadline_source = (
-        "auto"
-        if _rollout_idle_worker_config(drafter_cfg).get("initial_batch_estimate_sec")
-        is None
-        else "config"
-    )
+    deadline_source = "runtime_unknown"
     emitted = emit_rollout_idle_event(
         bus_name,
         {

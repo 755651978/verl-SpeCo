@@ -484,6 +484,7 @@ class TrainingPlan:
     idle_window_batches: int | None = None
     idle_batch_estimate_sec: float | None = None
     idle_startup_reserve_sec: float | None = None
+    idle_tail_reserve_sec: float | None = None
     idle_trainable_batches: int | None = None
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
@@ -508,6 +509,7 @@ class TrainingPlan:
         "missing_training_group_metadata": 19,
         "sync_fallback_training_ready": 20,
         "sync_fallback_no_trainable_batch": 21,
+        "target_lm_head_not_ready": 22,
     }
 
     def to_worker_payload(self) -> dict[str, object]:

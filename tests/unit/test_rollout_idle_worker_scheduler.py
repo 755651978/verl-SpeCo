@@ -430,6 +430,38 @@ def test_idle_worker_auto_budget_bootstraps_one_batch_without_manual_estimate() 
     assert plan.idle_batch_estimate_sec == pytest.approx(0.25)
 
 
+def test_runtime_idle_event_without_deadline_bootstraps_one_batch() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=None,
+            )
+        )
+    config = replace(
+        _auto_idle_config(2),
+        idle_worker_min_idle_window_sec=None,
+        idle_worker_max_batches_per_window=None,
+        idle_worker_initial_batch_estimate_sec=None,
+        idle_worker_deadline_guard_sec=None,
+    )
+
+    plan = scheduler.prepare_training_plan(_context(), config)
+
+    assert plan.launch
+    assert plan.max_batches == 1
+    assert plan.idle_window_sec == pytest.approx(
+        plan.idle_startup_reserve_sec
+        + plan.idle_batch_estimate_sec
+        + plan.idle_tail_reserve_sec
+        + 0.05
+    )
+
+
 def test_idle_worker_budget_is_capped_by_observed_replica_idle_window() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     for replica_rank, worker_id in enumerate(("0", "1")):
@@ -477,6 +509,108 @@ def test_idle_worker_budget_is_capped_by_observed_replica_idle_window() -> None:
     assert plan.max_batches == 3
 
 
+def test_generation_completion_records_real_idle_window() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    for replica_rank, worker_id in enumerate(("0", "1")):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=replica_rank,
+                memory_released=True,
+                must_be_ready_at=130.0,
+                event_ts=100.0,
+            )
+        )
+
+    metrics = scheduler.record_generation_completed(event_ts=102.0)
+
+    assert metrics["bubble/observed_idle_windows"] == 2
+    assert metrics["bubble/observed_idle_window_min_s"] == pytest.approx(2.0)
+    assert len(scheduler._replica_idle_window_samples_sec) == 2
+
+    for replica_rank, worker_id in enumerate(("0", "1")):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.GENERATION_STARTED,
+                worker_id=worker_id,
+                replica_rank=replica_rank,
+                event_ts=150.0,
+            )
+        )
+
+    assert len(scheduler._replica_idle_window_samples_sec) == 2
+
+
+def test_small_idle_window_uses_sync_fallback_after_starvation() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    deadline_ts = time.time() + 0.35
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=deadline_ts,
+            )
+        )
+    config = replace(
+        _idle_config(),
+        idle_worker_fallback_to_sync=True,
+        max_steps_without_training=4,
+    )
+    context = DrafterScheduleContext(
+        global_step=4,
+        training_mode="online",
+        collected_samples_this_step=0,
+        oldlogprob_collection_requested=False,
+    )
+
+    plan = scheduler.prepare_training_plan(context, config)
+
+    assert plan.launch
+    assert plan.reason == "sync_fallback_training_ready"
+    assert plan.execution_strategy is DrafterExecutionStrategy.SYNC
+    assert plan.target_worker_ids == ()
+
+
+def test_small_idle_window_does_not_sync_fallback_inside_idle_loop() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    deadline_ts = time.time() + 0.35
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=deadline_ts,
+            )
+        )
+    config = replace(
+        _idle_config(),
+        idle_worker_fallback_to_sync=True,
+        max_steps_without_training=4,
+    )
+    context = DrafterScheduleContext(
+        global_step=4,
+        training_mode="online",
+        collected_samples_this_step=0,
+        oldlogprob_collection_requested=False,
+    )
+
+    plan = scheduler.prepare_training_plan(
+        context,
+        config,
+        allow_sync_fallback=False,
+    )
+
+    assert not plan.launch
+    assert plan.reason == "window_too_small"
+    assert plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+
+
 def test_idle_worker_deadline_guard_learns_reclaim_cost() -> None:
     scheduler = DrafterScheduler()
     config = replace(_idle_config(), idle_worker_deadline_guard_sec=0.1)
@@ -486,7 +620,7 @@ def test_idle_worker_deadline_guard_learns_reclaim_cost() -> None:
     assert scheduler._effective_idle_deadline_guard_sec(config) == pytest.approx(0.7)
 
 
-def test_idle_worker_prebatch_reclaim_reserves_full_worker_critical_path() -> None:
+def test_idle_worker_prebatch_reclaim_splits_setup_and_tail_reserves() -> None:
     scheduler = DrafterScheduler()
     config = _idle_config()
     outcome = TrainingOutcome(
@@ -494,9 +628,8 @@ def test_idle_worker_prebatch_reclaim_reserves_full_worker_critical_path() -> No
         successful_steps=0,
         worker_results=[],
         raw_results=[],
-        # This is the coordinator-observed RPC time.  The worker also reports
-        # cleanup completed after reclaim, so the admission reserve must retain
-        # the larger end-to-end critical path.
+        # Driver-side RPC wall time includes waiting for the next rollout to
+        # reclaim.  It must not be treated as worker setup overhead.
         elapsed_sec=24.0,
         reason="submitted_async",
         metrics={
@@ -509,9 +642,8 @@ def test_idle_worker_prebatch_reclaim_reserves_full_worker_critical_path() -> No
 
     scheduler.record_idle_training_outcome(outcome)
 
-    assert scheduler._effective_idle_startup_reserve_sec(config) == pytest.approx(
-        26.5
-    )
+    assert scheduler._effective_idle_startup_reserve_sec(config) == pytest.approx(22.0)
+    assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(3.0)
 
 
 def test_idle_worker_training_does_not_wait_for_training_interval() -> None:

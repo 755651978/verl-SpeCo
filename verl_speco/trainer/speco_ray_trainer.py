@@ -1398,6 +1398,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         "bubble/target_lm_head_not_ready": 1,
                     }
                 )
+            elif (
+                plan is not None
+                and plan.launch
+                and required_target_version is not None
+            ):
+                print(
+                    "[BubbleTime] target_lm_head_ready_gate: "
+                    f"plan_id={plan.plan_id} required_target_version="
+                    f"{required_target_version} ready_versions="
+                    f"{tuple(sorted(self._speco_ready_target_lm_head_versions))}",
+                    flush=True,
+                )
             print(
                 "[BubbleTime] idle_launch_decision: "
                 f"launch={getattr(plan, 'launch', False)} "
@@ -1409,7 +1421,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"trainable_batches={getattr(plan, 'idle_trainable_batches', None)} "
                 f"batch_estimate_s={getattr(plan, 'idle_batch_estimate_sec', None)} "
                 f"startup_reserve_s={getattr(plan, 'idle_startup_reserve_sec', None)} "
+                f"tail_reserve_s={getattr(plan, 'idle_tail_reserve_sec', None)} "
                 f"deadline_ts={getattr(plan, 'deadline_ts', None)} "
+                "worker_deadline_in_s="
+                f"{max(float(getattr(plan, 'deadline_ts', 0.0) or 0.0) - time.time(), 0.0):.3f} "
                 f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
                 f"idle_groups={metrics.get('bubble/idle_training_groups', 0)}",
                 flush=True,
@@ -1533,11 +1548,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         del gen_batch_output
         if not self._speco_rollout_idle_worker_enabled():
             return {}
+        generation_complete_ts = time.time()
+        metrics = self._speco_get_drafter_scheduler().record_generation_completed(
+            generation_complete_ts
+        )
         runtime_state = self._speco_get_drafter_runtime_state()
         active_plan = runtime_state.active_plan
         if active_plan is None or not active_plan.target_worker_ids:
             logger.info("[BubbleTime] generation completed: no active idle training")
-            return {}
+            return metrics
         self._speco_get_drafter_scheduler().request_reclaim(
             active_plan.target_worker_ids
         )
@@ -1546,7 +1565,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             active_plan.plan_id,
             active_plan.target_worker_ids,
         )
-        return {"bubble/reclaim_requested": 1}
+        metrics["bubble/reclaim_requested"] = 1
+        return metrics
 
     @staticmethod
     def _speco_generation_output_replica_ranks(gen_batch_output: Any) -> tuple[int, ...]:
@@ -1586,9 +1606,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         config = self._speco_drafter_schedule_config()
         batch_estimate = scheduler._effective_idle_batch_estimate_sec(config)
         guard = scheduler._effective_idle_deadline_guard_sec(config)
-        min_window = scheduler._effective_idle_min_window_sec(config)
+        min_window = scheduler._minimum_idle_training_window_sec(config)
         max_batches = scheduler._effective_idle_max_batches_per_window(config)
-        fallback_window = max(batch_estimate * max(max_batches, 1) + guard, min_window)
+        startup = scheduler._effective_idle_startup_reserve_sec(config)
+        tail = scheduler._effective_idle_tail_reserve_sec(config)
+        fallback_window = max(
+            startup + batch_estimate * max(max_batches, 1) + tail + guard,
+            min_window,
+        )
         if scheduler._idle_batch_estimate_is_bootstrap(config):
             fallback_window = max(
                 fallback_window,

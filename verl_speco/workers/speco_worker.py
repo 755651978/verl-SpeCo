@@ -1350,6 +1350,15 @@ class SpecoWorker(Worker):
             result["reason"] = "buffer_version_changed"
             return result
         required_target_version = training_plan.get("required_target_version")
+        if required_target_version is not None:
+            print(
+                "[BubbleTime] target_lm_head_cache_check: "
+                f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
+                f"rank={self.rank} required_target_version={required_target_version} "
+                "cached_versions="
+                f"{tuple(sorted(getattr(self.trainer, '_target_lm_head_snapshots', {})))}",
+                flush=True,
+            )
         if (
             required_target_version is not None
             and not self.trainer.select_target_lm_head_version(
@@ -1369,6 +1378,13 @@ class SpecoWorker(Worker):
                     "required_target_version": required_target_version,
                 }
             )
+            print(
+                "[BubbleTime] target_lm_head_cache_miss: "
+                f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
+                f"rank={self.rank} required_target_version={required_target_version} "
+                "reason=target_version_unavailable",
+                flush=True,
+            )
             return result
         current_target_version = getattr(
             self.trainer, "_target_lm_head_weight_step", None
@@ -1376,8 +1392,23 @@ class SpecoWorker(Worker):
         if required_target_version is not None and int(required_target_version) != int(
             current_target_version if current_target_version is not None else -1
         ):
+            print(
+                "[BubbleTime] target_lm_head_cache_miss: "
+                f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
+                f"rank={self.rank} required_target_version={required_target_version} "
+                f"current_target_version={current_target_version} "
+                "reason=target_version_mismatch",
+                flush=True,
+            )
             result["reason"] = "target_version_mismatch"
             return result
+        if required_target_version is not None:
+            print(
+                "[BubbleTime] target_lm_head_cache_hit: "
+                f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
+                f"rank={self.rank} target_version={current_target_version}",
+                flush=True,
+            )
         data_status = self.trainer.get_training_data_status(
             sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
             require_full_batch=bool(training_plan.get("require_full_batch", False)),

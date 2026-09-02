@@ -219,6 +219,36 @@ def test_sglang_failed_request_does_not_claim_memory_release(monkeypatch) -> Non
     assert events[-1]["release_source"] == "runtime_request_failed"
 
 
+def test_sglang_runtime_idle_event_does_not_predict_deadline(monkeypatch) -> None:
+    payloads = []
+    monkeypatch.setattr(
+        sglang_runtime,
+        "emit_rollout_idle_event",
+        lambda _bus, payload: payloads.append(payload) or True,
+    )
+
+    emitted = sglang_runtime._emit_rollout_idle_worker_event(
+        drafter_cfg={
+            "training": {
+                "scheduler": {
+                    "execution": {"strategy": "rollout_idle_worker"},
+                    "idle_worker": {
+                        "event_bus_name": "bubble-bus",
+                        "initial_batch_estimate_sec": 9.0,
+                    },
+                }
+            }
+        },
+        replica_rank=0,
+        event_type="WORKER_IDLE",
+        memory_released=True,
+        release_source="runtime_request_complete",
+    )
+
+    assert emitted is True
+    assert payloads[-1]["must_be_ready_at"] is None
+
+
 def test_dflash_hidden_collection_requests_aux_hidden_without_raw_topk(
     monkeypatch,
 ) -> None:
