@@ -4703,8 +4703,13 @@ class DrafterBaseTrainer:
         collect_hidden_states_from_old_logprob = bool(
             training_cfg.get("collect_hidden_states_from_old_logprob", False)
         )
+        collect_hidden_states_from_vllm = bool(
+            training_cfg.get("collect_hidden_states_from_vllm", False)
+        )
         if not (
-            collect_hidden_states_from_sgl or collect_hidden_states_from_old_logprob
+            collect_hidden_states_from_sgl
+            or collect_hidden_states_from_old_logprob
+            or collect_hidden_states_from_vllm
         ):
             logger.debug(
                 f"[DrafterTrainer rank {self.rank}] Skipping training step {step} "

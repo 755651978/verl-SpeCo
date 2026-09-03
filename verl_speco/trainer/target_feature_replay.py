@@ -234,6 +234,8 @@ def load_vllm_final_norm(
     }
     norm.load_state_dict(state, strict=True, assign=True)
     norm = norm.to(device="cpu", dtype=dtype).eval().requires_grad_(False)
+    # Used by co-train to refresh this small module from the live actor export.
+    norm._speco_checkpoint_name = norm_name
     logger.info("Loaded vLLM target final norm %s from %s", norm_name, model_path)
     return norm
 

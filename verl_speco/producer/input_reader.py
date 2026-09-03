@@ -20,7 +20,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 
 import torch
 
@@ -457,6 +457,48 @@ def prepare_generated_prefill_request(
     )
 
 
+def build_rollout_prefill_request(
+    *,
+    sequence_no: int,
+    sample_id: str,
+    prompt_token_ids: Sequence[int] | torch.Tensor,
+    response_token_ids: Sequence[int] | torch.Tensor,
+    config: Mapping[str, Any] | Any,
+    source_metadata: Mapping[str, Any] | None = None,
+    feature_positions: Sequence[int] | torch.Tensor | None = None,
+) -> TokenizedRequest:
+    """Build a prefill request from tokenized rollout prompt and response.
+
+    Unlike the standalone input path this function performs no text tokenization
+    and no generation.  It preserves the rollout token boundary and requests
+    target features for ``prompt + response`` excluding the final label token.
+    """
+
+    prompt_ids = _token_ids(prompt_token_ids)
+    response_ids = _token_ids(response_token_ids)
+    if not prompt_ids:
+        raise ValueError(f"Rollout sample {sample_id!r} has no prompt tokens")
+    if not response_ids:
+        raise ValueError(f"Rollout sample {sample_id!r} has no response tokens")
+    full_ids = [*prompt_ids, *response_ids]
+    hidden_input_ids = full_ids[:-1]
+    return _build_tokenized_request(
+        sequence_no=sequence_no,
+        sample_id=sample_id,
+        prompt_length=len(prompt_ids),
+        full_ids=full_ids,
+        source_metadata={
+            **dict(source_metadata or {}),
+            "prompt_length": len(prompt_ids),
+            "response_length": len(response_ids),
+        },
+        config=config,
+        vllm_prompt_token_ids=hidden_input_ids,
+        feature_end_limit=len(hidden_input_ids),
+        explicit_feature_positions=feature_positions,
+    )
+
+
 def _prompt_ids(prompt: str | tuple[dict[str, str], ...], tokenizer: Any) -> list[int]:
     if isinstance(prompt, str):
         return _token_ids(tokenizer(prompt, add_special_tokens=False))
@@ -516,6 +558,7 @@ def _build_tokenized_request(
     config: Mapping[str, Any] | Any,
     vllm_prompt_token_ids: list[int] | None = None,
     feature_end_limit: int | None = None,
+    explicit_feature_positions: Sequence[int] | torch.Tensor | None = None,
 ) -> TokenizedRequest:
     input_ids = torch.tensor(full_ids, dtype=torch.int64)
     if int(input_ids.numel()) <= 0:
@@ -547,10 +590,28 @@ def _build_tokenized_request(
             f"(full_sequence_length={int(input_ids.numel())}, "
             f"prompt_length={prompt_length})"
         )
-    feature_positions = torch.arange(feature_start, feature_end, dtype=torch.int64)
+    if explicit_feature_positions is None:
+        feature_positions = torch.arange(feature_start, feature_end, dtype=torch.int64)
+    else:
+        feature_positions = torch.as_tensor(
+            explicit_feature_positions, dtype=torch.int64
+        ).detach().cpu().reshape(-1)
+        if int(feature_positions.numel()) > 0:
+            if bool((feature_positions[1:] <= feature_positions[:-1]).any().item()):
+                raise ValueError(
+                    f"Producer sample {sample_id!r} feature positions must be "
+                    "strictly increasing"
+                )
+            if int(feature_positions[0].item()) < 0 or int(
+                feature_positions[-1].item()
+            ) >= len(request_prompt_token_ids):
+                raise ValueError(
+                    f"Producer sample {sample_id!r} feature positions fall outside "
+                    "the vLLM prefill token range"
+                )
     if int(feature_positions.numel()) <= 0:
         raise ValueError(f"Producer sample {sample_id!r} has an empty feature window")
-    draft_position_ids = position_ids[feature_start:feature_end] + 1
+    draft_position_ids = position_ids.index_select(0, feature_positions) + 1
     return TokenizedRequest(
         sequence_no=sequence_no,
         sample_id=sample_id,
@@ -597,6 +658,7 @@ __all__ = [
     "InputRecord",
     "TokenizedRequest",
     "build_loss_mask",
+    "build_rollout_prefill_request",
     "finalize_generated_request",
     "iter_input_records",
     "prepare_generation_request",

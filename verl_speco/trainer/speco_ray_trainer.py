@@ -24,7 +24,7 @@ from typing import Any, cast
 
 import ray
 import torch
-from omegaconf import open_dict
+from omegaconf import OmegaConf, open_dict
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -35,7 +35,16 @@ from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
+from verl_speco.integration.external_vllm_weight_sync import (
+    close_external_vllm_weight_sync,
+    initialize_external_vllm_weight_sync,
+    update_external_vllm_weights,
+)
+from verl_speco.integration.oldlogprob_layer_ids import (
+    assert_sglang_aux_last_layer_norm_safe,
+    resolve_drafter_hidden_states_layout,
+    resolve_oldlogprob_aux_layer_ids,
+)
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
@@ -54,11 +63,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
-from verl_speco.integration.oldlogprob_layer_ids import (
-    assert_sglang_aux_last_layer_norm_safe,
-    resolve_drafter_hidden_states_layout,
-    resolve_oldlogprob_aux_layer_ids,
-)
+from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.sglang_adapter import pop_drafter_samples
 from verl_speco.integration.sglang_runtime import (
     clear_sglang_runtime_config,
@@ -70,6 +75,8 @@ from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     configure_vllm_runtime_from_config,
 )
+from verl_speco.producer.input_reader import build_rollout_prefill_request
+from verl_speco.producer.ray_feature_producer import VllmFeatureProducerActor
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.trainer.scheduler import (
     AfterActorUpdateContext,
@@ -409,6 +416,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
         self._speco_last_collection_outcome = None
+        self._speco_vllm_feature_producer = None
+        self._speco_external_vllm_weight_sync = None
 
     def attach_speco_worker_group(self, worker_group):
         self.drafter_wg = worker_group
@@ -545,6 +554,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 super().init_workers()
         if online_drafter_enabled:
             self._init_speco_drafter_workers()
+            self._speco_init_vllm_feature_producer()
             # Fail closed on the divergent SGLang last-layer-norm combination at
             # init, before any (expensive) rollout generation runs.
             self._speco_validate_sglang_aux_last_layer_norm()
@@ -678,6 +688,107 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return _get_nested(
             self.config, ("actor_rollout_ref", "rollout", "drafter"), None
         )
+
+    def _speco_vllm_collection_requested(self) -> bool:
+        return bool(
+            self._speco_drafter_training_config().get(
+                "collect_hidden_states_from_vllm", False
+            )
+        )
+
+    def _speco_vllm_collection_enabled(self) -> bool:
+        if (
+            not self._speco_online_enabled()
+            or not self._speco_vllm_collection_requested()
+        ):
+            return False
+        training_cfg = self._speco_drafter_training_config()
+        conflicting = [
+            name
+            for name in (
+                "collect_hidden_states_from_sgl",
+                "collect_hidden_states_from_old_logprob",
+            )
+            if bool(training_cfg.get(name, False))
+        ]
+        if conflicting:
+            raise ValueError(
+                "collect_hidden_states_from_vllm cannot be combined with "
+                + ", ".join(conflicting)
+            )
+        if bool(training_cfg.get("use_logits", False)):
+            raise ValueError(
+                "SPECO vLLM hidden collection currently supports use_logits=false only"
+            )
+        source_cfg = training_cfg.get("vllm_feature_source") or {}
+        endpoints = source_cfg.get("endpoints") if hasattr(source_cfg, "get") else None
+        if not endpoints:
+            raise ValueError(
+                "collect_hidden_states_from_vllm=true requires "
+                "drafter.training.vllm_feature_source.endpoints"
+            )
+        return True
+
+    def _speco_vllm_feature_configs(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        training_cfg = self._speco_drafter_training_config()
+        source_cfg = OmegaConf.to_container(
+            training_cfg.get("vllm_feature_source") or {}, resolve=True
+        )
+        if not isinstance(source_cfg, dict):
+            raise TypeError("drafter.training.vllm_feature_source must be a mapping")
+        model_path = _get_nested(
+            self.config, ("actor_rollout_ref", "model", "path"), None
+        )
+        if not source_cfg.get("model"):
+            source_cfg["model"] = model_path
+        if not source_cfg.get("target_model_id"):
+            source_cfg["target_model_id"] = model_path
+        if not source_cfg.get("target_layer_ids"):
+            source_cfg["target_layer_ids"] = self._speco_oldlogprob_aux_layer_ids()
+        source_cfg.setdefault(
+            "max_sequence_length", int(training_cfg.get("max_seq_len", 8192) or 8192)
+        )
+        source_cfg.setdefault("max_feature_length", 0)
+        drafter_cfg = OmegaConf.to_container(self._speco_drafter_config(), resolve=True)
+        if not isinstance(drafter_cfg, dict):
+            raise TypeError("actor_rollout_ref.rollout.drafter must be a mapping")
+        return source_cfg, drafter_cfg
+
+    def _speco_init_vllm_feature_producer(self) -> None:
+        if not self._speco_vllm_collection_enabled():
+            return
+        if self._speco_vllm_feature_producer is not None:
+            return
+        producer_cfg, drafter_cfg = self._speco_vllm_feature_configs()
+        sync_config = dict(producer_cfg.get("weight_hot_update") or {})
+        sync_config["endpoints"] = producer_cfg["endpoints"]
+        producer_cls = ray.remote(num_cpus=1)(VllmFeatureProducerActor)
+        self._speco_vllm_feature_producer = producer_cls.remote(
+            producer_cfg, drafter_cfg
+        )
+        if sync_config.get("enabled", False):
+            sync_config["final_norm_names"] = ray.get(
+                self._speco_vllm_feature_producer.get_final_norm_names.remote()
+            )
+        self._speco_external_vllm_weight_sync = initialize_external_vllm_weight_sync(
+            sync_config,
+            actor_worker_group=self.actor_rollout_wg,
+            feature_producer=self._speco_vllm_feature_producer,
+        )
+
+    def _speco_close_vllm_feature_producer(self) -> None:
+        producer = getattr(self, "_speco_vllm_feature_producer", None)
+        sync = getattr(self, "_speco_external_vllm_weight_sync", None)
+        self._speco_vllm_feature_producer = None
+        self._speco_external_vllm_weight_sync = None
+        try:
+            close_external_vllm_weight_sync(sync)
+        finally:
+            if producer is not None:
+                try:
+                    ray.get(producer.close.remote())
+                finally:
+                    ray.kill(producer)
 
     @staticmethod
     def _speco_set_config_value(config, key: str, value: Any):
@@ -897,11 +1008,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_collection_outcome = None
         training_cfg = self._speco_drafter_training_config()
         source_enabled = bool(
-            training_cfg.get(
-                "collect_hidden_states_from_sgl"
-                if source is DrafterCollectionSource.SGLANG
-                else "collect_hidden_states_from_old_logprob",
-                False,
+            training_cfg.get("collect_hidden_states_from_sgl", False)
+            if source is DrafterCollectionSource.SGLANG
+            else (
+                self._speco_oldlogprob_collection_requested()
+                or self._speco_vllm_collection_requested()
             )
         )
         plan = self._speco_get_drafter_scheduler().plan_collection(
@@ -971,6 +1082,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             ),
             oldlogprob_collection_requested=(
                 self._speco_oldlogprob_collection_requested()
+                or self._speco_vllm_collection_requested()
             ),
             data_status=None,
             pending_training_count=int(
@@ -1278,14 +1390,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
 
     def _speco_build_oldlogprob_collect_plan(
-        self, batch: DataProto
+        self,
+        batch: DataProto,
+        collection_plan: CollectionPlan | None = None,
     ) -> dict[str, Any] | None:
-        if not self._speco_oldlogprob_collection_enabled():
+        if not (
+            self._speco_oldlogprob_collection_enabled()
+            or self._speco_vllm_collection_enabled()
+        ):
             return None
-        collection_plan = self._speco_plan_drafter_collection(
-            DrafterCollectionSource.OLD_LOGPROB
-        )
-        self._speco_log_drafter_collection_plan(collection_plan)
+        if collection_plan is None:
+            collection_plan = self._speco_plan_drafter_collection(
+                DrafterCollectionSource.OLD_LOGPROB
+            )
+            self._speco_log_drafter_collection_plan(collection_plan)
         if not collection_plan.collect:
             return None
         training_cfg = self._speco_drafter_training_config()
@@ -1660,6 +1778,129 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         outcome = self._speco_execute_collection(
             collect_plan["collection_plan"],
             payload,
+        )
+        self._speco_last_collected_samples = outcome.collected_samples
+        self._speco_last_oldlogprob_collected_samples = outcome.collected_samples
+        self._speco_last_oldlogprob_collected_rows = collected_rows
+        self._speco_last_oldlogprob_payload_mib = payload_bytes / float(1024 * 1024)
+        return outcome.collected_samples
+
+    def _speco_collect_vllm_features(
+        self,
+        batch: DataProto,
+        collect_plan: dict[str, Any] | None,
+    ) -> int:
+        """Collect the scheduler-selected windows through the external vLLM actor."""
+
+        if not collect_plan:
+            return 0
+        producer = self._speco_vllm_feature_producer
+        if producer is None:
+            raise RuntimeError("vLLM feature Producer actor is not initialized")
+
+        producer_cfg, _ = self._speco_vllm_feature_configs()
+        prompts = batch.batch["prompts"]
+        responses = batch.batch["responses"]
+        attention_mask = batch.batch["attention_mask"]
+        response_mask_tensor = batch.batch.get("response_mask", None)
+        collect_mask = collect_plan["collect_mask"]
+        hidden_positions = collect_plan["hidden_positions"]
+        owner_rank = collect_plan["owner_rank"]
+        requests = []
+        owners_by_id: dict[str, int] = {}
+        for batch_idx in range(int(collect_mask.numel())):
+            if not bool(collect_mask[batch_idx].item()):
+                continue
+            prompt_mask = attention_mask[batch_idx, : prompts.size(1)].bool()
+            if response_mask_tensor is not None:
+                response_mask = response_mask_tensor[batch_idx].bool()
+            else:
+                response_mask = attention_mask[
+                    batch_idx, prompts.size(1) : prompts.size(1) + responses.size(1)
+                ].bool()
+            prompt_ids = prompts[batch_idx][prompt_mask].detach().cpu()
+            response_ids = responses[batch_idx][response_mask].detach().cpu()
+            sample_id = f"rollout-{self.global_steps:08d}-{batch_idx:06d}"
+            request = build_rollout_prefill_request(
+                sequence_no=batch_idx,
+                sample_id=sample_id,
+                prompt_token_ids=prompt_ids,
+                response_token_ids=response_ids,
+                feature_positions=hidden_positions[batch_idx].detach().cpu(),
+                source_metadata={
+                    "global_step": int(self.global_steps),
+                    "batch_index": batch_idx,
+                },
+                config=producer_cfg,
+            )
+            requests.append(request)
+            owners_by_id[sample_id] = int(owner_rank[batch_idx].item())
+
+        if not requests:
+            return 0
+        results = ray.get(producer.produce_batch.remote(requests))
+        failures = [result for result in results if result.error]
+        if failures:
+            details = "; ".join(
+                f"{result.request_id}: {result.error}" for result in failures[:3]
+            )
+            raise RuntimeError(
+                f"external vLLM feature collection failed for {len(failures)} "
+                f"sample(s): {details}"
+            )
+
+        samples: list[dict[str, Any]] = []
+        owners: list[int] = []
+        payload_bytes = 0
+        collected_rows = 0
+        for result in results:
+            feature = result.sample
+            if feature is None:
+                raise RuntimeError(
+                    f"external vLLM returned no feature for {result.request_id}"
+                )
+            request = result.request
+            prompt_len = int(request.source_metadata["prompt_length"])
+            full_ids = request.input_ids.detach().cpu().long()
+            positions = request.feature_positions.detach().cpu().long()
+            owner = owners_by_id[result.request_id]
+            sample = {
+                "input_ids": full_ids.unsqueeze(0),
+                "prompts": full_ids[:prompt_len].unsqueeze(0),
+                "responses": full_ids[prompt_len:].unsqueeze(0),
+                "loss_mask": request.loss_mask.detach().cpu().unsqueeze(0),
+                "hidden_positions": positions.unsqueeze(0),
+                "hidden_states_layout": feature.metadata.get(
+                    "hidden_states_layout", self._speco_oldlogprob_hidden_layout()
+                ),
+                "hidden_position_start": int(positions[0].item()),
+                "hidden_position_end": int(positions[-1].item()) + 1,
+                "global_step": self.global_steps,
+                "replica_rank": owner,
+            }
+            if result.hidden_states_ref is not None:
+                sample["hidden_states_ref"] = result.hidden_states_ref
+            else:
+                hidden = cast(torch.Tensor, feature.hidden_states)
+                sample["hidden_states"] = hidden.detach().cpu().unsqueeze(0)
+            hidden = feature.hidden_states
+            if torch.is_tensor(hidden):
+                collected_rows += int(hidden.size(0))
+                payload_bytes += int(hidden.numel()) * int(hidden.element_size())
+            samples.append(sample)
+            owners.append(owner)
+
+        payload = self._speco_get_drafter_scheduler().prepare_collection_payload(
+            source=DrafterCollectionSource.OLD_LOGPROB,
+            samples=samples,
+            owners=owners,
+            owner_count=int(collect_plan["owner_count"]),
+            dispatch_bucket_count=self._speco_dispatch_bucket_count(),
+            raw_samples=int(collect_plan.get("candidate_count", len(samples))),
+            collection_id=collect_plan["collection_plan"].collection_id,
+        )
+        outcome = self._speco_execute_collection(
+            collect_plan["collection_plan"], payload
         )
         self._speco_last_collected_samples = outcome.collected_samples
         self._speco_last_oldlogprob_collected_samples = outcome.collected_samples
@@ -2327,6 +2568,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
+            sync = getattr(self, "_speco_external_vllm_weight_sync", None)
+            if sync is not None and sync.enabled and sync.last_synced_step is None:
+                # fit() has restored actor checkpoints by now. Also covers
+                # vLLM services launched with --load-format dummy.
+                update_external_vllm_weights(sync, global_step=int(self.global_steps))
             gen_batch_output = original_generate_sequences(*args, **kwargs)
             is_validation_generation = _speco_is_validation_generation(
                 args, kwargs, gen_batch_output
@@ -2343,7 +2589,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return gen_batch_output
 
         def compute_old_log_prob_with_speco(trainer_self, batch: DataProto):
-            if not self._speco_oldlogprob_collection_enabled():
+            if not (
+                self._speco_oldlogprob_collection_enabled()
+                or self._speco_vllm_collection_enabled()
+            ):
                 if self._speco_oldlogprob_entropy_hook_enabled():
                     return self._speco_compute_old_log_prob_without_forced_entropy(
                         batch
@@ -2403,8 +2652,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 return compute_old_log_prob_without_collection()
 
             batch = _select_policy_model_batch(batch)
-            collect_plan = self._speco_build_oldlogprob_collect_plan(batch)
+            collect_plan = self._speco_build_oldlogprob_collect_plan(
+                batch, collection_plan
+            )
             if collect_plan is None:
+                return compute_old_log_prob_without_collection()
+            if self._speco_vllm_collection_enabled():
+                collect_started = time.perf_counter()
+                self._speco_collect_vllm_features(batch, collect_plan)
+                self._speco_last_oldlogprob_collect_elapsed_sec = (
+                    time.perf_counter() - collect_started
+                )
                 return compute_old_log_prob_without_collection()
             batch_td = batch.to_tensordict()
             batch_td = left_right_2_no_padding(batch_td)
@@ -2525,6 +2783,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             actor_started = time.perf_counter()
             actor_output = original_update_actor(*args, **kwargs)
             actor_elapsed = time.perf_counter() - actor_started
+            if not defer_publish_until_update_weights:
+                update_external_vllm_weights(
+                    getattr(self, "_speco_external_vllm_weight_sync", None),
+                    global_step=int(self.global_steps),
+                )
             pending_target_lm_head_sync = self._pending_target_lm_head_sync
             self._pending_target_lm_head_sync = None
             if pending_target_lm_head_sync is not None:
@@ -2581,6 +2844,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
+            # Export while the colocated rollout is still asleep; do not wake
+            # its weights/KV cache before the actor export staging is released.
+            update_external_vllm_weights(
+                getattr(self, "_speco_external_vllm_weight_sync", None),
+                global_step=int(self.global_steps),
+            )
             result = original_checkpoint_update_weights(*args, **kwargs)
             if pending_drafter_publish["ready"]:
                 publish_metrics = self._speco_publish_drafter_weights(
@@ -2603,6 +2872,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if (
             self._speco_oldlogprob_collection_requested()
+            or self._speco_vllm_collection_requested()
             or self._speco_oldlogprob_entropy_hook_enabled()
         ):
             self._compute_old_log_prob = MethodType(
@@ -2671,7 +2941,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
             return super().fit()
         finally:
-            self._speco_wait_pending_drafter_checkpoint()
+            try:
+                self._speco_wait_pending_drafter_checkpoint()
+            finally:
+                self._speco_close_vllm_feature_producer()
 
     def _save_checkpoint(self):
         self._speco_save_drafter_checkpoint(wait=True)

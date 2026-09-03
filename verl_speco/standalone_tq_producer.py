@@ -20,12 +20,7 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
-import torch
-
 from verl_speco.integration import transferqueue_bridge as default_transport
-from verl_speco.integration.oldlogprob_layer_ids import (
-    resolve_drafter_hidden_states_layout,
-)
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     TokenizedRequest,
@@ -40,12 +35,15 @@ from verl_speco.producer.vllm_feature_client import (
     VllmFeatureClientPool,
     delete_temporary_result,
 )
+from verl_speco.producer.vllm_feature_producer import (
+    VllmFeatureProducerCore,
+    build_feature_contract,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.trainer.standalone_resume import load_standalone_resume
 from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
     HiddenStateAlignmentError,
-    feature_from_vllm_payload,
     load_vllm_final_norm,
 )
 from verl_speco.transport.drafter_sample_protocol import (
@@ -233,19 +231,10 @@ async def run_producer(
         await pool.start()
         logger.info("Standalone TQ Producer vLLM client pool started")
 
-        algorithm = str(drafter_cfg["speculative_algorithm"]).strip().upper()
-        feature_contract = FeatureContract(
-            algorithm=algorithm,
-            target_layer_ids=[int(value) for value in producer_cfg["target_layer_ids"]],
-            hidden_states_layout=resolve_drafter_hidden_states_layout(
-                algorithm, drafter_cfg
-            ),
-            dtype=_parse_dtype(producer_cfg["hidden_dtype"]),
-            target_model_id=str(producer_cfg["target_model_id"]),
-            target_model_revision=str(producer_cfg["target_model_revision"]),
-            tokenizer_fingerprint=str(producer_cfg["tokenizer_fingerprint"]),
-            use_logits=False,
-            require_full_alignment=True,
+        feature_contract = build_feature_contract(
+            producer_cfg,
+            drafter_cfg,
+            source="standalone_tq_producer",
         )
         final_norm = None
         if feature_contract.hidden_states_layout.endswith("_plus_last"):
@@ -255,6 +244,7 @@ async def run_producer(
                 dtype=feature_contract.dtype,
                 trust_remote_code=bool(producer_cfg.get("trust_remote_code", False)),
             )
+        core = VllmFeatureProducerCore(pool, feature_contract, final_norm=final_norm)
         worker_count = int(producer_cfg["max_inflight_requests"])
         input_queue: asyncio.Queue[Any] = asyncio.Queue(
             maxsize=int(producer_cfg["input_queue_size"])
@@ -357,20 +347,10 @@ async def run_producer(
                         # connector file. It is not the training payload; the
                         # following full-sequence prefill produces that payload.
                         await asyncio.to_thread(delete_temporary_result, generated)
-                    raw = await pool.prefill(request)
-                else:
-                    raw = await pool.prefill(request)
-                stats.pending_bytes += int(raw.byte_size)
                 try:
-                    sample = feature_from_vllm_payload(
-                        raw, request, feature_contract, final_norm=final_norm
-                    )
+                    produced = await core.produce_one(request)
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
-                    stats.pending_bytes = max(
-                        stats.pending_bytes - int(raw.byte_size), 0
-                    )
-                    await asyncio.to_thread(delete_temporary_result, raw)
                     logger.warning(
                         "Standalone TQ Producer dropped misaligned sample "
                         "sequence_no=%s sample_id=%s dropped=%s reason=%s",
@@ -380,6 +360,9 @@ async def run_producer(
                         exc,
                     )
                     continue
+                raw = produced.raw
+                sample = produced.sample
+                stats.pending_bytes += int(raw.byte_size)
                 await publish_queue.put(
                     PreparedFeature(
                         request=request,
@@ -553,15 +536,6 @@ def _load_tokenizer(config: Mapping[str, Any]) -> Any:
         str(config["tokenizer_path"]),
         trust_remote_code=bool(config.get("trust_remote_code", False)),
     )
-
-
-def _parse_dtype(value: Any) -> torch.dtype:
-    name = str(value).strip().lower().removeprefix("torch.")
-    aliases = {"fp32": "float32", "fp16": "float16", "bf16": "bfloat16"}
-    dtype = getattr(torch, aliases.get(name, name), None)
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"Unsupported standalone_tq_producer.hidden_dtype={value!r}")
-    return dtype
 
 
 def _hydra_main(config: Any) -> None:

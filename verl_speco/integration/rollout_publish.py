@@ -866,6 +866,30 @@ class DraftWeightPublishMixin:
         return materialize_draft_weights_payload(weights)
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def init_external_vllm_weight_sync(self, config: dict):
+        from verl_speco.integration.external_vllm_weight_sync import (
+            initialize_worker_weight_sync,
+        )
+
+        initialize_worker_weight_sync(self, config)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def update_external_vllm_weights(self, global_step: int):
+        from verl_speco.integration.external_vllm_weight_sync import (
+            update_worker_weights,
+        )
+
+        return update_worker_weights(self, global_step)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def close_external_vllm_weight_sync(self):
+        from verl_speco.integration.external_vllm_weight_sync import (
+            close_worker_weight_sync,
+        )
+
+        close_worker_weight_sync(self)
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     async def update_draft_weights(
         self, weights: dict, global_steps: int | None = None
     ):

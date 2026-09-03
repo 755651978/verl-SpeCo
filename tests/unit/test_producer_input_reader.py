@@ -305,6 +305,41 @@ def test_finalize_generated_request_rejects_misaligned_connector_tokens() -> Non
         )
 
 
+def test_build_rollout_prefill_request_preserves_rollout_tokens_and_positions() -> None:
+    request = input_reader.build_rollout_prefill_request(
+        sequence_no=7,
+        sample_id="rollout-7",
+        prompt_token_ids=[10, 11, 12],
+        response_token_ids=[20, 21, 22, 23],
+        feature_positions=[3, 4, 5],
+        config={"max_sequence_length": 16, "max_feature_length": 0},
+        source_metadata={"global_step": 3},
+    )
+
+    assert request.input_ids.tolist() == [10, 11, 12, 20, 21, 22, 23]
+    assert request.prompt_token_ids == [10, 11, 12, 20, 21, 22]
+    assert request.loss_mask.tolist() == [0, 0, 0, 1, 1, 1, 1]
+    assert request.feature_positions.tolist() == [3, 4, 5]
+    assert request.draft_position_ids.tolist() == [4, 5, 6]
+    assert request.source_metadata == {
+        "global_step": 3,
+        "prompt_length": 3,
+        "response_length": 4,
+    }
+
+
+def test_build_rollout_prefill_request_rejects_final_label_position() -> None:
+    with pytest.raises(ValueError, match="outside the vLLM prefill token range"):
+        input_reader.build_rollout_prefill_request(
+            sequence_no=0,
+            sample_id="rollout-final-label",
+            prompt_token_ids=[10, 11],
+            response_token_ids=[20, 21],
+            feature_positions=[3],
+            config={"max_sequence_length": 16},
+        )
+
+
 def test_non_utf8_non_parquet_input_has_actionable_error(tmp_path: Path) -> None:
     input_path = tmp_path / "train.data"
     input_path.write_bytes(b"plain-prefix\xc0binary")

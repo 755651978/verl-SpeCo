@@ -82,6 +82,25 @@ actor_rollout_ref:
         mode: online
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
+        # Collect scheduler-selected rollout positions from an independently
+        # launched hidden-state vLLM service.
+        collect_hidden_states_from_vllm: false
+        vllm_feature_source:
+          endpoints: []
+          model: null
+          per_endpoint_concurrency: 1
+          max_inflight_requests: 1
+          request_timeout_seconds: 600
+          hidden_dtype: bfloat16
+          use_object_store: true
+          weight_hot_update:
+            enabled: false
+            # vLLM 0.23 NCCL backend: CUDA actors, full/merged HF weights.
+            master_address: null
+            timeout_seconds: 600
+            bucket_size_mb: 256
+            packed: true
+            packed_num_buffers: 2
         # SGLang does not apply the target final norm to captured aux states.
         # Keep this false unless training and serving consistently use pre-norm.
         allow_sglang_prenorm_last_layer: false
