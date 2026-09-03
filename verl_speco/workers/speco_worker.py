@@ -1350,15 +1350,6 @@ class SpecoWorker(Worker):
             result["reason"] = "buffer_version_changed"
             return result
         required_target_version = training_plan.get("required_target_version")
-        if required_target_version is not None:
-            print(
-                "[BubbleTime] target_lm_head_cache_check: "
-                f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
-                f"rank={self.rank} required_target_version={required_target_version} "
-                "cached_versions="
-                f"{tuple(sorted(getattr(self.trainer, '_target_lm_head_snapshots', {})))}",
-                flush=True,
-            )
         if (
             required_target_version is not None
             and not self.trainer.select_target_lm_head_version(
@@ -1402,13 +1393,6 @@ class SpecoWorker(Worker):
             )
             result["reason"] = "target_version_mismatch"
             return result
-        if required_target_version is not None:
-            print(
-                "[BubbleTime] target_lm_head_cache_hit: "
-                f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
-                f"rank={self.rank} target_version={current_target_version}",
-                flush=True,
-            )
         data_status = self.trainer.get_training_data_status(
             sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
             require_full_batch=bool(training_plan.get("require_full_batch", False)),
@@ -1488,7 +1472,7 @@ class SpecoWorker(Worker):
                 "preflight_elapsed_sec": preflight_elapsed_sec,
             }
         )
-        logger.warning(
+        logger.info(
             "[BubbleTime] training_preflight_ready: plan_id=%s worker_id=%s "
             "rank=%s activation_s=%.3f preflight_s=%.3f",
             training_plan.get("plan_id", ""),
@@ -1496,13 +1480,6 @@ class SpecoWorker(Worker):
             self.rank,
             result["activation_elapsed_sec"],
             preflight_elapsed_sec,
-        )
-        print(
-            "[BubbleTime] training_preflight_ready: "
-            f"plan_id={training_plan.get('plan_id', '')} worker_id={self.rank} "
-            f"rank={self.rank} activation_s={result['activation_elapsed_sec']:.3f} "
-            f"preflight_s={preflight_elapsed_sec:.3f}",
-            flush=True,
         )
         return result
 

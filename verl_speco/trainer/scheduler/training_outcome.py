@@ -137,6 +137,14 @@ class TrainingOutcome:
             trained = False
         metrics: dict[str, float | int] = {
             "drafter/trained": int(trained),
+            "drafter/trained_any": int(trained),
+            "drafter/idle_trained": int(
+                plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+                and trained
+            ),
+            "drafter/sync_fallback_trained": int(
+                plan.reason.startswith("sync_fallback") and trained
+            ),
             "drafter/train_successful_steps_max": successful_steps,
             "drafter/train_no_trainable_batch": int(
                 any(
@@ -234,6 +242,8 @@ class TrainingOutcome:
             metrics.update(
                 {
                     "bubble/sync_fallback_completed": int(trained),
+                    "drafter/sync_fallback_trained": int(trained),
+                    "drafter/trained_any": int(trained),
                     "bubble/sync_fallback_successful_steps": successful_steps,
                     "bubble/sync_fallback_elapsed_s": execution.elapsed_sec,
                 }

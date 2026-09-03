@@ -1422,6 +1422,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"batch_estimate_s={getattr(plan, 'idle_batch_estimate_sec', None)} "
                 f"startup_reserve_s={getattr(plan, 'idle_startup_reserve_sec', None)} "
                 f"tail_reserve_s={getattr(plan, 'idle_tail_reserve_sec', None)} "
+                f"reclaim_penalty_s={getattr(plan, 'idle_reclaim_penalty_sec', None)} "
                 f"deadline_ts={getattr(plan, 'deadline_ts', None)} "
                 "worker_deadline_in_s="
                 f"{max(float(getattr(plan, 'deadline_ts', 0.0) or 0.0) - time.time(), 0.0):.3f} "
@@ -1549,9 +1550,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not self._speco_rollout_idle_worker_enabled():
             return {}
         generation_complete_ts = time.time()
-        metrics = self._speco_get_drafter_scheduler().record_generation_completed(
-            generation_complete_ts
+        runtime_idle_events = int(
+            getattr(self, "_speco_runtime_idle_events_this_generation", 0)
         )
+        if runtime_idle_events > 0:
+            metrics: dict[str, Any] = {}
+            print(
+                "[BubbleTime] idle_window_sample_skipped: "
+                "reason=runtime_idle_events_active "
+                f"runtime_idle_events_this_generation={runtime_idle_events} "
+                f"generation_complete_ts={generation_complete_ts:.6f}",
+                flush=True,
+            )
+        else:
+            metrics = self._speco_get_drafter_scheduler().record_generation_completed(
+                generation_complete_ts
+            )
         runtime_state = self._speco_get_drafter_runtime_state()
         active_plan = runtime_state.active_plan
         if active_plan is None or not active_plan.target_worker_ids:
@@ -2750,6 +2764,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "timing_s/drafter_target_lm_head_fetch_submit": (
                         time.perf_counter() - fetch_started
                     ),
+                    "timing_s/drafter_target_lm_head_prefetch_submit_critical_path": (
+                        time.perf_counter() - fetch_started
+                    ),
                 },
                 {
                     "fetch_refs": payload_refs,
@@ -3301,6 +3318,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 publish_plan.source_global_step,
                 publish_plan.reason,
                 publish_outcome.attempted,
+            )
+            print(
+                "[BubbleTime] publish_skipped: "
+                f"plan_id={getattr(training_plan, 'plan_id', None)} "
+                f"source_step={publish_plan.source_global_step} "
+                f"reason={publish_plan.reason} "
+                f"attempted={publish_outcome.attempted}",
+                flush=True,
             )
         return dict(event.metrics or {})
 
@@ -3934,7 +3959,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     print(
                         "[BubbleTime] target_lm_head_prefetch_submitted: "
                         "target_version="
-                        f"{pending_target_lm_head_sync.get('target_version')}",
+                        f"{pending_target_lm_head_sync.get('target_version')} "
+                        "selected_rows="
+                        f"{cache_metrics.get('drafter/target_lm_head_selected_rows', 0)} "
+                        "submit_s="
+                        f"{cache_metrics.get('timing_s/drafter_target_lm_head_fetch_submit', 0.0):.3f}",
                         flush=True,
                     )
             actor_started = time.perf_counter()
@@ -3984,6 +4013,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "timing_s/drafter_publish_wait_pending",
                 "timing_s/drafter_publish_fetch_snapshot",
                 "timing_s/drafter_publish_update_weights",
+                "timing_s/drafter_target_lm_head_prefetch_submit_critical_path",
             ):
                 value = _speco_metric_float(metrics.get(key))
                 if value is not None:
@@ -3998,6 +4028,25 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics["timing_s/drafter_control_overhead"] = metrics[
                 "timing_s/drafter_outer_unaccounted"
             ]
+            metrics["drafter/trained_any"] = int(
+                bool(metrics.get("drafter/trained", 0))
+                or bool(metrics.get("drafter/idle_trained", 0))
+                or bool(metrics.get("drafter/sync_fallback_trained", 0))
+                or bool(metrics.get("bubble/sync_fallback_completed", 0))
+            )
+            if (
+                training_plan.execution_strategy
+                is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            ):
+                metrics.setdefault(
+                    "drafter/idle_trained",
+                    int(bool(train_metrics.get("drafter/trained", 0))),
+                )
+            if training_plan.reason.startswith("sync_fallback"):
+                metrics.setdefault(
+                    "drafter/sync_fallback_trained",
+                    int(bool(train_metrics.get("drafter/trained", 0))),
+                )
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):

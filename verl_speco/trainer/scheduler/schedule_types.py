@@ -427,7 +427,7 @@ class TrainingDataStatus:
             worker_id=str(value.get("worker_id", value.get("rank", ""))),
         )
 
-    def metrics(self) -> dict[str, int]:
+    def metrics(self) -> dict[str, int | float]:
         return {
             "drafter/data_current_step_samples": self.current_step_samples,
             "drafter/data_buffer_samples": self.buffer_samples,
@@ -485,6 +485,7 @@ class TrainingPlan:
     idle_batch_estimate_sec: float | None = None
     idle_startup_reserve_sec: float | None = None
     idle_tail_reserve_sec: float | None = None
+    idle_reclaim_penalty_sec: float | None = None
     idle_trainable_batches: int | None = None
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
@@ -565,6 +566,12 @@ class TrainingPlan:
                         not self.launch and self.reason == "incomplete_training_group"
                     ),
                     "bubble/window_too_small": int(self.reason == "window_too_small"),
+                    "bubble/idle_reclaim_penalty_active": int(
+                        bool(self.idle_reclaim_penalty_sec)
+                    ),
+                    "bubble/idle_reclaim_penalty_s": float(
+                        self.idle_reclaim_penalty_sec or 0.0
+                    ),
                     "bubble/missing_training_group_metadata": int(
                         self.reason == "missing_training_group_metadata"
                     ),

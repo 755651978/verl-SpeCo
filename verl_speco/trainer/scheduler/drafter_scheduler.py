@@ -241,6 +241,9 @@ class DrafterScheduler:
         self._idle_worker_tail_samples_sec: deque[float] = deque(maxlen=32)
         self._replica_idle_started_at: dict[int, float] = {}
         self._replica_idle_window_samples_sec: deque[float] = deque(maxlen=32)
+        self._idle_worker_prebatch_reclaim_streak: int = 0
+        self._idle_worker_reclaim_penalty_sec: float = 0.0
+        self._idle_worker_reclaim_penalty_last_step: int | None = None
 
     def _effective_idle_batch_estimate_sec(
         self,
@@ -509,7 +512,7 @@ class DrafterScheduler:
             worker_ids = (event.worker_id,)
         for worker_id in worker_ids:
             self._record_worker_event_state(event, worker_id, event_ts)
-        logger.warning(
+        logger.info(
             "[BubbleTime] worker_event type=%s worker_id=%s replica_rank=%s "
             "expanded_worker_ids=%s memory_released=%s release_source=%s must_be_ready_at=%s "
             "event_ts=%s idle_state=%s",
@@ -524,6 +527,114 @@ class DrafterScheduler:
             _idle_state_summary(self._idle_workers, now=event_ts),
         )
         return self.idle_worker_metrics()
+
+    def _effective_idle_reclaim_penalty_sec(self) -> float:
+        return max(float(self._idle_worker_reclaim_penalty_sec), 0.0)
+
+    def _decay_idle_reclaim_penalty(self, global_step: object) -> None:
+        if self._idle_worker_reclaim_penalty_sec <= 0.0:
+            return
+        try:
+            step = _as_int(global_step)
+        except (TypeError, ValueError):
+            return
+        last_step = self._idle_worker_reclaim_penalty_last_step
+        if last_step is None:
+            self._idle_worker_reclaim_penalty_last_step = step
+            return
+        # Keep the penalty fully active for the immediate next step after a
+        # zero-batch reclaim, then decay quickly.  This avoids fixed launch
+        # suppression while still preventing the same marginal window from
+        # being retried over and over.
+        decay_steps = max(step - last_step - 1, 0)
+        if decay_steps <= 0:
+            return
+        previous = self._idle_worker_reclaim_penalty_sec
+        self._idle_worker_reclaim_penalty_sec *= 0.5**min(decay_steps, 8)
+        self._idle_worker_reclaim_penalty_last_step = step
+        if self._idle_worker_reclaim_penalty_sec < 0.25:
+            self._idle_worker_reclaim_penalty_sec = 0.0
+            self._idle_worker_prebatch_reclaim_streak = 0
+        print(
+            "[BubbleTime] idle_reclaim_penalty_decayed: "
+            f"step={step} previous_s={previous:.3f} "
+            f"current_s={self._idle_worker_reclaim_penalty_sec:.3f} "
+            f"decay_steps={decay_steps}",
+            flush=True,
+        )
+
+    def _record_prebatch_reclaim_penalty(
+        self,
+        plan: TrainingPlan,
+        outcome: TrainingOutcome,
+    ) -> None:
+        """Adjust the dynamic admission penalty after zero-batch reclaims.
+
+        A zero-batch reclaim means the scheduler managed to reserve the worker
+        group, but the next rollout reclaimed it before the first batch could
+        start.  Treat that failed estimate as an admission-risk signal instead
+        of a fixed step cooldown: future windows that are clearly larger can
+        still train, while similarly marginal windows are skipped.
+        """
+
+        reclaimed_before_first_batch = bool(
+            outcome.metrics.get("bubble/train_reclaimed_before_first_batch", 0)
+        )
+        if outcome.trained and outcome.successful_steps > 0:
+            if self._idle_worker_prebatch_reclaim_streak:
+                print(
+                    "[BubbleTime] idle_reclaim_penalty_reset: "
+                    f"plan_id={plan.plan_id} source_step={plan.source_global_step} "
+                    f"successful_steps={outcome.successful_steps} "
+                    f"previous_s={self._idle_worker_reclaim_penalty_sec:.3f}",
+                    flush=True,
+                )
+            self._idle_worker_prebatch_reclaim_streak = 0
+            self._idle_worker_reclaim_penalty_sec = 0.0
+            self._idle_worker_reclaim_penalty_last_step = None
+            return
+        if not reclaimed_before_first_batch:
+            return
+        self._idle_worker_prebatch_reclaim_streak += 1
+        try:
+            source_step = _as_int(plan.source_global_step)
+        except (TypeError, ValueError):
+            source_step = 0
+        worker_elapsed_sec = max(
+            float(outcome.metrics.get("timing_s/drafter_worker_elapsed", 0.0) or 0.0),
+            0.0,
+        )
+        failed_usable_window_sec = max(float(plan.idle_usable_window_sec or 0.0), 0.0)
+        batch_estimate_sec = max(float(plan.idle_batch_estimate_sec or 0.0), 0.0)
+        # If the scheduler believed a large usable window existed but the
+        # worker could not start batch 1, most of that estimate was unsafe for
+        # admission.  Preserve room for a clearly larger future window by only
+        # penalizing up to roughly "failed usable minus half a batch".
+        failed_window_penalty = max(
+            failed_usable_window_sec - batch_estimate_sec * 0.5,
+            0.0,
+        )
+        observed_penalty = worker_elapsed_sec + batch_estimate_sec
+        next_penalty = max(
+            self._idle_worker_reclaim_penalty_sec,
+            failed_window_penalty,
+            observed_penalty,
+        )
+        self._idle_worker_reclaim_penalty_sec = next_penalty
+        self._idle_worker_reclaim_penalty_last_step = source_step
+        print(
+            "[BubbleTime] idle_reclaim_penalty_updated: "
+            f"plan_id={plan.plan_id} source_step={plan.source_global_step} "
+            f"streak={self._idle_worker_prebatch_reclaim_streak} "
+            "reason=reclaim_before_first_batch "
+            f"penalty_s={self._idle_worker_reclaim_penalty_sec:.3f} "
+            f"failed_usable_window_s={failed_usable_window_sec:.3f} "
+            f"batch_estimate_s={batch_estimate_sec:.3f} "
+            f"worker_elapsed_s={worker_elapsed_sec:.3f} "
+            "preflight_to_stop_s="
+            f"{outcome.metrics.get('timing_s/drafter_worker_preflight_to_stop', 0.0)}",
+            flush=True,
+        )
 
     def _record_observed_replica_idle_window(
         self,
@@ -772,7 +883,7 @@ class DrafterScheduler:
                 return AvailableTrainingResources(
                     False, "missing_training_group_metadata"
                 )
-            logger.warning(
+            logger.info(
                 "[BubbleTime] idle_resource_skip reason=no_idle_worker "
                 "groups=%s known_state=%s require_memory_released=%s",
                 groups,
@@ -786,7 +897,7 @@ class DrafterScheduler:
             missing = [worker_id for worker_id in group if worker_id not in idle_states]
             if missing:
                 incomplete_seen = True
-                logger.warning(
+                logger.info(
                     "[BubbleTime] idle_group_incomplete group_id=idle-group-%s "
                     "group=%s missing=%s idle_workers=%s known_state=%s",
                     index,
@@ -801,10 +912,15 @@ class DrafterScheduler:
                 for worker_id in group
                 if (state := idle_states[worker_id]).must_be_ready_at is not None
             ]
+            event_ages = tuple(
+                round(max(now - idle_states[worker_id].event_ts, 0.0), 3)
+                for worker_id in group
+            )
             historical_window = self._effective_historical_idle_window_sec()
             has_runtime_deadline = bool(windows)
             source = "runtime_deadline" if has_runtime_deadline else "bootstrap_minimum"
             minimum_window = min(windows, default=math.inf)
+            historical_remaining = None
             if historical_window is not None:
                 historical_remaining = min(
                     max(
@@ -839,6 +955,25 @@ class DrafterScheduler:
                     now,
                     _idle_state_summary(self._idle_workers, now=now),
                 )
+                print(
+                    "[BubbleTime] idle_resource_skip: "
+                    f"reason=window_too_small group_id=idle-group-{index} "
+                    f"group={group} minimum_window_s={minimum_window:.3f} "
+                    f"min_required_s={min_idle_window_sec:.3f} "
+                    f"historical_window_s={historical_window} "
+                    f"historical_remaining_s={historical_remaining} "
+                    f"deadline_windows_s={tuple(round(value, 3) for value in windows)} "
+                    f"source={source} event_age_s={event_ages} "
+                    "startup_reserve_s="
+                    f"{self._effective_idle_startup_reserve_sec(config):.3f} "
+                    "tail_reserve_s="
+                    f"{self._effective_idle_tail_reserve_sec(config):.3f} "
+                    "batch_estimate_s="
+                    f"{self._effective_idle_batch_estimate_sec(config):.3f} "
+                    f"guard_s={self._effective_idle_deadline_guard_sec(config):.3f} "
+                    f"idle_state={_idle_state_summary(self._idle_workers, now=now)}",
+                    flush=True,
+                )
                 return AvailableTrainingResources(
                     False,
                     "window_too_small",
@@ -846,7 +981,7 @@ class DrafterScheduler:
                     worker_ids=group,
                     minimum_idle_window_sec=minimum_window,
                 )
-            logger.warning(
+            logger.info(
                 "[BubbleTime] idle_resource_ready group_id=idle-group-%s group=%s "
                 "minimum_window_s=%.3f min_required_s=%.3f "
                 "historical_window_s=%s source=%s now=%.3f",
@@ -865,7 +1000,7 @@ class DrafterScheduler:
                 worker_ids=group,
                 minimum_idle_window_sec=minimum_window,
             )
-        logger.warning(
+        logger.info(
             "[BubbleTime] idle_resource_skip reason=%s groups=%s idle_workers=%s "
             "known_state=%s",
             "incomplete_training_group" if incomplete_seen else "no_idle_worker",
@@ -922,6 +1057,7 @@ class DrafterScheduler:
         *,
         allow_sync_fallback: bool = True,
     ) -> TrainingPlan:
+        self._decay_idle_reclaim_penalty(context.global_step)
         resources = self.select_idle_training_resources(config)
         if not resources.available:
             if allow_sync_fallback and self._should_sync_fallback(
@@ -1073,11 +1209,16 @@ class DrafterScheduler:
         resources: AvailableTrainingResources,
     ) -> TrainingPlan:
         interval_matched = self.training_interval_matched(context.global_step, config)
-        usable_window = max(
+        reclaim_penalty_sec = self._effective_idle_reclaim_penalty_sec()
+        base_usable_window = max(
             resources.minimum_idle_window_sec
             - self._effective_idle_deadline_guard_sec(config)
             - self._effective_idle_startup_reserve_sec(config)
             - self._effective_idle_tail_reserve_sec(config),
+            0.0,
+        )
+        usable_window = max(
+            base_usable_window - reclaim_penalty_sec,
             0.0,
         )
         batch_estimate = self._effective_idle_batch_estimate_sec(config)
@@ -1111,6 +1252,7 @@ class DrafterScheduler:
             idle_batch_estimate_sec=batch_estimate,
             idle_startup_reserve_sec=self._effective_idle_startup_reserve_sec(config),
             idle_tail_reserve_sec=self._effective_idle_tail_reserve_sec(config),
+            idle_reclaim_penalty_sec=reclaim_penalty_sec,
         )
 
     def prepare_training_execution(self, plan: TrainingPlan) -> dict[str, Any]:
@@ -1332,13 +1474,18 @@ class DrafterScheduler:
             deadline_guard_sec = self._effective_idle_deadline_guard_sec(config)
             startup_reserve_sec = self._effective_idle_startup_reserve_sec(config)
             tail_reserve_sec = self._effective_idle_tail_reserve_sec(config)
+            reclaim_penalty_sec = self._effective_idle_reclaim_penalty_sec()
             batch_estimate = self._effective_idle_batch_estimate_sec(config)
             max_batches_per_window = self._effective_idle_max_batches_per_window(config)
-            usable_window = max(
+            base_usable_window = max(
                 resources.minimum_idle_window_sec
                 - deadline_guard_sec
                 - startup_reserve_sec
                 - tail_reserve_sec,
+                0.0,
+            )
+            usable_window = max(
+                base_usable_window - reclaim_penalty_sec,
                 0.0,
             )
             # The worker checks ``deadline_ts`` only after activation and
@@ -1381,7 +1528,8 @@ class DrafterScheduler:
             )
             logger.info(
                 "[BubbleTime] idle_budget step=%s group=%s workers=%s "
-                "minimum_window_s=%.3f usable_window_s=%.3f guard_s=%.3f "
+                "minimum_window_s=%.3f base_usable_window_s=%.3f "
+                "usable_window_s=%.3f reclaim_penalty_s=%.3f guard_s=%.3f "
                 "startup_reserve_s=%.3f tail_reserve_s=%.3f worker_deadline_window_s=%.3f "
                 "batch_estimate_s=%.3f window_batches=%s trainable_batches=%s "
                 "max_batches_per_window=%s sync_budget_batches=%s "
@@ -1390,7 +1538,9 @@ class DrafterScheduler:
                 resources.training_group_id,
                 resources.worker_ids,
                 resources.minimum_idle_window_sec,
+                base_usable_window,
                 usable_window,
+                reclaim_penalty_sec,
                 deadline_guard_sec,
                 startup_reserve_sec,
                 tail_reserve_sec,
@@ -1411,6 +1561,25 @@ class DrafterScheduler:
                         else "history"
                     )
                 ),
+            )
+            print(
+                "[BubbleTime] idle_budget: "
+                f"step={context.global_step} group={resources.training_group_id} "
+                f"workers={resources.worker_ids} "
+                f"minimum_window_s={resources.minimum_idle_window_sec:.3f} "
+                f"base_usable_window_s={base_usable_window:.3f} "
+                f"usable_window_s={usable_window:.3f} "
+                f"reclaim_penalty_s={reclaim_penalty_sec:.3f} "
+                f"guard_s={deadline_guard_sec:.3f} "
+                f"startup_reserve_s={startup_reserve_sec:.3f} "
+                f"tail_reserve_s={tail_reserve_sec:.3f} "
+                f"worker_deadline_window_s={worker_deadline_window:.3f} "
+                f"batch_estimate_s={batch_estimate:.3f} "
+                f"window_batches={window_batches} "
+                "trainable_batches="
+                f"{context.data_status.trainable_batches if context.data_status else 0} "
+                f"planned_batches={max_batches} reason={budget.reason}",
+                flush=True,
             )
         common: Any = {
             "interval_matched": interval_matched,
@@ -1444,12 +1613,21 @@ class DrafterScheduler:
             ),
             "idle_usable_window_sec": (
                 max(
-                    resources.minimum_idle_window_sec
-                    - self._effective_idle_deadline_guard_sec(config)
-                    - self._effective_idle_startup_reserve_sec(config)
-                    - self._effective_idle_tail_reserve_sec(config),
+                    max(
+                        resources.minimum_idle_window_sec
+                        - self._effective_idle_deadline_guard_sec(config)
+                        - self._effective_idle_startup_reserve_sec(config)
+                        - self._effective_idle_tail_reserve_sec(config),
+                        0.0,
+                    )
+                    - self._effective_idle_reclaim_penalty_sec(),
                     0.0,
                 )
+                if resources is not None
+                else None
+            ),
+            "idle_reclaim_penalty_sec": (
+                self._effective_idle_reclaim_penalty_sec()
                 if resources is not None
                 else None
             ),
@@ -1457,10 +1635,14 @@ class DrafterScheduler:
                 int(
                     math.floor(
                         max(
-                            resources.minimum_idle_window_sec
-                            - self._effective_idle_deadline_guard_sec(config)
-                            - self._effective_idle_startup_reserve_sec(config)
-                            - self._effective_idle_tail_reserve_sec(config),
+                            max(
+                                resources.minimum_idle_window_sec
+                                - self._effective_idle_deadline_guard_sec(config)
+                                - self._effective_idle_startup_reserve_sec(config)
+                                - self._effective_idle_tail_reserve_sec(config),
+                                0.0,
+                            )
+                            - self._effective_idle_reclaim_penalty_sec(),
                             0.0,
                         )
                         / self._effective_idle_batch_estimate_sec(config)
@@ -1589,6 +1771,7 @@ class DrafterScheduler:
     ) -> None:
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             self.record_idle_training_outcome(outcome)
+            self._record_prebatch_reclaim_penalty(plan, outcome)
         if outcome.trained and outcome.successful_steps > 0:
             try:
                 self._last_successful_training_step = _as_int(plan.source_global_step)

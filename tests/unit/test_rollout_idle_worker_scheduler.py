@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import replace
 
 import pytest
@@ -620,6 +621,22 @@ def test_idle_worker_deadline_guard_learns_reclaim_cost() -> None:
     assert scheduler._effective_idle_deadline_guard_sec(config) == pytest.approx(0.7)
 
 
+def test_worker_event_returns_idle_metrics() -> None:
+    scheduler = DrafterScheduler()
+
+    metrics = scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="0",
+            replica_rank=0,
+            memory_released=True,
+            must_be_ready_at=time.time() + 5.0,
+        )
+    )
+
+    assert metrics["bubble/idle_workers"] == 1
+
+
 def test_idle_worker_prebatch_reclaim_splits_setup_and_tail_reserves() -> None:
     scheduler = DrafterScheduler()
     config = _idle_config()
@@ -644,6 +661,155 @@ def test_idle_worker_prebatch_reclaim_splits_setup_and_tail_reserves() -> None:
 
     assert scheduler._effective_idle_startup_reserve_sec(config) == pytest.approx(22.0)
     assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(3.0)
+
+
+def test_idle_worker_prebatch_reclaim_penalty_blocks_marginal_window() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    failed_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=1,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="reclaimed-plan",
+        idle_usable_window_sec=10.0,
+        idle_batch_estimate_sec=1.0,
+    )
+    failed_outcome = TrainingOutcome(
+        trained=False,
+        successful_steps=0,
+        worker_results=[],
+        raw_results=[],
+        elapsed_sec=3.0,
+        reason="submitted_async",
+        metrics={
+            "bubble/train_reclaimed_before_first_batch": 1,
+            "timing_s/drafter_worker_preflight": 1.2,
+            "timing_s/drafter_worker_preflight_to_stop": 0.1,
+            "timing_s/drafter_worker_cleanup": 1.7,
+        },
+    )
+
+    scheduler._record_training_outcome(failed_plan, failed_outcome)
+
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=time.time() + 12.0,
+            )
+        )
+    next_plan = scheduler.prepare_training_plan(
+        _context(),
+        config,
+        allow_sync_fallback=False,
+    )
+
+    assert not next_plan.launch
+    assert next_plan.reason == "window_too_small"
+    assert next_plan.idle_reclaim_penalty_sec == pytest.approx(9.5)
+    assert next_plan.metrics()["bubble/idle_reclaim_penalty_active"] == 1
+    assert next_plan.metrics()["bubble/idle_reclaim_penalty_s"] == pytest.approx(9.5)
+
+
+def test_idle_worker_prebatch_reclaim_penalty_allows_large_window() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler._idle_worker_reclaim_penalty_sec = 9.5
+    scheduler._idle_worker_reclaim_penalty_last_step = 10
+
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=time.time() + 30.0,
+            )
+        )
+    plan = scheduler.prepare_training_plan(
+        replace(_context(), global_step=11),
+        config,
+        allow_sync_fallback=False,
+    )
+
+    assert plan.launch
+    assert plan.reason == "training_ready"
+    assert plan.idle_reclaim_penalty_sec == pytest.approx(9.5)
+
+
+def test_idle_worker_reclaim_penalty_decays_after_grace_step() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._idle_worker_reclaim_penalty_sec = 8.0
+    scheduler._idle_worker_reclaim_penalty_last_step = 10
+
+    scheduler._decay_idle_reclaim_penalty(11)
+    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(8.0)
+
+    scheduler._decay_idle_reclaim_penalty(12)
+    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(4.0)
+
+
+def test_idle_worker_success_resets_prebatch_reclaim_penalty() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler._idle_worker_prebatch_reclaim_streak = 2
+    scheduler._idle_worker_reclaim_penalty_sec = 9.5
+    scheduler._idle_worker_reclaim_penalty_last_step = 10
+    success_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=1,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="success-plan",
+    )
+    success_outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=1,
+        worker_results=[],
+        raw_results=[],
+        elapsed_sec=4.0,
+        reason="submitted_async",
+        metrics={
+            "bubble/train_reclaimed_before_first_batch": 0,
+            "timing_s/drafter_worker_training_loop": 1.0,
+        },
+    )
+
+    scheduler._record_training_outcome(success_plan, success_outcome)
+
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=time.time() + 30.0,
+            )
+        )
+    plan = scheduler.prepare_training_plan(
+        replace(_context(), global_step=11),
+        config,
+        allow_sync_fallback=False,
+    )
+
+    assert plan.launch
+    assert plan.reason == "training_ready"
 
 
 def test_idle_worker_training_does_not_wait_for_training_interval() -> None:
@@ -871,6 +1037,8 @@ def test_sync_fallback_training_outcome_reports_bubble_metrics() -> None:
     )
 
     assert outcome.trained
+    assert outcome.metrics["drafter/trained_any"] == 1
+    assert outcome.metrics["drafter/sync_fallback_trained"] == 1
     assert outcome.metrics["bubble/sync_fallback_completed"] == 1
     assert outcome.metrics["bubble/sync_fallback_successful_steps"] == 1
     assert outcome.metrics["bubble/sync_fallback_elapsed_s"] == 0.5
@@ -1167,6 +1335,30 @@ def test_trainer_generation_completion_does_not_create_synthetic_idle_window() -
     assert complete_metrics == {}
     assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 0
     assert output.non_tensor_batch["drafter_sample"][0]["id"] == "a"
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_generation_completion_does_not_pollute_runtime_idle_window_history() -> None:
+    trainer = _trainer_with_idle_config()
+    scheduler = trainer._drafter_scheduler
+    output = _FakeGenerationOutput([])
+    for replica_rank, worker_id in enumerate(("worker-0", "worker-1")):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=replica_rank,
+                memory_released=True,
+                event_ts=100.0 + replica_rank,
+            )
+        )
+    trainer._speco_runtime_idle_events_this_generation = 2
+
+    metrics = trainer._speco_emit_rollout_generation_completed(output)
+
+    assert metrics == {}
+    assert scheduler._replica_idle_window_samples_sec == deque()
+    assert scheduler._replica_idle_started_at == {0: 100.0, 1: 101.0}
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
