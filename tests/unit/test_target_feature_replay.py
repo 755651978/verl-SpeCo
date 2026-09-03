@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -22,10 +23,13 @@ torch = pytest.importorskip("torch")
 from verl_speco.trainer.feature_store import DraftFeatureSample, DraftReplaySample  # noqa: E402
 from verl_speco.trainer.target_feature_replay import (  # noqa: E402
     BoundedReplayCache,
+    FeatureContract,
     TargetFeatureReplayer,
     _VllmEndpointState,
     _hidden_capture_target,
     _normalize_vllm_endpoints,
+    feature_from_vllm_payload,
+    load_vllm_final_norm,
 )
 
 
@@ -95,7 +99,9 @@ def test_vllm_request_fails_over_to_another_endpoint(monkeypatch):
             model="target",
         ),
     ]
-    monkeypatch.setattr("verl_speco.trainer.target_feature_replay.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "verl_speco.trainer.target_feature_replay.time.sleep", lambda _: None
+    )
 
     response = replayer._request_vllm_response([1, 2, 3])
 
@@ -176,6 +182,7 @@ def test_vllm_payload_maps_suffix_hidden_rows_to_absolute_positions():
     replayer.target_revision = None
     replayer.target_config_fingerprint = "unit"
     replayer.use_logits = False
+    replayer.vllm_final_norm = torch.nn.RMSNorm(4, eps=1e-6)
 
     sample = DraftReplaySample(
         algorithm="DSPARK",
@@ -206,3 +213,198 @@ def test_vllm_payload_maps_suffix_hidden_rows_to_absolute_positions():
     assert feature.metadata["feature_start"] == 5
     assert feature.metadata["feature_end"] == 10
     assert feature.metadata["vllm_hidden_position_offset"] == 5
+    torch.testing.assert_close(feature.hidden_states[:, :8], hidden[:, :2].flatten(1))
+    torch.testing.assert_close(
+        feature.hidden_states[:, 8:], replayer.vllm_final_norm(hidden[:, 2])
+    )
+
+
+@pytest.mark.parametrize("model_type", ["llama", "qwen2", "qwen3", "qwen3_moe"])
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_vllm_final_norm_matches_target_forward(
+    tmp_path, monkeypatch, model_type, sharded, dtype
+):
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    from verl_speco import checkpoint_tensor
+
+    if model_type not in CONFIG_MAPPING:
+        pytest.skip(f"Installed Transformers does not include {model_type}")
+    config = transformers.AutoConfig.for_model(
+        model_type,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+        rms_norm_eps=1e-5,
+        head_dim=4,
+        moe_intermediate_size=8,
+        num_experts=2,
+        num_experts_per_tok=1,
+    )
+    model = transformers.AutoModelForCausalLM.from_config(config).to(dtype).eval()
+    with torch.no_grad():
+        model.model.norm.weight.copy_(torch.linspace(0.5, 2.0, 8))
+    model.save_pretrained(tmp_path, max_shard_size="1KB" if sharded else "1GB")
+    loaded_keys = []
+    original_load = checkpoint_tensor._load_checkpoint_tensor
+
+    def load_one(path, key):
+        loaded_keys.append(key)
+        return original_load(path, key)
+
+    monkeypatch.setattr(checkpoint_tensor, "_load_checkpoint_tensor", load_one)
+    norm = load_vllm_final_norm(str(tmp_path), dtype=dtype)
+    assert loaded_keys == ["model.norm.weight"]
+    assert all(
+        p.device.type == "cpu" and not p.requires_grad for p in norm.parameters()
+    )
+
+    captured = {}
+    handle = model.model.norm.register_forward_pre_hook(
+        lambda module, args: captured.update(final_input=args[0].detach().clone())
+    )
+    ids = torch.tensor([[1, 2, 3, 4]])
+    with torch.no_grad():
+        output = model(ids, output_hidden_states=True)
+    handle.remove()
+    # A connector-style payload: auxiliary layer output + final PRE-norm output.
+    raw = torch.stack([output.hidden_states[1][0], captured["final_input"][0]], dim=1)
+    original_raw = raw.clone()
+    request = DraftReplaySample(
+        input_ids=ids[0],
+        loss_mask=torch.ones(4),
+        attention_mask=torch.ones(4),
+        position_ids=torch.arange(4),
+        feature_positions=torch.arange(4),
+        draft_position_ids=torch.arange(1, 5),
+    )
+    for algorithm, layout in [
+        ("DSPARK", "dflash_aux_plus_last"),
+        ("EAGLE3", "eagle3_aux_plus_last"),
+    ]:
+        contract = FeatureContract(
+            algorithm=algorithm,
+            target_layer_ids=[0],
+            hidden_states_layout=layout,
+            dtype=dtype,
+            target_model_id=str(tmp_path),
+            target_model_revision=None,
+            tokenizer_fingerprint="test",
+        )
+        payload = {"token_ids": ids[0], "hidden_states": raw}
+        feature = feature_from_vllm_payload(payload, request, contract, final_norm=norm)
+        torch.testing.assert_close(
+            feature.hidden_states[:, :8], raw[:, 0], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            feature.hidden_states[:, 8:], output.hidden_states[-1][0]
+        )
+        torch.testing.assert_close(raw, original_raw, rtol=0, atol=0)
+        assert not feature.hidden_states.requires_grad
+        # Re-reading the same raw payload must not apply norm to an already-mutated tensor.
+        again = feature_from_vllm_payload(payload, request, contract, final_norm=norm)
+        torch.testing.assert_close(
+            again.hidden_states, feature.hidden_states, rtol=0, atol=0
+        )
+        with pytest.raises(ValueError, match="require the target final norm"):
+            feature_from_vllm_payload(payload, request, contract)
+        aux_only = feature_from_vllm_payload(
+            payload,
+            request,
+            replace(contract, hidden_states_layout="dflash_aux", algorithm="DFLASH"),
+        )
+        torch.testing.assert_close(aux_only.hidden_states, raw[:, 0], rtol=0, atol=0)
+
+
+def test_final_norm_loader_requires_checkpoint_weight(tmp_path):
+    transformers = pytest.importorskip("transformers")
+    from safetensors import SafetensorError
+    from safetensors.torch import save_file
+
+    config = transformers.LlamaConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+    )
+    config.save_pretrained(tmp_path)
+    save_file({"unrelated.weight": torch.ones(8)}, str(tmp_path / "model.safetensors"))
+    with pytest.raises(SafetensorError, match="model.norm.weight"):
+        load_vllm_final_norm(str(tmp_path), dtype=torch.float32)
+
+
+def test_vllm_replay_initializes_norm_and_invalidates_old_cache(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+    import transformers
+
+    transformers.LlamaConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        vocab_size=32,
+    ).save_pretrained(tmp_path)
+    calls = []
+    norm = torch.nn.RMSNorm(8)
+
+    def loader(*args, **kwargs):
+        calls.append(args)
+        return norm
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.target_feature_replay.load_vllm_final_norm", loader
+    )
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "model": {"path": str(tmp_path)},
+                "rollout": {
+                    "drafter": {
+                        "speculative_algorithm": "DSPARK",
+                        "target_layer_ids": [0],
+                        "training": {
+                            "use_logits": False,
+                            "dspark_l1_loss_alpha": 0.9,
+                            "target_feature_replay": {
+                                "backend": "vllm_file",
+                                "dtype": "float32",
+                            },
+                        },
+                    }
+                },
+            }
+        }
+    )
+    replayer = TargetFeatureReplayer(
+        config, rank=0, world_size=1, device=torch.device("cpu")
+    )
+    assert calls == [(str(tmp_path),)]
+    assert replayer.model is None  # No full target model was loaded for replay.
+    assert replayer.vllm_final_norm is norm
+    sample = DraftReplaySample(
+        input_ids=torch.arange(4),
+        loss_mask=torch.ones(4),
+        attention_mask=torch.ones(4),
+        position_ids=torch.arange(4),
+        feature_positions=torch.arange(4),
+        draft_position_ids=torch.arange(1, 5),
+    )
+    new_key = replayer._cache_key(sample)
+    replayer.backend = "torch"
+    assert new_key != replayer._cache_key(sample)
+    config.actor_rollout_ref.rollout.drafter.training.target_feature_replay.backend = (
+        "torch"
+    )
+    calls.clear()
+    torch_replayer = TargetFeatureReplayer(
+        config, rank=0, world_size=1, device=torch.device("cpu")
+    )
+    assert calls == []
+    assert torch_replayer.vllm_final_norm is None

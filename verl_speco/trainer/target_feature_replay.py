@@ -198,6 +198,46 @@ def _hidden_capture_target(layer_id: int, num_layers: int) -> tuple[str, int | N
     return "layer", hidden_state_index - 1
 
 
+def load_vllm_final_norm(
+    model_path: str,
+    *,
+    dtype: torch.dtype,
+    trust_remote_code: bool = False,
+    target_config: Any = None,
+) -> nn.Module:
+    """Load only the target's final norm, using its actual HF implementation.
+
+    extract_hidden_states collects layer residuals BEFORE the target final norm.
+    Constructing the architecture on meta discovers the norm without allocating
+    target weights; only that module's checkpoint tensors are read into CPU RAM.
+    The checkpoint must be the same frozen target served by the vLLM endpoint.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from verl_speco.checkpoint_tensor import _load_checkpoint_tensor
+
+    if target_config is None:
+        target_config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(
+            target_config,
+            trust_remote_code=trust_remote_code,
+            attn_implementation="eager",
+        )
+    _, norm = _find_layers_and_final_norm(model)
+    norm_name = next(name for name, module in model.named_modules() if module is norm)
+    state = {
+        key: _load_checkpoint_tensor(model_path, f"{norm_name}.{key}")
+        for key in norm.state_dict()
+    }
+    norm.load_state_dict(state, strict=True, assign=True)
+    norm = norm.to(device="cpu", dtype=dtype).eval().requires_grad_(False)
+    logger.info("Loaded vLLM target final norm %s from %s", norm_name, model_path)
+    return norm
+
+
 def _load_json_config(path: Any) -> dict[str, Any] | None:
     if not path:
         return None
@@ -373,6 +413,8 @@ def feature_from_vllm_payload(
     payload: Mapping[str, Any] | Any,
     request: DraftReplaySample | Any,
     feature_config: FeatureContract,
+    *,
+    final_norm: nn.Module | None = None,
 ) -> DraftFeatureSample:
     """Pure vLLM payload conversion shared by replay and standalone Producer."""
 
@@ -469,7 +511,12 @@ def feature_from_vllm_payload(
     selected = hidden.index_select(0, relative_positions).to(dtype=feature_config.dtype)
     aux_hidden = selected[:, : len(target_layer_ids), :].flatten(1)
     if include_final:
-        final_hidden = selected[:, required_layers - 1, :]
+        if final_norm is None:
+            raise ValueError("vLLM plus_last features require the target final norm")
+        # Auxiliary layers stay raw. Only the final supervision block goes
+        # through the frozen target norm, exactly once, before storage/transport.
+        with torch.no_grad():
+            final_hidden = final_norm(selected[:, required_layers - 1, :])
         output_hidden = torch.cat([aux_hidden, final_hidden], dim=-1)
     else:
         output_hidden = aux_hidden
@@ -507,6 +554,8 @@ def feature_from_vllm_payload(
             "use_logits": feature_config.use_logits,
         }
     )
+    if include_final:
+        metadata["last_hidden_state_norm"] = "target_final_norm"
     return DraftFeatureSample(
         algorithm=algorithm,
         input_ids=selected_input_ids,
@@ -641,6 +690,14 @@ class TargetFeatureReplayer:
             if self.algorithm in {"DFLASH", "DSPARK"}
             else "eagle3_aux_plus_last"
         )
+        self.vllm_final_norm = None
+        if self.backend == "vllm_file" and self.hidden_layout.endswith("_plus_last"):
+            self.vllm_final_norm = load_vllm_final_norm(
+                self.model_path,
+                dtype=self.dtype,
+                trust_remote_code=self.trust_remote_code,
+                target_config=self.target_config,
+            )
         config_json = json.dumps(
             self.target_config.to_dict(), sort_keys=True, default=str
         ).encode()
@@ -809,6 +866,9 @@ class TargetFeatureReplayer:
             "use_logits": self.use_logits,
             "logits_topk": self.logits_topk,
         }
+        if self.backend == "vllm_file" and self.hidden_layout.endswith("_plus_last"):
+            # Old cache entries contain pre-norm final hidden; never reuse them.
+            contract["vllm_last_hidden_state_norm"] = "target_final_norm_v1"
         digest.update(json.dumps(contract, sort_keys=True).encode())
         for tensor in (
             sample.input_ids,
@@ -1379,6 +1439,7 @@ class TargetFeatureReplayer:
                 target_config_fingerprint=self.target_config_fingerprint,
                 source=source,
             ),
+            final_norm=self.vllm_final_norm,
         )
 
     def _build_sparse_target_logprobs(
@@ -1436,6 +1497,7 @@ class TargetFeatureReplayer:
         return metrics
 
     def close(self) -> None:
+        self.vllm_final_norm = None
         for state in self._vllm_endpoint_states:
             client = state.client
             close = getattr(client, "close", None)

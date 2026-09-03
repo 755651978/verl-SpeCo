@@ -26,6 +26,21 @@ from verl_speco.producer.vllm_feature_client import RawVllmFeature
 from verl_speco.standalone_tq_producer import run_producer, validate_producer_config
 from verl_speco.trainer.standalone_resume import save_standalone_resume
 from verl_speco.transport.drafter_sample_protocol import PROTOCOL_SCHEMA_VERSION
+from verl_speco.transport.drafter_sample_protocol import decode_sample
+
+
+@pytest.fixture(autouse=True)
+def target_final_norm(monkeypatch):
+    # These pipeline tests use a fake /target checkpoint. Loader accuracy is
+    # covered separately with real tiny HF checkpoints.
+    norm = torch.nn.RMSNorm(2, eps=1e-6).requires_grad_(False)
+    with torch.no_grad():
+        norm.weight.copy_(torch.tensor([2.0, 3.0]))
+    monkeypatch.setattr(
+        "verl_speco.standalone_tq_producer.load_vllm_final_norm",
+        lambda *args, **kwargs: norm,
+    )
+    return norm
 
 
 def _config(input_path: Path) -> dict[str, Any]:
@@ -214,7 +229,9 @@ def _write_input(path: Path) -> None:
     )
 
 
-def test_run_producer_publishes_samples_then_eos(tmp_path: Path) -> None:
+def test_run_producer_publishes_samples_then_eos(
+    tmp_path: Path, target_final_norm
+) -> None:
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)
     transport = _Transport()
@@ -251,6 +268,62 @@ def test_run_producer_publishes_samples_then_eos(tmp_path: Path) -> None:
     assert pool.started and pool.closed and transport.closed
     first_fields = transport.payloads[sorted(sample_keys)[0]]
     assert tuple(first_fields["sample__hidden_states"].shape) == (3, 6)
+    # The existing response feature window starts at prompt_length - 1 = 1.
+    raw = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[1:]
+    torch.testing.assert_close(
+        first_fields["sample__hidden_states"][:, :4], raw[:, :2].flatten(1)
+    )
+    torch.testing.assert_close(
+        first_fields["sample__hidden_states"][:, 4:], target_final_norm(raw[:, 2])
+    )
+    first_key = sorted(sample_keys)[0]
+    sample = decode_sample(
+        first_key, transport.records[first_key], first_fields, {"run_id": "run-a"}
+    )
+    torch.testing.assert_close(
+        sample.hidden_states[:, 4:], target_final_norm(raw[:, 2])
+    )
+    assert sample.metadata["last_hidden_state_norm"] == "target_final_norm"
+
+
+@pytest.mark.parametrize("algorithm", ["DFLASH", "DSPARK"])
+def test_aux_only_producer_does_not_load_or_apply_final_norm(
+    tmp_path, monkeypatch, algorithm
+):
+    def unexpected_load(*args, **kwargs):
+        raise AssertionError("aux-only features must not load a target final norm")
+
+    monkeypatch.setattr(
+        "verl_speco.standalone_tq_producer.load_vllm_final_norm", unexpected_load
+    )
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
+    drafter["speculative_algorithm"] = algorithm
+    drafter["training"]["dspark_l1_loss_alpha"] = 0.0
+    transport = _Transport()
+    asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=_Pool(tmp_path),
+        )
+    )
+    sample_key = next(
+        key
+        for key, tag in transport.records.items()
+        if tag.get("record_type") == "sample"
+    )
+    sample = decode_sample(
+        sample_key,
+        transport.records[sample_key],
+        transport.payloads[sample_key],
+        {"run_id": "run-a"},
+    )
+    raw_aux = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)[1:, :2].flatten(1)
+    torch.testing.assert_close(sample.hidden_states, raw_aux)
 
 
 def test_run_producer_restarts_input_until_max_samples(tmp_path: Path) -> None:
@@ -271,9 +344,7 @@ def test_run_producer_restarts_input_until_max_samples(tmp_path: Path) -> None:
     )
 
     sample_tags = [
-        tag
-        for tag in transport.records.values()
-        if tag.get("record_type") == "sample"
+        tag for tag in transport.records.values() if tag.get("record_type") == "sample"
     ]
     eos_tags = [tag for tag in transport.records.values() if tag.get("status") == "eos"]
     assert stats.input_count == stats.published_count == 5

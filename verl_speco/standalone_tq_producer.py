@@ -46,6 +46,7 @@ from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
     HiddenStateAlignmentError,
     feature_from_vllm_payload,
+    load_vllm_final_norm,
 )
 from verl_speco.transport.drafter_sample_protocol import (
     DRAFTER_TQ_PARTITION,
@@ -246,6 +247,14 @@ async def run_producer(
             use_logits=False,
             require_full_alignment=True,
         )
+        final_norm = None
+        if feature_contract.hidden_states_layout.endswith("_plus_last"):
+            final_norm = await asyncio.to_thread(
+                load_vllm_final_norm,
+                feature_contract.target_model_id,
+                dtype=feature_contract.dtype,
+                trust_remote_code=bool(producer_cfg.get("trust_remote_code", False)),
+            )
         worker_count = int(producer_cfg["max_inflight_requests"])
         input_queue: asyncio.Queue[Any] = asyncio.Queue(
             maxsize=int(producer_cfg["input_queue_size"])
@@ -353,7 +362,9 @@ async def run_producer(
                     raw = await pool.prefill(request)
                 stats.pending_bytes += int(raw.byte_size)
                 try:
-                    sample = feature_from_vllm_payload(raw, request, feature_contract)
+                    sample = feature_from_vllm_payload(
+                        raw, request, feature_contract, final_norm=final_norm
+                    )
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
                     stats.pending_bytes = max(
