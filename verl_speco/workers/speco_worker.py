@@ -1555,6 +1555,10 @@ class SpecoWorker(Worker):
         self._prepared_training_preflight_elapsed_sec = 0.0
         self._prepared_training_ready_ts = None
         max_batches = max(int(training_plan.get("max_batches", 0)), 0)
+        idle_batch_estimate_sec = max(
+            float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
+            0.0,
+        )
         prepare_publish = bool(training_plan.get("publish_after_success", False))
         snapshot = (training_plan.get("worker_snapshots") or {})[str(self.rank)]
         buffer_size_before = int(snapshot.get("trainable_samples", 0))
@@ -1582,7 +1586,7 @@ class SpecoWorker(Worker):
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
-                for _ in range(max_batches):
+                for batch_index in range(max_batches):
                     deadline_ts = training_plan.get("deadline_ts")
                     now_ts = time.time()
                     if deadline_ts is not None and now_ts >= float(deadline_ts):
@@ -1591,11 +1595,17 @@ class SpecoWorker(Worker):
                             result["preflight_to_stop_sec"] = max(
                                 now_ts - prepared_ready_ts, 0.0
                             )
+                        log_prefix = (
+                            "training_not_started"
+                            if not result["first_batch_started"]
+                            else "training_stopped"
+                        )
                         logger.warning(
-                            "[BubbleTime] training_not_started: plan_id=%s "
+                            "[BubbleTime] %s: plan_id=%s "
                             "worker_id=%s rank=%s reason=deadline_reached "
                             "now_ts=%.6f deadline_ts=%.6f remaining_s=%.4f "
                             "reclaim_requested=%s",
+                            log_prefix,
                             plan_id,
                             self.rank,
                             self.rank,
@@ -1605,11 +1615,62 @@ class SpecoWorker(Worker):
                             self._drafter_reclaim_requested,
                         )
                         print(
-                            "[BubbleTime] training_not_started: "
+                            f"[BubbleTime] {log_prefix}: "
                             f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
                             "reason=deadline_reached "
                             f"now_ts={now_ts:.6f} deadline_ts={float(deadline_ts):.6f} "
                             f"remaining_s={float(deadline_ts) - now_ts:.4f} "
+                            f"reclaim_requested={self._drafter_reclaim_requested}",
+                            flush=True,
+                        )
+                        break
+                    if (
+                        deadline_ts is not None
+                        and idle_batch_estimate_sec > 0.0
+                        and now_ts + idle_batch_estimate_sec > float(deadline_ts)
+                    ):
+                        result["reason"] = "next_batch_budget_too_small"
+                        remaining_s = float(deadline_ts) - now_ts
+                        if (
+                            prepared_ready_ts is not None
+                            and not result["first_batch_started"]
+                        ):
+                            result["preflight_to_stop_sec"] = max(
+                                now_ts - prepared_ready_ts, 0.0
+                            )
+                        log_prefix = (
+                            "training_not_started"
+                            if not result["first_batch_started"]
+                            else "training_stopped"
+                        )
+                        logger.warning(
+                            "[BubbleTime] %s: plan_id=%s worker_id=%s rank=%s "
+                            "reason=next_batch_budget_too_small batch_index=%s "
+                            "successful_steps=%s now_ts=%.6f deadline_ts=%.6f "
+                            "remaining_s=%.4f batch_estimate_s=%.4f "
+                            "reclaim_requested=%s",
+                            log_prefix,
+                            plan_id,
+                            self.rank,
+                            self.rank,
+                            batch_index,
+                            result["successful_steps"],
+                            now_ts,
+                            float(deadline_ts),
+                            remaining_s,
+                            idle_batch_estimate_sec,
+                            self._drafter_reclaim_requested,
+                        )
+                        print(
+                            f"[BubbleTime] {log_prefix}: "
+                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
+                            "reason=next_batch_budget_too_small "
+                            f"batch_index={batch_index} "
+                            f"successful_steps={result['successful_steps']} "
+                            f"now_ts={now_ts:.6f} "
+                            f"deadline_ts={float(deadline_ts):.6f} "
+                            f"remaining_s={remaining_s:.4f} "
+                            f"batch_estimate_s={idle_batch_estimate_sec:.4f} "
                             f"reclaim_requested={self._drafter_reclaim_requested}",
                             flush=True,
                         )
@@ -1620,10 +1681,16 @@ class SpecoWorker(Worker):
                             result["preflight_to_stop_sec"] = max(
                                 now_ts - prepared_ready_ts, 0.0
                             )
+                        log_prefix = (
+                            "training_not_started"
+                            if not result["first_batch_started"]
+                            else "training_stopped"
+                        )
                         logger.warning(
-                            "[BubbleTime] training_not_started: plan_id=%s "
+                            "[BubbleTime] %s: plan_id=%s "
                             "worker_id=%s rank=%s reason=reclaim_requested "
                             "now_ts=%.6f deadline_ts=%s reclaim_requested=True",
+                            log_prefix,
                             plan_id,
                             self.rank,
                             self.rank,
@@ -1631,7 +1698,7 @@ class SpecoWorker(Worker):
                             deadline_ts,
                         )
                         print(
-                            "[BubbleTime] training_not_started: "
+                            f"[BubbleTime] {log_prefix}: "
                             f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
                             "reason=reclaim_requested "
                             f"now_ts={now_ts:.6f} deadline_ts={deadline_ts} "
@@ -1659,10 +1726,7 @@ class SpecoWorker(Worker):
                             prepared_activation_elapsed_sec,
                             prepared_preflight_elapsed_sec,
                             float(
-                                result.get(
-                                    "preflight_to_first_batch_sec", 0.0
-                                )
-                                or 0.0
+                                result.get("preflight_to_first_batch_sec", 0.0) or 0.0
                             ),
                         )
                         print(

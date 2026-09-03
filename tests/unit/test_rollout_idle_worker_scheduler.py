@@ -704,7 +704,7 @@ def test_idle_worker_prebatch_reclaim_penalty_blocks_marginal_window() -> None:
                 worker_id=worker_id,
                 replica_rank=int(worker_id),
                 memory_released=True,
-                must_be_ready_at=time.time() + 12.0,
+                must_be_ready_at=time.time() + 5.0,
             )
         )
     next_plan = scheduler.prepare_training_plan(
@@ -715,9 +715,9 @@ def test_idle_worker_prebatch_reclaim_penalty_blocks_marginal_window() -> None:
 
     assert not next_plan.launch
     assert next_plan.reason == "window_too_small"
-    assert next_plan.idle_reclaim_penalty_sec == pytest.approx(9.5)
+    assert next_plan.idle_reclaim_penalty_sec == pytest.approx(2.3)
     assert next_plan.metrics()["bubble/idle_reclaim_penalty_active"] == 1
-    assert next_plan.metrics()["bubble/idle_reclaim_penalty_s"] == pytest.approx(9.5)
+    assert next_plan.metrics()["bubble/idle_reclaim_penalty_s"] == pytest.approx(2.3)
 
 
 def test_idle_worker_prebatch_reclaim_penalty_allows_large_window() -> None:
@@ -744,19 +744,88 @@ def test_idle_worker_prebatch_reclaim_penalty_allows_large_window() -> None:
 
     assert plan.launch
     assert plan.reason == "training_ready"
-    assert plan.idle_reclaim_penalty_sec == pytest.approx(9.5)
+    assert plan.idle_reclaim_penalty_sec == pytest.approx(4.75)
 
 
-def test_idle_worker_reclaim_penalty_decays_after_grace_step() -> None:
+def test_idle_worker_prebatch_reclaim_streak_keeps_multi_batch_window() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler._idle_worker_prebatch_reclaim_streak = 1
+    scheduler._idle_worker_reclaim_penalty_sec = 2.0
+    scheduler._idle_worker_reclaim_penalty_last_step = 10
+
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=time.time() + 80.0,
+            )
+        )
+    plan = scheduler.prepare_training_plan(
+        replace(_context(), global_step=10),
+        config,
+        allow_sync_fallback=False,
+    )
+
+    assert plan.launch
+    assert plan.reason == "training_ready"
+    assert plan.max_batches == 2
+
+
+def test_idle_worker_reclaim_penalty_decays_on_next_step() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler._idle_worker_reclaim_penalty_sec = 8.0
     scheduler._idle_worker_reclaim_penalty_last_step = 10
 
     scheduler._decay_idle_reclaim_penalty(11)
-    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(8.0)
+    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(4.0)
 
     scheduler._decay_idle_reclaim_penalty(12)
-    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(4.0)
+    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(2.0)
+
+
+def test_idle_worker_prebatch_reclaim_penalty_shrinks_from_stale_high_value() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._idle_worker_reclaim_penalty_sec = 35.56564683914185
+    scheduler._idle_worker_reclaim_penalty_last_step = 10
+    failed_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=11,
+        max_batches=3,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="reclaimed-plan",
+        idle_usable_window_sec=27.77753145694733,
+        idle_batch_estimate_sec=4.228558301925659,
+        idle_startup_reserve_sec=2.7478981018066406,
+    )
+    failed_outcome = TrainingOutcome(
+        trained=False,
+        successful_steps=0,
+        worker_results=[],
+        raw_results=[],
+        elapsed_sec=25.0,
+        reason="submitted_async",
+        metrics={
+            "bubble/train_reclaimed_before_first_batch": 1,
+            "timing_s/drafter_worker_elapsed": 3.56601881980896,
+            "timing_s/drafter_worker_preflight": 2.7478981018066406,
+            "timing_s/drafter_worker_preflight_to_stop": 0.9483940601348877,
+        },
+    )
+
+    scheduler._record_training_outcome(failed_plan, failed_outcome)
+
+    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(
+        4.228558301925659 * 3.0
+    )
 
 
 def test_idle_worker_success_resets_prebatch_reclaim_penalty() -> None:
@@ -1423,9 +1492,9 @@ def test_trainer_fallback_idle_events_from_generation_output() -> None:
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
 def test_trainer_strict_idle_mode_rejects_synthetic_idle_window() -> None:
     trainer = _trainer_with_idle_config()
-    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
-        "scheduler"
-    ]["idle_worker"]["require_runtime_idle_events"] = True
+    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["scheduler"][
+        "idle_worker"
+    ]["require_runtime_idle_events"] = True
     output = _FakeGenerationOutput([{"replica_rank": 0, "id": "a"}])
 
     metrics = trainer._speco_emit_rollout_idle_from_generation_output(
@@ -1493,9 +1562,9 @@ def test_trainer_reclaims_active_idle_workers_before_next_generation() -> None:
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
 def test_trainer_can_skip_reclaim_drain_when_configured() -> None:
     trainer = _trainer_with_idle_config()
-    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
-        "scheduler"
-    ]["idle_worker"]["drain_before_next_rollout"] = False
+    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["scheduler"][
+        "idle_worker"
+    ]["drain_before_next_rollout"] = False
     events = []
     trainer._drafter_scheduler.bind_worker_executor(
         CallbackDrafterWorkerExecutor(

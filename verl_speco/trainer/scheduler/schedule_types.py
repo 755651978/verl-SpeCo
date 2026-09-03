@@ -532,6 +532,9 @@ class TrainingPlan:
             "worker_snapshots": self.worker_snapshots or {},
             "target_worker_ids": self.target_worker_ids,
             "training_group_id": self.training_group_id,
+            "idle_batch_estimate_sec": self.idle_batch_estimate_sec,
+            "idle_tail_reserve_sec": self.idle_tail_reserve_sec,
+            "idle_reclaim_penalty_sec": self.idle_reclaim_penalty_sec,
         }
 
     def metrics(self) -> dict[str, int]:
