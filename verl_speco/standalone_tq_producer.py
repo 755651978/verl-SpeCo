@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import Any, Mapping
 
 import torch
@@ -63,6 +65,7 @@ from verl_speco.transport.drafter_sample_protocol import (
 logger = logging.getLogger(__name__)
 _INPUT_DONE = object()
 _PUBLISH_DONE = object()
+_FEATURE_CONVERSION_WORKERS = 8
 
 
 @dataclass
@@ -170,6 +173,7 @@ async def run_producer(
     stats = ProducerStats()
     connected = False
     pool = client_pool
+    feature_executor: ThreadPoolExecutor | None = None
     try:
         logger.info(
             "Standalone TQ Producer starting run_id=%s input=%s endpoints=%s",
@@ -255,6 +259,12 @@ async def run_producer(
                 dtype=feature_contract.dtype,
                 trust_remote_code=bool(producer_cfg.get("trust_remote_code", False)),
             )
+        feature_executor = ThreadPoolExecutor(
+            max_workers=_FEATURE_CONVERSION_WORKERS,
+            thread_name_prefix="speco-feature",
+        )
+        feature_slots = asyncio.Semaphore(_FEATURE_CONVERSION_WORKERS)
+        event_loop = asyncio.get_running_loop()
         worker_count = int(producer_cfg["max_inflight_requests"])
         input_queue: asyncio.Queue[Any] = asyncio.Queue(
             maxsize=int(producer_cfg["input_queue_size"])
@@ -362,9 +372,17 @@ async def run_producer(
                     raw = await pool.prefill(request)
                 stats.pending_bytes += int(raw.byte_size)
                 try:
-                    sample = feature_from_vllm_payload(
-                        raw, request, feature_contract, final_norm=final_norm
-                    )
+                    async with feature_slots:
+                        sample = await event_loop.run_in_executor(
+                            feature_executor,
+                            partial(
+                                feature_from_vllm_payload,
+                                raw,
+                                request,
+                                feature_contract,
+                                final_norm=final_norm,
+                            ),
+                        )
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
                     stats.pending_bytes = max(
@@ -438,8 +456,12 @@ async def run_producer(
         return stats
     finally:
         try:
-            if pool is not None:
-                await pool.close()
+            try:
+                if pool is not None:
+                    await pool.close()
+            finally:
+                if feature_executor is not None:
+                    feature_executor.shutdown(wait=True)
         finally:
             if connected:
                 transport.close_transfer_queue_client()
