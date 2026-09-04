@@ -168,6 +168,7 @@ async def run_producer(
     stats = ProducerStats()
     connected = False
     pool = client_pool
+    core: VllmFeatureProducerCore | None = None
     try:
         logger.info(
             "Standalone TQ Producer starting run_id=%s input=%s endpoints=%s",
@@ -421,7 +422,9 @@ async def run_producer(
         return stats
     finally:
         try:
-            if pool is not None:
+            if core is not None:
+                await core.close()
+            elif pool is not None:
                 await pool.close()
         finally:
             if connected:

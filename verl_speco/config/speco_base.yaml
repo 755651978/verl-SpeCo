@@ -95,7 +95,7 @@ actor_rollout_ref:
           use_object_store: true
           weight_hot_update:
             enabled: false
-            # vLLM 0.23 NCCL backend: CUDA actors, full/merged HF weights.
+            # vLLM 0.23 NCCL/HCCL backend: CUDA or Ascend actors, full HF weights.
             master_address: null
             timeout_seconds: 600
             bucket_size_mb: 256

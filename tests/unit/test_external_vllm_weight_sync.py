@@ -43,8 +43,8 @@ def sender(monkeypatch):
 
     engine = SimpleNamespace(
         trainer_init=trainer_init,
-        trainer_send_weights=lambda iterator, args: sends.append(
-            (list(iterator), args)
+        trainer_send_weights=lambda iterator, trainer_args: sends.append(
+            (list(iterator), trainer_args)
         ),
     )
     ports = iter([29001, 29002])
@@ -60,6 +60,7 @@ def sender(monkeypatch):
     )
     monkeypatch.setattr(requests, "Session", Session)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     value = sync.ExternalVllmWeightSender(
         {
@@ -312,13 +313,93 @@ def test_worker_rpc_returns_norm_payload(monkeypatch):
     assert namespace["update_external_vllm_weights"](object(), 5) is payload
 
 
-def test_worker_rejects_npu_before_nccl_init(monkeypatch):
+def test_worker_rejects_when_no_supported_accelerator(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(is_available=lambda: False), raising=False
+    )
     worker = SimpleNamespace(
         config=SimpleNamespace(actor=SimpleNamespace(strategy="fsdp2")), rank=0
     )
     with pytest.raises(RuntimeError, match="NPU/HCCL"):
         sync.initialize_worker_weight_sync(worker, {})
+
+
+def test_sender_selects_vllm_ascend_hccl(monkeypatch):
+    calls = []
+    group = SimpleNamespace(available=True, disabled=False)
+    engine = SimpleNamespace(
+        trainer_init=Mock(return_value=group), trainer_send_weights=Mock()
+    )
+
+    class Session:
+        trust_env = True
+
+        def request(self, method, url, json, params, timeout):
+            calls.append((method, url, json, params))
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {"world_size": 2}
+                if url.endswith("get_world_size")
+                else {},
+            )
+
+        def close(self):
+            calls.append(("CLOSE", "session", None, None))
+
+    original_device = torch.device
+    fake_npu = SimpleNamespace(
+        is_available=lambda: True,
+        current_device=lambda: 0,
+        synchronize=Mock(),
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    monkeypatch.setattr(
+        torch,
+        "device",
+        lambda kind, *args: (
+            original_device("cpu")
+            if kind == "npu"
+            else original_device(kind, *args)
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.distributed.weight_transfer.hccl_engine",
+        SimpleNamespace(HCCLWeightTransferEngine=engine),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils.network_utils",
+        SimpleNamespace(get_ip=lambda: "10.0.0.1", get_open_port=lambda: 29001),
+    )
+    monkeypatch.setattr(requests, "Session", Session)
+
+    value = sync.ExternalVllmWeightSender(
+        {"endpoints": ["http://npu-vllm:8000/v1"]}
+    )
+    assert value.backend == "HCCL"
+    assert value.device_module is fake_npu
+    engine.trainer_init.assert_called_once_with(
+        {
+            "master_address": "10.0.0.1",
+            "master_port": 29001,
+            "rank_offset": 1,
+            "world_size": 3,
+        }
+    )
+    monkeypatch.setattr(
+        value,
+        "_batches",
+        lambda iterator: iter([[item] for item in iterator]),
+    )
+    value.update(iter([("model.weight", torch.ones(2))]), 3)
+    _, kwargs = engine.trainer_send_weights.call_args
+    assert kwargs["trainer_args"]["group"] is group
+    assert kwargs["trainer_args"]["packed"] is True
+    fake_npu.synchronize.assert_called()
+    value.close()
 
 
 def test_unpacked_update_omits_packed_geometry(sender):
@@ -353,6 +434,7 @@ def test_staging_batches_own_exported_views(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     value = sync.ExternalVllmWeightSender.__new__(sync.ExternalVllmWeightSender)
     value.bucket_bytes = 16
+    value.device = torch.device("cpu")
 
     def exporter():
         reused = torch.zeros(2)

@@ -1,7 +1,7 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""External vLLM 0.23 weight updates: actor-local NCCL, HTTP metadata only."""
+"""External vLLM 0.23 weight updates: actor-local NCCL/HCCL, HTTP metadata only."""
 
 from __future__ import annotations
 
@@ -80,19 +80,35 @@ def close_external_vllm_weight_sync(
 
 
 class ExternalVllmWeightSender:
-    """Lives on actor rank 0, on its existing CUDA device, not on the driver."""
+    """Lives on actor rank 0 and sends from its existing CUDA or NPU device."""
 
     def __init__(self, config: Mapping[str, Any]) -> None:
         import requests
         import torch
-        from vllm.distributed.weight_transfer.nccl_engine import (
-            NCCLWeightTransferEngine,
-        )
         from vllm.utils.network_utils import get_ip, get_open_port
 
-        if not torch.cuda.is_available():
+        npu = getattr(torch, "npu", None)
+        if torch.cuda.is_available():
+            from vllm.distributed.weight_transfer.nccl_engine import (
+                NCCLWeightTransferEngine,
+            )
+
+            self.engine = NCCLWeightTransferEngine
+            self.device_module = torch.cuda
+            self.device = torch.device("cuda", torch.cuda.current_device())
+            self.backend = "NCCL"
+        elif npu is not None and npu.is_available():
+            from vllm_ascend.distributed.weight_transfer.hccl_engine import (
+                HCCLWeightTransferEngine,
+            )
+
+            self.engine = HCCLWeightTransferEngine
+            self.device_module = npu
+            self.device = torch.device("npu", npu.current_device())
+            self.backend = "HCCL"
+        else:
             raise RuntimeError(
-                "External vLLM NCCL weight sync requires CUDA, not NPU/HCCL"
+                "External vLLM weight sync requires CUDA/NCCL or Ascend NPU/HCCL"
             )
         endpoints = config.get("endpoints") or []
         if isinstance(endpoints, str) or not endpoints:
@@ -108,7 +124,6 @@ class ExternalVllmWeightSender:
             )
         self.session = requests.Session()
         self.session.trust_env = False
-        self.engine = NCCLWeightTransferEngine
         self.groups: list[Any] = []
         self.failed = False
         address = str(config.get("master_address") or get_ip())
@@ -127,7 +142,7 @@ class ExternalVllmWeightSender:
                     "rank_offset": 1,
                     "world_size": size + 1,
                 }
-                # Server init blocks waiting for the sender's NCCL rendezvous.
+                # Server init blocks waiting for the sender's NCCL/HCCL rendezvous.
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     pending = pool.submit(
                         self._request,
@@ -140,10 +155,12 @@ class ExternalVllmWeightSender:
                     pending.result()
                 if not group.available or group.disabled:
                     raise RuntimeError(
-                        "vLLM PyNcclCommunicator is unavailable/disabled"
+                        f"vLLM {self.backend} communicator is unavailable/disabled"
                     )
                 logger.warning(
-                    "[external vLLM weights] connected endpoint=%s workers=%s",
+                    "[external vLLM weights] connected backend=%s endpoint=%s "
+                    "workers=%s",
+                    self.backend,
                     endpoint,
                     size,
                 )
@@ -184,7 +201,7 @@ class ExternalVllmWeightSender:
                     str(name),
                     tensor.detach()
                     .to(
-                        device=torch.device("cuda", torch.cuda.current_device()),
+                        device=self.device,
                         copy=True,
                     )
                     .contiguous(),
@@ -236,7 +253,7 @@ class ExternalVllmWeightSender:
                             for k in ("packed_buffer_size_bytes", "packed_num_buffers")
                         }
                     )
-                torch.cuda.synchronize()
+                self.device_module.synchronize()
                 for endpoint, group in zip(self.endpoints, self.groups, strict=True):
                     with ThreadPoolExecutor(max_workers=1) as pool:
                         pending = pool.submit(
@@ -246,9 +263,10 @@ class ExternalVllmWeightSender:
                             {"update_info": info},
                         )
                         self.engine.trainer_send_weights(
-                            iter(batch), {"group": group, **args}
+                            iterator=iter(batch),
+                            trainer_args={"group": group, **args},
                         )
-                        torch.cuda.synchronize()
+                        self.device_module.synchronize()
                         # Unlike Thread.join(), result() propagates HTTP errors.
                         pending.result()
                 count += len(batch)
@@ -275,7 +293,9 @@ class ExternalVllmWeightSender:
     def close(self) -> None:
         try:
             for group in self.groups:
-                group.destroy()
+                destroy = getattr(group, "destroy", None)
+                if callable(destroy):
+                    destroy()
         finally:
             self.groups.clear()
             self.session.close()
@@ -289,8 +309,13 @@ def initialize_worker_weight_sync(worker: Any, config: Mapping[str, Any]) -> Non
         raise ValueError(
             "External vLLM sync requires a full HF weight iterator (FSDP/FSDP2/VeOmni)"
         )
-    if not torch.cuda.is_available():
-        raise RuntimeError("External vLLM NCCL sync supports CUDA only, not NPU/HCCL")
+    npu = getattr(torch, "npu", None)
+    if not torch.cuda.is_available() and not (
+        npu is not None and npu.is_available()
+    ):
+        raise RuntimeError(
+            "External vLLM sync requires CUDA/NCCL or Ascend NPU/HCCL"
+        )
     if getattr(worker, "_speco_external_vllm_sender", None) is not None:
         raise RuntimeError("External vLLM weight sync is already initialized")
     if worker.rank == 0:

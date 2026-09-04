@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -26,6 +28,9 @@ from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
     feature_from_vllm_payload,
 )
+
+
+_FEATURE_CONVERSION_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,11 @@ class VllmFeatureProducerCore:
         self.client_pool = client_pool
         self.feature_contract = feature_contract
         self.final_norm = final_norm
+        self._feature_executor = ThreadPoolExecutor(
+            max_workers=_FEATURE_CONVERSION_WORKERS,
+            thread_name_prefix="speco-feature",
+        )
+        self._feature_slots = asyncio.Semaphore(_FEATURE_CONVERSION_WORKERS)
 
     async def start(self) -> None:
         await self.client_pool.start()
@@ -109,9 +119,17 @@ class VllmFeatureProducerCore:
     async def produce_one(self, request: TokenizedRequest) -> ProducedFeature:
         raw = await self.client_pool.prefill(request)
         try:
-            sample = feature_from_vllm_payload(
-                raw, request, self.feature_contract, final_norm=self.final_norm
-            )
+            async with self._feature_slots:
+                sample = await asyncio.get_running_loop().run_in_executor(
+                    self._feature_executor,
+                    partial(
+                        feature_from_vllm_payload,
+                        raw,
+                        request,
+                        self.feature_contract,
+                        final_norm=self.final_norm,
+                    ),
+                )
         except BaseException:
             await asyncio.to_thread(delete_temporary_result, raw)
             raise
@@ -128,7 +146,10 @@ class VllmFeatureProducerCore:
         )
 
     async def close(self) -> None:
-        await self.client_pool.close()
+        try:
+            await self.client_pool.close()
+        finally:
+            self._feature_executor.shutdown(wait=True)
 
 
 __all__ = [

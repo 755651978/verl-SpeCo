@@ -21,7 +21,7 @@ from pathlib import Path
 # Files that are allowed to mention CUDA because they select backend/runtime
 # behavior at the verl/SpeCo integration boundary.
 CUDA_KEYWORD_CHECK_WHITELIST = [
-    # vLLM 0.23 PyNcclCommunicator/packed weight transfer is a CUDA-only API.
+    # Selects vLLM 0.23 NCCL or vLLM-Ascend 0.23 HCCL at runtime.
     "verl_speco/integration/external_vllm_weight_sync.py",
     "verl_speco/backends/dflash_trainer_backend.py",
     "verl_speco/backends/domino_trainer_backend.py",
