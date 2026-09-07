@@ -158,6 +158,18 @@ class TrainingOutcome:
                     for result in normalized_results
                 )
             ),
+            "bubble/replica_local_unavailable": int(
+                any(
+                    bool(result.get("replica_local_unavailable", False))
+                    for result in normalized_results
+                )
+            ),
+            "bubble/replica_local_oom": int(
+                any(
+                    bool(result.get("replica_local_oom", False))
+                    for result in normalized_results
+                )
+            ),
             "drafter/train_attempted_batches_max": max(
                 (result.attempted_batches for result in worker_results), default=0
             ),

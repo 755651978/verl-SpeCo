@@ -64,6 +64,18 @@ def _config_str(value, default: str = "") -> str:
     return default if text in {"", "None", "null"} else text
 
 
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    get = config.get if hasattr(config, "get") else None
+    if get is not None:
+        return get(key, default)
+    return getattr(config, key, default)
+
+
+def _is_oom_error(error: BaseException) -> bool:
+    text = f"{type(error).__name__}: {error}".lower()
+    return "out of memory" in text or "oom" in text or "memory allocation" in text
+
+
 def _is_ray_object_ref(value) -> bool:
     object_ref_type = getattr(ray, "ObjectRef", ())
     return bool(object_ref_type) and isinstance(value, object_ref_type)
@@ -361,10 +373,13 @@ class SpecoWorker(Worker):
         self.dp_group_ranks: list[int] = []
         self.dp_group_world_size = 1
         self.full_collective_ranks: list[int] = []
+        self.sync_collective_ranks: list[int] = []
         self.num_rollout_replicas = 1
         self.training_device_mesh = None
         self._process_group_initialized = False
         self._training_group_initialized = False
+        self._last_trained_execution_strategy: Optional[str] = None
+        self._last_trained_target_worker_ids: tuple[str, ...] = ()
 
         self.rollout_tp = int(self.config.rollout.tensor_model_parallel_size)
         self.rollout_dp = int(self.config.rollout.data_parallel_size)
@@ -385,6 +400,20 @@ class SpecoWorker(Worker):
             self.config.rollout.drafter.enable
             and self.config.rollout.drafter.enable_drafter_training
         )
+
+    def _drafter_execution_strategy(self) -> str:
+        training_cfg = self.config.rollout.drafter.training
+        scheduler_cfg = _config_get(training_cfg, "scheduler", {}) or {}
+        execution_cfg = _config_get(scheduler_cfg, "execution", {}) or {}
+        strategy = _config_get(
+            execution_cfg,
+            "strategy",
+            _config_get(training_cfg, "execution_strategy", "sync"),
+        )
+        return str(strategy or "sync").strip().lower()
+
+    def _use_replica_local_idle_training(self) -> bool:
+        return self._drafter_execution_strategy() == "rollout_idle_worker"
 
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
@@ -450,12 +479,15 @@ class SpecoWorker(Worker):
             ]
             self.training_group_world_size = self.training_device_mesh["sp"].size()
             self.dp_group_world_size = self.training_device_mesh["dp"].size()
-            if self.dp_group_world_size > 1:
-                self.full_collective_ranks = [
-                    rank
-                    for replica_ranks in rollout_layout.replica_training_ranks
-                    for rank in replica_ranks
-                ]
+            self.sync_collective_ranks = [
+                rank
+                for replica_ranks in rollout_layout.replica_training_ranks
+                for rank in replica_ranks
+            ]
+            if self._use_replica_local_idle_training():
+                self.full_collective_ranks = list(self.training_group_ranks)
+            elif self.dp_group_world_size > 1:
+                self.full_collective_ranks = list(self.sync_collective_ranks)
             else:
                 self.full_collective_ranks = list(self.training_group_ranks)
             self.local_drafter_sp_rank = mesh_sp_rank
@@ -488,6 +520,39 @@ class SpecoWorker(Worker):
         from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 
         trainer_backend = build_trainer_backend(self.config, self.config.model)
+
+        if self._use_replica_local_idle_training():
+            logger.warning(
+                "[BubbleTime] replica_local_training_mesh: rank=%s replica_rank=%s "
+                "training_group_ranks=%s sync_collective_ranks=%s "
+                "training_group_world_size=%s dp_group_world_size=%s",
+                self.rank,
+                self.replica_rank,
+                tuple(self.training_group_ranks),
+                tuple(self.sync_collective_ranks or self.full_collective_ranks),
+                self.training_group_world_size,
+                self.dp_group_world_size,
+            )
+            print(
+                "[BubbleTime] replica_local_training_mesh: "
+                f"rank={self.rank} replica_rank={self.replica_rank} "
+                f"training_group_ranks={tuple(self.training_group_ranks)} "
+                "sync_collective_ranks="
+                f"{tuple(self.sync_collective_ranks or self.full_collective_ranks)} "
+                f"training_group_world_size={self.training_group_world_size} "
+                f"dp_group_world_size={self.dp_group_world_size}",
+                flush=True,
+            )
+            self.trainer = DrafterBaseTrainer(
+                config=self.config,
+                world_size=self.training_group_world_size,
+                rollout_dp_rank=self.replica_rank,
+                training_device_mesh=None,
+                training_process_group=self.training_process_group,
+                data_parallel_process_group=None,
+                backend=trainer_backend,
+            )
+            return
 
         self.trainer = DrafterBaseTrainer(
             config=self.config,
@@ -1268,6 +1333,8 @@ class SpecoWorker(Worker):
             "dp_group_ranks": [],
             "dp_group_world_size": 0,
             "full_collective_ranks": [],
+            "sync_collective_ranks": [],
+            "idle_collective_scope": "",
             "reason": "",
         }
         if not self.enable_drafter:
@@ -1287,6 +1354,14 @@ class SpecoWorker(Worker):
                 "dp_group_world_size": int(self.dp_group_world_size),
                 "full_collective_ranks": list(
                     self.full_collective_ranks or self.training_group_ranks
+                ),
+                "sync_collective_ranks": list(
+                    self.sync_collective_ranks or self.full_collective_ranks
+                ),
+                "idle_collective_scope": (
+                    "replica_local"
+                    if self._use_replica_local_idle_training()
+                    else "full_collective"
                 ),
                 "reason": "ok",
             }
@@ -1445,8 +1520,13 @@ class SpecoWorker(Worker):
         self._prepared_training_target_version = current_target_version
         self._drafter_reclaim_requested = False
         activation_started_ts = time.time()
+        activation_error: BaseException | None = None
         with _preserve_process_rng_state(self.device_name):
-            activated = bool(await self.trainer.activate_training_model())
+            try:
+                activated = bool(await self.trainer.activate_training_model())
+            except Exception as error:  # noqa: BLE001
+                activation_error = error
+                activated = False
         result["activated"] = activated
         result["activation_elapsed_sec"] = time.time() - activation_started_ts
         if not activated:
@@ -1454,6 +1534,59 @@ class SpecoWorker(Worker):
                 str(training_plan.get("plan_id", ""))
             )
             result["reason"] = "activation_failed"
+            if (
+                execution_strategy == "rollout_idle_worker"
+                and self._use_replica_local_idle_training()
+            ):
+                replica_local_oom = bool(
+                    activation_error is not None and _is_oom_error(activation_error)
+                )
+                result.update(
+                    {
+                        "replica_local_unavailable": True,
+                        "replica_local_oom": replica_local_oom,
+                        "training_group_ranks": list(self.training_group_ranks),
+                        "sync_collective_ranks": list(
+                            self.sync_collective_ranks or self.full_collective_ranks
+                        ),
+                    }
+                )
+                logger.error(
+                    "[BubbleTime] replica_local_unavailable: plan_id=%s "
+                    "worker_id=%s rank=%s replica_rank=%s reason=activation_failed "
+                    "oom=%s activation_s=%.3f training_group_ranks=%s "
+                    "sync_collective_ranks=%s error=%s",
+                    training_plan.get("plan_id", ""),
+                    self.rank,
+                    self.rank,
+                    self.replica_rank,
+                    replica_local_oom,
+                    result["activation_elapsed_sec"],
+                    tuple(self.training_group_ranks),
+                    tuple(self.sync_collective_ranks or self.full_collective_ranks),
+                    repr(activation_error) if activation_error is not None else "",
+                )
+                print(
+                    "[BubbleTime] replica_local_unavailable: "
+                    f"plan_id={training_plan.get('plan_id', '')} "
+                    f"worker_id={self.rank} rank={self.rank} "
+                    f"replica_rank={self.replica_rank} reason=activation_failed "
+                    f"oom={replica_local_oom} "
+                    f"activation_s={result['activation_elapsed_sec']:.3f} "
+                    f"training_group_ranks={tuple(self.training_group_ranks)} "
+                    "sync_collective_ranks="
+                    f"{tuple(self.sync_collective_ranks or self.full_collective_ranks)}",
+                    flush=True,
+                )
+                if activation_error is not None and not replica_local_oom:
+                    logger.error(
+                        "[BubbleTime] replica-local activation failed with non-OOM exception",
+                        exc_info=(
+                            type(activation_error),
+                            activation_error,
+                            activation_error.__traceback__,
+                        ),
+                    )
             return result
         ready_ts = time.time()
         preflight_elapsed_sec = ready_ts - preflight_started_ts
@@ -1521,6 +1654,12 @@ class SpecoWorker(Worker):
             if isinstance(training_plan, dict)
             else "sync"
         )
+        publish_leader = (
+            self.is_drafter_group_leader
+            if execution_strategy == "rollout_idle_worker"
+            else self.is_global_publish_leader
+        )
+        result["is_publish_leader"] = publish_leader
         target_worker_ids = {
             str(worker_id)
             for worker_id in (
@@ -1739,9 +1878,66 @@ class SpecoWorker(Worker):
                             flush=True,
                         )
                     result["attempted_steps"] += 1
-                    step_ok = await self.trainer.training_step(self.last_global_step)
+                    step_error: BaseException | None = None
+                    try:
+                        step_ok = await self.trainer.training_step(self.last_global_step)
+                    except Exception as error:  # noqa: BLE001
+                        step_error = error
+                        step_ok = False
                     if step_ok:
                         result["successful_steps"] += 1
+                    else:
+                        result["reason"] = "training_step_returned_false"
+                        if (
+                            execution_strategy == "rollout_idle_worker"
+                            and self._use_replica_local_idle_training()
+                            and step_error is not None
+                            and _is_oom_error(step_error)
+                        ):
+                            result.update(
+                                {
+                                    "reason": "replica_local_oom",
+                                    "replica_local_unavailable": True,
+                                    "replica_local_oom": True,
+                                    "training_group_ranks": list(
+                                        self.training_group_ranks
+                                    ),
+                                    "sync_collective_ranks": list(
+                                        self.sync_collective_ranks
+                                        or self.full_collective_ranks
+                                    ),
+                                }
+                            )
+                        now_after_step_ts = time.time()
+                        logger.warning(
+                            "[BubbleTime] training_stopped: plan_id=%s "
+                            "worker_id=%s rank=%s reason=%s "
+                            "batch_index=%s attempted_steps=%s successful_steps=%s "
+                            "now_ts=%.6f deadline_ts=%s reclaim_requested=%s error=%s",
+                            plan_id,
+                            self.rank,
+                            self.rank,
+                            result["reason"],
+                            batch_index,
+                            result["attempted_steps"],
+                            result["successful_steps"],
+                            now_after_step_ts,
+                            deadline_ts,
+                            self._drafter_reclaim_requested,
+                            repr(step_error) if step_error is not None else "",
+                        )
+                        print(
+                            "[BubbleTime] training_stopped: "
+                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
+                            f"reason={result['reason']} "
+                            f"batch_index={batch_index} "
+                            f"attempted_steps={result['attempted_steps']} "
+                            f"successful_steps={result['successful_steps']} "
+                            f"now_ts={now_after_step_ts:.6f} deadline_ts={deadline_ts} "
+                            f"reclaim_requested={self._drafter_reclaim_requested}",
+                            flush=True,
+                        )
+                        break
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
@@ -1778,6 +1974,10 @@ class SpecoWorker(Worker):
             )
             if result["trained"]:
                 self.last_trained_step = self.last_global_step
+                self._last_trained_execution_strategy = execution_strategy
+                self._last_trained_target_worker_ids = tuple(
+                    sorted(target_worker_ids, key=str)
+                )
             data_status_after = self.trainer.get_training_data_status(
                 sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
@@ -1830,7 +2030,18 @@ class SpecoWorker(Worker):
                 self.last_global_step,
             )
             return None
-        if not self.is_global_publish_leader:
+        publish_leader = self.is_global_publish_leader
+        if self._last_trained_execution_strategy == "rollout_idle_worker":
+            publish_leader = self.is_drafter_group_leader
+        if not publish_leader:
             return None
 
+        print(
+            "[BubbleTime] publish_snapshot_ready: "
+            f"rank={self.rank} replica_rank={self.replica_rank} "
+            f"step={self.last_global_step} "
+            f"execution_strategy={self._last_trained_execution_strategy or 'sync'} "
+            f"target_worker_ids={self._last_trained_target_worker_ids}",
+            flush=True,
+        )
         return {"weights_ref": ray.put(weights)}

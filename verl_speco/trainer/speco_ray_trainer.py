@@ -1621,7 +1621,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         batch_estimate = scheduler._effective_idle_batch_estimate_sec(config)
         guard = scheduler._effective_idle_deadline_guard_sec(config)
         min_window = scheduler._minimum_idle_training_window_sec(config)
-        max_batches = scheduler._effective_idle_max_batches_per_window(config)
+        max_batches = 1
+        if not scheduler._idle_batch_estimate_is_bootstrap(config):
+            max_batches = max(int(config.train_batches_per_trigger), 1)
         startup = scheduler._effective_idle_startup_reserve_sec(config)
         tail = scheduler._effective_idle_tail_reserve_sec(config)
         fallback_window = max(

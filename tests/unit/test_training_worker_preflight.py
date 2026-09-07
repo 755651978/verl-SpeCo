@@ -58,6 +58,9 @@ class _FakeTrainer:
         self.activation_calls += 1
         return True
 
+    def pop_model_state_dict_for_publish(self, global_step: int):
+        return global_step == 4, {"weight": global_step}
+
 
 def _worker(*, data_version: int) -> SpecoWorker:
     worker = SpecoWorker.__new__(SpecoWorker)
@@ -71,6 +74,12 @@ def _worker(*, data_version: int) -> SpecoWorker:
     worker._prepared_training_plan_id = None
     worker._prepared_training_data_version = None
     worker._prepared_training_target_version = None
+    worker.replica_rank = 0
+    worker.last_trained_step = None
+    worker.is_drafter_group_leader = True
+    worker.is_global_publish_leader = True
+    worker._last_trained_execution_strategy = None
+    worker._last_trained_target_worker_ids = ()
     return worker
 
 
@@ -119,3 +128,28 @@ def test_worker_preflight_records_actual_versions_for_training_result() -> None:
     assert worker._prepared_training_plan_id == "plan-4"
     assert worker._prepared_training_data_version == 4
     assert worker._prepared_training_target_version == 4
+
+
+def test_bubble_publish_uses_replica_local_group_leader(monkeypatch) -> None:
+    worker = _worker(data_version=4)
+    worker.last_trained_step = 4
+    worker.is_global_publish_leader = False
+    worker.is_drafter_group_leader = True
+    worker._last_trained_execution_strategy = "rollout_idle_worker"
+    worker._last_trained_target_worker_ids = ("2", "3")
+    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
+
+    result = worker.maybe_publish()
+
+    assert result == {"weights_ref": {"weight": 4}}
+
+
+def test_sync_publish_still_uses_global_leader(monkeypatch) -> None:
+    worker = _worker(data_version=4)
+    worker.last_trained_step = 4
+    worker.is_global_publish_leader = False
+    worker.is_drafter_group_leader = True
+    worker._last_trained_execution_strategy = "sync"
+    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
+
+    assert worker.maybe_publish() is None

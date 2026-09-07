@@ -107,7 +107,6 @@ class DrafterScheduleConfig:
     sample_last_n_steps: int = 2
     execution_strategy: DrafterExecutionStrategy = DrafterExecutionStrategy.SYNC
     idle_worker_min_idle_window_sec: float | None = None
-    idle_worker_max_batches_per_window: int | None = None
     idle_worker_initial_batch_estimate_sec: float | None = None
     idle_worker_deadline_guard_sec: float | None = None
     idle_worker_require_memory_released: bool = True
@@ -179,9 +178,6 @@ class DrafterScheduleConfig:
             execution_strategy=DrafterExecutionStrategy(strategy_value),
             idle_worker_min_idle_window_sec=_optional_float(
                 idle_get("min_idle_window_sec", None)
-            ),
-            idle_worker_max_batches_per_window=_optional_int(
-                idle_get("max_batches_per_window", None)
             ),
             idle_worker_initial_batch_estimate_sec=_optional_float(
                 idle_get("initial_batch_estimate_sec", None)
@@ -511,6 +507,7 @@ class TrainingPlan:
         "sync_fallback_training_ready": 20,
         "sync_fallback_no_trainable_batch": 21,
         "target_lm_head_not_ready": 22,
+        "replica_local_unavailable": 23,
     }
 
     def to_worker_payload(self) -> dict[str, object]:

@@ -76,7 +76,6 @@ def _idle_config() -> DrafterScheduleConfig:
         idle_worker_min_idle_window_sec=0.25,
         idle_worker_initial_batch_estimate_sec=0.9,
         idle_worker_deadline_guard_sec=0.2,
-        idle_worker_max_batches_per_window=2,
     )
 
 
@@ -418,7 +417,6 @@ def test_idle_worker_auto_budget_bootstraps_one_batch_without_manual_estimate() 
     config = replace(
         _auto_idle_config(2),
         idle_worker_min_idle_window_sec=None,
-        idle_worker_max_batches_per_window=None,
         idle_worker_initial_batch_estimate_sec=None,
         idle_worker_deadline_guard_sec=None,
     )
@@ -446,7 +444,6 @@ def test_runtime_idle_event_without_deadline_bootstraps_one_batch() -> None:
     config = replace(
         _auto_idle_config(2),
         idle_worker_min_idle_window_sec=None,
-        idle_worker_max_batches_per_window=None,
         idle_worker_initial_batch_estimate_sec=None,
         idle_worker_deadline_guard_sec=None,
     )
@@ -463,7 +460,7 @@ def test_runtime_idle_event_without_deadline_bootstraps_one_batch() -> None:
     )
 
 
-def test_idle_worker_budget_is_capped_by_observed_replica_idle_window() -> None:
+def test_idle_worker_admission_uses_observed_replica_idle_window() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     for replica_rank, worker_id in enumerate(("0", "1")):
         scheduler.on_worker_event(
@@ -500,14 +497,13 @@ def test_idle_worker_budget_is_capped_by_observed_replica_idle_window() -> None:
         _idle_config(),
         idle_worker_initial_batch_estimate_sec=0.5,
         idle_worker_deadline_guard_sec=0.1,
-        idle_worker_max_batches_per_window=10,
     )
 
     plan = scheduler.prepare_training_plan(_context(), config)
 
     assert plan.launch
     assert plan.idle_window_sec == pytest.approx(2.0, abs=0.1)
-    assert plan.max_batches == 3
+    assert plan.max_batches == 5
 
 
 def test_generation_completion_records_real_idle_window() -> None:
@@ -663,6 +659,98 @@ def test_idle_worker_prebatch_reclaim_splits_setup_and_tail_reserves() -> None:
     assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(3.0)
 
 
+def test_replica_local_activation_failure_disables_idle_group() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler.register_idle_training_resource_metadata(
+        [
+            {
+                "rank": 0,
+                "worker_id": "0",
+                "in_drafter_train_group": True,
+                "replica_rank": 0,
+                "training_group_ranks": [0, 1],
+                "full_collective_ranks": [0, 1],
+                "sync_collective_ranks": [0, 1, 2, 3],
+                "idle_collective_scope": "replica_local",
+            }
+        ]
+    )
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=1,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="activation-failed-plan",
+        idle_usable_window_sec=10.0,
+        idle_batch_estimate_sec=1.0,
+        worker_snapshots={
+            "0": {"worker_incarnation": "worker-0"},
+            "1": {"worker_incarnation": "worker-1"},
+        },
+    )
+    runtime_state = DrafterRuntimeState()
+    runtime_state.submit(plan, started_at=time.time())
+    outcome = TrainingOutcome.from_execution(
+        ExecutionOutcome(
+            raw_results=[
+                {
+                    "ready": False,
+                    "participating": True,
+                    "activated": False,
+                    "worker_id": "0",
+                    "worker_incarnation": "worker-0",
+                    "reason": "activation_failed",
+                    "replica_local_unavailable": True,
+                    "replica_local_oom": True,
+                },
+                {
+                    "ready": False,
+                    "participating": True,
+                    "activated": False,
+                    "worker_id": "1",
+                    "worker_incarnation": "worker-1",
+                    "reason": "activation_failed",
+                    "replica_local_unavailable": True,
+                    "replica_local_oom": True,
+                },
+            ],
+            elapsed_sec=0.5,
+            launched=False,
+            reason="worker_preflight_failed",
+        ),
+        runtime_state=runtime_state,
+        plan=plan,
+    )
+
+    scheduler._record_training_outcome(plan, outcome)
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=0,
+                memory_released=True,
+                must_be_ready_at=time.time() + 30.0,
+            )
+        )
+    next_plan = scheduler.prepare_training_plan(
+        _context(),
+        config,
+        allow_sync_fallback=False,
+    )
+
+    assert outcome.metrics["bubble/replica_local_unavailable"] == 1
+    assert outcome.metrics["bubble/replica_local_oom"] == 1
+    assert not next_plan.launch
+    assert next_plan.reason == "replica_local_unavailable"
+
+
 def test_idle_worker_prebatch_reclaim_penalty_blocks_marginal_window() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     config = _auto_idle_config(2)
@@ -772,7 +860,7 @@ def test_idle_worker_prebatch_reclaim_streak_keeps_multi_batch_window() -> None:
 
     assert plan.launch
     assert plan.reason == "training_ready"
-    assert plan.max_batches == 2
+    assert plan.max_batches == 5
 
 
 def test_idle_worker_reclaim_penalty_decays_on_next_step() -> None:
@@ -898,7 +986,6 @@ def test_idle_worker_training_does_not_wait_for_training_interval() -> None:
         _auto_idle_config(2),
         training_interval_steps=5,
         idle_worker_min_idle_window_sec=None,
-        idle_worker_max_batches_per_window=None,
         idle_worker_initial_batch_estimate_sec=None,
         idle_worker_deadline_guard_sec=None,
     )
@@ -1187,7 +1274,7 @@ def test_scheduler_duplicate_tuning_subtrees_do_not_override_training_fields() -
     assert config.sample_last_n_steps == 10
 
 
-def test_idle_worker_plan_caps_batches_by_window_data_and_config() -> None:
+def test_idle_worker_window_is_admission_not_hard_batch_cap() -> None:
     scheduler = DrafterScheduler(
         CallbackDrafterWorkerExecutor(
             submit=lambda payload: None,
@@ -1226,7 +1313,7 @@ def test_idle_worker_plan_caps_batches_by_window_data_and_config() -> None:
     plan = scheduler.prepare_training_plan(_context(), _idle_config())
 
     assert plan.launch
-    assert plan.max_batches == 2
+    assert plan.max_batches == 5
     assert plan.target_worker_ids == ("0", "1")
     assert plan.training_group_id == "idle-group-0"
     assert plan.to_worker_payload()["execution_strategy"] == "rollout_idle_worker"
@@ -1349,7 +1436,6 @@ def _trainer_with_idle_config() -> SpecoRayPPOTrainer:
                             "idle_worker": {
                                 "training_groups": [["worker-0", "worker-1"]],
                                 "initial_batch_estimate_sec": 0.5,
-                                "max_batches_per_window": 2,
                                 "deadline_guard_sec": 0.1,
                             },
                         }
