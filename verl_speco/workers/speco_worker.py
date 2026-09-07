@@ -27,6 +27,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, cast
@@ -36,7 +37,7 @@ import ray
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -69,6 +70,27 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
     if get is not None:
         return get(key, default)
     return getattr(config, key, default)
+
+
+def _config_has(config: Any, key: str) -> bool:
+    if config is None:
+        return False
+    if isinstance(config, dict):
+        return key in config
+    if isinstance(config, DictConfig):
+        return key in config
+    return hasattr(config, key)
+
+
+def _config_set(config: Any, key: str, value: Any) -> None:
+    if isinstance(config, DictConfig):
+        with open_dict(config):
+            config[key] = value
+        return
+    if isinstance(config, dict):
+        config[key] = value
+        return
+    setattr(config, key, value)
 
 
 def _is_oom_error(error: BaseException) -> bool:
@@ -415,6 +437,58 @@ class SpecoWorker(Worker):
     def _use_replica_local_idle_training(self) -> bool:
         return self._drafter_execution_strategy() == "rollout_idle_worker"
 
+    def _replica_local_idle_trainer_config(self) -> DictConfig:
+        """Return a Bubble-only trainer config.
+
+        Replica-local Bubble training may wrap only the drafter trainable subset
+        with FSDP.  Some drafter variants freeze target/auxiliary parameters
+        while leaving the draft head trainable; FSDP1 with ``use_orig_params``
+        disabled cannot flatten such mixed ``requires_grad`` groups.  Keep the
+        sync/full-collective config untouched, but force the replica-local
+        Bubble trainer copy to preserve original params.
+        """
+
+        trainer_config = deepcopy(self.config)
+        changed_paths: list[str] = []
+
+        def _force_use_orig_params(fsdp_config: Any, path: str) -> None:
+            if fsdp_config is None or not _config_has(fsdp_config, "use_orig_params"):
+                return
+            old_value = _config_get(fsdp_config, "use_orig_params", None)
+            if bool(old_value) is True:
+                return
+            _config_set(fsdp_config, "use_orig_params", True)
+            changed_paths.append(f"{path}.use_orig_params:{old_value}->True")
+
+        actor_cfg = _config_get(trainer_config, "actor", None)
+        _force_use_orig_params(
+            _config_get(actor_cfg, "fsdp_config", None),
+            "actor.fsdp_config",
+        )
+
+        rollout_cfg = _config_get(trainer_config, "rollout", None)
+        drafter_cfg = _config_get(rollout_cfg, "drafter", None)
+        training_cfg = _config_get(drafter_cfg, "training", None)
+        _force_use_orig_params(
+            _config_get(training_cfg, "fsdp_config", None),
+            "rollout.drafter.training.fsdp_config",
+        )
+
+        if changed_paths:
+            logger.warning(
+                "[BubbleTime] replica_local_fsdp_override: rank=%s paths=%s "
+                "reason=mixed_requires_grad_requires_use_orig_params",
+                self.rank,
+                tuple(changed_paths),
+            )
+            print(
+                "[BubbleTime] replica_local_fsdp_override: "
+                f"rank={self.rank} paths={tuple(changed_paths)} "
+                "reason=mixed_requires_grad_requires_use_orig_params",
+                flush=True,
+            )
+        return trainer_config
+
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
             initialize_global_process_group_ray(
@@ -519,9 +593,9 @@ class SpecoWorker(Worker):
         from verl_speco.backends.factory import build_trainer_backend
         from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 
-        trainer_backend = build_trainer_backend(self.config, self.config.model)
-
         if self._use_replica_local_idle_training():
+            trainer_config = self._replica_local_idle_trainer_config()
+            trainer_backend = build_trainer_backend(trainer_config, trainer_config.model)
             logger.warning(
                 "[BubbleTime] replica_local_training_mesh: rank=%s replica_rank=%s "
                 "training_group_ranks=%s sync_collective_ranks=%s "
@@ -544,7 +618,7 @@ class SpecoWorker(Worker):
                 flush=True,
             )
             self.trainer = DrafterBaseTrainer(
-                config=self.config,
+                config=trainer_config,
                 world_size=self.training_group_world_size,
                 rollout_dp_rank=self.replica_rank,
                 training_device_mesh=None,
@@ -554,6 +628,7 @@ class SpecoWorker(Worker):
             )
             return
 
+        trainer_backend = build_trainer_backend(self.config, self.config.model)
         self.trainer = DrafterBaseTrainer(
             config=self.config,
             world_size=self.training_group_world_size,
@@ -1291,6 +1366,92 @@ class SpecoWorker(Worker):
                 "activated" if result["activated"] else "activation_failed"
             )
             return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def prewarm_drafter_training_model(self):
+        result = {
+            "activated": False,
+            "elapsed_sec": 0.0,
+            "reason": "",
+            "rank": self.rank,
+            "worker_id": str(self.rank),
+            "worker_incarnation": self.worker_incarnation,
+            "replica_rank": self.replica_rank,
+            "training_group_ranks": list(getattr(self, "training_group_ranks", [])),
+        }
+        if not self.enable_drafter:
+            result["reason"] = "disabled"
+            return result
+        if not self.in_drafter_train_group or self.trainer is None:
+            result["reason"] = "not_in_training_group"
+            return result
+        if not self._use_replica_local_idle_training():
+            result["reason"] = "not_rollout_idle_worker"
+            return result
+
+        start_ts = time.time()
+        activation_error: BaseException | None = None
+        with _preserve_process_rng_state(self.device_name):
+            try:
+                result["activated"] = bool(await self.trainer.activate_training_model())
+            except Exception as error:  # noqa: BLE001
+                activation_error = error
+                result["activated"] = False
+        result["elapsed_sec"] = time.time() - start_ts
+        result["reason"] = "prewarmed" if result["activated"] else "activation_failed"
+
+        if not result["activated"]:
+            try:
+                await self.trainer.cleanup_training(clear_data=False)
+            except Exception as cleanup_error:  # noqa: BLE001
+                logger.warning(
+                    "[BubbleTime] idle_prewarm_cleanup_failed: rank=%s error=%s",
+                    self.rank,
+                    repr(cleanup_error),
+                )
+            replica_local_oom = bool(
+                activation_error is not None and _is_oom_error(activation_error)
+            )
+            result["replica_local_oom"] = replica_local_oom
+            result["replica_local_unavailable"] = True
+            logger.error(
+                "[BubbleTime] idle_prewarm_failed: worker_id=%s rank=%s "
+                "replica_rank=%s oom=%s elapsed_s=%.3f group=%s error=%s",
+                self.rank,
+                self.rank,
+                self.replica_rank,
+                replica_local_oom,
+                result["elapsed_sec"],
+                tuple(getattr(self, "training_group_ranks", [])),
+                repr(activation_error) if activation_error is not None else "",
+            )
+            print(
+                "[BubbleTime] idle_prewarm_failed: "
+                f"worker_id={self.rank} rank={self.rank} "
+                f"replica_rank={self.replica_rank} oom={replica_local_oom} "
+                f"elapsed_s={result['elapsed_sec']:.3f} "
+                f"group={tuple(getattr(self, 'training_group_ranks', []))}",
+                flush=True,
+            )
+            return result
+
+        logger.warning(
+            "[BubbleTime] idle_prewarm_succeeded: worker_id=%s rank=%s "
+            "replica_rank=%s elapsed_s=%.3f group=%s keep_hot=True",
+            self.rank,
+            self.rank,
+            self.replica_rank,
+            result["elapsed_sec"],
+            tuple(getattr(self, "training_group_ranks", [])),
+        )
+        print(
+            "[BubbleTime] idle_prewarm_succeeded: "
+            f"worker_id={self.rank} rank={self.rank} "
+            f"replica_rank={self.replica_rank} elapsed_s={result['elapsed_sec']:.3f} "
+            f"group={tuple(getattr(self, 'training_group_ranks', []))} keep_hot=True",
+            flush=True,
+        )
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_drafter_training_data_status(

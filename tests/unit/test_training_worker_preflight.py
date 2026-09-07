@@ -19,6 +19,9 @@ import pytest
 
 pytest.importorskip("torch")
 
+from omegaconf import OmegaConf
+
+from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 from verl_speco.workers.speco_worker import SpecoWorker
 
 
@@ -29,6 +32,8 @@ class _FakeTrainer:
         self.optimizer_steps_total = 0
         self.data_version = data_version
         self.activation_calls = 0
+        self.cleanup_calls = 0
+        self.release_after_activation_calls = 0
         self.reserved_plan_id = None
 
     def select_target_lm_head_version(self, global_step: int) -> bool:
@@ -58,6 +63,13 @@ class _FakeTrainer:
         self.activation_calls += 1
         return True
 
+    async def cleanup_training(self, clear_data: bool = True):
+        del clear_data
+        self.cleanup_calls += 1
+
+    async def release_training_memory_after_activation(self):
+        self.release_after_activation_calls += 1
+
     def pop_model_state_dict_for_publish(self, global_step: int):
         return global_step == 4, {"weight": global_step}
 
@@ -80,6 +92,20 @@ def _worker(*, data_version: int) -> SpecoWorker:
     worker.is_global_publish_leader = True
     worker._last_trained_execution_strategy = None
     worker._last_trained_target_worker_ids = ()
+    worker.training_group_ranks = [0]
+    worker.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "scheduler": {
+                            "execution": {"strategy": "rollout_idle_worker"}
+                        }
+                    }
+                }
+            }
+        }
+    )
     return worker
 
 
@@ -130,6 +156,18 @@ def test_worker_preflight_records_actual_versions_for_training_result() -> None:
     assert worker._prepared_training_target_version == 4
 
 
+def test_worker_idle_prewarm_keeps_training_model_hot() -> None:
+    worker = _worker(data_version=4)
+
+    result = asyncio.run(worker.prewarm_drafter_training_model())
+
+    assert result["activated"]
+    assert result["reason"] == "prewarmed"
+    assert worker.trainer.activation_calls == 1
+    assert worker.trainer.release_after_activation_calls == 0
+    assert worker.trainer.cleanup_calls == 0
+
+
 def test_bubble_publish_uses_replica_local_group_leader(monkeypatch) -> None:
     worker = _worker(data_version=4)
     worker.last_trained_step = 4
@@ -153,3 +191,58 @@ def test_sync_publish_still_uses_global_leader(monkeypatch) -> None:
     monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
 
     assert worker.maybe_publish() is None
+
+
+def test_replica_local_idle_trainer_config_enables_use_orig_params() -> None:
+    worker = SpecoWorker.__new__(SpecoWorker)
+    worker.rank = 2
+    worker.config = OmegaConf.create(
+        {
+            "actor": {
+                "fsdp_config": {
+                    "use_orig_params": False,
+                    "forward_prefetch": False,
+                }
+            },
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "fsdp_config": {
+                            "use_orig_params": False,
+                            "forward_prefetch": True,
+                        }
+                    }
+                }
+            },
+        }
+    )
+
+    trainer_config = worker._replica_local_idle_trainer_config()
+
+    assert trainer_config.actor.fsdp_config.use_orig_params is True
+    assert (
+        trainer_config.rollout.drafter.training.fsdp_config.use_orig_params is True
+    )
+    assert worker.config.actor.fsdp_config.use_orig_params is False
+    assert worker.config.rollout.drafter.training.fsdp_config.use_orig_params is False
+
+
+def test_base_trainer_orig_params_override_is_replica_local_bubble_only() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer._bubble_time_enabled = True
+    trainer.training_device_mesh = None
+    trainer.training_process_group = object()
+    trainer.training_group_world_size = 2
+
+    assert trainer._replica_local_bubble_fsdp_requires_orig_params()
+
+    trainer._bubble_time_enabled = False
+    assert not trainer._replica_local_bubble_fsdp_requires_orig_params()
+
+    trainer._bubble_time_enabled = True
+    trainer.training_device_mesh = object()
+    assert not trainer._replica_local_bubble_fsdp_requires_orig_params()
+
+    trainer.training_device_mesh = None
+    trainer.training_process_group = None
+    assert not trainer._replica_local_bubble_fsdp_requires_orig_params()

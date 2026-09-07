@@ -458,6 +458,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 inspect_data=self.speco_get_drafter_training_data_status,
                 prepare=self._speco_prepare_drafter_training_rpc,
                 activate=self.speco_activate_drafter_training_model,
+                prewarm=self.speco_prewarm_drafter_training_model,
                 preflight=self.speco_preflight_drafter_training,
                 abort_preflight=self.speco_abort_drafter_training_preflight,
                 poll=self._speco_poll_drafter_training,
@@ -598,6 +599,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def speco_activate_drafter_training_model(self):
         return self._require_speco_worker_group().activate_drafter_training_model()
+
+    def speco_prewarm_drafter_training_model(self):
+        return self._require_speco_worker_group().prewarm_drafter_training_model()
 
     def speco_maybe_publish(self):
         return self._require_speco_worker_group().maybe_publish()
@@ -3168,6 +3172,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_activate_drafter_training_model_before_fit(self) -> None:
         if not self.is_drafter_training_enabled(self.config):
+            return
+        if (
+            self._speco_drafter_schedule_config().execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+        ):
+            try:
+                self._speco_get_drafter_scheduler().prewarm_idle_training_workers()
+            except Exception:
+                logger.exception(
+                    "[BubbleTime] idle prewarm failed before fit; "
+                    "continuing with on-idle activation"
+                )
+                print(
+                    "[BubbleTime] idle_prewarm_failed_before_fit: "
+                    "fallback=on_idle_activation",
+                    flush=True,
+                )
+                return
+            logger.warning(
+                "[BubbleTime] completed before-fit idle prewarm: "
+                "reason=rollout_idle_worker_hot_activation"
+            )
+            print(
+                "[BubbleTime] completed before-fit idle prewarm: "
+                "reason=rollout_idle_worker_hot_activation",
+                flush=True,
+            )
             return
         self._speco_get_drafter_scheduler().activate_training_workers()
 

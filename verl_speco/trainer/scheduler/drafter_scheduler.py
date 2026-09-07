@@ -237,6 +237,7 @@ class DrafterScheduler:
         self._idle_worker_reclaim_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_startup_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_tail_samples_sec: deque[float] = deque(maxlen=32)
+        self._idle_worker_hot_prewarmed: bool = False
         self._replica_idle_started_at: dict[int, float] = {}
         self._replica_idle_window_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_prebatch_reclaim_streak: int = 0
@@ -291,9 +292,58 @@ class DrafterScheduler:
         historical = _conservative_percentile(self._idle_worker_startup_samples_sec)
         if historical > 0.0:
             return historical
+        if self._idle_worker_hot_prewarmed:
+            return 0.0
         if self._idle_batch_estimate_is_bootstrap(config):
             return _BOOTSTRAP_IDLE_STARTUP_RESERVE_SEC
         return 0.0
+
+    def prewarm_idle_training_workers(self) -> list[Any]:
+        if self._worker_executor is None:
+            raise RuntimeError("Drafter worker executor has not been bound")
+        results = self._worker_executor.prewarm_training_workers()
+        active = [
+            result
+            for result in results
+            if isinstance(result, dict)
+            and result.get("reason") not in {"disabled", "not_in_training_group"}
+        ]
+        successful = [
+            result for result in active if bool(result.get("activated", False))
+        ]
+        failed = [
+            result for result in active if not bool(result.get("activated", False))
+        ]
+        for result in failed:
+            if bool(result.get("replica_local_unavailable", False)):
+                self._disable_replica_local_idle_group(
+                    tuple(
+                        str(worker_id)
+                        for worker_id in result.get("training_group_ranks", ())
+                    ),
+                    reason=(
+                        "replica_local_oom"
+                        if bool(result.get("replica_local_oom", False))
+                        else "replica_local_prewarm_failed"
+                    ),
+                )
+        if active and successful and not failed:
+            self._idle_worker_hot_prewarmed = True
+        logger.warning(
+            "[BubbleTime] idle_prewarm_completed: active=%s successful=%s failed=%s "
+            "hot_prewarmed=%s",
+            len(active),
+            len(successful),
+            len(failed),
+            self._idle_worker_hot_prewarmed,
+        )
+        print(
+            "[BubbleTime] idle_prewarm_completed: "
+            f"active={len(active)} successful={len(successful)} failed={len(failed)} "
+            f"hot_prewarmed={self._idle_worker_hot_prewarmed}",
+            flush=True,
+        )
+        return results
 
     def _effective_idle_tail_reserve_sec(self, config: DrafterScheduleConfig) -> float:
         """Reserve snapshot and cleanup work after the final batch."""

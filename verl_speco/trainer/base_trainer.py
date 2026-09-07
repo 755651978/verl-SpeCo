@@ -1036,6 +1036,25 @@ class DrafterBaseTrainer:
             )
         return fsdp_config
 
+    def _replica_local_bubble_fsdp_requires_orig_params(self) -> bool:
+        """Whether the current FSDP1 wrap is the replica-local Bubble path.
+
+        This path intentionally builds drafter FSDP over the rollout replica's
+        local training process group instead of the full dp x sp mesh used by
+        sync training.  DFlash/DSpark-style drafters can contain a mixed set of
+        frozen target/auxiliary parameters and trainable draft parameters.  FSDP
+        with ``use_orig_params=False`` rejects such mixed ``requires_grad``
+        flatten groups before any training starts, so force original-parameter
+        mode only for this narrow replica-local Bubble wrap.
+        """
+
+        return bool(
+            self._bubble_time_enabled
+            and self.training_device_mesh is None
+            and self.training_process_group is not None
+            and self.training_group_world_size > 1
+        )
+
     def _build_draft_model(self):
         """build draft model"""
         logger.debug(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
@@ -1111,6 +1130,19 @@ class DrafterBaseTrainer:
                 )
             else:
                 logger.debug("Building drafter model with subgroup FSDP")
+            configured_use_orig_params = bool(fsdp_config.use_orig_params)
+            use_orig_params = configured_use_orig_params
+            if self._replica_local_bubble_fsdp_requires_orig_params():
+                use_orig_params = True
+                if not configured_use_orig_params:
+                    message = (
+                        "[BubbleTime] replica_local_fsdp_callsite_override: "
+                        f"rank={self.rank} rollout_dp_rank={self.rollout_dp_rank} "
+                        "use_orig_params=False->True "
+                        "reason=mixed_requires_grad_requires_use_orig_params"
+                    )
+                    logger.warning(message)
+                    print(message, flush=True)
             self.model = FSDP(
                 raw_model,
                 auto_wrap_policy=auto_wrap_policy,
@@ -1119,7 +1151,7 @@ class DrafterBaseTrainer:
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 process_group=process_group,
-                use_orig_params=fsdp_config.use_orig_params,
+                use_orig_params=use_orig_params,
                 forward_prefetch=fsdp_config.forward_prefetch,
                 cpu_offload=None,
             )

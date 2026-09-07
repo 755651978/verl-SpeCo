@@ -659,6 +659,19 @@ def test_idle_worker_prebatch_reclaim_splits_setup_and_tail_reserves() -> None:
     assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(3.0)
 
 
+def test_idle_worker_prewarm_removes_bootstrap_startup_reserve() -> None:
+    scheduler = DrafterScheduler()
+    config = replace(
+        _idle_config(),
+        idle_worker_initial_batch_estimate_sec=None,
+    )
+
+    assert scheduler._effective_idle_startup_reserve_sec(config) > 0.0
+    scheduler._idle_worker_hot_prewarmed = True
+
+    assert scheduler._effective_idle_startup_reserve_sec(config) == 0.0
+
+
 def test_replica_local_activation_failure_disables_idle_group() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     config = _auto_idle_config(2)
@@ -1474,6 +1487,47 @@ def _trainer_with_default_idle_budget() -> SpecoRayPPOTrainer:
     trainer._drafter_scheduler = DrafterScheduler()
     trainer._drafter_runtime_state = DrafterRuntimeState()
     return trainer
+
+
+class _ActivationRecorder:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prewarm_calls = 0
+
+    def activate_training_workers(self):
+        self.calls += 1
+        return []
+
+    def prewarm_idle_training_workers(self):
+        self.prewarm_calls += 1
+        return []
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_before_fit_prewarms_rollout_idle_worker() -> None:
+    trainer = _trainer_with_idle_config()
+    recorder = _ActivationRecorder()
+    trainer._drafter_scheduler = recorder
+
+    trainer._speco_activate_drafter_training_model_before_fit()
+
+    assert recorder.calls == 0
+    assert recorder.prewarm_calls == 1
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_before_fit_activation_still_runs_for_sync_training() -> None:
+    trainer = _trainer_with_idle_config()
+    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["scheduler"][
+        "execution"
+    ]["strategy"] = "sync"
+    recorder = _ActivationRecorder()
+    trainer._drafter_scheduler = recorder
+
+    trainer._speco_activate_drafter_training_model_before_fit()
+
+    assert recorder.calls == 1
+    assert recorder.prewarm_calls == 0
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
