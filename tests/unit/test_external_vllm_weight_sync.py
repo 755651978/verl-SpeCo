@@ -67,7 +67,8 @@ def sender(monkeypatch):
             "endpoints": ["http://one:8000/v1/", "http://two:8001/v1"],
             "bucket_size_mb": 1,
             "packed": True,
-        }
+        },
+        device_type="cuda",
     )
     # Test the real HTTP/transfer orchestration with CPU tensor stand-ins.
     monkeypatch.setattr(
@@ -81,12 +82,14 @@ def test_init_uses_one_nccl_group_per_endpoint(sender):
     assert value.endpoints == ["http://one:8000", "http://two:8001"]
     assert not value.session.trust_env
     assert [g.info["world_size"] for g in groups] == [3, 3]
-    assert [g.info["rank_offset"] for g in groups] == [1, 1]
+    assert all("rank_offset" not in g.info for g in groups)
     assert [g.info["master_port"] for g in groups] == [29001, 29002]
     init_bodies = [
         body for _, url, body, _ in calls if url.endswith("init_weight_transfer_engine")
     ]
-    assert [body["init_info"] for body in init_bodies] == [g.info for g in groups]
+    assert [body["init_info"] for body in init_bodies] == [
+        {**group.info, "rank_offset": 1} for group in groups
+    ]
     value.close()
     for group in groups:
         group.destroy.assert_called_once()
@@ -314,18 +317,19 @@ def test_worker_rpc_returns_norm_payload(monkeypatch):
 
 
 def test_worker_rejects_when_no_supported_accelerator(monkeypatch):
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(
-        torch, "npu", SimpleNamespace(is_available=lambda: False), raising=False
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.utils.device",
+        SimpleNamespace(get_device_name=lambda: "cpu"),
     )
     worker = SimpleNamespace(
         config=SimpleNamespace(actor=SimpleNamespace(strategy="fsdp2")), rank=0
     )
-    with pytest.raises(RuntimeError, match="NPU/HCCL"):
+    with pytest.raises(RuntimeError, match="device_type='cuda' or 'npu'"):
         sync.initialize_worker_weight_sync(worker, {})
 
 
-def test_sender_selects_vllm_ascend_hccl(monkeypatch):
+def test_sender_prefers_vllm_ascend_hccl_when_cuda_is_also_available(monkeypatch):
     calls = []
     group = SimpleNamespace(available=True, disabled=False)
     engine = SimpleNamespace(
@@ -353,7 +357,9 @@ def test_sender_selects_vllm_ascend_hccl(monkeypatch):
         current_device=lambda: 0,
         synchronize=Mock(),
     )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # Some Ascend environments expose a truthy CUDA compatibility probe after
+    # the production actor engine is imported.  A real NPU must still win.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
     monkeypatch.setattr(
         torch,
@@ -377,7 +383,7 @@ def test_sender_selects_vllm_ascend_hccl(monkeypatch):
     monkeypatch.setattr(requests, "Session", Session)
 
     value = sync.ExternalVllmWeightSender(
-        {"endpoints": ["http://npu-vllm:8000/v1"]}
+        {"endpoints": ["http://npu-vllm:8000/v1"]}, device_type="npu"
     )
     assert value.backend == "HCCL"
     assert value.device_module is fake_npu
@@ -385,7 +391,6 @@ def test_sender_selects_vllm_ascend_hccl(monkeypatch):
         {
             "master_address": "10.0.0.1",
             "master_port": 29001,
-            "rank_offset": 1,
             "world_size": 3,
         }
     )

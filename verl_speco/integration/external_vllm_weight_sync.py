@@ -14,6 +14,56 @@ from urllib.parse import urlsplit, urlunsplit
 logger = logging.getLogger(__name__)
 
 
+_COMMUNICATION_ENV_KEYS = (
+    "ASCEND_RT_VISIBLE_DEVICES",
+    "ASCEND_VISIBLE_DEVICES",
+    "DEVICE_ID",
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "GROUP_RANK",
+    "GROUP_WORLD_SIZE",
+    "ROLE_RANK",
+    "ROLE_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "DIST_INIT_METHOD",
+    "HCCL_IF_IP",
+    "HCCL_CONNECT_TIMEOUT",
+    "HCCL_EXEC_TIMEOUT",
+    "RAY_ADDRESS",
+    "RAY_NODE_IP_ADDRESS",
+    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
+)
+
+
+def _communication_environment_snapshot() -> dict[str, Any]:
+    import os
+    import torch
+
+    snapshot: dict[str, Any] = {
+        key: os.environ.get(key) for key in _COMMUNICATION_ENV_KEYS
+    }
+    dist = torch.distributed
+    snapshot["torch_dist_available"] = dist.is_available()
+    snapshot["torch_dist_initialized"] = dist.is_initialized()
+    if dist.is_available() and dist.is_initialized():
+        snapshot["torch_dist_rank"] = dist.get_rank()
+        snapshot["torch_dist_world_size"] = dist.get_world_size()
+        snapshot["torch_dist_backend"] = str(dist.get_backend())
+    try:
+        import ray
+
+        context = ray.get_runtime_context()
+        snapshot["ray_actor_id"] = str(context.get_actor_id())
+        snapshot["ray_node_id"] = str(context.get_node_id())
+        snapshot["ray_accelerator_ids"] = context.get_accelerator_ids()
+    except Exception as exc:  # noqa: BLE001
+        snapshot["ray_runtime_context"] = f"unavailable:{type(exc).__name__}"
+    return snapshot
+
+
 def _server_url(endpoint: str) -> str:
     parsed = urlsplit(str(endpoint).rstrip("/"))
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -82,22 +132,17 @@ def close_external_vllm_weight_sync(
 class ExternalVllmWeightSender:
     """Lives on actor rank 0 and sends from its existing CUDA or NPU device."""
 
-    def __init__(self, config: Mapping[str, Any]) -> None:
+    def __init__(self, config: Mapping[str, Any], *, device_type: str) -> None:
+        import os
         import requests
+        import socket
         import torch
-        from vllm.utils.network_utils import get_ip, get_open_port
 
-        npu = getattr(torch, "npu", None)
-        if torch.cuda.is_available():
-            from vllm.distributed.weight_transfer.nccl_engine import (
-                NCCLWeightTransferEngine,
-            )
-
-            self.engine = NCCLWeightTransferEngine
-            self.device_module = torch.cuda
-            self.device = torch.device("cuda", torch.cuda.current_device())
-            self.backend = "NCCL"
-        elif npu is not None and npu.is_available():
+        device_type = str(device_type).lower()
+        if device_type == "npu":
+            npu = getattr(torch, "npu", None)
+            if npu is None or not npu.is_available():
+                raise RuntimeError("Actor selected NPU but torch.npu is unavailable")
             from vllm_ascend.distributed.weight_transfer.hccl_engine import (
                 HCCLWeightTransferEngine,
             )
@@ -106,10 +151,23 @@ class ExternalVllmWeightSender:
             self.device_module = npu
             self.device = torch.device("npu", npu.current_device())
             self.backend = "HCCL"
+        elif device_type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("Actor selected CUDA but torch.cuda is unavailable")
+            from vllm.distributed.weight_transfer.nccl_engine import (
+                NCCLWeightTransferEngine,
+            )
+
+            self.engine = NCCLWeightTransferEngine
+            self.device_module = torch.cuda
+            self.device = torch.device("cuda", torch.cuda.current_device())
+            self.backend = "NCCL"
         else:
             raise RuntimeError(
-                "External vLLM weight sync requires CUDA/NCCL or Ascend NPU/HCCL"
+                "External vLLM weight sync requires actor device_type='cuda' or 'npu', "
+                f"got {device_type!r}"
             )
+        from vllm.utils.network_utils import get_ip, get_open_port
         endpoints = config.get("endpoints") or []
         if isinstance(endpoints, str) or not endpoints:
             raise ValueError("External vLLM weight sync requires an endpoint list")
@@ -136,21 +194,69 @@ class ExternalVllmWeightSender:
                 )
                 if size < 1:
                     raise ValueError(f"Invalid vLLM world_size={size} at {endpoint}")
-                info = {
+                trainer_info = {
                     "master_address": address,
                     "master_port": get_open_port(),
-                    "rank_offset": 1,
                     "world_size": size + 1,
                 }
+                server_info = {**trainer_info, "rank_offset": 1}
+                dist_rank = None
+                dist_world_size = None
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    dist_rank = torch.distributed.get_rank()
+                    dist_world_size = torch.distributed.get_world_size()
+                logger.warning(
+                    "[external vLLM init sender] hostname=%s pid=%s backend=%s "
+                    "device=%s current_device=%s dist_rank=%s dist_world_size=%s "
+                    "visible=%r hccl_if_ip=%r default_master=%r:%r "
+                    "trainer_info=%s server_info=%s",
+                    socket.gethostname(),
+                    os.getpid(),
+                    self.backend,
+                    self.device,
+                    self.device_module.current_device(),
+                    dist_rank,
+                    dist_world_size,
+                    os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+                    os.environ.get("HCCL_IF_IP"),
+                    os.environ.get("MASTER_ADDR"),
+                    os.environ.get("MASTER_PORT"),
+                    trainer_info,
+                    server_info,
+                )
+                logger.warning(
+                    "[external vLLM weights] init starting endpoint=%s "
+                    "trainer_rank=0 worker_rank_offset=1 world_size=%s "
+                    "master=%s:%s",
+                    endpoint,
+                    trainer_info["world_size"],
+                    trainer_info["master_address"],
+                    trainer_info["master_port"],
+                )
+                logger.warning(
+                    "[external vLLM communication environment] %s",
+                    _communication_environment_snapshot(),
+                )
                 # Server init blocks waiting for the sender's NCCL/HCCL rendezvous.
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     pending = pool.submit(
                         self._request,
                         endpoint,
                         "init_weight_transfer_engine",
-                        {"init_info": info},
+                        {"init_info": server_info},
                     )
-                    group = self.engine.trainer_init(info)
+                    logger.warning(
+                        "[external vLLM weights] trainer_init entering backend=%s",
+                        self.backend,
+                    )
+                    group = self.engine.trainer_init(trainer_info)
+                    logger.warning(
+                        "[external vLLM weights] trainer_init completed backend=%s",
+                        self.backend,
+                    )
                     self.groups.append(group)
                     pending.result()
                 if not group.available or group.disabled:
@@ -302,24 +408,20 @@ class ExternalVllmWeightSender:
 
 
 def initialize_worker_weight_sync(worker: Any, config: Mapping[str, Any]) -> None:
-    import torch
+    from verl.utils.device import get_device_name
 
     strategy = str(worker.config.actor.strategy).lower()
     if strategy not in {"fsdp", "fsdp2", "veomni"}:
         raise ValueError(
             "External vLLM sync requires a full HF weight iterator (FSDP/FSDP2/VeOmni)"
         )
-    npu = getattr(torch, "npu", None)
-    if not torch.cuda.is_available() and not (
-        npu is not None and npu.is_available()
-    ):
-        raise RuntimeError(
-            "External vLLM sync requires CUDA/NCCL or Ascend NPU/HCCL"
-        )
+    device_type = str(get_device_name()).lower()
     if getattr(worker, "_speco_external_vllm_sender", None) is not None:
         raise RuntimeError("External vLLM weight sync is already initialized")
     if worker.rank == 0:
-        worker._speco_external_vllm_sender = ExternalVllmWeightSender(config)
+        worker._speco_external_vllm_sender = ExternalVllmWeightSender(
+            config, device_type=device_type
+        )
     worker._speco_final_norm_names = tuple(config.get("final_norm_names", ()))
 
 

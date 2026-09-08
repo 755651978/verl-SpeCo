@@ -867,11 +867,37 @@ class DraftWeightPublishMixin:
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def init_external_vllm_weight_sync(self, config: dict):
+        from verl.utils.device import get_device_name, get_torch_device
         from verl_speco.integration.external_vllm_weight_sync import (
             initialize_worker_weight_sync,
         )
 
-        initialize_worker_weight_sync(self, config)
+        device_name = str(get_device_name()).lower()
+        device_module = get_torch_device()
+        logger.warning(
+            "[external vLLM init worker] enter pid=%s rank=%s device_type=%s "
+            "current_device=%s visible=%r hccl_if_ip=%r",
+            os.getpid(),
+            getattr(self, "rank", None),
+            device_name,
+            getattr(device_module, "current_device", lambda: None)(),
+            os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+            os.environ.get("HCCL_IF_IP"),
+        )
+        try:
+            initialize_worker_weight_sync(self, config)
+        except BaseException:
+            logger.exception(
+                "[external vLLM init worker] failed pid=%s rank=%s",
+                os.getpid(),
+                getattr(self, "rank", None),
+            )
+            raise
+        logger.warning(
+            "[external vLLM init worker] exit pid=%s rank=%s",
+            os.getpid(),
+            getattr(self, "rank", None),
+        )
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def update_external_vllm_weights(self, global_step: int):
