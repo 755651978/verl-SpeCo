@@ -417,6 +417,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._pending_drafter_checkpoint_refs = []
         self._pending_target_lm_head_sync = None
         self._speco_ready_target_lm_head_versions: set[int] = set()
+        self._speco_ready_target_lm_head_workers: dict[int, tuple[str, ...]] = {}
         self._speco_last_known_trainable_batches: int | None = None
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
@@ -600,8 +601,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_activate_drafter_training_model(self):
         return self._require_speco_worker_group().activate_drafter_training_model()
 
-    def speco_prewarm_drafter_training_model(self):
-        return self._require_speco_worker_group().prewarm_drafter_training_model()
+    def speco_prewarm_drafter_training_model(
+        self, worker_ids: tuple[str, ...] | None = None
+    ):
+        return self._require_speco_worker_group().prewarm_drafter_training_model(
+            list(worker_ids) if worker_ids is not None else None
+        )
 
     def speco_maybe_publish(self):
         return self._require_speco_worker_group().maybe_publish()
@@ -1373,17 +1378,37 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             required_target_version = (
                 None if plan is None else plan.required_target_version
             )
+            required_target_workers = (
+                tuple(str(worker_id) for worker_id in plan.target_worker_ids)
+                if plan is not None
+                else ()
+            )
+            ready_target_workers = (
+                self._speco_ready_target_lm_head_workers.get(
+                    int(required_target_version)
+                )
+                if required_target_version is not None
+                else None
+            )
+            target_lm_head_ready_for_workers = (
+                required_target_version is None
+                or self._speco_target_lm_head_ready_for_workers(
+                    required_target_version,
+                    required_target_workers,
+                )
+            )
             if (
                 plan is not None
                 and plan.launch
                 and required_target_version is not None
-                and int(required_target_version)
-                not in self._speco_ready_target_lm_head_versions
+                and not target_lm_head_ready_for_workers
             ):
                 print(
                     "[BubbleTime] idle_launch_blocked: "
                     f"plan_id={plan.plan_id} reason=target_lm_head_not_ready "
                     f"required_target_version={required_target_version} "
+                    f"required_workers={required_target_workers} "
+                    f"ready_workers={ready_target_workers} "
                     "ready_versions="
                     f"{tuple(sorted(self._speco_ready_target_lm_head_versions))}",
                     flush=True,
@@ -1410,7 +1435,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 print(
                     "[BubbleTime] target_lm_head_ready_gate: "
                     f"plan_id={plan.plan_id} required_target_version="
-                    f"{required_target_version} ready_versions="
+                    f"{required_target_version} required_workers={required_target_workers} "
+                    f"ready_workers={ready_target_workers} ready_versions="
                     f"{tuple(sorted(self._speco_ready_target_lm_head_versions))}",
                     flush=True,
                 )
@@ -2707,6 +2733,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             return {"drafter/target_lm_head_synced": 0}, None
 
+        target_worker_ids: tuple[str, ...] | None = None
+        if self._speco_rollout_idle_worker_enabled():
+            if training_plan is not None:
+                target_worker_ids = tuple(
+                    str(worker_id) for worker_id in training_plan.target_worker_ids
+                )
+            else:
+                target_worker_ids = self._speco_get_drafter_scheduler().target_lm_head_sync_worker_ids(
+                    full_collective_fallback=bool(
+                        self._speco_drafter_schedule_config().idle_worker_full_collective_fallback
+                    )
+                )
+
         row_selection = self._speco_get_drafter_target_lm_head_row_selection()
         row_indices = (
             row_selection.get("row_indices") if row_selection is not None else None
@@ -2767,6 +2806,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "drafter/target_lm_head_synced": 0,
                     "drafter/target_lm_head_selected_rows": selected_rows,
                     "drafter/target_lm_head_source_vocab_size": source_vocab_size,
+                    "drafter/target_lm_head_target_workers": len(
+                        target_worker_ids or ()
+                    ),
                     "timing_s/drafter_target_lm_head_fetch_submit": (
                         time.perf_counter() - fetch_started
                     ),
@@ -2781,6 +2823,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "selected_rows": selected_rows,
                     "source_vocab_size": source_vocab_size,
                     "target_version": int(self.global_steps),
+                    "target_worker_ids": target_worker_ids,
                     "stage": "fetch",
                 },
             )
@@ -2806,6 +2849,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             fetch_elapsed=fetch_elapsed,
             selected_rows=selected_rows,
             source_vocab_size=source_vocab_size,
+            target_worker_ids=target_worker_ids,
         )
         if (
             pending is not None
@@ -2885,6 +2929,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 fetch_elapsed=time.perf_counter() - float(pending["fetch_started"]),
                 selected_rows=int(pending["selected_rows"]),
                 source_vocab_size=int(pending["source_vocab_size"]),
+                target_worker_ids=pending.get("target_worker_ids"),
             )
             assert dispatch_pending is not None
             dispatch_pending["target_version"] = target_version
@@ -2892,7 +2937,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._pending_target_lm_head_sync = dispatch_pending
             print(
                 "[BubbleTime] target_lm_head_prefetch_dispatched: "
-                f"target_version={target_version}",
+                f"target_version={target_version} "
+                f"target_workers={dispatch_pending.get('target_worker_ids')}",
                 flush=True,
             )
             metrics["bubble/target_lm_head_prefetch_pending"] = 1
@@ -2903,12 +2949,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._ray_get_if_needed(refs)
         self._pending_target_lm_head_sync = None
         evicted_versions = self._speco_mark_target_lm_head_version_ready(
-            target_version
+            target_version,
+            worker_ids=pending.get("target_worker_ids"),
         )
         print(
             "[BubbleTime] target_lm_head_prefetch_ready: "
             f"target_version={target_version} "
             f"ready_versions={tuple(sorted(self._speco_ready_target_lm_head_versions))} "
+            "ready_workers="
+            f"{self._speco_ready_target_lm_head_workers.get(int(target_version), None)} "
             f"evicted_versions={evicted_versions}",
             flush=True,
         )
@@ -2923,13 +2972,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_mark_target_lm_head_version_ready(
         self,
         target_version: object,
+        *,
+        worker_ids: tuple[str, ...] | None = None,
     ) -> tuple[int, ...]:
         """Record only target-head versions that can still exist on workers."""
 
         try:
-            self._speco_ready_target_lm_head_versions.add(int(target_version))
+            version = int(target_version)
         except (TypeError, ValueError):
             return ()
+        self._speco_ready_target_lm_head_versions.add(version)
+        if worker_ids is not None:
+            self._speco_ready_target_lm_head_workers[version] = tuple(
+                str(worker_id) for worker_id in worker_ids
+            )
+        else:
+            self._speco_ready_target_lm_head_workers.pop(version, None)
         evicted_versions: list[int] = []
         while (
             len(self._speco_ready_target_lm_head_versions)
@@ -2937,6 +2995,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             version = min(self._speco_ready_target_lm_head_versions)
             self._speco_ready_target_lm_head_versions.remove(version)
+            self._speco_ready_target_lm_head_workers.pop(version, None)
             evicted_versions.append(version)
         if evicted_versions:
             logger.warning(
@@ -2948,6 +3007,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
         return tuple(evicted_versions)
 
+    def _speco_target_lm_head_ready_for_workers(
+        self,
+        target_version: object,
+        worker_ids: tuple[str, ...],
+    ) -> bool:
+        try:
+            version = int(target_version)
+        except (TypeError, ValueError):
+            return False
+        if version not in self._speco_ready_target_lm_head_versions:
+            return False
+        ready_workers = self._speco_ready_target_lm_head_workers.get(version)
+        if ready_workers is None:
+            return True
+        return set(str(worker_id) for worker_id in worker_ids).issubset(
+            set(ready_workers)
+        )
+
     def _speco_dispatch_target_lm_head_payload(
         self,
         payload: Any,
@@ -2956,6 +3033,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         fetch_elapsed: float,
         selected_rows: int,
         source_vocab_size: int,
+        target_worker_ids: tuple[str, ...] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Stage a captured actor head on drafter workers without waiting."""
 
@@ -2971,6 +3049,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if defer_device_apply:
             payload = dict(payload)
             payload["defer_device_apply"] = True
+            if target_worker_ids:
+                payload["target_worker_ids"] = tuple(str(worker_id) for worker_id in target_worker_ids)
         payload_arg, global_step_arg, _ = (
             self._speco_build_drafter_target_lm_head_sync_args(payload)
         )
@@ -2983,6 +3063,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter/target_lm_head_apply_deferred": int(defer_device_apply),
             "drafter/target_lm_head_selected_rows": selected_rows,
             "drafter/target_lm_head_source_vocab_size": source_vocab_size,
+            "drafter/target_lm_head_target_workers": len(target_worker_ids or ()),
             "drafter/target_lm_head_direct_sparse_export": int(
                 export_strategy in {"direct_sparse", "veomni_lm_head_sparse"}
             ),
@@ -2996,6 +3077,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "dispatch_elapsed": dispatch_elapsed,
             "pre_dispatch_elapsed": dispatch_started - sync_started,
             "defer_device_apply": defer_device_apply,
+            "target_worker_ids": target_worker_ids,
         }
         return metrics, pending
 
@@ -3032,6 +3114,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 fetch_elapsed=fetch_elapsed,
                 selected_rows=int(pending["selected_rows"]),
                 source_vocab_size=int(pending["source_vocab_size"]),
+                target_worker_ids=pending.get("target_worker_ids"),
             )
             metrics["timing_s/drafter_target_lm_head_fetch_async_work"] = (
                 fetch_elapsed
@@ -3993,6 +4076,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         "[BubbleTime] target_lm_head_prefetch_submitted: "
                         "target_version="
                         f"{pending_target_lm_head_sync.get('target_version')} "
+                        "target_workers="
+                        f"{pending_target_lm_head_sync.get('target_worker_ids')} "
                         "selected_rows="
                         f"{cache_metrics.get('drafter/target_lm_head_selected_rows', 0)} "
                         "submit_s="

@@ -1298,6 +1298,17 @@ class SpecoWorker(Worker):
             }
         if not payload:
             return {"accepted": False, "applied": False, "reason": "missing_payload"}
+        target_worker_ids = payload.get("target_worker_ids")
+        if target_worker_ids:
+            target_worker_id_set = {str(worker_id) for worker_id in target_worker_ids}
+            if str(self.rank) not in target_worker_id_set:
+                return {
+                    "accepted": False,
+                    "applied": False,
+                    "reason": "not_target_worker",
+                    "worker_id": str(self.rank),
+                    "target_worker_ids": tuple(sorted(target_worker_id_set)),
+                }
 
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
@@ -1368,7 +1379,8 @@ class SpecoWorker(Worker):
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def prewarm_drafter_training_model(self):
+    async def prewarm_drafter_training_model(self, worker_ids=None):
+        target_worker_ids = {str(worker_id) for worker_id in (worker_ids or ())}
         result = {
             "activated": False,
             "elapsed_sec": 0.0,
@@ -1378,7 +1390,11 @@ class SpecoWorker(Worker):
             "worker_incarnation": self.worker_incarnation,
             "replica_rank": self.replica_rank,
             "training_group_ranks": list(getattr(self, "training_group_ranks", [])),
+            "target_worker_ids": tuple(sorted(target_worker_ids)),
         }
+        if target_worker_ids and str(self.rank) not in target_worker_ids:
+            result["reason"] = "not_in_training_group"
+            return result
         if not self.enable_drafter:
             result["reason"] = "disabled"
             return result
@@ -1430,25 +1446,29 @@ class SpecoWorker(Worker):
                 f"worker_id={self.rank} rank={self.rank} "
                 f"replica_rank={self.replica_rank} oom={replica_local_oom} "
                 f"elapsed_s={result['elapsed_sec']:.3f} "
-                f"group={tuple(getattr(self, 'training_group_ranks', []))}",
+                f"group={tuple(getattr(self, 'training_group_ranks', []))} "
+                f"target_workers={tuple(sorted(target_worker_ids))}",
                 flush=True,
             )
             return result
 
         logger.warning(
             "[BubbleTime] idle_prewarm_succeeded: worker_id=%s rank=%s "
-            "replica_rank=%s elapsed_s=%.3f group=%s keep_hot=True",
+            "replica_rank=%s elapsed_s=%.3f group=%s target_workers=%s "
+            "keep_hot=True",
             self.rank,
             self.rank,
             self.replica_rank,
             result["elapsed_sec"],
             tuple(getattr(self, "training_group_ranks", [])),
+            tuple(sorted(target_worker_ids)),
         )
         print(
             "[BubbleTime] idle_prewarm_succeeded: "
             f"worker_id={self.rank} rank={self.rank} "
             f"replica_rank={self.replica_rank} elapsed_s={result['elapsed_sec']:.3f} "
-            f"group={tuple(getattr(self, 'training_group_ranks', []))} keep_hot=True",
+            f"group={tuple(getattr(self, 'training_group_ranks', []))} "
+            f"target_workers={tuple(sorted(target_worker_ids))} keep_hot=True",
             flush=True,
         )
         return result

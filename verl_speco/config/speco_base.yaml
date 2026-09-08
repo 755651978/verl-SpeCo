@@ -192,6 +192,12 @@ actor_rollout_ref:
             require_memory_released: true
             drain_before_next_rollout: true
             fallback_to_sync: false
+            # Last-resort Bubble fallback. If every replica-local group is
+            # disabled (for example OOM during activation), allow the scheduler
+            # to require the full drafter collective to be idle. Disabled by
+            # default because it reduces Bubble granularity and can reintroduce
+            # rollout wake-up memory pressure.
+            full_collective_fallback: false
             # Optional starvation guard. When fallback_to_sync is true, a
             # sync fallback can be launched at a trainer safe point after
             # max_steps_without_training or this wall-clock limit.

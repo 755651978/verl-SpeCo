@@ -71,6 +71,9 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
         )
     )
     trainer._pending_drafter_publish_refs = None
+    trainer._pending_target_lm_head_sync = None
+    trainer._speco_ready_target_lm_head_versions = set()
+    trainer._speco_ready_target_lm_head_workers = {}
     trainer._speco_last_collected_samples = 0
     trainer._ray_get_if_needed = lambda value: value
     trainer.speco_get_drafter_training_data_status = lambda *args: [
@@ -612,6 +615,28 @@ def test_bubble_target_head_fetch_overlaps_actor_update() -> None:
     assert metrics["drafter/target_lm_head_synced"] == 1
     assert metrics["timing_s/drafter_target_lm_head_fetch_async_work"] >= 0.0
     assert metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] >= 0.0
+
+
+def test_bubble_target_head_ready_is_scoped_to_synced_workers() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=1,
+    )
+
+    trainer._speco_mark_target_lm_head_version_ready(
+        2,
+        worker_ids=("0", "1"),
+    )
+
+    assert trainer._speco_target_lm_head_ready_for_workers(2, ("0", "1"))
+    assert not trainer._speco_target_lm_head_ready_for_workers(2, ("2", "3"))
+
+    trainer._speco_mark_target_lm_head_version_ready(
+        4,
+        worker_ids=("0", "1", "2", "3"),
+    )
+
+    assert trainer._speco_target_lm_head_ready_for_workers(4, ("2", "3"))
 
 
 def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:

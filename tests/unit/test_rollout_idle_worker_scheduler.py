@@ -667,9 +667,220 @@ def test_idle_worker_prewarm_removes_bootstrap_startup_reserve() -> None:
     )
 
     assert scheduler._effective_idle_startup_reserve_sec(config) > 0.0
-    scheduler._idle_worker_hot_prewarmed = True
+    scheduler._idle_worker_hot_prewarmed_groups.add(("0", "1"))
 
-    assert scheduler._effective_idle_startup_reserve_sec(config) == 0.0
+    assert scheduler._effective_idle_startup_reserve_sec(config, ("0", "1")) == 0.0
+    assert scheduler._effective_idle_startup_reserve_sec(config, ("2", "3")) > 0.0
+
+
+def test_idle_worker_prewarm_targets_one_metadata_group() -> None:
+    class _PrewarmExecutor:
+        def __init__(self) -> None:
+            self.worker_ids = None
+
+        def prewarm_training_workers(self, worker_ids=None):
+            self.worker_ids = worker_ids
+            return [
+                {"activated": True, "worker_id": worker_id, "reason": "prewarmed"}
+                for worker_id in worker_ids
+            ]
+
+    scheduler = DrafterScheduler(worker_executor=_PrewarmExecutor())
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+
+    scheduler.prewarm_idle_training_workers()
+
+    assert scheduler._worker_executor.worker_ids == ("0", "1")
+    assert ("0", "1") in scheduler._idle_worker_hot_prewarmed_groups
+    assert ("2", "3") not in scheduler._idle_worker_hot_prewarmed_groups
+
+
+def test_idle_worker_skips_non_prewarmed_group_when_hot_group_exists() -> None:
+    scheduler = _scheduler_with_statuses(("2", "3"))
+    config = _auto_idle_config(2)
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+    scheduler._idle_worker_hot_prewarmed_groups.add(("0", "1"))
+
+    now = time.time()
+    for worker_id in ("2", "3"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=1,
+                memory_released=True,
+                must_be_ready_at=now + 10.0,
+            )
+        )
+
+    resources = scheduler.select_idle_training_resources(config, now=now)
+
+    assert not resources.available
+    assert resources.reason == "incomplete_training_group"
+    assert resources.worker_ids == ()
+
+
+def test_idle_worker_keeps_single_writer_after_stable_hot_group_successes() -> None:
+    scheduler = _scheduler_with_statuses(("2", "3"))
+    config = _auto_idle_config(2)
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+    scheduler._idle_worker_hot_prewarmed_groups.add(("0", "1"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+
+    now = time.time()
+    for worker_id in ("2", "3"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=1,
+                memory_released=True,
+                must_be_ready_at=now + 10.0,
+            )
+        )
+
+    resources = scheduler.select_idle_training_resources(config, now=now)
+
+    assert not resources.available
+    assert resources.reason == "incomplete_training_group"
+    assert resources.worker_ids == ()
+
+
+def test_target_lm_head_sync_workers_use_single_writer_group() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+    scheduler._idle_worker_hot_prewarmed_groups.add(("0", "1"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+
+    assert scheduler.target_lm_head_sync_worker_ids() == ("0", "1")
+
+
+def test_disabling_replica_local_group_clears_hot_prewarm_state() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+    scheduler._idle_worker_hot_prewarmed_groups.add(("0", "1"))
+
+    scheduler._disable_replica_local_idle_group(("0", "1"), reason="replica_local_oom")
+
+    assert ("0", "1") not in scheduler._idle_worker_hot_prewarmed_groups
+    assert scheduler._metadata_idle_training_groups == (("2", "3"),)
+
+
+def test_idle_worker_full_collective_fallback_requires_explicit_config() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1", "2", "3"))
+    scheduler.register_idle_training_resource_metadata(
+        [
+            {
+                "rank": 0,
+                "worker_id": "0",
+                "in_drafter_train_group": True,
+                "replica_rank": 0,
+                "training_group_ranks": [0, 1],
+                "full_collective_ranks": [0, 1],
+                "sync_collective_ranks": [0, 1, 2, 3],
+            },
+            {
+                "rank": 2,
+                "worker_id": "2",
+                "in_drafter_train_group": True,
+                "replica_rank": 1,
+                "training_group_ranks": [2, 3],
+                "full_collective_ranks": [2, 3],
+                "sync_collective_ranks": [0, 1, 2, 3],
+            },
+        ]
+    )
+    scheduler._disable_replica_local_idle_group(("0", "1"), reason="replica_local_oom")
+    scheduler._disable_replica_local_idle_group(("2", "3"), reason="replica_local_oom")
+
+    assert scheduler._idle_training_groups(_auto_idle_config(2)) == ()
+
+
+def test_idle_worker_full_collective_fallback_after_all_local_groups_disabled() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1", "2", "3"))
+    scheduler.register_idle_training_resource_metadata(
+        [
+            {
+                "rank": 0,
+                "worker_id": "0",
+                "in_drafter_train_group": True,
+                "replica_rank": 0,
+                "training_group_ranks": [0, 1],
+                "full_collective_ranks": [0, 1],
+                "sync_collective_ranks": [0, 1, 2, 3],
+            },
+            {
+                "rank": 2,
+                "worker_id": "2",
+                "in_drafter_train_group": True,
+                "replica_rank": 1,
+                "training_group_ranks": [2, 3],
+                "full_collective_ranks": [2, 3],
+                "sync_collective_ranks": [0, 1, 2, 3],
+            },
+        ]
+    )
+    scheduler._disable_replica_local_idle_group(("0", "1"), reason="replica_local_oom")
+    scheduler._disable_replica_local_idle_group(("2", "3"), reason="replica_local_oom")
+    config = replace(
+        _auto_idle_config(2),
+        idle_worker_full_collective_fallback=True,
+    )
+
+    now = time.time()
+    for worker_id in ("0", "1", "2", "3"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=0 if worker_id in {"0", "1"} else 1,
+                memory_released=True,
+                must_be_ready_at=now + 10.0,
+            )
+        )
+
+    resources = scheduler.select_idle_training_resources(config, now=now)
+
+    assert resources.available
+    assert resources.worker_ids == ("0", "1", "2", "3")
+    assert scheduler.target_lm_head_sync_worker_ids(
+        full_collective_fallback=True
+    ) == ("0", "1", "2", "3")
+
+
+def test_idle_worker_prewarm_tries_next_group_after_failure() -> None:
+    class _PrewarmExecutor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def prewarm_training_workers(self, worker_ids=None):
+            self.calls.append(worker_ids)
+            if worker_ids == ("0", "1"):
+                return [
+                    {
+                        "activated": False,
+                        "worker_id": worker_id,
+                        "reason": "activation_failed",
+                        "replica_local_unavailable": True,
+                        "replica_local_oom": True,
+                        "training_group_ranks": ("0", "1"),
+                    }
+                    for worker_id in worker_ids
+                ]
+            return [
+                {"activated": True, "worker_id": worker_id, "reason": "prewarmed"}
+                for worker_id in worker_ids
+            ]
+
+    executor = _PrewarmExecutor()
+    scheduler = DrafterScheduler(worker_executor=executor)
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+
+    scheduler.prewarm_idle_training_workers()
+
+    assert executor.calls == [("0", "1"), ("2", "3")]
+    assert ("0", "1") in scheduler._disabled_replica_local_idle_groups
+    assert ("2", "3") in scheduler._idle_worker_hot_prewarmed_groups
 
 
 def test_replica_local_activation_failure_disables_idle_group() -> None:

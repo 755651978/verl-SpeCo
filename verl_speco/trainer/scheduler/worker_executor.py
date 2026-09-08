@@ -47,7 +47,9 @@ class DrafterWorkerExecutor(Protocol):
 
     def abort_training_preflight(self, plan: TrainingPlan) -> list[Any]: ...
 
-    def prewarm_training_workers(self) -> list[Any]: ...
+    def prewarm_training_workers(
+        self, worker_ids: tuple[str, ...] | None = None
+    ) -> list[Any]: ...
 
 
 @dataclass(frozen=True)
@@ -63,7 +65,7 @@ class CallbackDrafterWorkerExecutor:
     abort_preflight: Callable[[str], Any]
     poll: Callable[[Any], Any] | None = None
     reclaim: Callable[[tuple[str, ...]], Any] | None = None
-    prewarm: Callable[[], Any] | None = None
+    prewarm: Callable[[tuple[str, ...] | None], Any] | None = None
 
     def submit_training(self, plan: TrainingPlan) -> Any:
         return self.submit(plan.to_worker_payload())
@@ -122,10 +124,12 @@ class CallbackDrafterWorkerExecutor:
         results = self.resolve(self.activate()) or []
         return results if isinstance(results, list) else [results]
 
-    def prewarm_training_workers(self) -> list[Any]:
+    def prewarm_training_workers(
+        self, worker_ids: tuple[str, ...] | None = None
+    ) -> list[Any]:
         if self.prewarm is None:
             return self.activate_training_workers()
-        results = self.resolve(self.prewarm()) or []
+        results = self.resolve(self.prewarm(worker_ids)) or []
         return results if isinstance(results, list) else [results]
 
     def preflight_training(self, plan: TrainingPlan) -> list[Any]:

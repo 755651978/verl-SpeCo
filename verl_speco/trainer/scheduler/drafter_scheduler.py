@@ -228,6 +228,7 @@ class DrafterScheduler:
         self.rollout_idle_execution_strategy = RolloutIdleWorkerExecutionStrategy()
         self._idle_workers: dict[str, _IdleWorkerState] = {}
         self._metadata_idle_training_groups: tuple[tuple[str, ...], ...] = ()
+        self._metadata_full_collective_idle_groups: tuple[tuple[str, ...], ...] = ()
         self._replica_idle_worker_groups: dict[int, tuple[str, ...]] = {}
         self._last_successful_training_step: int | None = None
         self._last_successful_training_ts: float | None = None
@@ -237,7 +238,9 @@ class DrafterScheduler:
         self._idle_worker_reclaim_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_startup_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_tail_samples_sec: deque[float] = deque(maxlen=32)
-        self._idle_worker_hot_prewarmed: bool = False
+        self._idle_worker_hot_prewarmed_groups: set[tuple[str, ...]] = set()
+        self._idle_worker_writer_group: tuple[str, ...] | None = None
+        self._idle_worker_group_success_counts: dict[tuple[str, ...], int] = {}
         self._replica_idle_started_at: dict[int, float] = {}
         self._replica_idle_window_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_prebatch_reclaim_streak: int = 0
@@ -285,14 +288,17 @@ class DrafterScheduler:
         return max(configured_guard, reclaim_guard)
 
     def _effective_idle_startup_reserve_sec(
-        self, config: DrafterScheduleConfig
+        self,
+        config: DrafterScheduleConfig,
+        worker_ids: tuple[str, ...] | None = None,
     ) -> float:
         """Reserve activation and preflight work before the first batch."""
 
         historical = _conservative_percentile(self._idle_worker_startup_samples_sec)
         if historical > 0.0:
             return historical
-        if self._idle_worker_hot_prewarmed:
+        group = _normalize_worker_id_group(worker_ids)
+        if group and group in self._idle_worker_hot_prewarmed_groups:
             return 0.0
         if self._idle_batch_estimate_is_bootstrap(config):
             return _BOOTSTRAP_IDLE_STARTUP_RESERVE_SEC
@@ -301,49 +307,143 @@ class DrafterScheduler:
     def prewarm_idle_training_workers(self) -> list[Any]:
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
-        results = self._worker_executor.prewarm_training_workers()
-        active = [
-            result
-            for result in results
-            if isinstance(result, dict)
-            and result.get("reason") not in {"disabled", "not_in_training_group"}
-        ]
-        successful = [
-            result for result in active if bool(result.get("activated", False))
-        ]
-        failed = [
-            result for result in active if not bool(result.get("activated", False))
-        ]
-        for result in failed:
-            if bool(result.get("replica_local_unavailable", False)):
-                self._disable_replica_local_idle_group(
-                    tuple(
-                        str(worker_id)
-                        for worker_id in result.get("training_group_ranks", ())
-                    ),
-                    reason=(
-                        "replica_local_oom"
-                        if bool(result.get("replica_local_oom", False))
-                        else "replica_local_prewarm_failed"
-                    ),
-                )
-        if active and successful and not failed:
-            self._idle_worker_hot_prewarmed = True
-        logger.warning(
-            "[BubbleTime] idle_prewarm_completed: active=%s successful=%s failed=%s "
-            "hot_prewarmed=%s",
-            len(active),
-            len(successful),
-            len(failed),
-            self._idle_worker_hot_prewarmed,
+        candidate_groups = tuple(
+            _normalize_worker_id_group(group)
+            for group in self._metadata_idle_training_groups
+            if _normalize_worker_id_group(group)
+            not in self._disabled_replica_local_idle_groups
         )
-        print(
-            "[BubbleTime] idle_prewarm_completed: "
-            f"active={len(active)} successful={len(successful)} failed={len(failed)} "
-            f"hot_prewarmed={self._idle_worker_hot_prewarmed}",
-            flush=True,
+        if not candidate_groups:
+            logger.warning(
+                "[BubbleTime] idle_prewarm_skipped: reason=no_training_group_metadata"
+            )
+            print(
+                "[BubbleTime] idle_prewarm_skipped: "
+                "reason=no_training_group_metadata",
+                flush=True,
+            )
+            return []
+        all_results: list[Any] = []
+        for target_group in candidate_groups:
+            results = self._worker_executor.prewarm_training_workers(target_group)
+            all_results.extend(results)
+            active = [
+                result
+                for result in results
+                if isinstance(result, dict)
+                and result.get("reason") not in {"disabled", "not_in_training_group"}
+            ]
+            successful = [
+                result for result in active if bool(result.get("activated", False))
+            ]
+            failed = [
+                result for result in active if not bool(result.get("activated", False))
+            ]
+            for result in failed:
+                if bool(result.get("replica_local_unavailable", False)):
+                    self._disable_replica_local_idle_group(
+                        tuple(
+                            str(worker_id)
+                            for worker_id in result.get("training_group_ranks", ())
+                        ),
+                        reason=(
+                            "replica_local_oom"
+                            if bool(result.get("replica_local_oom", False))
+                            else "replica_local_prewarm_failed"
+                        ),
+                    )
+            if active and successful and not failed:
+                self._idle_worker_hot_prewarmed_groups.add(target_group)
+                if self._idle_worker_writer_group is None:
+                    self._idle_worker_writer_group = target_group
+            logger.warning(
+                "[BubbleTime] idle_prewarm_completed: group=%s active=%s "
+                "successful=%s failed=%s writer_group=%s hot_groups=%s",
+                target_group,
+                len(active),
+                len(successful),
+                len(failed),
+                self._idle_worker_writer_group,
+                tuple(sorted(self._idle_worker_hot_prewarmed_groups)),
+            )
+            print(
+                "[BubbleTime] idle_prewarm_completed: "
+                f"group={target_group} active={len(active)} "
+                f"successful={len(successful)} failed={len(failed)} "
+                f"writer_group={self._idle_worker_writer_group} "
+                f"hot_groups={tuple(sorted(self._idle_worker_hot_prewarmed_groups))}",
+                flush=True,
+            )
+            if target_group in self._idle_worker_hot_prewarmed_groups:
+                break
+        return all_results
+
+    def _current_idle_writer_group(self) -> tuple[str, ...] | None:
+        """Return the only replica-local group allowed to mutate drafter state."""
+
+        writer_group = _normalize_worker_id_group(self._idle_worker_writer_group)
+        if (
+            writer_group
+            and writer_group not in self._disabled_replica_local_idle_groups
+            and (
+                not self._metadata_idle_training_groups
+                or writer_group in self._metadata_idle_training_groups
+            )
+        ):
+            return writer_group
+        for group in sorted(self._idle_worker_hot_prewarmed_groups):
+            normalized = _normalize_worker_id_group(group)
+            if normalized and normalized not in self._disabled_replica_local_idle_groups:
+                self._idle_worker_writer_group = normalized
+                return normalized
+        for group in self._metadata_idle_training_groups:
+            normalized = _normalize_worker_id_group(group)
+            if normalized and normalized not in self._disabled_replica_local_idle_groups:
+                self._idle_worker_writer_group = normalized
+                return normalized
+        return None
+
+    def target_lm_head_sync_worker_ids(
+        self,
+        *,
+        full_collective_fallback: bool = False,
+    ) -> tuple[str, ...] | None:
+        """Workers that should cache the next target LM-head snapshot.
+
+        Returning ``None`` preserves the legacy/sync broadcast behavior.  In
+        Bubble replica-local mode, keep the heavy target head cache limited to
+        the single writer group.  This prevents multiple independent
+        replica-local optimizer/model states from publishing over each other.
+        """
+
+        groups: list[tuple[str, ...]] = []
+        writer_group = self._current_idle_writer_group()
+        if writer_group is not None:
+            groups.append(writer_group)
+        if not groups:
+            for group in self._metadata_idle_training_groups:
+                normalized = _normalize_worker_id_group(group)
+                if normalized and normalized not in self._disabled_replica_local_idle_groups:
+                    groups.append(normalized)
+                    break
+        if (
+            not groups
+            and full_collective_fallback
+            and self._disabled_replica_local_idle_groups
+        ):
+            for group in self._metadata_full_collective_idle_groups:
+                normalized = _normalize_worker_id_group(group)
+                if normalized:
+                    groups.append(normalized)
+                    break
+        worker_ids = tuple(
+            dict.fromkeys(
+                worker_id
+                for group in groups
+                for worker_id in _normalize_worker_id_group(group)
+            )
         )
-        return results
+        return worker_ids or None
 
     def _effective_idle_tail_reserve_sec(self, config: DrafterScheduleConfig) -> float:
         """Reserve snapshot and cleanup work after the final batch."""
@@ -415,6 +515,10 @@ class DrafterScheduler:
             return
         first_seen = group not in self._disabled_replica_local_idle_groups
         self._disabled_replica_local_idle_groups.add(group)
+        self._idle_worker_hot_prewarmed_groups.discard(group)
+        if self._idle_worker_writer_group == group:
+            self._idle_worker_writer_group = None
+        self._idle_worker_group_success_counts.pop(group, None)
         self._replica_local_idle_unavailable_reason = reason
         self._metadata_idle_training_groups = tuple(
             existing
@@ -434,7 +538,8 @@ class DrafterScheduler:
             "[BubbleTime] replica_local_group_disabled: "
             f"group={group} reason={reason} "
             f"disabled_groups={tuple(sorted(self._disabled_replica_local_idle_groups))} "
-            f"remaining_groups={self._metadata_idle_training_groups}",
+            f"remaining_groups={self._metadata_idle_training_groups} "
+            f"writer_group={self._idle_worker_writer_group}",
             flush=True,
         )
 
@@ -478,13 +583,14 @@ class DrafterScheduler:
         config: DrafterScheduleConfig,
         *,
         min_batches: int = 1,
+        worker_ids: tuple[str, ...] | None = None,
     ) -> float:
         """Minimum window that can start and finish a useful idle batch."""
 
         return max(
             self._effective_idle_min_window_sec(config),
             self._effective_idle_deadline_guard_sec(config)
-            + self._effective_idle_startup_reserve_sec(config)
+            + self._effective_idle_startup_reserve_sec(config, worker_ids)
             + self._effective_idle_tail_reserve_sec(config)
             + self._effective_idle_batch_estimate_sec(config)
             * max(int(min_batches), 1),
@@ -844,7 +950,9 @@ class DrafterScheduler:
         records = _flatten_metadata_records(metadata)
         replica_group_members: dict[int, set[str]] = {}
         full_groups: list[tuple[str, ...]] = []
+        full_collective_groups: list[tuple[str, ...]] = []
         seen_groups: set[tuple[str, ...]] = set()
+        seen_full_collective_groups: set[tuple[str, ...]] = set()
         for record in records:
             if not bool(record.get("in_drafter_train_group", False)):
                 continue
@@ -856,6 +964,21 @@ class DrafterScheduler:
                 replica_group_members.setdefault(int(replica_rank), set()).update(
                     training_ranks
                 )
+            fallback_group = _normalize_worker_id_group(
+                record.get("sync_collective_ranks", ())
+            )
+            if not fallback_group:
+                fallback_group = _normalize_worker_id_group(
+                    record.get("full_collective_ranks", ())
+                )
+            if not fallback_group:
+                fallback_group = training_ranks
+            if (
+                fallback_group
+                and fallback_group not in seen_full_collective_groups
+            ):
+                full_collective_groups.append(fallback_group)
+                seen_full_collective_groups.add(fallback_group)
             if training_ranks in self._disabled_replica_local_idle_groups:
                 continue
             full_group = _normalize_worker_id_group(
@@ -872,6 +995,7 @@ class DrafterScheduler:
         }
         self._replica_idle_worker_groups = replica_groups
         self._metadata_idle_training_groups = tuple(full_groups)
+        self._metadata_full_collective_idle_groups = tuple(full_collective_groups)
         metadata_summary = [
             {
                 "rank": record.get("rank"),
@@ -888,10 +1012,11 @@ class DrafterScheduler:
         ]
         logger.warning(
             "[BubbleTime] resource_metadata groups=%s replica_groups=%s records=%s "
-            "record_summary=%s",
+            "full_collective_fallback_groups=%s record_summary=%s",
             self._metadata_idle_training_groups,
             self._replica_idle_worker_groups,
             len(records),
+            self._metadata_full_collective_idle_groups,
             metadata_summary,
         )
         return {
@@ -956,6 +1081,25 @@ class DrafterScheduler:
                 if _normalize_worker_id_group(group)
                 not in self._disabled_replica_local_idle_groups
             )
+        if (
+            self._disabled_replica_local_idle_groups
+            and config.idle_worker_full_collective_fallback
+            and self._metadata_full_collective_idle_groups
+        ):
+            logger.warning(
+                "[BubbleTime] idle_full_collective_fallback_enabled: "
+                "disabled_replica_local_groups=%s fallback_groups=%s",
+                tuple(sorted(self._disabled_replica_local_idle_groups)),
+                self._metadata_full_collective_idle_groups,
+            )
+            print(
+                "[BubbleTime] idle_full_collective_fallback_enabled: "
+                "disabled_replica_local_groups="
+                f"{tuple(sorted(self._disabled_replica_local_idle_groups))} "
+                f"fallback_groups={self._metadata_full_collective_idle_groups}",
+                flush=True,
+            )
+            return self._metadata_full_collective_idle_groups
         if self._disabled_replica_local_idle_groups:
             return ()
         if config.idle_worker_group_mode != "auto":
@@ -1020,8 +1164,21 @@ class DrafterScheduler:
             )
             return AvailableTrainingResources(False, "no_idle_worker")
         incomplete_seen = False
+        not_prewarmed_seen = False
+        writer_group = self._current_idle_writer_group()
         for index, group in enumerate(groups):
-            group = tuple(str(worker_id) for worker_id in group)
+            group = _normalize_worker_id_group(group)
+            if writer_group is not None and group != writer_group:
+                not_prewarmed_seen = True
+                logger.info(
+                    "[BubbleTime] idle_group_not_writer group_id=idle-group-%s "
+                    "group=%s writer_group=%s hot_groups=%s",
+                    index,
+                    group,
+                    writer_group,
+                    tuple(sorted(self._idle_worker_hot_prewarmed_groups)),
+                )
+                continue
             missing = [worker_id for worker_id in group if worker_id not in idle_states]
             if missing:
                 incomplete_seen = True
@@ -1063,7 +1220,10 @@ class DrafterScheduler:
                 minimum_window = min(minimum_window, historical_remaining)
             if math.isinf(minimum_window):
                 minimum_window = self._minimum_idle_training_window_sec(config)
-            min_idle_window_sec = self._minimum_idle_training_window_sec(config)
+            min_idle_window_sec = self._minimum_idle_training_window_sec(
+                config,
+                worker_ids=group,
+            )
             if minimum_window < min_idle_window_sec:
                 logger.warning(
                     "[BubbleTime] idle_resource_skip reason=window_too_small "
@@ -1078,7 +1238,7 @@ class DrafterScheduler:
                     min_idle_window_sec,
                     historical_window,
                     source,
-                    self._effective_idle_startup_reserve_sec(config),
+                    self._effective_idle_startup_reserve_sec(config, group),
                     self._effective_idle_tail_reserve_sec(config),
                     self._effective_idle_batch_estimate_sec(config),
                     self._effective_idle_deadline_guard_sec(config),
@@ -1097,7 +1257,7 @@ class DrafterScheduler:
                     f"deadline_windows_s={tuple(round(value, 3) for value in windows)} "
                     f"source={source} event_age_s={event_ages} "
                     "startup_reserve_s="
-                    f"{self._effective_idle_startup_reserve_sec(config):.3f} "
+                    f"{self._effective_idle_startup_reserve_sec(config, group):.3f} "
                     "tail_reserve_s="
                     f"{self._effective_idle_tail_reserve_sec(config):.3f} "
                     "batch_estimate_s="
@@ -1138,18 +1298,23 @@ class DrafterScheduler:
                 worker_ids=group,
                 minimum_idle_window_sec=minimum_window,
             )
+        reason = (
+            "incomplete_training_group"
+            if incomplete_seen
+            else "idle_group_not_prewarmed"
+            if not_prewarmed_seen
+            else "no_idle_worker"
+        )
         logger.info(
             "[BubbleTime] idle_resource_skip reason=%s groups=%s idle_workers=%s "
-            "known_state=%s",
-            "incomplete_training_group" if incomplete_seen else "no_idle_worker",
+            "known_state=%s hot_groups=%s",
+            reason,
             groups,
             tuple(sorted(idle_states, key=_natural_worker_sort_key)),
             _idle_state_summary(self._idle_workers, now=now),
+            tuple(sorted(self._idle_worker_hot_prewarmed_groups)),
         )
-        return AvailableTrainingResources(
-            False,
-            "incomplete_training_group" if incomplete_seen else "no_idle_worker",
-        )
+        return AvailableTrainingResources(False, reason)
 
     def prepare_training_plan(
         self,
@@ -1365,7 +1530,10 @@ class DrafterScheduler:
         base_usable_window = max(
             resources.minimum_idle_window_sec
             - self._effective_idle_deadline_guard_sec(config)
-            - self._effective_idle_startup_reserve_sec(config)
+            - self._effective_idle_startup_reserve_sec(
+                config,
+                resources.worker_ids,
+            )
             - self._effective_idle_tail_reserve_sec(config),
             0.0,
         )
@@ -1402,7 +1570,10 @@ class DrafterScheduler:
             idle_usable_window_sec=usable_window,
             idle_window_batches=int(math.floor(usable_window / batch_estimate)),
             idle_batch_estimate_sec=batch_estimate,
-            idle_startup_reserve_sec=self._effective_idle_startup_reserve_sec(config),
+            idle_startup_reserve_sec=self._effective_idle_startup_reserve_sec(
+                config,
+                resources.worker_ids,
+            ),
             idle_tail_reserve_sec=self._effective_idle_tail_reserve_sec(config),
             idle_reclaim_penalty_sec=reclaim_penalty_sec,
         )
@@ -1624,7 +1795,10 @@ class DrafterScheduler:
         budget = self.sync_budget_policy.make_budget(context, config)
         if resources is not None and budget.max_batches > 0:
             deadline_guard_sec = self._effective_idle_deadline_guard_sec(config)
-            startup_reserve_sec = self._effective_idle_startup_reserve_sec(config)
+            startup_reserve_sec = self._effective_idle_startup_reserve_sec(
+                config,
+                resources.worker_ids,
+            )
             tail_reserve_sec = self._effective_idle_tail_reserve_sec(config)
             reclaim_penalty_sec = self._effective_idle_reclaim_penalty_sec()
             batch_estimate = self._effective_idle_batch_estimate_sec(config)
@@ -1786,7 +1960,10 @@ class DrafterScheduler:
                     max(
                         resources.minimum_idle_window_sec
                         - self._effective_idle_deadline_guard_sec(config)
-                        - self._effective_idle_startup_reserve_sec(config)
+                        - self._effective_idle_startup_reserve_sec(
+                            config,
+                            resources.worker_ids,
+                        )
                         - self._effective_idle_tail_reserve_sec(config),
                         0.0,
                     )
@@ -1808,7 +1985,10 @@ class DrafterScheduler:
                             max(
                                 resources.minimum_idle_window_sec
                                 - self._effective_idle_deadline_guard_sec(config)
-                                - self._effective_idle_startup_reserve_sec(config)
+                                - self._effective_idle_startup_reserve_sec(
+                                    config,
+                                    resources.worker_ids,
+                                )
                                 - self._effective_idle_tail_reserve_sec(config),
                                 0.0,
                             )
@@ -1827,7 +2007,10 @@ class DrafterScheduler:
                 else None
             ),
             "idle_startup_reserve_sec": (
-                self._effective_idle_startup_reserve_sec(config)
+                self._effective_idle_startup_reserve_sec(
+                    config,
+                    resources.worker_ids,
+                )
                 if resources is not None
                 else None
             ),
@@ -1944,6 +2127,30 @@ class DrafterScheduler:
             self._record_replica_local_unavailable(plan, outcome)
             self._record_prebatch_reclaim_penalty(plan, outcome)
         if outcome.trained and outcome.successful_steps > 0:
+            if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+                group = _normalize_worker_id_group(plan.target_worker_ids)
+                if group:
+                    previous_group_successes = self._idle_worker_group_success_counts.get(
+                        group, 0
+                    )
+                    self._idle_worker_group_success_counts[group] = (
+                        previous_group_successes + 1
+                    )
+                    writer_group = self._current_idle_writer_group()
+                    if writer_group is None:
+                        self._idle_worker_writer_group = group
+                        writer_group = group
+                    is_writer = group == writer_group
+                    if is_writer:
+                        self._idle_worker_hot_prewarmed_groups.add(group)
+                    print(
+                        "[BubbleTime] idle_group_success_recorded: "
+                        f"group={group} successful_steps={outcome.successful_steps} "
+                        f"group_successes={self._idle_worker_group_success_counts[group]} "
+                        f"is_writer={is_writer} writer_group={writer_group} "
+                        f"hot_groups={tuple(sorted(self._idle_worker_hot_prewarmed_groups))}",
+                        flush=True,
+                    )
             try:
                 self._last_successful_training_step = _as_int(plan.source_global_step)
             except (TypeError, ValueError):

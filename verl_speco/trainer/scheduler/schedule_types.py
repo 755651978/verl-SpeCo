@@ -117,6 +117,7 @@ class DrafterScheduleConfig:
     idle_worker_require_runtime_idle_events: bool = False
     idle_worker_drain_before_next_rollout: bool = True
     idle_worker_fallback_to_sync: bool = False
+    idle_worker_full_collective_fallback: bool = False
     idle_worker_max_seconds_without_training: float | None = None
     # Retain a small amount of ready data, then stop creating newer target-head
     # versions until the buffer has been consumed by Bubble training.
@@ -195,6 +196,9 @@ class DrafterScheduleConfig:
                 idle_get("drain_before_next_rollout", True)
             ),
             idle_worker_fallback_to_sync=bool(idle_get("fallback_to_sync", False)),
+            idle_worker_full_collective_fallback=bool(
+                idle_get("full_collective_fallback", False)
+            ),
             idle_worker_max_seconds_without_training=_optional_float(
                 idle_get("max_seconds_without_training", None)
             ),
@@ -508,6 +512,7 @@ class TrainingPlan:
         "sync_fallback_no_trainable_batch": 21,
         "target_lm_head_not_ready": 22,
         "replica_local_unavailable": 23,
+        "idle_group_not_prewarmed": 24,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
