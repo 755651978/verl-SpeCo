@@ -182,6 +182,7 @@ def _emit_rollout_idle_worker_event(
     event_type: str,
     memory_released: bool = False,
     release_source: str = "",
+    idle_confidence: str = "speculative",
 ) -> bool:
     bus_name = _rollout_idle_event_bus_name(drafter_cfg)
     if not bus_name:
@@ -202,6 +203,7 @@ def _emit_rollout_idle_worker_event(
             "replica_rank": int(replica_rank),
             "memory_released": memory_released,
             "release_source": release_source,
+            "idle_confidence": idle_confidence,
             "must_be_ready_at": must_be_ready_at,
             "event_ts": event_ts,
         },

@@ -205,6 +205,13 @@ actor_rollout_ref:
             max_seconds_without_training: null
             event_bus_name: null
             event_poll_interval_sec: 0.05
+            # Runtime request completion is speculative until the replica
+            # manager closes assignment for the current generation epoch.
+            speculative_window_multiplier: 1.5
+            # Let asynchronous staging overlap later work, but bound how long
+            # rollout may keep serving an older drafter version.
+            max_publish_lag_steps: 2
+            max_pending_publish: 1
             # Explicit training_groups wins.  With group_mode=auto, the
             # scheduler forms stable collective groups from known rollout
             # workers and only trains when a full group is idle.

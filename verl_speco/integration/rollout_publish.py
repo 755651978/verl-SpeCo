@@ -883,6 +883,12 @@ class DraftWeightPublishMixin:
                 len(weights) if weights else 0,
             )
         await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        return {
+            "published": True,
+            "staged": False,
+            "published_version": global_steps,
+            "worker_rank": getattr(self, "rank", None),
+        }
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_draft_weights_async(
@@ -902,6 +908,68 @@ class DraftWeightPublishMixin:
                 len(weights) if weights else 0,
             )
         await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        return {
+            "published": True,
+            "staged": False,
+            "published_version": global_steps,
+            "worker_rank": getattr(self, "rank", None),
+        }
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
+    async def stage_draft_weights_async(
+        self, weights: dict, global_steps: int | None = None
+    ):
+        if not drafter_rollout_enabled(self.config):
+            return {"staged": False, "reason": "drafter_disabled"}
+        weights, _ = materialize_draft_weights_payload(weights)
+        # Two-phase Bubble publication: materialize the immutable snapshot in
+        # actor-rollout workers, but do not mutate the live inference engine.
+        # The trainer commits this staged payload only at a generation boundary.
+        self._speco_staged_draft_weights = weights
+        self._speco_staged_draft_version = global_steps
+        return {
+            "published": False,
+            "staged": True,
+            "staged_version": global_steps,
+            "worker_rank": getattr(self, "rank", None),
+        }
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
+    async def commit_staged_draft_weights(
+        self, global_steps: int | None = None
+    ):
+        if not drafter_rollout_enabled(self.config):
+            return {"published": False, "reason": "drafter_disabled"}
+        weights = getattr(self, "_speco_staged_draft_weights", None)
+        staged_version = getattr(self, "_speco_staged_draft_version", None)
+        if weights is None:
+            return {
+                "published": False,
+                "reason": "no_staged_weights",
+                "worker_rank": getattr(self, "rank", None),
+            }
+        if global_steps is not None and staged_version != global_steps:
+            return {
+                "published": False,
+                "reason": "staged_version_mismatch",
+                "staged_version": staged_version,
+                "requested_version": global_steps,
+                "worker_rank": getattr(self, "rank", None),
+            }
+
+        self._attach_update_draft_weights_to_rollout()
+        await self.rollout.update_draft_weights(
+            weights,
+            global_steps=staged_version,
+        )
+        self._speco_staged_draft_weights = None
+        self._speco_staged_draft_version = None
+        return {
+            "published": True,
+            "staged": True,
+            "published_version": staged_version,
+            "worker_rank": getattr(self, "rank", None),
+        }
 
     def _attach_update_draft_weights_to_rollout(self):
         backend = rollout_backend_name(getattr(self, "config", None))

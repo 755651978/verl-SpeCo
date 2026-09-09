@@ -12,6 +12,7 @@ import pytest
 from verl_speco.trainer.scheduler import (
     CallbackDrafterWorkerExecutor,
     DrafterExecutionStrategy,
+    IdleWindowConfidence,
     DrafterRuntimeState,
     DrafterRuntimeStatus,
     DrafterScheduleConfig,
@@ -136,6 +137,79 @@ def test_idle_worker_plan_requires_complete_training_group() -> None:
     assert plan.reason == "incomplete_training_group"
     assert plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
     assert plan.metrics()["bubble/skipped_incomplete_group"] == 1
+
+
+def test_speculative_idle_window_uses_stricter_admission_threshold() -> None:
+    now = time.time()
+    config = replace(
+        _idle_config(),
+        idle_worker_training_groups=(("0",),),
+        idle_worker_speculative_window_multiplier=1.5,
+    )
+    confirmed = DrafterScheduler()
+    confirmed.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="0",
+            replica_rank=0,
+            memory_released=True,
+            idle_confidence=IdleWindowConfidence.CONFIRMED,
+            must_be_ready_at=now + 1.3,
+            event_ts=now,
+        )
+    )
+    speculative = DrafterScheduler()
+    speculative.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="0",
+            replica_rank=0,
+            memory_released=True,
+            idle_confidence=IdleWindowConfidence.SPECULATIVE,
+            must_be_ready_at=now + 1.3,
+            event_ts=now,
+        )
+    )
+
+    assert confirmed.select_idle_training_resources(config, now=now).available
+    speculative_resources = speculative.select_idle_training_resources(
+        config, now=now
+    )
+    assert not speculative_resources.available
+    assert speculative_resources.reason == "window_too_small"
+
+
+def test_replica_local_plan_accumulates_to_full_collective_batch() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._metadata_full_collective_idle_groups = (("0", "1", "2", "3"),)
+    config = replace(_idle_config(), training_interval_steps=1)
+    context = DrafterScheduleContext(
+        global_step=10,
+        training_mode="online",
+        collected_samples_this_step=6,
+        oldlogprob_collection_requested=False,
+        data_status=replace(
+            _status("0", batches=6), trainable_valid_tokens=600
+        ),
+    )
+    resources = type(
+        "Resources",
+        (),
+        {
+            "training_group_id": "idle-group-0",
+            "worker_ids": ("0", "1"),
+            "minimum_idle_window_sec": 10.0,
+            "idle_confidence": IdleWindowConfidence.CONFIRMED,
+        },
+    )()
+
+    plan = scheduler.plan_training(context, config, resources=resources)
+
+    assert plan.launch
+    assert plan.gradient_accumulation_steps == 2
+    assert plan.max_batches == 3
+    assert plan.planned_optimizer_steps == 3
+    assert plan.planned_valid_tokens == 600
 
 
 def test_auto_idle_worker_groups_do_not_train_half_collective_group() -> None:
@@ -1951,3 +2025,20 @@ def test_trainer_can_skip_reclaim_drain_when_configured() -> None:
     assert metrics == {"bubble/reclaim_requested": 1}
     assert events == [("worker-0", "worker-1")]
     assert drain_calls == []
+
+
+def test_writer_failover_is_blocked_after_optimizer_state_exists() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1", "2", "3"))
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+    scheduler._idle_worker_writer_state_version = 10
+
+    scheduler._disable_replica_local_idle_group(("0", "1"), reason="replica_local_oom")
+    plan = scheduler.prepare_idle_worker_training_plan(
+        _context(), replace(_auto_idle_config(2), training_interval_steps=1)
+    )
+
+    assert scheduler.idle_writer_group() is None
+    assert scheduler._idle_worker_writer_migration_blocked
+    assert not plan.launch
+    assert plan.reason == "writer_state_migration_required"

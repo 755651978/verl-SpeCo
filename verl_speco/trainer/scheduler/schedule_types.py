@@ -53,6 +53,13 @@ class RolloutWorkerEventType(str, Enum):
     WORKER_READY = "worker_ready"
 
 
+class IdleWindowConfidence(str, Enum):
+    """How strongly the runtime can prove that a rollout replica is idle."""
+
+    CONFIRMED = "confirmed"
+    SPECULATIVE = "speculative"
+
+
 @dataclass(frozen=True)
 class RolloutWorkerEvent:
     """One rollout replica/owner event consumed by the idle-worker scheduler."""
@@ -62,6 +69,9 @@ class RolloutWorkerEvent:
     replica_rank: int
     memory_released: bool = False
     release_source: str = ""
+    # Legacy event producers are authoritative. Runtime adapters that only see
+    # an empty local request counter explicitly emit ``speculative``.
+    idle_confidence: IdleWindowConfidence = IdleWindowConfidence.CONFIRMED
     must_be_ready_at: float | None = None
     event_ts: float | None = None
 
@@ -75,6 +85,7 @@ class AvailableTrainingResources:
     training_group_id: str = ""
     worker_ids: tuple[str, ...] = ()
     minimum_idle_window_sec: float = 0.0
+    idle_confidence: IdleWindowConfidence = IdleWindowConfidence.CONFIRMED
 
 
 class DrafterCollectionSource(str, Enum):
@@ -125,6 +136,10 @@ class DrafterScheduleConfig:
     idle_worker_group_mode: str = "auto"
     idle_worker_group_size: int | None = None
     idle_worker_training_groups: tuple[tuple[str, ...], ...] = ()
+    idle_worker_speculative_window_multiplier: float = 1.5
+    idle_worker_max_publish_lag_steps: int = 2
+    idle_worker_max_pending_publish: int = 1
+    gradient_accumulation_steps: int = 1
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -210,6 +225,19 @@ class DrafterScheduleConfig:
             .lower(),
             idle_worker_group_size=_optional_int(idle_get("group_size", None)),
             idle_worker_training_groups=training_groups,
+            idle_worker_speculative_window_multiplier=max(
+                float(idle_get("speculative_window_multiplier", 1.5) or 1.5),
+                1.0,
+            ),
+            idle_worker_max_publish_lag_steps=max(
+                int(idle_get("max_publish_lag_steps", 2) or 0), 0
+            ),
+            idle_worker_max_pending_publish=max(
+                int(idle_get("max_pending_publish", 1) or 1), 1
+            ),
+            gradient_accumulation_steps=max(
+                int(get("gradient_accumulation_steps", 1) or 1), 1
+            ),
         )
 
 
@@ -269,6 +297,7 @@ class CollectionPlan:
         "sample_rate_zero": 6,
         "collection_enabled": 7,
         "buffer_target_reached": 8,
+        "writer_state_migration_required": 9,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -400,6 +429,7 @@ class TrainingDataStatus:
     worker_incarnation: str = ""
     worker_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
+    trainable_valid_tokens: int = 0
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
@@ -425,6 +455,7 @@ class TrainingDataStatus:
             buffer_version=_as_int(value.get("buffer_version", 0)),
             worker_incarnation=str(value.get("worker_incarnation", "")),
             worker_id=str(value.get("worker_id", value.get("rank", ""))),
+            trainable_valid_tokens=_as_int(value.get("trainable_valid_tokens", 0)),
         )
 
     def metrics(self) -> dict[str, int | float]:
@@ -433,6 +464,7 @@ class TrainingDataStatus:
             "drafter/data_buffer_samples": self.buffer_samples,
             "drafter/data_trainable_samples": self.trainable_samples,
             "drafter/data_trainable_batches": self.trainable_batches,
+            "drafter/data_trainable_valid_tokens": self.trainable_valid_tokens,
             "drafter/data_partial_batch_available": int(self.partial_batch_available),
             "drafter/data_same_step_required": int(self.same_step_data_required),
             "drafter/data_target_version_consistent": int(
@@ -487,6 +519,10 @@ class TrainingPlan:
     idle_tail_reserve_sec: float | None = None
     idle_reclaim_penalty_sec: float | None = None
     idle_trainable_batches: int | None = None
+    idle_confidence: IdleWindowConfidence = IdleWindowConfidence.SPECULATIVE
+    gradient_accumulation_steps: int = 1
+    planned_optimizer_steps: int = 0
+    planned_valid_tokens: int = 0
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
@@ -513,6 +549,7 @@ class TrainingPlan:
         "target_lm_head_not_ready": 22,
         "replica_local_unavailable": 23,
         "idle_group_not_prewarmed": 24,
+        "writer_state_migration_required": 25,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -537,6 +574,10 @@ class TrainingPlan:
             "idle_batch_estimate_sec": self.idle_batch_estimate_sec,
             "idle_tail_reserve_sec": self.idle_tail_reserve_sec,
             "idle_reclaim_penalty_sec": self.idle_reclaim_penalty_sec,
+            "idle_confidence": self.idle_confidence.value,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "planned_optimizer_steps": self.planned_optimizer_steps,
+            "planned_valid_tokens": self.planned_valid_tokens,
         }
 
     def metrics(self) -> dict[str, int]:
@@ -625,6 +666,7 @@ class TrainingResult:
     data_version: int | None = None
     target_version: int | None = None
     is_publish_leader: bool = False
+    successful_valid_tokens: int = 0
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingResult":
@@ -648,4 +690,7 @@ class TrainingResult:
             data_version=_optional_int(value.get("data_version")),
             target_version=_optional_int(value.get("target_version")),
             is_publish_leader=bool(value.get("is_publish_leader", False)),
+            successful_valid_tokens=_as_int(
+                value.get("successful_valid_tokens", 0)
+            ),
         )

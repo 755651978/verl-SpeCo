@@ -37,6 +37,7 @@ from verl_speco.trainer.scheduler.schedule_types import (
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterExecutionStrategy,
+    IdleWindowConfidence,
     DrafterScheduleConfig,
     DrafterScheduleContext,
     RolloutWorkerEvent,
@@ -99,6 +100,7 @@ class _IdleWorkerState:
     memory_released: bool = False
     must_be_ready_at: float | None = None
     event_ts: float = 0.0
+    idle_confidence: IdleWindowConfidence = IdleWindowConfidence.SPECULATIVE
 
 
 def _rollout_worker_event_type(value: object) -> RolloutWorkerEventType:
@@ -109,6 +111,16 @@ def _rollout_worker_event_type(value: object) -> RolloutWorkerEventType:
         return RolloutWorkerEventType(text)
     except ValueError:
         return RolloutWorkerEventType[text.upper()]
+
+
+def _idle_window_confidence(value: object) -> IdleWindowConfidence:
+    if isinstance(value, IdleWindowConfidence):
+        return value
+    text = str(value or IdleWindowConfidence.SPECULATIVE.value).strip().lower()
+    try:
+        return IdleWindowConfidence(text)
+    except ValueError:
+        return IdleWindowConfidence.SPECULATIVE
 
 
 def _natural_worker_sort_key(worker_id: object) -> tuple[str, int, str]:
@@ -168,6 +180,7 @@ def _idle_state_summary(
                 "replica_rank": state.replica_rank,
                 "status": state.status,
                 "memory_released": state.memory_released,
+                "idle_confidence": state.idle_confidence.value,
                 "window_s": None if window is None else round(window, 3),
                 "event_age_s": round(max(now - float(state.event_ts), 0.0), 3),
             }
@@ -240,6 +253,8 @@ class DrafterScheduler:
         self._idle_worker_tail_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_hot_prewarmed_groups: set[tuple[str, ...]] = set()
         self._idle_worker_writer_group: tuple[str, ...] | None = None
+        self._idle_worker_writer_state_version: int | None = None
+        self._idle_worker_writer_migration_blocked: bool = False
         self._idle_worker_group_success_counts: dict[tuple[str, ...], int] = {}
         self._replica_idle_started_at: dict[int, float] = {}
         self._replica_idle_window_samples_sec: deque[float] = deque(maxlen=32)
@@ -381,6 +396,8 @@ class DrafterScheduler:
     def _current_idle_writer_group(self) -> tuple[str, ...] | None:
         """Return the only replica-local group allowed to mutate drafter state."""
 
+        if self._idle_worker_writer_migration_blocked:
+            return None
         writer_group = _normalize_worker_id_group(self._idle_worker_writer_group)
         if (
             writer_group
@@ -402,6 +419,16 @@ class DrafterScheduler:
                 self._idle_worker_writer_group = normalized
                 return normalized
         return None
+
+    def idle_writer_group(self) -> tuple[str, ...] | None:
+        """Return the current Bubble writer group without exposing mutable state."""
+
+        return self._current_idle_writer_group()
+
+    def idle_writer_migration_blocked(self) -> bool:
+        """Whether the current writer owns state that cannot be failed over."""
+
+        return self._idle_worker_writer_migration_blocked
 
     def target_lm_head_sync_worker_ids(
         self,
@@ -517,8 +544,15 @@ class DrafterScheduler:
         self._disabled_replica_local_idle_groups.add(group)
         self._idle_worker_hot_prewarmed_groups.discard(group)
         if self._idle_worker_writer_group == group:
-            self._idle_worker_writer_group = None
-        self._idle_worker_group_success_counts.pop(group, None)
+            if self._idle_worker_writer_state_version is None:
+                # No optimizer update has happened yet, so another initialized
+                # group still has an equivalent training state.
+                self._idle_worker_writer_group = None
+            else:
+                # The group owns model, optimizer, scheduler and RNG state.
+                # Never fail over to a stale group without state transfer.
+                self._idle_worker_writer_migration_blocked = True
+                reason = "writer_state_migration_required"
         self._replica_local_idle_unavailable_reason = reason
         self._metadata_idle_training_groups = tuple(
             existing
@@ -527,19 +561,24 @@ class DrafterScheduler:
         )
         logger.error(
             "[BubbleTime] replica_local_group_disabled: group=%s reason=%s "
-            "disabled_groups=%s remaining_groups=%s first_seen=%s",
+            "disabled_groups=%s remaining_groups=%s first_seen=%s "
+            "writer_state_version=%s migration_blocked=%s",
             group,
             reason,
             tuple(sorted(self._disabled_replica_local_idle_groups)),
             self._metadata_idle_training_groups,
             first_seen,
+            self._idle_worker_writer_state_version,
+            self._idle_worker_writer_migration_blocked,
         )
         print(
             "[BubbleTime] replica_local_group_disabled: "
             f"group={group} reason={reason} "
             f"disabled_groups={tuple(sorted(self._disabled_replica_local_idle_groups))} "
             f"remaining_groups={self._metadata_idle_training_groups} "
-            f"writer_group={self._idle_worker_writer_group}",
+            f"writer_group={self._idle_worker_writer_group} "
+            f"writer_state_version={self._idle_worker_writer_state_version} "
+            f"migration_blocked={self._idle_worker_writer_migration_blocked}",
             flush=True,
         )
 
@@ -587,14 +626,35 @@ class DrafterScheduler:
     ) -> float:
         """Minimum window that can start and finish a useful idle batch."""
 
+        accumulation_steps = self._idle_gradient_accumulation_steps(
+            config, _normalize_worker_id_group(worker_ids)
+        )
+        optimizer_step_estimate_sec = (
+            self._effective_idle_batch_estimate_sec(config) * accumulation_steps
+        )
         return max(
             self._effective_idle_min_window_sec(config),
             self._effective_idle_deadline_guard_sec(config)
             + self._effective_idle_startup_reserve_sec(config, worker_ids)
             + self._effective_idle_tail_reserve_sec(config)
-            + self._effective_idle_batch_estimate_sec(config)
+            + optimizer_step_estimate_sec
             * max(int(min_batches), 1),
         )
+
+    def _idle_gradient_accumulation_steps(
+        self,
+        config: DrafterScheduleConfig,
+        worker_ids: tuple[str, ...],
+    ) -> int:
+        """Match the sync path's effective data-parallel batch in Bubble mode."""
+
+        group_size = max(len(_normalize_worker_id_group(worker_ids)), 1)
+        sync_size = max(
+            (len(group) for group in self._metadata_full_collective_idle_groups),
+            default=group_size,
+        )
+        replica_ratio = max(int(math.ceil(sync_size / group_size)), 1)
+        return max(int(config.gradient_accumulation_steps), 1) * replica_ratio
 
     def bind_worker_executor(self, worker_executor: DrafterWorkerExecutor) -> None:
         """Bind the worker execution port used by all execution strategies."""
@@ -666,6 +726,9 @@ class DrafterScheduler:
                 replica_rank=_as_int(event.get("replica_rank", 0)),
                 memory_released=bool(event.get("memory_released", False)),
                 release_source=str(event.get("release_source", "") or ""),
+                idle_confidence=_idle_window_confidence(
+                    event.get("idle_confidence", IdleWindowConfidence.CONFIRMED.value)
+                ),
                 must_be_ready_at=(
                     None
                     if event.get("must_be_ready_at") is None
@@ -684,6 +747,7 @@ class DrafterScheduler:
                 replica_rank=event.replica_rank,
                 memory_released=event.memory_released,
                 release_source=event.release_source,
+                idle_confidence=_idle_window_confidence(event.idle_confidence),
                 must_be_ready_at=event.must_be_ready_at,
                 event_ts=event.event_ts,
             )
@@ -927,12 +991,14 @@ class DrafterScheduler:
             state.status = "idle"
             state.memory_released = event.memory_released
             state.must_be_ready_at = event.must_be_ready_at
+            state.idle_confidence = _idle_window_confidence(event.idle_confidence)
         elif event.event_type is RolloutWorkerEventType.WORKER_RECLAIM_REQUESTED:
             state.status = "reclaiming"
         elif event.event_type is RolloutWorkerEventType.WORKER_READY:
             state.status = "ready"
             state.memory_released = False
             state.must_be_ready_at = None
+            state.idle_confidence = IdleWindowConfidence.SPECULATIVE
 
     def register_idle_training_resource_metadata(
         self,
@@ -1067,6 +1133,8 @@ class DrafterScheduler:
         of accidentally training only the idle subset.
         """
 
+        if self._idle_worker_writer_migration_blocked:
+            return ()
         if config.idle_worker_training_groups:
             return tuple(
                 group
@@ -1202,6 +1270,15 @@ class DrafterScheduler:
                 for worker_id in group
             )
             historical_window = self._effective_historical_idle_window_sec()
+            group_confidence = (
+                IdleWindowConfidence.CONFIRMED
+                if all(
+                    idle_states[worker_id].idle_confidence
+                    is IdleWindowConfidence.CONFIRMED
+                    for worker_id in group
+                )
+                else IdleWindowConfidence.SPECULATIVE
+            )
             has_runtime_deadline = bool(windows)
             source = "runtime_deadline" if has_runtime_deadline else "bootstrap_minimum"
             minimum_window = min(windows, default=math.inf)
@@ -1224,6 +1301,8 @@ class DrafterScheduler:
                 config,
                 worker_ids=group,
             )
+            if group_confidence is IdleWindowConfidence.SPECULATIVE:
+                min_idle_window_sec *= config.idle_worker_speculative_window_multiplier
             if minimum_window < min_idle_window_sec:
                 logger.warning(
                     "[BubbleTime] idle_resource_skip reason=window_too_small "
@@ -1256,6 +1335,7 @@ class DrafterScheduler:
                     f"historical_remaining_s={historical_remaining} "
                     f"deadline_windows_s={tuple(round(value, 3) for value in windows)} "
                     f"source={source} event_age_s={event_ages} "
+                    f"confidence={group_confidence.value} "
                     "startup_reserve_s="
                     f"{self._effective_idle_startup_reserve_sec(config, group):.3f} "
                     "tail_reserve_s="
@@ -1276,6 +1356,7 @@ class DrafterScheduler:
                     training_group_id=f"idle-group-{index}",
                     worker_ids=group,
                     minimum_idle_window_sec=minimum_window,
+                    idle_confidence=group_confidence,
                 )
             logger.info(
                 "[BubbleTime] idle_resource_ready group_id=idle-group-%s group=%s "
@@ -1297,6 +1378,7 @@ class DrafterScheduler:
                 training_group_id=f"idle-group-{index}",
                 worker_ids=group,
                 minimum_idle_window_sec=minimum_window,
+                idle_confidence=group_confidence,
             )
         reason = (
             "incomplete_training_group"
@@ -1363,7 +1445,15 @@ class DrafterScheduler:
         self._decay_idle_reclaim_penalty(context.global_step)
         resources = self.select_idle_training_resources(config)
         if not resources.available:
+            if self._idle_worker_writer_migration_blocked:
+                resources = AvailableTrainingResources(
+                    available=False,
+                    reason="writer_state_migration_required",
+                )
+                allow_sync_fallback = False
             if (
+                not self._idle_worker_writer_migration_blocked
+                and
                 self._disabled_replica_local_idle_groups
                 and not self._metadata_idle_training_groups
             ):
@@ -1541,7 +1631,13 @@ class DrafterScheduler:
             base_usable_window - reclaim_penalty_sec,
             0.0,
         )
-        batch_estimate = self._effective_idle_batch_estimate_sec(config)
+        gradient_accumulation_steps = self._idle_gradient_accumulation_steps(
+            config, resources.worker_ids
+        )
+        batch_estimate = (
+            self._effective_idle_batch_estimate_sec(config)
+            * gradient_accumulation_steps
+        )
         return TrainingPlan(
             launch=False,
             reason=resources.reason,
@@ -1576,6 +1672,10 @@ class DrafterScheduler:
             ),
             idle_tail_reserve_sec=self._effective_idle_tail_reserve_sec(config),
             idle_reclaim_penalty_sec=reclaim_penalty_sec,
+            idle_confidence=getattr(
+                resources, "idle_confidence", IdleWindowConfidence.CONFIRMED
+            ),
+            gradient_accumulation_steps=gradient_accumulation_steps,
         )
 
     def prepare_training_execution(self, plan: TrainingPlan) -> dict[str, Any]:
@@ -1793,7 +1893,18 @@ class DrafterScheduler:
             interval_matched=interval_matched if require_interval else True,
         )
         budget = self.sync_budget_policy.make_budget(context, config)
+        gradient_accumulation_steps = 1
+        planned_optimizer_steps = budget.max_batches
+        planned_valid_tokens = (
+            context.data_status.trainable_valid_tokens
+            if context.data_status is not None
+            else 0
+        )
         if resources is not None and budget.max_batches > 0:
+            sync_budget_batches = budget.max_batches
+            gradient_accumulation_steps = self._idle_gradient_accumulation_steps(
+                config, resources.worker_ids
+            )
             deadline_guard_sec = self._effective_idle_deadline_guard_sec(config)
             startup_reserve_sec = self._effective_idle_startup_reserve_sec(
                 config,
@@ -1801,7 +1912,10 @@ class DrafterScheduler:
             )
             tail_reserve_sec = self._effective_idle_tail_reserve_sec(config)
             reclaim_penalty_sec = self._effective_idle_reclaim_penalty_sec()
-            batch_estimate = self._effective_idle_batch_estimate_sec(config)
+            micro_batch_estimate = self._effective_idle_batch_estimate_sec(config)
+            optimizer_step_estimate = (
+                micro_batch_estimate * gradient_accumulation_steps
+            )
             train_batch_cap = (
                 1
                 if self._idle_batch_estimate_is_bootstrap(config)
@@ -1828,10 +1942,13 @@ class DrafterScheduler:
                 - tail_reserve_sec,
                 0.0,
             )
-            window_batches = int(math.floor(usable_window / batch_estimate))
-            trainable_batches = (
+            window_batches = int(
+                math.floor(usable_window / optimizer_step_estimate)
+            )
+            trainable_micro_batches = (
                 context.data_status.trainable_batches if context.data_status else 0
             )
+            trainable_batches = trainable_micro_batches // gradient_accumulation_steps
             # ``window_batches`` is an admission signal, not the hard training
             # length.  Once an idle worker group is launched, the worker checks
             # deadline/reclaim before every batch and keeps training while the
@@ -1841,7 +1958,7 @@ class DrafterScheduler:
                 min(
                     trainable_batches,
                     train_batch_cap,
-                    budget.max_batches,
+                    sync_budget_batches,
                 )
                 if window_batches > 0
                 else 0
@@ -1864,12 +1981,24 @@ class DrafterScheduler:
                 sample_last_n_steps=budget.sample_last_n_steps,
                 reason=idle_budget_reason,
             )
+            planned_optimizer_steps = max_batches
+            if context.data_status is not None and trainable_micro_batches > 0:
+                planned_valid_tokens = int(
+                    context.data_status.trainable_valid_tokens
+                    * min(
+                        max_batches * gradient_accumulation_steps,
+                        trainable_micro_batches,
+                    )
+                    / trainable_micro_batches
+                )
             logger.info(
                 "[BubbleTime] idle_budget step=%s group=%s workers=%s "
                 "minimum_window_s=%.3f base_usable_window_s=%.3f "
                 "usable_window_s=%.3f reclaim_penalty_s=%.3f guard_s=%.3f "
                 "startup_reserve_s=%.3f tail_reserve_s=%.3f worker_deadline_window_s=%.3f "
-                "batch_estimate_s=%.3f admission_window_batches=%s trainable_batches=%s "
+                "micro_batch_estimate_s=%.3f optimizer_step_estimate_s=%.3f "
+                "admission_window_batches=%s trainable_batches=%s "
+                "trainable_micro_batches=%s gradient_accumulation_steps=%s "
                 "train_batch_cap=%s sync_budget_batches=%s "
                 "planned_batches=%s window_mode=%s reason=%s estimate_source=%s "
                 "prebatch_reclaim_streak=%s",
@@ -1884,11 +2013,14 @@ class DrafterScheduler:
                 startup_reserve_sec,
                 tail_reserve_sec,
                 worker_deadline_window,
-                batch_estimate,
+                micro_batch_estimate,
+                optimizer_step_estimate,
                 window_batches,
-                context.data_status.trainable_batches if context.data_status else 0,
+                trainable_batches,
+                trainable_micro_batches,
+                gradient_accumulation_steps,
                 train_batch_cap,
-                self.sync_budget_policy.make_budget(context, config).max_batches,
+                sync_budget_batches,
                 max_batches,
                 "admission",
                 budget.reason,
@@ -1915,14 +2047,39 @@ class DrafterScheduler:
                 f"startup_reserve_s={startup_reserve_sec:.3f} "
                 f"tail_reserve_s={tail_reserve_sec:.3f} "
                 f"worker_deadline_window_s={worker_deadline_window:.3f} "
-                f"batch_estimate_s={batch_estimate:.3f} "
+                f"micro_batch_estimate_s={micro_batch_estimate:.3f} "
+                f"optimizer_step_estimate_s={optimizer_step_estimate:.3f} "
                 f"admission_window_batches={window_batches} "
-                "trainable_batches="
-                f"{context.data_status.trainable_batches if context.data_status else 0} "
+                f"trainable_batches={trainable_batches} "
+                f"trainable_micro_batches={trainable_micro_batches} "
+                f"gradient_accumulation_steps={gradient_accumulation_steps} "
+                f"trainable_valid_tokens={context.data_status.trainable_valid_tokens if context.data_status else 0} "
+                f"planned_valid_tokens={planned_valid_tokens} "
                 f"planned_batches={max_batches} window_mode=admission "
                 f"reason={budget.reason} "
                 "prebatch_reclaim_streak="
                 f"{self._idle_worker_prebatch_reclaim_streak}",
+                flush=True,
+            )
+            limiting_factor = (
+                "window"
+                if window_batches <= 0
+                else (
+                    "data"
+                    if trainable_batches <= min(train_batch_cap, sync_budget_batches)
+                    else "config"
+                )
+            )
+            print(
+                "[BubbleTime] idle_budget_limits: "
+                f"step={context.global_step} group={resources.training_group_id} "
+                f"window_optimizer_steps={window_batches} "
+                f"data_optimizer_steps={trainable_batches} "
+                "config_optimizer_steps="
+                f"{min(train_batch_cap, sync_budget_batches)} "
+                f"planned_optimizer_steps={planned_optimizer_steps} "
+                f"planned_valid_tokens={planned_valid_tokens} "
+                f"limiting_factor={limiting_factor}",
                 flush=True,
             )
         common: Any = {
@@ -2003,6 +2160,7 @@ class DrafterScheduler:
             ),
             "idle_batch_estimate_sec": (
                 self._effective_idle_batch_estimate_sec(config)
+                * max(gradient_accumulation_steps, 1)
                 if resources is not None
                 else None
             ),
@@ -2020,10 +2178,21 @@ class DrafterScheduler:
                 else None
             ),
             "idle_trainable_batches": (
-                context.data_status.trainable_batches
+                (
+                    context.data_status.trainable_batches
+                    // max(gradient_accumulation_steps, 1)
+                )
                 if resources is not None and context.data_status is not None
                 else None
             ),
+            "idle_confidence": (
+                getattr(resources, "idle_confidence", IdleWindowConfidence.CONFIRMED)
+                if resources is not None
+                else IdleWindowConfidence.CONFIRMED
+            ),
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "planned_optimizer_steps": planned_optimizer_steps,
+            "planned_valid_tokens": planned_valid_tokens,
         }
         if not trigger.should_train:
             return TrainingPlan(
@@ -2143,6 +2312,9 @@ class DrafterScheduler:
                     is_writer = group == writer_group
                     if is_writer:
                         self._idle_worker_hot_prewarmed_groups.add(group)
+                        self._idle_worker_writer_state_version = _as_int(
+                            plan.source_global_step
+                        )
                     print(
                         "[BubbleTime] idle_group_success_recorded: "
                         f"group={group} successful_steps={outcome.successful_steps} "
@@ -2175,29 +2347,36 @@ class DrafterScheduler:
                 for result in outcome.worker_results
                 if result.successful_steps > 0
             ]
-            batch_sec = max(
+            optimizer_step_sec = max(
                 worker_batch_estimates,
                 default=0.0,
             )
+            micro_batch_sec = optimizer_step_sec / max(
+                int(plan.gradient_accumulation_steps), 1
+            )
             if (
-                batch_sec > 0
+                micro_batch_sec > 0
                 and plan.execution_strategy
                 is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
             ):
-                self._idle_worker_batch_samples_sec.append(batch_sec)
+                self._idle_worker_batch_samples_sec.append(micro_batch_sec)
                 if self._idle_worker_batch_estimate_sec is None:
-                    self._idle_worker_batch_estimate_sec = batch_sec
+                    self._idle_worker_batch_estimate_sec = micro_batch_sec
                 else:
                     self._idle_worker_batch_estimate_sec = (
-                        self._idle_worker_batch_estimate_sec * 0.8 + batch_sec * 0.2
+                        self._idle_worker_batch_estimate_sec * 0.8
+                        + micro_batch_sec * 0.2
                     )
                 logger.info(
                     "[BubbleTime] updated idle batch estimate: step=%s "
-                    "observed_batch_s=%.3f estimated_batch_s=%.3f "
+                    "observed_micro_batch_s=%.3f estimated_micro_batch_s=%.3f "
+                    "gradient_accumulation_steps=%s optimizer_step_s=%.3f "
                     "successful_steps=%s elapsed_s=%.3f",
                     plan.source_global_step,
-                    batch_sec,
+                    micro_batch_sec,
                     self._idle_worker_batch_estimate_sec,
+                    plan.gradient_accumulation_steps,
+                    optimizer_step_sec,
                     outcome.successful_steps,
                     outcome.elapsed_sec,
                 )

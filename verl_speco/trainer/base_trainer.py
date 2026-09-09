@@ -22,7 +22,7 @@ import fnmatch
 import shutil
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Any, cast
+from typing import Optional, Any, Callable, cast
 from omegaconf import open_dict
 from contextlib import contextmanager, nullcontext
 
@@ -280,6 +280,15 @@ def _batch_item_float(value: Any, index: int = 0) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _batch_item_value(value: Any, index: int = 0) -> Any:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        index = min(max(int(index), 0), len(value) - 1)
+        return value[index]
+    return value
 
 
 def _tensor_sum_int(tensor: torch.Tensor) -> int:
@@ -577,6 +586,10 @@ class DrafterBaseTrainer:
         self._training_timing_steps = 0
         self._training_metric_sums: dict[str, float] = {}
         self._training_metric_steps = 0
+        self._current_accumulation_valid_tokens = 0
+        self._current_accumulation_vloss_sum = 0.0
+        self._current_accumulation_ploss_sum = 0.0
+        self._last_optimizer_valid_tokens = 0
         self._frozen_param_names = {"model.embed_tokens.weight"}
 
         # Ulysses Sequence Parallelism configuration. EAGLE3 can slice
@@ -2658,7 +2671,7 @@ class DrafterBaseTrainer:
         batch: dict,
         hidden_states: torch.Tensor,
         target_logprobs: torch.Tensor | None = None,
-    ) -> None:
+    ) -> bool:
         """Collect online data from inference for drafter training.
 
         This method stores hidden states in the cross-step DataBuffer only when
@@ -2667,7 +2680,7 @@ class DrafterBaseTrainer:
         input_ids = batch.get("input_ids")
         if input_ids is None:
             logger.debug(f"[Rank {self.rank}] Non-batched data in input_ids")
-            return
+            return False
 
         # 1、异步拷贝，GPU在后台进行数据搬运，避免阻塞Rollout Stream
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
@@ -2790,13 +2803,14 @@ class DrafterBaseTrainer:
         input_seq_length = cpu_input_ids.size(1)
         hidden_seq_length = cpu_h_states.size(1)
         if min(input_seq_length, hidden_seq_length) <= 0:
-            return
+            return False
 
         model_config = getattr(self, "model_config", None)
         pad_id = int(
             getattr(model_config, "pad_token_id", self.pad_token_id)
             or self.pad_token_id
         )
+        accepted_any = False
         for i in range(batch_size):
             expected_hidden_rows = max(input_seq_length - 1, 0)
             raw_positions_item_for_alignment = None
@@ -3228,6 +3242,14 @@ class DrafterBaseTrainer:
                 "hidden_last_hidden_filter": batch.get("hidden_last_hidden_filter"),
                 "hidden_last_hidden_select": batch.get("hidden_last_hidden_select"),
                 "global_step": _batch_item_int(batch.get("global_step"), i),
+                "source_replica_rank": _batch_item_int(
+                    batch.get("source_replica_rank"), i
+                ),
+                "_speco_global_sample_id": (
+                    _batch_item_value(batch.get("_speco_global_sample_id"), i)
+                    if batch.get("_speco_global_sample_id") is not None
+                    else None
+                ),
             }
 
             if alignment_debug_enabled():
@@ -3379,13 +3401,17 @@ class DrafterBaseTrainer:
             data_item["step"] = int(self.current_rl_step)
             data_item["target_version"] = int(self.current_rl_step)
             if self.use_data_buffer:
-                self.data_buffer.add_batch(data_item)
+                added = self.data_buffer.add_batch(data_item)
 
             # 同步 collect_data (当前步训练直接使用)
             else:
                 data_item["step"] = self.current_rl_step
                 self.collected_data.append(data_item)
-            self._mark_buffer_changed()
+                added = True
+            accepted_any = True
+            if added:
+                self._mark_buffer_changed()
+        return accepted_any
 
     def _get_hidden_state_clip_value(self) -> Optional[float]:
         clip_value = self.config.rollout.drafter.training.get(
@@ -3631,6 +3657,8 @@ class DrafterBaseTrainer:
                 for item in available_data
                 if item.get("_drafter_reserved_by")
                 == self._active_training_reservation_id
+                and id(item)
+                not in getattr(self, "_active_accumulation_item_ids", set())
             ]
             if not available_data:
                 return None
@@ -4563,6 +4591,15 @@ class DrafterBaseTrainer:
             )
         return consumed
 
+    def _consume_training_items(self, items: list[dict[str, Any]]) -> int:
+        plan_id = self._active_training_reservation_id
+        if plan_id is None or not items:
+            return 0
+        consumed = self.data_buffer.consume(plan_id, items)
+        if consumed:
+            self._mark_buffer_changed()
+        return consumed
+
     def get_training_data_status(
         self,
         *,
@@ -4623,6 +4660,17 @@ class DrafterBaseTrainer:
             for item in trainable_data
             if item is not None
         ]
+        trainable_valid_tokens = 0
+        for item in trainable_data:
+            loss_tokens = item.get("loss_tokens")
+            if loss_tokens is not None:
+                trainable_valid_tokens += max(int(loss_tokens), 0)
+                continue
+            loss_mask = item.get("loss_mask")
+            if torch.is_tensor(loss_mask):
+                trainable_valid_tokens += max(
+                    int(loss_mask.detach().float().sum().item()), 0
+                )
         return {
             "current_step": current_step,
             "current_step_samples": len(current_step_data),
@@ -4637,6 +4685,7 @@ class DrafterBaseTrainer:
             "target_version": selected_target_version,
             "buffer_version": self.buffer_version,
             "data_version": max(sample_steps) if sample_steps else None,
+            "trainable_valid_tokens": trainable_valid_tokens,
         }
 
     def _mark_buffer_changed(self) -> None:
@@ -4725,6 +4774,64 @@ class DrafterBaseTrainer:
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
+
+    async def training_accumulation_step(
+        self,
+        step: int,
+        accumulation_steps: int,
+        can_start_micro_batch: Callable[[int], bool] | None = None,
+    ) -> bool:
+        """Execute one Bubble optimizer step from reserved micro-batches."""
+
+        accumulation_steps = max(int(accumulation_steps), 1)
+        if accumulation_steps == 1:
+            return await self.training_step(step)
+        batches: list[dict[str, torch.Tensor]] = []
+        batch_items: list[list[dict[str, Any]]] = []
+        self._active_accumulation_item_ids: set[int] = set()
+        try:
+            for _ in range(accumulation_steps):
+                batch = self.prepare_training_batch()
+                if not self._sync_batch_readiness(batch is not None) or batch is None:
+                    self._last_prepared_training_items = []
+                    return False
+                batches.append(batch)
+                items = list(self._last_prepared_training_items)
+                batch_items.append(items)
+                self._active_accumulation_item_ids.update(id(item) for item in items)
+        finally:
+            self._active_accumulation_item_ids = set()
+
+        self.optimizer.zero_grad(set_to_none=True)
+        try:
+            with torch.enable_grad():
+                for micro_index, batch in enumerate(batches):
+                    if can_start_micro_batch is not None and not can_start_micro_batch(
+                        micro_index
+                    ):
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self._last_prepared_training_items = []
+                        return False
+                    if not await self._training_step_on_batch(
+                        batch,
+                        step,
+                        accumulation_steps=accumulation_steps,
+                        accumulation_index=micro_index,
+                    ):
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self._last_prepared_training_items = []
+                        return False
+        except Exception as e:  # noqa: BLE001
+            self.optimizer.zero_grad(set_to_none=True)
+            self._last_prepared_training_items = []
+            logger.exception(f"Accumulated training step {step} failed with error: {e}")
+            return False
+
+        self._consume_training_items(
+            [item for items in batch_items for item in items]
+        )
+        self._last_prepared_training_items = []
+        return True
 
     @contextmanager
     def _ulysses_group_context(self):
@@ -4818,10 +4925,21 @@ class DrafterBaseTrainer:
         return metrics[0], metrics[1], metrics[2], reduce_world_size
 
     async def _training_step_on_batch(
-        self, batch: dict[str, torch.Tensor], step: int
+        self,
+        batch: dict[str, torch.Tensor],
+        step: int,
+        *,
+        accumulation_steps: int = 1,
+        accumulation_index: int = 0,
     ) -> bool:
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
+        accumulation_steps = max(int(accumulation_steps), 1)
+        accumulation_index = max(int(accumulation_index), 0)
+        if accumulation_index == 0:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._current_accumulation_valid_tokens = 0
+            self._current_accumulation_vloss_sum = 0.0
+            self._current_accumulation_ploss_sum = 0.0
 
         # Forward pass.
         forward_ts = time.time()
@@ -4859,6 +4977,15 @@ class DrafterBaseTrainer:
                 f"Step {self.training_steps + 1}: no finite drafter target tokens, skipping optimizer step"
             )
             return False
+        self._current_accumulation_valid_tokens += int(
+            global_tokens.detach().float().item()
+        )
+        self._current_accumulation_vloss_sum += float(
+            global_vloss.detach().float().item()
+        )
+        self._current_accumulation_ploss_sum += float(
+            global_ploss.detach().float().item()
+        )
 
         denom = global_tokens.clamp(min=1.0)
         vloss = global_vloss / denom
@@ -4880,11 +5007,13 @@ class DrafterBaseTrainer:
         # outside the autograd graph, so each rank's backward carries only its own
         # contribution, and FSDP then averages gradients across the same
         # `reduce_world_size` ranks. Scaling by `reduce_world_size` cancels that
-        # mean, making the synchronized gradient the exact global token-mean
-        # gradient regardless of world size.
-        local_loss = (loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p) * (
-            float(reduce_world_size) / denom
-        )
+        # mean. Scaling by `reduce_world_size` cancels that mean. A single
+        # micro-batch divides here; accumulated loss-sum gradients divide once
+        # by the combined valid-token count immediately before optimizer.step.
+        local_loss_sum = loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p
+        local_loss = local_loss_sum * float(reduce_world_size)
+        if accumulation_steps == 1:
+            local_loss = local_loss / denom
         backward_ts = time.time()
         local_loss.backward()
         self.record_training_timing(
@@ -4892,7 +5021,17 @@ class DrafterBaseTrainer:
         )
 
         # 更新权重
+        if accumulation_index + 1 < accumulation_steps:
+            return True
+
         optimizer_ts = time.time()
+        if accumulation_steps > 1:
+            accumulation_denom = float(
+                max(self._current_accumulation_valid_tokens, 1)
+            )
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.div_(accumulation_denom)
         grad_norm = torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), max_norm=1.0
         )
@@ -4908,20 +5047,30 @@ class DrafterBaseTrainer:
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.optimizer_steps_total += 1
+        self._last_optimizer_valid_tokens = int(
+            self._current_accumulation_valid_tokens
+        )
         self.optimizer.zero_grad(set_to_none=True)
         self.record_training_timing(
             "timing_s/drafter_optimizer", time.time() - optimizer_ts
         )
 
         self.training_steps += 1
+        logged_denom = float(max(self._current_accumulation_valid_tokens, 1))
+        logged_vloss = self._current_accumulation_vloss_sum / logged_denom
+        logged_ploss = self._current_accumulation_ploss_sum / logged_denom
+        logged_loss = (
+            float(loss_dict["v_weight"]) * logged_vloss
+            + float(loss_dict["p_weight"]) * logged_ploss
+        )
         logger.warning(
             "[drafter loss] step=%s optimizer_step_total=%s lr=%.3e loss=%.4f vloss=%.4f ploss=%.4f",
             self.training_steps,
             self.optimizer_steps_total,
             current_lr,
-            float(loss.item()),
-            float(vloss.item()),
-            float(ploss.item()),
+            logged_loss,
+            logged_vloss,
+            logged_ploss,
         )
         return True
 

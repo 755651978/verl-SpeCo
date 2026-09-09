@@ -146,6 +146,10 @@ class TrainingOutcome:
                 plan.reason.startswith("sync_fallback") and trained
             ),
             "drafter/train_successful_steps_max": successful_steps,
+            "drafter/train_successful_valid_tokens_max": max(
+                (result.successful_valid_tokens for result in worker_results),
+                default=0,
+            ),
             "drafter/train_no_trainable_batch": int(
                 any(
                     result.get("reason") == "no_trainable_batch"

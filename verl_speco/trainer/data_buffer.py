@@ -29,8 +29,6 @@ import logging
 from collections import deque
 from typing import Any, Optional
 
-import torch
-
 logger = logging.getLogger(__name__)
 
 
@@ -50,9 +48,10 @@ class DataBuffer:
         self.max_size = max_size
         self.store_hidden_states = store_hidden_states
         self.buffer: deque[dict[str, Any]] = deque(maxlen=max_size)
+        self._global_sample_ids: set[object] = set()
         self._current_step: Optional[int] = 0
 
-    def add_batch(self, batch: dict[str, torch.Tensor]):
+    def add_batch(self, batch: dict[str, Any]) -> bool:
         """Add a batch of data to the buffer.
 
         Args:
@@ -62,14 +61,27 @@ class DataBuffer:
                 - prompts: Tensor of shape [batch_size, prompt_len]
                 - hiddens: Tensor of shape [batch_size, seq_len, hidden_dim]
         """
+        sample_id = batch.get("_speco_global_sample_id")
+        if sample_id is not None and sample_id in self._global_sample_ids:
+            return False
+        if self.max_size <= 0:
+            return False
+        if len(self.buffer) >= self.max_size:
+            evicted = self.buffer.popleft()
+            evicted_id = evicted.get("_speco_global_sample_id")
+            if evicted_id is not None:
+                self._global_sample_ids.discard(evicted_id)
         batch["step"] = self._current_step
         self.buffer.append(batch)
+        if sample_id is not None:
+            self._global_sample_ids.add(sample_id)
+        return True
 
     def update_rl_step(self, step: Optional[int] = None):
         """Increment the current RL step counter."""
         self._current_step = step
 
-    def get_all_data(self) -> list[dict[str, torch.Tensor]]:
+    def get_all_data(self) -> list[dict[str, Any]]:
         """Get all data from the buffer.
 
         Returns:
@@ -135,9 +147,14 @@ class DataBuffer:
             (sample for sample in self.buffer if id(sample) not in consumed_ids),
             maxlen=self.max_size,
         )
+        self._global_sample_ids = {
+            sample_id
+            for sample in self.buffer
+            if (sample_id := sample.get("_speco_global_sample_id")) is not None
+        }
         return before - len(self.buffer)
 
-    def get_data_from_last_n_steps(self, n: int) -> list[dict[str, torch.Tensor]]:
+    def get_data_from_last_n_steps(self, n: int) -> list[dict[str, Any]]:
         """Get data from the last n RL steps.
 
         Args:
@@ -163,6 +180,7 @@ class DataBuffer:
     def clear(self):
         """Clear all data from the buffer."""
         self.buffer.clear()
+        self._global_sample_ids.clear()
         self._current_step = 0
 
     def get_current_step(self) -> int:

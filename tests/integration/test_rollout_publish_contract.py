@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 from inspect import getsource
 from types import SimpleNamespace
 
@@ -70,6 +71,60 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert not rollout_publish.drafter_rollout_enabled(
         {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
     )
+
+
+def test_bubble_publish_stages_before_safe_point_commit() -> None:
+    class _Rollout:
+        def __init__(self):
+            self.updates = []
+
+        async def update_draft_weights(self, weights, *, global_steps=None):
+            self.updates.append((weights, global_steps))
+
+    class _Worker(rollout_publish.DraftWeightPublishMixin):
+        def _attach_update_draft_weights_to_rollout(self):
+            return None
+
+    worker = _Worker()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = _Rollout()
+
+    stage_ack = asyncio.run(
+        worker.stage_draft_weights_async({"weight": 1}, global_steps=4)
+    )
+
+    assert stage_ack["staged"] is True
+    assert stage_ack["published"] is False
+    assert worker.rollout.updates == []
+
+    commit_ack = asyncio.run(worker.commit_staged_draft_weights(global_steps=4))
+
+    assert commit_ack["published"] is True
+    assert worker.rollout.updates == [({"weight": 1}, 4)]
+
+
+def test_legacy_async_publish_still_updates_rollout_directly() -> None:
+    class _Rollout:
+        def __init__(self):
+            self.updates = []
+
+        async def update_draft_weights(self, weights, *, global_steps=None):
+            self.updates.append((weights, global_steps))
+
+    class _Worker(rollout_publish.DraftWeightPublishMixin):
+        def _attach_update_draft_weights_to_rollout(self):
+            return None
+
+    worker = _Worker()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = _Rollout()
+
+    ack = asyncio.run(
+        worker.update_draft_weights_async({"weight": 1}, global_steps=4)
+    )
+
+    assert ack["published"] is True
+    assert worker.rollout.updates == [({"weight": 1}, 4)]
 
 
 def test_veomni_backend_and_parallel_layout_support_worker_config_shape() -> None:

@@ -657,8 +657,9 @@ class SpecoWorker(Worker):
             raise RuntimeError(
                 "Online drafter training requires collected hidden states"
             )
-        self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
-        return True
+        return bool(
+            self.trainer.collect_online_data(batch, hidden_states, target_logprobs)
+        )
 
     def _drafter_training_mode(self) -> str:
         return (
@@ -1176,6 +1177,8 @@ class SpecoWorker(Worker):
                 "target_logprobs_position_start",
                 "target_logprobs_position_end",
                 "global_step",
+                "source_replica_rank",
+                "_speco_global_sample_id",
             ):
                 if key in sample:
                     batch[key] = sample[key]
@@ -1682,7 +1685,13 @@ class SpecoWorker(Worker):
                     if required_target_version is not None
                     else actual_data_version
                 ),
-                max_batches=int(training_plan.get("max_batches", 0)),
+                max_batches=(
+                    int(training_plan.get("max_batches", 0))
+                    * max(
+                        int(training_plan.get("gradient_accumulation_steps", 1)),
+                        1,
+                    )
+                ),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
             )
             if int(reservation.get("reserved_samples", 0)) <= 0:
@@ -1818,6 +1827,7 @@ class SpecoWorker(Worker):
             "triggered": False,
             "successful_steps": 0,
             "attempted_steps": 0,
+            "successful_valid_tokens": 0,
             "elapsed_sec": 0.0,
             "reason": "",
             "worker_id": str(self.rank),
@@ -1875,6 +1885,9 @@ class SpecoWorker(Worker):
         self._prepared_training_preflight_elapsed_sec = 0.0
         self._prepared_training_ready_ts = None
         max_batches = max(int(training_plan.get("max_batches", 0)), 0)
+        gradient_accumulation_steps = max(
+            int(training_plan.get("gradient_accumulation_steps", 1)), 1
+        )
         idle_batch_estimate_sec = max(
             float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
             0.0,
@@ -1896,6 +1909,10 @@ class SpecoWorker(Worker):
                 "activation_elapsed_sec": prepared_activation_elapsed_sec,
                 "preflight_elapsed_sec": prepared_preflight_elapsed_sec,
                 "first_batch_started": 0,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "planned_valid_tokens": int(
+                    training_plan.get("planned_valid_tokens", 0) or 0
+                ),
             }
         )
 
@@ -2060,15 +2077,52 @@ class SpecoWorker(Worker):
                         )
                     result["attempted_steps"] += 1
                     step_error: BaseException | None = None
+                    accumulation_stop_reason: str | None = None
+
+                    def can_start_micro_batch(micro_index: int) -> bool:
+                        nonlocal accumulation_stop_reason
+                        if self._drafter_reclaim_requested:
+                            accumulation_stop_reason = "reclaim_requested"
+                            return False
+                        if deadline_ts is None:
+                            return True
+                        remaining_micro_batches = max(
+                            gradient_accumulation_steps - int(micro_index), 1
+                        )
+                        micro_batch_estimate_sec = (
+                            idle_batch_estimate_sec
+                            / max(gradient_accumulation_steps, 1)
+                        )
+                        if (
+                            float(deadline_ts) - time.time()
+                            < micro_batch_estimate_sec * remaining_micro_batches
+                        ):
+                            accumulation_stop_reason = "deadline_reached"
+                            return False
+                        return True
+
                     try:
-                        step_ok = await self.trainer.training_step(self.last_global_step)
+                        step_ok = await self.trainer.training_accumulation_step(
+                            self.last_global_step,
+                            gradient_accumulation_steps,
+                            can_start_micro_batch=can_start_micro_batch,
+                        )
                     except Exception as error:  # noqa: BLE001
                         step_error = error
                         step_ok = False
                     if step_ok:
                         result["successful_steps"] += 1
+                        result["successful_valid_tokens"] += int(
+                            getattr(
+                                self.trainer, "_last_optimizer_valid_tokens", 0
+                            )
+                            or 0
+                        )
                     else:
-                        result["reason"] = "training_step_returned_false"
+                        result["reason"] = (
+                            accumulation_stop_reason
+                            or "training_step_returned_false"
+                        )
                         if (
                             execution_strategy == "rollout_idle_worker"
                             and self._use_replica_local_idle_training()
