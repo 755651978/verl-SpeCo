@@ -49,6 +49,11 @@ from verl_speco.integration.rollout_publish import DraftWeightPublishMixin
 
 
 _PHASE_ENV = "SPECO_CONNECT_SMOKE_PHASE"
+_EMPTY_ACTOR_PROFILER_ENV = "SPECO_CONNECT_SMOKE_EMPTY_ACTOR_PROFILER"
+_INSTALL_ROLLOUT_RUNTIME_ENV = "SPECO_CONNECT_SMOKE_INSTALL_ROLLOUT_RUNTIME"
+_INSTALL_OLDLOGPROB_RUNTIME_ENV = "SPECO_CONNECT_SMOKE_INSTALL_OLDLOGPROB_RUNTIME"
+_SET_DEVICE_BEFORE_HCCL_ENV = "SPECO_CONNECT_SMOKE_SET_DEVICE_BEFORE_HCCL"
+_PEER_WAIT_MODE_ENV = "SPECO_CONNECT_SMOKE_PEER_WAIT_MODE"
 _MARKER_ENV = "SPECO_CONNECT_SMOKE_MARKER"
 _BEFORE_INIT_MODEL = "before_init_model"
 _AFTER_ACTOR_MODEL = "after_actor_model"
@@ -95,6 +100,10 @@ def _before_init_model_probe(worker, *args, **kwargs):
 
     from verl.utils.device import get_device_name, get_torch_device
     from verl.utils.distributed import initialize_global_process_group_ray
+    from verl_speco.integration.rollout_publish import (
+        install_oldlogprob_hidden_runtime_for_worker,
+        install_rollout_runtime_for_worker,
+    )
     from verl_speco.integration.external_vllm_weight_sync import (
         initialize_worker_weight_sync,
     )
@@ -113,13 +122,37 @@ def _before_init_model_probe(worker, *args, **kwargs):
     )
     rank = int(getattr(worker, "rank", -1))
     device_module = get_torch_device()
+    if os.environ.get(_INSTALL_ROLLOUT_RUNTIME_ENV, "0") == "1":
+        logger.warning(
+            "[cotrain connect smoke] installing rollout runtime before "
+            "external HCCL rank=%s",
+            rank,
+        )
+        install_rollout_runtime_for_worker(worker)
+    if os.environ.get(_INSTALL_OLDLOGPROB_RUNTIME_ENV, "0") == "1":
+        logger.warning(
+            "[cotrain connect smoke] installing old-logprob runtime before "
+            "external HCCL rank=%s",
+            rank,
+        )
+        install_oldlogprob_hidden_runtime_for_worker(worker)
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    set_device_before_hccl = (
+        os.environ.get(_SET_DEVICE_BEFORE_HCCL_ENV, "1") == "1"
+    )
+    if set_device_before_hccl:
+        device_module.set_device(local_rank)
     logger.warning(
         "[cotrain connect smoke] before init_model enter rank=%s pid=%s "
-        "device=%s current_device=%s visible=%r dist_initialized=%s "
+        "device=%s set_device_before_hccl=%s local_rank=%s "
+        "current_device=%s visible=%r "
+        "dist_initialized=%s "
         "actor_exists=%s rollout_exists=%s",
         rank,
         os.getpid(),
         get_device_name(),
+        set_device_before_hccl,
+        local_rank,
         device_module.current_device(),
         os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
         __import__("torch").distributed.is_initialized(),
@@ -143,9 +176,47 @@ def _before_init_model_probe(worker, *args, **kwargs):
         getattr(worker, "actor", None) is not None,
         getattr(worker, "rollout", None) is not None,
     )
+    peer_wait_mode = os.environ.get(_PEER_WAIT_MODE_ENV, "marker").lower()
+    if peer_wait_mode not in {"marker", "gloo"}:
+        raise ValueError(
+            f"{_PEER_WAIT_MODE_ENV} must be 'marker' or 'gloo', "
+            f"got {peer_wait_mode!r}"
+        )
+    sync_config = _pre_model_weight_sync_config(worker)
+    logger.warning(
+        "[cotrain connect smoke] peer wait mode=%s rank=%s",
+        peer_wait_mode,
+        rank,
+    )
+    if peer_wait_mode == "gloo":
+        control_group = dist.new_group(backend="gloo")
+        caught = None
+        local_error = None
+        try:
+            initialize_worker_weight_sync(worker, sync_config)
+        except BaseException as exc:
+            caught = exc
+            local_error = f"rank={rank}: {type(exc).__name__}: {exc}"
+        errors = [None] * dist.get_world_size()
+        try:
+            dist.all_gather_object(errors, local_error, group=control_group)
+        finally:
+            dist.destroy_process_group(control_group)
+        if caught is not None:
+            raise caught
+        peer_errors = [error for error in errors if error is not None]
+        if peer_errors:
+            raise RuntimeError("; ".join(peer_errors))
+        if rank == 0:
+            marker.write_text("OK", encoding="utf-8")
+        logger.warning(
+            "[cotrain connect smoke] gloo peer wait completed rank=%s", rank
+        )
+        raise RuntimeError("EXPECTED_BEFORE_INIT_MODEL_CONNECT_PASS")
+
     if rank == 0:
         try:
-            initialize_worker_weight_sync(worker, _pre_model_weight_sync_config(worker))
+            initialize_worker_weight_sync(worker, sync_config)
         except BaseException as exc:
             marker.write_text(f"ERROR:{type(exc).__name__}:{exc}", encoding="utf-8")
             raise
@@ -292,6 +363,33 @@ def _after_actor_model_probe(worker, *args, **kwargs):
 class _BeforeInitModelDraftWeightPublishMixin(DraftWeightPublishMixin):
     """Diagnostic mixin serialized into the real ActorRolloutRef WorkerDict."""
 
+    def __init__(self, *args, **kwargs):
+        config = kwargs.get("config")
+        if config is None and args:
+            config = args[0]
+        empty_profiler = os.environ.get(_EMPTY_ACTOR_PROFILER_ENV, "1") == "1"
+        actor_config = _mapping_value(config, "actor")
+        profiler_config = _mapping_value(actor_config, "profiler")
+        if not empty_profiler or actor_config is None or profiler_config is None:
+            super().__init__(*args, **kwargs)
+            return
+
+        from omegaconf import OmegaConf, open_dict
+
+        saved_profiler = OmegaConf.to_container(profiler_config, resolve=False)
+        logger.warning(
+            "[cotrain connect smoke] temporarily disabling actor profiler "
+            "during Worker construction pid=%s",
+            os.getpid(),
+        )
+        with open_dict(actor_config):
+            actor_config.profiler = {}
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            with open_dict(actor_config):
+                actor_config.profiler = OmegaConf.create(saved_profiler)
+
     init_model = register(dispatch_mode=Dispatch.ONE_TO_ALL)(
         _before_init_model_probe
     )
@@ -426,6 +524,11 @@ def main(config) -> None:
     check_compatible_verl()
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
+
+    logger.warning(
+        "[cotrain connect smoke] temporary actor-profiler suppression=%s",
+        os.environ.get(_EMPTY_ACTOR_PROFILER_ENV, "1"),
+    )
 
     import ray
 

@@ -416,13 +416,19 @@ def initialize_worker_weight_sync(worker: Any, config: Mapping[str, Any]) -> Non
             "External vLLM sync requires a full HF weight iterator (FSDP/FSDP2/VeOmni)"
         )
     device_type = str(get_device_name()).lower()
-    if getattr(worker, "_speco_external_vllm_sender", None) is not None:
-        raise RuntimeError("External vLLM weight sync is already initialized")
+    if bool(getattr(worker, "_speco_external_vllm_sync_initialized", False)):
+        # The communicator is created before actor/model initialization.  The
+        # later producer initialization call supplies the final-norm names once
+        # its model-side metadata is available; it must not create a second
+        # NCCL/HCCL communicator.
+        worker._speco_final_norm_names = tuple(config.get("final_norm_names", ()))
+        return
     if worker.rank == 0:
         worker._speco_external_vllm_sender = ExternalVllmWeightSender(
             config, device_type=device_type
         )
     worker._speco_final_norm_names = tuple(config.get("final_norm_names", ()))
+    worker._speco_external_vllm_sync_initialized = True
 
 
 def update_worker_weights(worker: Any, global_step: int) -> dict[str, Any]:
@@ -479,5 +485,6 @@ def update_worker_weights(worker: Any, global_step: int) -> dict[str, Any]:
 def close_worker_weight_sync(worker: Any) -> None:
     sender = getattr(worker, "_speco_external_vllm_sender", None)
     worker._speco_external_vllm_sender = None
+    worker._speco_external_vllm_sync_initialized = False
     if sender is not None:
         sender.close()

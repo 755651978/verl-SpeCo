@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -214,6 +215,90 @@ def install_rollout_runtime_for_worker(worker: Any) -> None:
         install_vllm_runtime_for_worker(worker)
         return
     install_sglang_runtime_for_worker(worker)
+
+
+def _pre_model_external_vllm_sync_config(worker: Any) -> dict[str, Any] | None:
+    """Return enabled external-vLLM sync config before actor model creation."""
+    config = getattr(worker, "config", None)
+    drafter = _get_nested(config, ("rollout", "drafter"), None)
+    if drafter is None:
+        serialized = getattr(
+            type(worker), "_speco_sglang_drafter_config_env", ""
+        )
+        drafter = json.loads(serialized) if serialized else None
+    training = _get_nested(drafter, ("training",), None)
+    if not bool(_get_nested(training, ("collect_hidden_states_from_vllm",), False)):
+        return None
+    source = _get_nested(training, ("vllm_feature_source",), None)
+    hot_update = _get_nested(source, ("weight_hot_update",), None)
+    if not bool(_get_nested(hot_update, ("enabled",), False)):
+        return None
+    sync_config = dict(hot_update)
+    sync_config["endpoints"] = list(_get_nested(source, ("endpoints",), ()) or ())
+    if not sync_config["endpoints"]:
+        raise RuntimeError(
+            "External vLLM weight sync requires vllm_feature_source.endpoints"
+        )
+    return sync_config
+
+
+def _initialize_pre_model_external_vllm_weight_sync(
+    worker: Any, sync_config: dict[str, Any]
+) -> None:
+    """Create external HCCL/NCCL before model init and hold peer ranks."""
+    import torch.distributed as dist
+
+    from verl.utils.device import get_torch_device
+    from verl.utils.distributed import initialize_global_process_group_ray
+    from verl_speco.integration.external_vllm_weight_sync import (
+        initialize_worker_weight_sync,
+    )
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    get_torch_device().set_device(local_rank)
+    if not dist.is_initialized():
+        initialize_global_process_group_ray(timeout_second=None)
+
+    # Rank 0 blocks inside the external communicator handshake. Peer actor
+    # ranks must not enter super().init_model() and start model/FSDP HCCL work
+    # in parallel, so coordinate completion over a CPU-only group.
+    control_group = dist.new_group(backend="gloo")
+    rank = int(getattr(worker, "rank", dist.get_rank()))
+    logger.warning(
+        "[external vLLM pre-model sync] communicator init enter rank=%s "
+        "local_rank=%s sender_rank=%s",
+        rank,
+        local_rank,
+        rank == 0,
+    )
+    caught: BaseException | None = None
+    local_error: str | None = None
+    try:
+        initialize_worker_weight_sync(worker, sync_config)
+    except BaseException as exc:
+        caught = exc
+        local_error = f"rank={rank}: {type(exc).__name__}: {exc}"
+
+    errors: list[str | None] = [None] * dist.get_world_size()
+    try:
+        dist.all_gather_object(errors, local_error, group=control_group)
+    finally:
+        dist.destroy_process_group(control_group)
+
+    if caught is not None:
+        raise caught
+    peer_errors = [error for error in errors if error is not None]
+    if peer_errors:
+        raise RuntimeError(
+            "External vLLM communicator initialization failed on a peer: "
+            + "; ".join(peer_errors)
+        )
+    logger.warning(
+        "[external vLLM pre-model sync] all actor ranks ready rank=%s "
+        "local_rank=%s",
+        rank,
+        local_rank,
+    )
 
 
 def install_oldlogprob_hidden_runtime_for_worker(worker: Any) -> None:
@@ -845,6 +930,9 @@ class DraftWeightPublishMixin:
     def init_model(self, *args, **kwargs):
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)
+        sync_config = _pre_model_external_vllm_sync_config(self)
+        if sync_config is not None:
+            _initialize_pre_model_external_vllm_weight_sync(self, sync_config)
         result = super().init_model(*args, **kwargs)
         validate_oldlogprob_hidden_runtime_for_worker(self)
         return result
@@ -874,12 +962,15 @@ class DraftWeightPublishMixin:
 
         device_name = str(get_device_name()).lower()
         device_module = get_torch_device()
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device_module.set_device(local_rank)
         logger.warning(
             "[external vLLM init worker] enter pid=%s rank=%s device_type=%s "
-            "current_device=%s visible=%r hccl_if_ip=%r",
+            "local_rank=%s current_device=%s visible=%r hccl_if_ip=%r",
             os.getpid(),
             getattr(self, "rank", None),
             device_name,
+            local_rank,
             getattr(device_module, "current_device", lambda: None)(),
             os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
             os.environ.get("HCCL_IF_IP"),

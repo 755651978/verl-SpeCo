@@ -1,5 +1,5 @@
 set -x
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-1,2}"
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
     *)
@@ -21,8 +21,8 @@ project_name='verl_grpo_example_dspark_drafter'
 exp_name='qwen3_8b_dspark_drafter_vllm_npu'
 
 gen_tp=2
-train_sp=4
-ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
+train_sp=1
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-2}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 
@@ -31,6 +31,8 @@ CKPTS_DIR=/path/to/checkpoint
 TRAIN_FILE=/path/to/train_file
 TEST_FILE=/path/to/test_file
 DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+VLLM_ENDPOINT=${VLLM_ENDPOINT:-http://127.0.0.1:8000/v1}
+VLLM_MODEL=${VLLM_MODEL:-weight-difference-test}
 
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
@@ -77,7 +79,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
     actor_rollout_ref.rollout.max_num_seqs=256 \
     actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
@@ -85,7 +87,20 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
-    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
+    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=False \
+    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_sgl=False \
+    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_vllm=True \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.endpoints="[${VLLM_ENDPOINT}]" \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.model=${VLLM_MODEL} \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.per_endpoint_concurrency=1 \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.max_inflight_requests=1 \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.request_timeout_seconds=600 \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.weight_hot_update.enabled=True \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.weight_hot_update.master_address=null \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.weight_hot_update.timeout_seconds=600 \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.weight_hot_update.bucket_size_mb=256 \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.weight_hot_update.packed=True \
+    actor_rollout_ref.rollout.drafter.training.vllm_feature_source.weight_hot_update.packed_num_buffers=2 \
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \

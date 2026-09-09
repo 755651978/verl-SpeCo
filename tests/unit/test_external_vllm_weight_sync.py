@@ -329,6 +329,35 @@ def test_worker_rejects_when_no_supported_accelerator(monkeypatch):
         sync.initialize_worker_weight_sync(worker, {})
 
 
+def test_worker_reuses_pre_model_sender_and_updates_final_norm_names(monkeypatch):
+    senders = []
+
+    class Sender:
+        def __init__(self, config, *, device_type):
+            senders.append((dict(config), device_type))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.utils.device",
+        SimpleNamespace(get_device_name=lambda: "npu"),
+    )
+    monkeypatch.setattr(sync, "ExternalVllmWeightSender", Sender)
+    worker = SimpleNamespace(
+        config=SimpleNamespace(actor=SimpleNamespace(strategy="fsdp2")), rank=0
+    )
+
+    sync.initialize_worker_weight_sync(worker, {"final_norm_names": ()})
+    first_sender = worker._speco_external_vllm_sender
+    sync.initialize_worker_weight_sync(
+        worker, {"final_norm_names": ("model.norm.weight",)}
+    )
+
+    assert len(senders) == 1
+    assert worker._speco_external_vllm_sender is first_sender
+    assert worker._speco_final_norm_names == ("model.norm.weight",)
+    assert worker._speco_external_vllm_sync_initialized is True
+
+
 def test_sender_prefers_vllm_ascend_hccl_when_cuda_is_also_available(monkeypatch):
     calls = []
     group = SimpleNamespace(available=True, disabled=False)
