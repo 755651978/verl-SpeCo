@@ -133,12 +133,18 @@ class DrafterScheduleConfig:
     # Retain a small amount of ready data, then stop creating newer target-head
     # versions until the buffer has been consumed by Bubble training.
     idle_worker_collection_target_batches: int | None = 2
+    # A replica-local writer receives all routed rollout samples.  Keep its
+    # default intake aligned with the synchronous two-worker collection run.
+    idle_worker_min_collect_samples_per_writer: int = 20
     idle_worker_group_mode: str = "auto"
     idle_worker_group_size: int | None = None
     idle_worker_training_groups: tuple[tuple[str, ...], ...] = ()
     idle_worker_speculative_window_multiplier: float = 1.5
     idle_worker_max_publish_lag_steps: int = 2
     idle_worker_max_pending_publish: int = 1
+    idle_worker_dynamic_batch_cap: bool = True
+    idle_worker_initial_dynamic_batches: int = 1
+    idle_worker_gen_slowdown_threshold: float = 0.08
     gradient_accumulation_steps: int = 1
 
     @classmethod
@@ -220,6 +226,9 @@ class DrafterScheduleConfig:
             idle_worker_collection_target_batches=_optional_int(
                 idle_get("collection_target_batches", 2)
             ),
+            idle_worker_min_collect_samples_per_writer=max(
+                int(idle_get("min_collect_samples_per_writer", 20) or 0), 0
+            ),
             idle_worker_group_mode=str(idle_get("group_mode", "auto") or "auto")
             .strip()
             .lower(),
@@ -234,6 +243,16 @@ class DrafterScheduleConfig:
             ),
             idle_worker_max_pending_publish=max(
                 int(idle_get("max_pending_publish", 1) or 1), 1
+            ),
+            idle_worker_dynamic_batch_cap=bool(
+                idle_get("dynamic_batch_cap", True)
+            ),
+            idle_worker_initial_dynamic_batches=max(
+                int(idle_get("initial_dynamic_batches", 1) or 1), 1
+            ),
+            idle_worker_gen_slowdown_threshold=max(
+                float(idle_get("gen_slowdown_threshold", 0.08) or 0.0),
+                0.0,
             ),
             gradient_accumulation_steps=max(
                 int(get("gradient_accumulation_steps", 1) or 1), 1

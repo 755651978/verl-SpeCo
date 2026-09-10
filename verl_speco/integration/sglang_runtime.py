@@ -2217,7 +2217,7 @@ class _SpecoSGLangHttpServerMixin:
                         f"{collection_global_steps}:{self.replica_rank}:{request_id}"
                     )
                     drafter_sample["_speco_sample_id"] = sample_id
-                    drafter_sample["_speco_direct_event_emitted"] = (
+                    direct_event_emitted = (
                         emit_rollout_drafter_sample(
                             _rollout_idle_event_bus_name(drafter_cfg),
                             drafter_sample,
@@ -2225,6 +2225,16 @@ class _SpecoSGLangHttpServerMixin:
                             replica_rank=int(self.replica_rank),
                             global_step=collection_global_steps,
                         )
+                    )
+                    drafter_sample["_speco_direct_event_emitted"] = direct_event_emitted
+                    logger.debug(
+                        "[BubbleTime] emit_drafter_sample runtime=sglang "
+                        "sample_id=%s replica_rank=%s global_step=%s "
+                        "local_hidden_buffer=True emitted=%s",
+                        sample_id,
+                        self.replica_rank,
+                        collection_global_steps,
+                        direct_event_emitted,
                     )
             else:
                 self._speco_log_missing_hidden_states_once(

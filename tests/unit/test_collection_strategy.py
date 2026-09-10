@@ -331,6 +331,36 @@ def test_collection_executor_sends_control_request_for_empty_worker_bucket() -> 
         assert submitted[phase] == expected_control_requests
 
 
+def test_collection_accepts_empty_worker_bucket_for_single_writer_routing() -> None:
+    sample = {"input_ids": [1, 2]}
+    payload = CollectionPayload(
+        source=DrafterCollectionSource.SGLANG,
+        buckets=[[sample], []],
+        collected_samples=1,
+        raw_samples=1,
+        collection_id="collection-4",
+    )
+    executor = _executor(
+        stage_results=[
+            _staged_result(worker_id="0", staged_samples=1),
+            _staged_result(worker_id="1", staged_samples=0),
+        ],
+        commit_results=[
+            _worker_result(worker_id="0", accepted_samples=1),
+            _worker_result(worker_id="1", accepted_samples=0),
+        ],
+    )
+
+    outcome = DrafterScheduler(
+        collection_executor=executor
+    ).execute_collection_plan(_plan(), payload)
+
+    assert outcome.collected
+    assert outcome.reason == "collection_completed"
+    assert outcome.collected_samples == 1
+    assert outcome.finalized
+
+
 def test_collection_rejects_payload_from_another_source() -> None:
     executor = _executor()
 

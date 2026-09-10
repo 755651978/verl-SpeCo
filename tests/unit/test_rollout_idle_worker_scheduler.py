@@ -207,9 +207,9 @@ def test_replica_local_plan_accumulates_to_full_collective_batch() -> None:
 
     assert plan.launch
     assert plan.gradient_accumulation_steps == 2
-    assert plan.max_batches == 3
-    assert plan.planned_optimizer_steps == 3
-    assert plan.planned_valid_tokens == 600
+    assert plan.max_batches == 1
+    assert plan.planned_optimizer_steps == 1
+    assert plan.planned_valid_tokens == 200
 
 
 def test_auto_idle_worker_groups_do_not_train_half_collective_group() -> None:
@@ -577,7 +577,7 @@ def test_idle_worker_admission_uses_observed_replica_idle_window() -> None:
 
     assert plan.launch
     assert plan.idle_window_sec == pytest.approx(2.0, abs=0.1)
-    assert plan.max_batches == 5
+    assert plan.max_batches == 1
 
 
 def test_generation_completion_records_real_idle_window() -> None:
@@ -769,7 +769,7 @@ def test_idle_worker_prewarm_targets_one_metadata_group() -> None:
     assert ("2", "3") not in scheduler._idle_worker_hot_prewarmed_groups
 
 
-def test_idle_worker_skips_non_prewarmed_group_when_hot_group_exists() -> None:
+def test_idle_worker_can_migrate_writer_before_private_state_exists() -> None:
     scheduler = _scheduler_with_statuses(("2", "3"))
     config = _auto_idle_config(2)
     scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
@@ -789,9 +789,49 @@ def test_idle_worker_skips_non_prewarmed_group_when_hot_group_exists() -> None:
 
     resources = scheduler.select_idle_training_resources(config, now=now)
 
-    assert not resources.available
-    assert resources.reason == "incomplete_training_group"
-    assert resources.worker_ids == ()
+    assert resources.available
+    assert resources.reason == "training_group_ready"
+    assert resources.worker_ids == ("2", "3")
+    assert scheduler.idle_writer_group() == ("2", "3")
+
+
+def test_idle_worker_selects_later_group_when_earlier_window_is_too_small() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1", "2", "3"))
+    config = replace(
+        _auto_idle_config(2),
+        idle_worker_min_idle_window_sec=1.0,
+        idle_worker_initial_batch_estimate_sec=0.5,
+        idle_worker_deadline_guard_sec=0.0,
+    )
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+
+    now = time.time()
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=0,
+                memory_released=True,
+                must_be_ready_at=now + 0.2,
+            )
+        )
+    for worker_id in ("2", "3"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=1,
+                memory_released=True,
+                must_be_ready_at=now + 5.0,
+            )
+        )
+
+    resources = scheduler.select_idle_training_resources(config, now=now)
+
+    assert resources.available
+    assert resources.worker_ids == ("2", "3")
+    assert resources.training_group_id == "idle-group-1"
 
 
 def test_idle_worker_keeps_single_writer_after_stable_hot_group_successes() -> None:
@@ -800,6 +840,7 @@ def test_idle_worker_keeps_single_writer_after_stable_hot_group_successes() -> N
     scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
     scheduler._idle_worker_hot_prewarmed_groups.add(("0", "1"))
     scheduler._idle_worker_writer_group = ("0", "1")
+    scheduler._idle_worker_writer_state_version = 3
 
     now = time.time()
     for worker_id in ("2", "3"):
@@ -818,6 +859,7 @@ def test_idle_worker_keeps_single_writer_after_stable_hot_group_successes() -> N
     assert not resources.available
     assert resources.reason == "incomplete_training_group"
     assert resources.worker_ids == ()
+    assert scheduler.idle_writer_group() == ("0", "1")
 
 
 def test_target_lm_head_sync_workers_use_single_writer_group() -> None:
@@ -1158,7 +1200,7 @@ def test_idle_worker_prebatch_reclaim_streak_keeps_multi_batch_window() -> None:
 
     assert plan.launch
     assert plan.reason == "training_ready"
-    assert plan.max_batches == 5
+    assert plan.max_batches == 1
 
 
 def test_idle_worker_reclaim_penalty_decays_on_next_step() -> None:
@@ -1611,10 +1653,61 @@ def test_idle_worker_window_is_admission_not_hard_batch_cap() -> None:
     plan = scheduler.prepare_training_plan(_context(), _idle_config())
 
     assert plan.launch
-    assert plan.max_batches == 5
+    assert plan.max_batches == 1
     assert plan.target_worker_ids == ("0", "1")
     assert plan.training_group_id == "idle-group-0"
     assert plan.to_worker_payload()["execution_strategy"] == "rollout_idle_worker"
+
+
+def test_idle_worker_dynamic_cap_grows_after_reaching_cap() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=1,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="success-plan",
+    )
+    outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=1,
+        worker_results=[],
+        raw_results=[{"reason": "trained", "stop_reason": "max_batches_reached"}],
+        elapsed_sec=1.0,
+        reason="submitted_async",
+        metrics={"bubble/train_reclaimed_before_first_batch": 0},
+    )
+
+    scheduler._record_training_outcome(plan, outcome)
+
+    assert scheduler._effective_idle_dynamic_batch_cap(config) == 2
+
+
+def test_idle_worker_dynamic_cap_reduces_on_gen_slowdown() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler._idle_worker_dynamic_batch_cap = 4
+
+    scheduler.record_step_metrics(
+        {"timing_per_token_ms/gen": 0.2},
+        config,
+    )
+    metrics = scheduler.record_step_metrics(
+        {
+            "timing_per_token_ms/gen": 0.24,
+            "drafter/idle_trained": 1,
+        },
+        config,
+    )
+
+    assert metrics["bubble/gen_slowdown_cap_reduced"] == 1
+    assert scheduler._effective_idle_dynamic_batch_cap(config) == 2
 
 
 def test_idle_worker_async_submit_and_poll_completion() -> None:

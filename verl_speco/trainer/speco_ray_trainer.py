@@ -1475,13 +1475,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 and plan.launch
                 and required_target_version is not None
             ):
-                print(
-                    "[BubbleTime] target_lm_head_ready_gate: "
-                    f"plan_id={plan.plan_id} required_target_version="
-                    f"{required_target_version} required_workers={required_target_workers} "
-                    f"ready_workers={ready_target_workers} ready_versions="
-                    f"{tuple(sorted(self._speco_ready_target_lm_head_versions))}",
-                    flush=True,
+                logger.debug(
+                    "[BubbleTime] target_lm_head_ready_gate: plan_id=%s "
+                    "required_target_version=%s required_workers=%s ready_workers=%s "
+                    "ready_versions=%s",
+                    plan.plan_id,
+                    required_target_version,
+                    required_target_workers,
+                    ready_target_workers,
+                    tuple(sorted(self._speco_ready_target_lm_head_versions)),
                 )
             print(
                 "[BubbleTime] idle_launch_decision: "
@@ -1514,12 +1516,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_service_rollout_idle_events(self) -> dict[str, Any]:
         metrics = self._speco_drain_rollout_idle_events()
-        if metrics:
-            print(
-                "[BubbleTime] idle_event_service: "
-                f"metrics={metrics}",
-                flush=True,
-            )
         if metrics:
             metrics.update(self._speco_try_launch_rollout_idle_training())
         self._speco_record_rollout_idle_metrics(metrics)
@@ -2213,6 +2209,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         max_per_owner = collection_plan.max_samples_per_replica
         max_per_owner = max_per_owner if max_per_owner is not None else batch_size
         max_per_owner = max(max_per_owner, 0)
+        if self._speco_rollout_idle_worker_enabled():
+            # Single-writer Bubble routing concentrates samples that Sync
+            # would have kept on multiple owners.  Do not let the legacy
+            # per-owner default silently reduce its plan-local dataset.
+            writer_minimum = max(
+                int(
+                    self._speco_drafter_schedule_config().idle_worker_min_collect_samples_per_writer
+                ),
+                0,
+            )
+            if max_per_owner < writer_minimum:
+                print(
+                    "[BubbleTime] collection_writer_capacity_raised: "
+                    f"configured_per_owner={max_per_owner} writer_minimum={writer_minimum}",
+                    flush=True,
+                )
+                max_per_owner = writer_minimum
         max_tokens_per_owner = collection_plan.max_tokens_per_replica
         if max_tokens_per_owner is not None:
             max_tokens_per_owner = max(max_tokens_per_owner, 0)
@@ -3516,6 +3529,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"elapsed_s={elapsed_sec:.4f} mode=async_two_phase",
                 flush=True,
             )
+            print(
+                "[BubbleTime] publish_version: "
+                f"plan_id={context.get('plan_id')} "
+                f"published_version={self._speco_published_drafter_version} "
+                f"latest_target_version={self.global_steps} "
+                "mode=bubble",
+                flush=True,
+            )
         return len(pending_refs) if isinstance(pending_refs, (list, tuple)) else 1
 
     def _speco_poll_pending_drafter_publish(self) -> dict[str, Any]:
@@ -3742,6 +3763,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     )
                 output_metrics["timing_s/update_actor"] = adjusted_update_actor
                 output_metrics[_SPECO_DRAFTER_TIMING_DEDUCTED_KEY] = True
+            try:
+                scheduler = self._speco_get_drafter_scheduler()
+                config = self._speco_drafter_schedule_config()
+                feedback_metrics = scheduler.record_step_metrics(
+                    output_metrics,
+                    config,
+                )
+            except Exception:  # noqa: BLE001
+                feedback_metrics = {}
+            if feedback_metrics:
+                output_metrics.update(feedback_metrics)
         return output
 
     def _speco_rollout_generation_target(self):
@@ -4037,13 +4069,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     == 0
                 ):
                     generation_metrics.update(self._speco_publish_boundary())
-            print(
-                "[BubbleTime] generation_hook: "
-                f"validation={input_is_validation} "
-                f"online_enabled={self._speco_online_enabled()} "
-                f"idle_enabled={self._speco_rollout_idle_worker_enabled()} "
-                f"event_bus={self._speco_rollout_idle_event_bus_name() or ''}",
-                flush=True,
+            logger.debug(
+                "[BubbleTime] generation_hook: validation=%s online_enabled=%s "
+                "idle_enabled=%s event_bus=%s",
+                input_is_validation,
+                self._speco_online_enabled(),
+                self._speco_rollout_idle_worker_enabled(),
+                self._speco_rollout_idle_event_bus_name() or "",
             )
             if not input_is_validation:
                 self._speco_direct_sample_ids = set()
@@ -4072,14 +4104,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             runtime_sample_events = int(
                 getattr(self, "_speco_runtime_sample_events_this_generation", 0)
             )
-            print(
-                "[BubbleTime] generation_complete: "
-                f"validation={is_validation_generation} "
-                f"metrics_keys={tuple(sorted(generation_metrics))} "
-                f"runtime_events_drained={generation_metrics.get('bubble/runtime_worker_events_drained', 0)} "
-                f"runtime_idle_events_this_generation={runtime_idle_events} "
-                f"runtime_sample_events_this_generation={runtime_sample_events}",
-                flush=True,
+            logger.debug(
+                "[BubbleTime] generation_complete: validation=%s metrics_keys=%s "
+                "runtime_events_drained=%s runtime_idle_events_this_generation=%s "
+                "runtime_sample_events_this_generation=%s",
+                is_validation_generation,
+                tuple(sorted(generation_metrics)),
+                generation_metrics.get("bubble/runtime_worker_events_drained", 0),
+                runtime_idle_events,
+                runtime_sample_events,
             )
             if not is_validation_generation:
                 generation_metrics.update(
@@ -4089,15 +4122,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_rollout_idle_worker_enabled()
                     and runtime_idle_events == 0
                 )
-                print(
-                    "[BubbleTime] fallback_idle_decision: "
-                    f"enabled={self._speco_rollout_idle_worker_enabled()} "
-                    f"use_fallback={use_fallback_idle} "
-                    "callback_verified="
-                    f"{getattr(self, '_speco_runtime_idle_callback_verified', False)} "
-                    f"runtime_events_drained={generation_metrics.get('bubble/runtime_worker_events_drained', 0)} "
-                    f"runtime_idle_events_this_generation={runtime_idle_events}",
-                    flush=True,
+                logger.debug(
+                    "[BubbleTime] fallback_idle_decision: enabled=%s use_fallback=%s "
+                    "callback_verified=%s runtime_events_drained=%s "
+                    "runtime_idle_events_this_generation=%s",
+                    self._speco_rollout_idle_worker_enabled(),
+                    use_fallback_idle,
+                    getattr(self, "_speco_runtime_idle_callback_verified", False),
+                    generation_metrics.get("bubble/runtime_worker_events_drained", 0),
+                    runtime_idle_events,
                 )
                 if use_fallback_idle:
                     generation_metrics.update(

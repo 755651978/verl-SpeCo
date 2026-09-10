@@ -3662,7 +3662,15 @@ class DrafterBaseTrainer:
             ]
             if not available_data:
                 return None
-            items = available_data[:effective_batch_size]
+            # Shuffle by rotation rather than permanently taking the first
+            # entries.  The reservation remains immutable for this plan, so a
+            # later optimizer step can replay it without changing its target
+            # LM-head version or colliding with another plan.
+            cursor = int(getattr(self, "_active_training_replay_cursor", 0))
+            start = cursor % len(available_data)
+            ordered_data = available_data[start:] + available_data[:start]
+            items = ordered_data[:effective_batch_size]
+            self._active_training_replay_cursor = cursor + len(items)
 
         # last-hidden supervision can only be reconstructed with the exact target
         # head version that produced those hidden states, so older buffered Eagle3
@@ -4548,6 +4556,13 @@ class DrafterBaseTrainer:
             reserved = []
         self._active_training_reservation_id = str(plan_id) if reserved else None
         self._active_training_target_version = int(target_version) if reserved else None
+        # Bubble Time owns a version-homogeneous snapshot for the whole plan.
+        # Unlike the synchronous path (which re-samples its Buffer), deleting
+        # items after every optimizer step artificially capped a Bubble plan at
+        # the number of distinct micro-batches.  Keep the reservation stable
+        # until the plan completes and consume each *unique* item once then.
+        self._active_training_replay_cursor = 0
+        self._active_training_replay_used_items: dict[int, dict[str, Any]] = {}
         logger.warning(
             "[BubbleTime] reserve training data: rank=%s plan_id=%s target_version=%s "
             "reserved_samples=%s max_samples=%s",
@@ -4559,12 +4574,36 @@ class DrafterBaseTrainer:
         )
         return {"reserved_samples": len(reserved), "target_version": target_version}
 
+    def finalize_training_data_reservation(self, plan_id: str) -> int:
+        """Consume unique replayed items after a Bubble training plan finishes."""
+
+        if self._active_training_reservation_id != str(plan_id):
+            return 0
+        used_items = list(
+            getattr(self, "_active_training_replay_used_items", {}).values()
+        )
+        consumed = self.data_buffer.consume(str(plan_id), used_items)
+        self._active_training_replay_used_items = {}
+        self._active_training_replay_cursor = 0
+        if consumed:
+            logger.info(
+                "[BubbleTime] finalized replay reservation: rank=%s plan_id=%s "
+                "unique_samples=%s remaining=%s",
+                self.rank,
+                plan_id,
+                consumed,
+                len(self.data_buffer),
+            )
+        return consumed
+
     def release_training_data_reservation(self, plan_id: str) -> int:
         released = self.data_buffer.release_reservation(str(plan_id))
         if self._active_training_reservation_id == str(plan_id):
             self._active_training_reservation_id = None
             self._active_training_target_version = None
             self._last_prepared_training_items = []
+            self._active_training_replay_used_items = {}
+            self._active_training_replay_cursor = 0
         if released:
             logger.info(
                 "[BubbleTime] released training reservation: rank=%s plan_id=%s samples=%s",
@@ -4594,6 +4633,13 @@ class DrafterBaseTrainer:
     def _consume_training_items(self, items: list[dict[str, Any]]) -> int:
         plan_id = self._active_training_reservation_id
         if plan_id is None or not items:
+            return 0
+        # Bubble reservations intentionally replay their immutable plan-local
+        # sample snapshot.  Actual consumption happens in
+        # finalize_training_data_reservation once the worker stops.
+        replay_used = getattr(self, "_active_training_replay_used_items", None)
+        if replay_used is not None:
+            replay_used.update({id(item): item for item in items})
             return 0
         consumed = self.data_buffer.consume(plan_id, items)
         if consumed:

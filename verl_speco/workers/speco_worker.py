@@ -1704,6 +1704,14 @@ class SpecoWorker(Worker):
                 )
                 result["reason"] = "data_reservation_failed"
                 return result
+            print(
+                "[BubbleTime] training_replay_snapshot: "
+                f"plan_id={training_plan.get('plan_id', '')} rank={self.rank} "
+                f"samples={reservation.get('reserved_samples', 0)} "
+                f"planned_optimizer_steps={training_plan.get('max_batches', 0)} "
+                "mode=plan_local_replay",
+                flush=True,
+            )
 
         self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
         self._prepared_training_data_version = actual_data_version
@@ -1913,6 +1921,7 @@ class SpecoWorker(Worker):
                 "planned_valid_tokens": int(
                     training_plan.get("planned_valid_tokens", 0) or 0
                 ),
+                "stop_reason": "",
             }
         )
 
@@ -1928,6 +1937,7 @@ class SpecoWorker(Worker):
                     now_ts = time.time()
                     if deadline_ts is not None and now_ts >= float(deadline_ts):
                         result["reason"] = "deadline_reached"
+                        result["stop_reason"] = "deadline_reached"
                         if prepared_ready_ts is not None:
                             result["preflight_to_stop_sec"] = max(
                                 now_ts - prepared_ready_ts, 0.0
@@ -1967,6 +1977,7 @@ class SpecoWorker(Worker):
                         and now_ts + idle_batch_estimate_sec > float(deadline_ts)
                     ):
                         result["reason"] = "next_batch_budget_too_small"
+                        result["stop_reason"] = "deadline_reached"
                         remaining_s = float(deadline_ts) - now_ts
                         if (
                             prepared_ready_ts is not None
@@ -2014,6 +2025,7 @@ class SpecoWorker(Worker):
                         break
                     if self._drafter_reclaim_requested:
                         result["reason"] = "reclaim_requested"
+                        result["stop_reason"] = "reclaim_requested"
                         if prepared_ready_ts is not None:
                             result["preflight_to_stop_sec"] = max(
                                 now_ts - prepared_ready_ts, 0.0
@@ -2123,6 +2135,7 @@ class SpecoWorker(Worker):
                             accumulation_stop_reason
                             or "training_step_returned_false"
                         )
+                        result["stop_reason"] = result["reason"]
                         if (
                             execution_strategy == "rollout_idle_worker"
                             and self._use_replica_local_idle_training()
@@ -2132,6 +2145,7 @@ class SpecoWorker(Worker):
                             result.update(
                                 {
                                     "reason": "replica_local_oom",
+                                    "stop_reason": "replica_local_oom",
                                     "replica_local_unavailable": True,
                                     "replica_local_oom": True,
                                     "training_group_ranks": list(
@@ -2173,6 +2187,12 @@ class SpecoWorker(Worker):
                             flush=True,
                         )
                         break
+                if (
+                    result["successful_steps"] > 0
+                    and not result.get("stop_reason")
+                    and result["successful_steps"] >= max_batches
+                ):
+                    result["stop_reason"] = "max_batches_reached"
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
@@ -2197,11 +2217,29 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
             finally:
                 cleanup_ts = time.time()
+                finalize_reservation = getattr(
+                    self.trainer, "finalize_training_data_reservation", None
+                )
+                replay_consumed = (
+                    int(finalize_reservation(plan_id))
+                    if callable(finalize_reservation)
+                    else 0
+                )
+                result["replay_consumed_samples"] = replay_consumed
+                if replay_consumed:
+                    print(
+                        "[BubbleTime] training_replay_finalized: "
+                        f"plan_id={plan_id} rank={self.rank} "
+                        f"unique_samples={replay_consumed}",
+                        flush=True,
+                    )
                 self.trainer.release_training_data_reservation(plan_id)
                 await self.trainer.cleanup_training(clear_data=False)
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0
+            if not result["trained"] and not result.get("stop_reason"):
+                result["stop_reason"] = result["reason"] or "no_trainable_batch"
             result["reason"] = (
                 "trained"
                 if result["trained"]

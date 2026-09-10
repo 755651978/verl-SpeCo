@@ -238,10 +238,29 @@ class TrainingOutcome:
 
         metrics["bubble/train_reclaimed_before_first_batch"] = int(
             any(
-                result.get("reason") == "reclaim_requested"
+                (
+                    result.get("reason") == "reclaim_requested"
+                    or result.get("stop_reason") == "reclaim_requested"
+                )
                 and int(result.get("attempted_steps", 0) or 0) == 0
                 for result in normalized_results
             )
+        )
+        stop_reasons = {
+            str(result.get("stop_reason") or result.get("reason") or "")
+            for result in normalized_results
+        }
+        metrics["bubble/train_stop_reclaim_requested"] = int(
+            "reclaim_requested" in stop_reasons
+        )
+        metrics["bubble/train_stop_deadline_reached"] = int(
+            "deadline_reached" in stop_reasons
+        )
+        metrics["bubble/train_stop_max_batches_reached"] = int(
+            "max_batches_reached" in stop_reasons
+        )
+        metrics["bubble/train_stop_no_trainable_batch"] = int(
+            "no_trainable_batch" in stop_reasons
         )
         metrics["bubble/train_first_batch_started"] = int(
             any(bool(result.get("first_batch_started", False)) for result in normalized_results)
