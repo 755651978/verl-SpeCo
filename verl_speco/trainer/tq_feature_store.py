@@ -29,6 +29,7 @@ from verl_speco.integration.transferqueue_bridge import (
 )
 from verl_speco.trainer.feature_store import DraftFeatureSample
 from verl_speco.transport.drafter_sample_protocol import (
+    PROTOCOL_SCHEMA_VERSION,
     ExpectedFeatureConfig,
     decode_sample,
     parse_ready_tag,
@@ -66,19 +67,33 @@ class TQFeatureStore:
         self.run_id = str(self.config.get("run_id") or "").strip()
         if not self.run_id:
             raise ValueError("transfer_queue.run_id is required for a TQ Consumer")
-        self.schema_version = int(self.config.get("schema_version", 1))
+        self.schema_version = int(
+            self.config.get("schema_version", PROTOCOL_SCHEMA_VERSION)
+        )
         ray_cfg = _plain_dict(self.config.get("ray") or {})
         self.ray_address = str(ray_cfg.get("address") or "").strip()
         self.ray_namespace = str(ray_cfg.get("namespace") or "").strip() or None
         if not self.ray_address:
             raise ValueError("transfer_queue.ray.address is required for a TQ Consumer")
         self._connected = False
-        # First version deliberately checks only run/protocol. Tensor
-        # presence, lengths, shape and dtype self-consistency remain enforced by
-        # decode_sample; model/tokenizer/layer identity checks stay disabled.
+        expected = _plain_dict(self.config.get("expected_feature") or {})
+        target_layer_ids = expected.get("target_layer_ids")
         self.expected_config = ExpectedFeatureConfig(
             run_id=self.run_id,
             schema_version=self.schema_version,
+            algorithm=_optional_string(expected.get("algorithm")),
+            target_model_path=_optional_string(expected.get("target_model_path")),
+            target_revision=_optional_string(expected.get("target_revision")),
+            tokenizer_fingerprint=_optional_string(
+                expected.get("tokenizer_fingerprint")
+            ),
+            target_layer_ids=(
+                tuple(int(value) for value in target_layer_ids)
+                if target_layer_ids is not None
+                else None
+            ),
+            hidden_states_layout=_optional_string(expected.get("hidden_states_layout")),
+            hidden_dtype=_optional_string(expected.get("hidden_dtype")),
         )
 
     @classmethod
@@ -218,6 +233,13 @@ def _plain_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_plain_value(item) for item in value]
     return value
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 __all__ = ["EosMetadata", "ReadyEntry", "TQFeatureStore"]

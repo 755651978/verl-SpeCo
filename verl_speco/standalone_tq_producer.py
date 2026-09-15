@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
@@ -66,6 +68,7 @@ logger = logging.getLogger(__name__)
 _INPUT_DONE = object()
 _PUBLISH_DONE = object()
 _FEATURE_CONVERSION_WORKERS = 8
+_HEARTBEAT_INTERVAL_SECONDS = 60.0
 
 
 @dataclass
@@ -272,19 +275,51 @@ async def run_producer(
         publish_queue: asyncio.Queue[Any] = asyncio.Queue(
             maxsize=int(producer_cfg["publish_queue_size"])
         )
+        stages: dict[str, tuple[str, float, str]] = {}
+        last_published_at = time.monotonic()
+        max_samples = int(producer_cfg.get("max_samples", 0) or 0)
 
-        async def read_inputs() -> None:
-            max_samples = int(producer_cfg.get("max_samples", 0) or 0)
+        def mark_stage(worker: str, stage: str, sample_id: str = "") -> None:
+            stages[worker] = (stage, time.monotonic(), sample_id)
+
+        async def log_heartbeat() -> None:
+            while True:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                now = time.monotonic()
+                oldest = sorted(
+                    (
+                        (now - started, worker, stage, sample_id)
+                        for worker, (stage, started, sample_id) in stages.items()
+                    ),
+                    reverse=True,
+                )[:3]
+                logger.warning(
+                    "Standalone TQ Producer heartbeat inputs=%s published=%s "
+                    "dropped=%s input_queue=%s/%s publish_queue=%s/%s "
+                    "seconds_since_publish=%.0f stages=%s oldest=%s",
+                    stats.input_count,
+                    stats.published_count,
+                    stats.dropped_count,
+                    input_queue.qsize(),
+                    input_queue.maxsize,
+                    publish_queue.qsize(),
+                    publish_queue.maxsize,
+                    now - last_published_at,
+                    dict(Counter(stage for stage, _, _ in stages.values())),
+                    [
+                        (worker, stage, sample_id, round(age))
+                        for age, worker, stage, sample_id in oldest
+                    ],
+                )
+
+        def iter_requests():
             epoch = 0
             source_sequence_no = 0
             while True:
-                epoch_count = 0
                 scanned_count = 0
                 for source_record in iter_input_records(
                     str(producer_cfg["input_path"])
                 ):
-                    if max_samples > 0 and stats.input_count >= max_samples:
-                        break
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1
@@ -302,42 +337,67 @@ async def run_producer(
                         if record.response is None
                         else tokenize_record(record, tokenizer, producer_cfg)
                     )
-                    await input_queue.put(request)
-                    stats.input_count += 1
-                    epoch_count += 1
-                    if _should_log_sample_progress(stats.input_count):
-                        logger.info(
-                            "Standalone TQ Producer queued input count=%s epoch=%s "
-                            "sample_id=%s has_response=%s",
-                            stats.input_count,
-                            epoch,
-                            record.sample_id,
-                            record.response is not None,
-                        )
-                if scanned_count == 0 and stats.input_count == 0:
+                    yield request
+                if scanned_count == 0:
                     raise ValueError("Standalone TQ Producer input contains no samples")
-                if max_samples <= 0 or stats.input_count >= max_samples:
-                    break
+                if max_samples <= 0:
+                    return
                 epoch += 1
                 logger.info(
-                    "Standalone TQ Producer restarting input epoch=%s "
-                    "queued=%s target=%s",
+                    "Standalone TQ Producer restarting input epoch=%s attempts=%s "
+                    "target_published=%s",
                     epoch,
                     stats.input_count,
                     max_samples,
                 )
+
+        requests = iter(iter_requests())
+
+        def next_request() -> Any:
+            request = next(requests)
+            stats.input_count += 1
+            if _should_log_sample_progress(stats.input_count):
+                logger.info(
+                    "Standalone TQ Producer queued input count=%s sample_id=%s",
+                    stats.input_count,
+                    request.sample_id,
+                )
+            return request
+
+        async def read_inputs() -> None:
+            initial_count = 0
+            while max_samples <= 0 or initial_count < max_samples:
+                try:
+                    request = next_request()
+                except StopIteration:
+                    break
+                mark_stage("input", "input_queue_put", request.sample_id)
+                await input_queue.put(request)
+                initial_count += 1
             for _ in range(worker_count):
                 await input_queue.put(_INPUT_DONE)
             logger.info(
                 "Standalone TQ Producer input exhausted total=%s", stats.input_count
             )
+            stages.pop("input", None)
 
         async def request_worker() -> None:
+            current = asyncio.current_task()
+            worker = current.get_name() if current is not None else "request-unknown"
+            replacement_request = None
             while True:
-                request = await input_queue.get()
+                if replacement_request is None:
+                    mark_stage(worker, "input_queue_get")
+                    request = await input_queue.get()
+                else:
+                    request = replacement_request
+                    replacement_request = None
                 if request is _INPUT_DONE:
+                    mark_stage(worker, "publish_queue_done")
                     await publish_queue.put(_PUBLISH_DONE)
+                    stages.pop(worker, None)
                     return
+                mark_stage(worker, "tq_capacity", request.sample_id)
                 await _wait_for_pending_capacity(
                     transport,
                     run_id,
@@ -355,6 +415,7 @@ async def run_producer(
                         else "prefill",
                     )
                 if isinstance(request, GenerationRequest):
+                    mark_stage(worker, "vllm_generate", request.sample_id)
                     generated = await pool.generate(request)
                     try:
                         request = prepare_generated_prefill_request(
@@ -367,11 +428,14 @@ async def run_producer(
                         # connector file. It is not the training payload; the
                         # following full-sequence prefill produces that payload.
                         await asyncio.to_thread(delete_temporary_result, generated)
+                    mark_stage(worker, "vllm_prefill", request.sample_id)
                     raw = await pool.prefill(request)
                 else:
+                    mark_stage(worker, "vllm_prefill", request.sample_id)
                     raw = await pool.prefill(request)
                 stats.pending_bytes += int(raw.byte_size)
                 try:
+                    mark_stage(worker, "feature_conversion", request.sample_id)
                     async with feature_slots:
                         sample = await event_loop.run_in_executor(
                             feature_executor,
@@ -397,7 +461,16 @@ async def run_producer(
                         stats.dropped_count,
                         exc,
                     )
+                    if max_samples > 0:
+                        replacement_request = next_request()
+                        logger.info(
+                            "Standalone TQ Producer replacing dropped sample "
+                            "with sequence_no=%s sample_id=%s",
+                            replacement_request.sequence_no,
+                            replacement_request.sample_id,
+                        )
                     continue
+                mark_stage(worker, "publish_queue_put", request.sample_id)
                 await publish_queue.put(
                     PreparedFeature(
                         request=request,
@@ -410,14 +483,26 @@ async def run_producer(
                 )
 
         async def publish_results() -> None:
+            nonlocal last_published_at
             finished_workers = 0
             while finished_workers < worker_count:
+                mark_stage("publisher", "publish_queue_get")
                 result = await publish_queue.get()
                 if result is _PUBLISH_DONE:
                     finished_workers += 1
                     continue
+                mark_stage("publisher", "tq_put", result.request.sample_id)
+                put_started = time.monotonic()
                 await publish_one(result, transport)
+                put_elapsed = time.monotonic() - put_started
+                if put_elapsed >= 30:
+                    logger.warning(
+                        "Standalone TQ Producer slow TQ put sample_id=%s elapsed=%.1fs",
+                        result.request.sample_id,
+                        put_elapsed,
+                    )
                 stats.published_count += 1
+                last_published_at = time.monotonic()
                 if _should_log_sample_progress(stats.published_count):
                     logger.info(
                         "Standalone TQ Producer published count=%s sequence_no=%s "
@@ -429,21 +514,48 @@ async def run_producer(
                 stats.pending_bytes = max(
                     stats.pending_bytes - int(result.raw.byte_size), 0
                 )
+            stages.pop("publisher", None)
 
-        tasks = [asyncio.create_task(read_inputs())]
-        tasks.extend(asyncio.create_task(request_worker()) for _ in range(worker_count))
-        tasks.append(asyncio.create_task(publish_results()))
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        failure = next(
-            (task.exception() for task in done if task.exception() is not None), None
+        tasks = [asyncio.create_task(read_inputs(), name="input")]
+        tasks.extend(
+            asyncio.create_task(request_worker(), name=f"request-{index}")
+            for index in range(worker_count)
         )
-        if failure is not None:
-            stats.failed_count += 1
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            raise failure
-        await asyncio.gather(*pending)
+        tasks.append(asyncio.create_task(publish_results(), name="publisher"))
+        heartbeat = asyncio.create_task(log_heartbeat(), name="producer-heartbeat")
+        try:
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_EXCEPTION
+            )
+            failure_task = next(
+                (task for task in done if task.exception() is not None), None
+            )
+            failure_error = (
+                failure_task.exception() if failure_task is not None else None
+            )
+            if failure_task is not None and failure_error is not None:
+                stats.failed_count += 1
+                logger.error(
+                    "Standalone TQ Producer task failed task=%s stages=%s "
+                    "input_queue=%s publish_queue=%s",
+                    failure_task.get_name(),
+                    stages,
+                    input_queue.qsize(),
+                    publish_queue.qsize(),
+                    exc_info=(
+                        type(failure_error),
+                        failure_error,
+                        failure_error.__traceback__,
+                    ),
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise failure_error
+            await asyncio.gather(*pending)
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
         eos_key, eos_fields, eos_tag = make_eos_record(run_id, stats.published_count)
         await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)

@@ -40,6 +40,9 @@ def _sample(*, algorithm: str = "DSPARK") -> DraftFeatureSample:
         hidden_states=torch.arange(64, dtype=torch.bfloat16).reshape(4, 16),
         last_hidden_states=torch.arange(32, dtype=torch.float32).reshape(4, 8),
         metadata={
+            "target_model_path": "/models/target",
+            "target_revision": "target-rev-a",
+            "tokenizer_fingerprint": "tokenizer-sha256-a",
             "hidden_states_layout": "dflash_aux_plus_last",
             "target_layer_ids": [2, 8, 14],
             "hidden_positions": torch.tensor([6, 7, 8, 9]),
@@ -69,6 +72,41 @@ def test_sample_round_trip_preserves_complete_sample() -> None:
     )
     assert restored.metadata["nested"]["pair"] == ("a", 2)
     assert fields["sample__manifest_json"].dtype == torch.uint8
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("algorithm", "EAGLE3"),
+        ("target_model_path", "/models/wrong"),
+        ("target_revision", "wrong-revision"),
+        ("tokenizer_fingerprint", "wrong-tokenizer"),
+        ("target_layer_ids", (1, 3)),
+        ("hidden_states_layout", "dflash_aux"),
+        ("hidden_dtype", "float32"),
+    ],
+)
+def test_decode_rejects_consumer_feature_contract_mismatch(
+    field: str, wrong_value: object
+) -> None:
+    meta = _metadata()
+    expected = ExpectedFeatureConfig(
+        run_id="run-a",
+        algorithm="DSPARK",
+        target_model_path="/models/target",
+        target_revision="target-rev-a",
+        tokenizer_fingerprint="tokenizer-sha256-a",
+        target_layer_ids=(2, 8, 14),
+        hidden_states_layout="dflash_aux_plus_last",
+        hidden_dtype="bfloat16",
+    )
+    with pytest.raises(ValueError, match=field):
+        decode_sample(
+            make_sample_key(meta),
+            make_ready_tag(meta),
+            encode_sample(_sample(), meta),
+            replace(expected, **{field: wrong_value}),
+        )
 
 
 def test_hidden_state_tensor_list_round_trip() -> None:
@@ -106,6 +144,31 @@ def test_decode_rejects_identity_mismatch() -> None:
         decode_sample(
             make_sample_key(meta),
             bad_tag,
+            fields,
+            ExpectedFeatureConfig(run_id="run-a"),
+        )
+
+
+@pytest.mark.parametrize("hidden_kind", ["tensor", "list"])
+def test_decode_rejects_hidden_state_row_mismatch(hidden_kind: str) -> None:
+    meta = _metadata()
+    sample = _sample()
+    if hidden_kind == "list":
+        sample = replace(
+            sample,
+            hidden_states=[torch.ones(4, 8), torch.ones(4, 8)],
+        )
+    fields = encode_sample(sample, meta)
+    malformed_field = (
+        "sample__hidden_states"
+        if hidden_kind == "tensor"
+        else "sample__hidden_states__000001"
+    )
+    fields[malformed_field] = fields[malformed_field][:-1]
+    with pytest.raises(ValueError, match="input_ids/hidden_states row mismatch"):
+        decode_sample(
+            make_sample_key(meta),
+            make_ready_tag(meta),
             fields,
             ExpectedFeatureConfig(run_id="run-a"),
         )

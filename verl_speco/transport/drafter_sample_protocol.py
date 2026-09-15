@@ -84,6 +84,13 @@ class ExpectedFeatureConfig:
     """Consumer-side transport contract."""
 
     run_id: str
+    algorithm: str | None = None
+    target_model_path: str | None = None
+    target_revision: str | None = None
+    tokenizer_fingerprint: str | None = None
+    target_layer_ids: tuple[int, ...] | None = None
+    hidden_states_layout: str | None = None
+    hidden_dtype: str | None = None
     schema_version: int = PROTOCOL_SCHEMA_VERSION
 
 
@@ -240,7 +247,81 @@ def decode_sample(
         if name in present:
             payload[name] = _require_tensor(fields, f"sample__{name}")
     payload["hidden_states"] = _decode_hidden_states(fields, manifest)
-    return DraftFeatureSample.from_dict(payload, strict=True)
+    sample = DraftFeatureSample.from_dict(payload, strict=True)
+    _validate_expected_feature(key, sample, expected)
+    return sample
+
+
+def _validate_expected_feature(
+    key: str, sample: DraftFeatureSample, expected: ExpectedFeatureConfig
+) -> None:
+    metadata = sample.metadata
+    checks = {
+        "algorithm": (
+            str(expected.algorithm).upper() if expected.algorithm is not None else None,
+            str(sample.algorithm).upper(),
+        ),
+        "target_model_path": (
+            expected.target_model_path,
+            metadata.get("target_model_path"),
+        ),
+        "target_revision": (
+            expected.target_revision,
+            metadata.get("target_revision"),
+        ),
+        "tokenizer_fingerprint": (
+            expected.tokenizer_fingerprint,
+            metadata.get("tokenizer_fingerprint"),
+        ),
+        "hidden_states_layout": (
+            expected.hidden_states_layout,
+            metadata.get("hidden_states_layout"),
+        ),
+    }
+    mismatches = [
+        f"{name}: expected={wanted!r}, got={actual!r}"
+        for name, (wanted, actual) in checks.items()
+        if wanted is not None and str(actual) != str(wanted)
+    ]
+    if expected.target_layer_ids is not None:
+        actual_layers = metadata.get("target_layer_ids")
+        try:
+            normalized_layers = (
+                tuple(int(value) for value in actual_layers)
+                if actual_layers is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            normalized_layers = None
+        if normalized_layers != expected.target_layer_ids:
+            mismatches.append(
+                "target_layer_ids: "
+                f"expected={list(expected.target_layer_ids)!r}, got={actual_layers!r}"
+            )
+    if expected.hidden_dtype is not None:
+        hidden_values = (
+            sample.hidden_states
+            if isinstance(sample.hidden_states, (list, tuple))
+            else [sample.hidden_states]
+        )
+        actual_dtypes = sorted(
+            {str(value.dtype).removeprefix("torch.") for value in hidden_values}
+        )
+        normalized_dtype = str(expected.hidden_dtype).lower().removeprefix("torch.")
+        normalized_dtype = {
+            "bf16": "bfloat16",
+            "fp16": "float16",
+            "fp32": "float32",
+        }.get(normalized_dtype, normalized_dtype)
+        if actual_dtypes != [normalized_dtype]:
+            mismatches.append(
+                f"hidden_dtype: expected={normalized_dtype!r}, got={actual_dtypes!r}"
+            )
+    if mismatches:
+        raise ValueError(
+            f"TQ sample {key!r} does not match the Consumer feature contract: "
+            + "; ".join(mismatches)
+        )
 
 
 def make_eos_record(

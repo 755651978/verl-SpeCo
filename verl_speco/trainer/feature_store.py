@@ -127,6 +127,24 @@ class DraftFeatureSample:
             hidden_states_tensor = cast(Any, hidden_states)
             if hidden_states_tensor.dim() == 3 and hidden_states_tensor.size(0) == 1:
                 self.hidden_states = hidden_states_tensor.squeeze(0)
+        if strict:
+            hidden_values = (
+                self.hidden_states
+                if isinstance(self.hidden_states, (list, tuple))
+                else [self.hidden_states]
+            )
+            expected_rows = int(self.input_ids.size(0))
+            for index, value in enumerate(hidden_values):
+                if not torch.is_tensor(value):
+                    raise TypeError(
+                        f"DraftFeatureSample.hidden_states[{index}] must be a torch.Tensor"
+                    )
+                if value.dim() == 0 or int(value.size(0)) != expected_rows:
+                    raise ValueError(
+                        "DraftFeatureSample input_ids/hidden_states row mismatch: "
+                        f"input_rows={expected_rows}, hidden_index={index}, "
+                        f"hidden_shape={tuple(value.shape)}"
+                    )
         last_hidden_states = self.last_hidden_states
         if torch.is_tensor(last_hidden_states):
             last_hidden_states_tensor = cast(Any, last_hidden_states)

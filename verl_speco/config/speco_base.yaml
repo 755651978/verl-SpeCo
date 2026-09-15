@@ -271,6 +271,14 @@ actor_rollout_ref:
           partition_id: speco_drafter_features
           run_id: null
           schema_version: 2
+          expected_feature:
+            algorithm: null
+            target_model_path: null
+            target_revision: null
+            tokenizer_fingerprint: null
+            target_layer_ids: null
+            hidden_states_layout: null
+            hidden_dtype: null
           connect_timeout_seconds: 120
           poll_interval_seconds: 0.5
           drop_last: true

@@ -39,6 +39,9 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 import uuid
 
+from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
+)
 from verl_speco.trainer.standalone_resume import load_standalone_resume
 
 
@@ -52,6 +55,10 @@ _TOKENIZER_PATH_KEY = (
     "actor_rollout_ref.rollout.drafter.training.feature_store.tokenizer_path"
 )
 _PRODUCER_TARGET_LAYER_IDS_KEY = "speco.standalone_tq_producer.target_layer_ids"
+_PRODUCER_HIDDEN_DTYPE_KEY = "speco.standalone_tq_producer.hidden_dtype"
+_DSPARK_L1_LOSS_ALPHA_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha"
+)
 _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
     "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
@@ -89,6 +96,7 @@ _PRODUCER_TUNING_KEYS = frozenset(
         f"{_PRODUCER_PREFIX}.max_sequence_length",
         f"{_PRODUCER_PREFIX}.max_feature_length",
         f"{_PRODUCER_PREFIX}.generation_max_tokens",
+        _PRODUCER_HIDDEN_DTYPE_KEY,
     }
 )
 _INTERNAL_OVERRIDE_KEYS = frozenset(
@@ -106,6 +114,13 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.backend.storage_backend",
         f"{_TQ_PREFIX}.backend.SimpleStorage.total_storage_size",
         f"{_TQ_PREFIX}.backend.SimpleStorage.num_data_storage_units",
+        f"{_TQ_PREFIX}.expected_feature.algorithm",
+        f"{_TQ_PREFIX}.expected_feature.target_model_path",
+        f"{_TQ_PREFIX}.expected_feature.target_revision",
+        f"{_TQ_PREFIX}.expected_feature.tokenizer_fingerprint",
+        f"{_TQ_PREFIX}.expected_feature.target_layer_ids",
+        f"{_TQ_PREFIX}.expected_feature.hidden_states_layout",
+        f"{_TQ_PREFIX}.expected_feature.hidden_dtype",
     }
 )
 
@@ -523,6 +538,31 @@ def build_pipeline_commands(
         f"{_FEATURE_STORE_PREFIX}.repeat=false",
         *tq_overrides,
     ]
+    hidden_dtype = _strip_quotes(
+        _find_override(training_args, _PRODUCER_HIDDEN_DTYPE_KEY) or "bfloat16"
+    )
+    dspark_l1_loss_alpha = float(
+        _strip_quotes(_find_override(training_args, _DSPARK_L1_LOSS_ALPHA_KEY) or "0.9")
+    )
+    hidden_layout = resolve_drafter_hidden_states_layout(
+        config.algorithm,
+        {"dspark_l1_loss_alpha": dspark_l1_loss_alpha},
+    )
+    consumer_internal.extend(
+        [
+            f"{_TQ_PREFIX}.expected_feature.algorithm={config.algorithm}",
+            f"{_TQ_PREFIX}.expected_feature.target_model_path="
+            + json.dumps(config.model_path),
+            f"{_TQ_PREFIX}.expected_feature.target_revision="
+            + _stable_path_identity("target", config.model_path),
+            f"{_TQ_PREFIX}.expected_feature.tokenizer_fingerprint="
+            + _stable_path_identity("tokenizer", config.tokenizer_path),
+            f"{_TQ_PREFIX}.expected_feature.target_layer_ids="
+            + _hydra_list(config.target_layer_ids),
+            f"{_TQ_PREFIX}.expected_feature.hidden_states_layout={hidden_layout}",
+            f"{_TQ_PREFIX}.expected_feature.hidden_dtype={hidden_dtype}",
+        ]
+    )
     algorithm_layer_ids_key = _ALGORITHM_TARGET_LAYER_IDS_KEYS.get(config.algorithm)
     if algorithm_layer_ids_key is not None:
         consumer_internal.append(

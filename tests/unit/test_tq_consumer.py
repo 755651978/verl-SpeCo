@@ -44,6 +44,15 @@ def _config() -> dict:
         "partition_id": "speco_drafter_features",
         "run_id": "run-a",
         "schema_version": PROTOCOL_SCHEMA_VERSION,
+        "expected_feature": {
+            "algorithm": "DSPARK",
+            "target_model_path": "/models/target",
+            "target_revision": "producer-revision",
+            "tokenizer_fingerprint": "tokenizer-sha256-a",
+            "target_layer_ids": [2, 8],
+            "hidden_states_layout": "dflash_aux",
+            "hidden_dtype": "float32",
+        },
     }
 
 
@@ -63,7 +72,13 @@ def _sample() -> DraftFeatureSample:
         loss_mask=torch.tensor([1.0, 1.0, 1.0]),
         position_ids=torch.tensor([0, 1, 2]),
         hidden_states=torch.arange(12, dtype=torch.float32).reshape(3, 4),
-        metadata={"target_model_revision": "producer-revision"},
+        metadata={
+            "target_model_path": "/models/target",
+            "target_revision": "producer-revision",
+            "tokenizer_fingerprint": "tokenizer-sha256-a",
+            "target_layer_ids": [2, 8],
+            "hidden_states_layout": "dflash_aux",
+        },
     )
 
 
@@ -80,6 +95,16 @@ def test_feature_store_factory_builds_tq_without_path() -> None:
     )
     assert isinstance(store, TQFeatureStore)
     assert store.run_id == "run-a"
+
+
+def test_tq_store_defaults_to_current_protocol_version() -> None:
+    config = _config()
+    del config["schema_version"]
+
+    store = TQFeatureStore.from_config(config)
+
+    assert store.schema_version == PROTOCOL_SCHEMA_VERSION
+    assert store.expected_config.schema_version == PROTOCOL_SCHEMA_VERSION
 
 
 def test_tq_store_connect_filter_sort_and_minimal_decode(monkeypatch) -> None:
@@ -139,9 +164,7 @@ def test_tq_store_connect_filter_sort_and_minimal_decode(monkeypatch) -> None:
     assert calls == [("ray", "ray-head:6379", "speco-drafter"), ("tq",)]
     assert [entry.tag["sequence_no"] for entry in ready] == [1, 2]
     assert len(samples) == 2
-    # Model/revision/tokenizer/layers are intentionally not in the first
-    # Consumer contract; tensor and run/protocol checks still execute.
-    assert samples[0].metadata["target_model_revision"] == "producer-revision"
+    assert samples[0].metadata["target_revision"] == "producer-revision"
     eos = store.read_eos()
     assert eos is not None and eos.total_samples == 2
 

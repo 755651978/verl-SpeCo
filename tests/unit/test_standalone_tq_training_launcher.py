@@ -212,6 +212,20 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     assert any(item.endswith("feature_store.type=tq") for item in commands.consumer)
     assert not any("run_id=user-value" in item for item in commands.consumer)
     assert any(f"run_id={config.run_id}" in item for item in commands.consumer)
+    expected_contract = " ".join(commands.consumer)
+    assert "expected_feature.algorithm=DSPARK" in expected_contract
+    assert 'expected_feature.target_model_path="/models/Qwen3-8B"' in expected_contract
+    assert "expected_feature.target_revision=target-path-sha256-" in expected_contract
+    assert (
+        "expected_feature.tokenizer_fingerprint=tokenizer-path-sha256-"
+        in expected_contract
+    )
+    assert "expected_feature.target_layer_ids=[1,9,17,25,33]" in expected_contract
+    assert (
+        "expected_feature.hidden_states_layout=dflash_aux_plus_last"
+        in expected_contract
+    )
+    assert "expected_feature.hidden_dtype=bfloat16" in expected_contract
     assert any(
         "vllm_endpoints=[http://127.0.0.1:8000/v1]" in item
         for item in commands.producer

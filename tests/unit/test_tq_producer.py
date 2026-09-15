@@ -211,10 +211,16 @@ class _Pool:
             raise self.close_error
 
 
-class _MisalignedPool(_Pool):
+class _OneMisalignedPool(_Pool):
+    def __init__(self, root: Path):
+        super().__init__(root)
+        self.misaligned_remaining = 1
+
     async def prefill(self, request: Any) -> RawVllmFeature:
         raw = await super().prefill(request)
-        raw.payload["hidden_states"] = raw.payload["hidden_states"][-1:]
+        if self.misaligned_remaining:
+            self.misaligned_remaining -= 1
+            raw.payload["hidden_states"] = raw.payload["hidden_states"][-1:]
         return raw
 
 
@@ -428,36 +434,43 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     assert fields["sample__loss_mask"].tolist() == [0.0, 1.0]
 
 
-def test_run_producer_drops_misaligned_hidden_states_and_writes_eos(
+def test_run_producer_replaces_misaligned_sample_before_eos(
     tmp_path: Path,
 ) -> None:
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)
     transport = _Transport()
-    pool = _MisalignedPool(tmp_path)
+    pool = _OneMisalignedPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
 
     stats = asyncio.run(
         run_producer(
-            _config(input_path),
+            config,
             transport=transport,
             tokenizer=_Tokenizer(),
             client_pool=pool,
         )
     )
 
-    assert stats.input_count == 2
-    assert stats.published_count == 0
-    assert stats.dropped_count == 2
-    assert not any(
-        tag.get("record_type") == "sample" for tag in transport.records.values()
-    )
+    sample_tags = [
+        tag
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    ]
     eos = next(tag for tag in transport.records.values() if tag.get("status") == "eos")
-    assert eos["total_samples"] == 0
+    assert stats.input_count == 3
+    assert stats.published_count == 2
+    assert stats.dropped_count == 1
+    assert len(sample_tags) == 2
+    assert eos["total_samples"] == 2
     assert all(not path.exists() for path in pool.paths)
+    assert pool.closed and transport.closed
 
 
 def test_run_producer_put_failure_keeps_temporary_file_and_omits_eos(
     tmp_path: Path,
+    caplog,
 ) -> None:
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)
@@ -477,6 +490,8 @@ def test_run_producer_put_failure_keeps_temporary_file_and_omits_eos(
     assert any(path.exists() for path in pool.paths)
     assert not any(tag.get("status") == "eos" for tag in transport.records.values())
     assert pool.closed and transport.closed
+    assert "Producer task failed task=publisher" in caplog.text
+    assert "'tq_put'" in caplog.text
 
 
 def test_validate_producer_rejects_consumer_partition_mismatch(tmp_path: Path) -> None:
