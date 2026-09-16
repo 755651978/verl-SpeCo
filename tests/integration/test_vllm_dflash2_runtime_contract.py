@@ -157,7 +157,7 @@ def test_dflash2_validator_requires_the_runtime_hyperparameters(tmp_path) -> Non
 def test_dflash2_validator_accepts_top_level_hyperparameters(tmp_path) -> None:
     """Configs saved by the trainer keep the knobs flat; the alias patch nests them."""
     config = {
-        "architectures": ["Qwen3DFlash2Model"],
+        "architectures": ["DFlash2DraftModel"],
         **_DFLASH2_CONFIG["dflash_config"],
     }
     model_path = _write_drafter(tmp_path, config)
@@ -249,7 +249,7 @@ def test_dflash2_runtime_aliases_nest_flat_hyperparameters() -> None:
 
 
 def test_dflash2_runtime_aliases_create_the_nested_block_and_ignore_others() -> None:
-    config = {"architectures": ["Qwen3DFlash2Model"], "selector_top_k": 4}
+    config = {"architectures": ["DFlash2DraftModel"], "selector_top_k": 4}
     assert _normalize_dflash2_runtime_aliases(config) is True
     assert config["dflash_config"] == {"selector_top_k": 4}
 
@@ -296,3 +296,14 @@ def test_dflash2_engine_param_name_renames_only_the_codebooks() -> None:
         "fc.weight",
     ):
         assert _dflash2_engine_param_name(untouched) == untouched
+
+
+@pytest.mark.parametrize("algorithm", ["DFLASH", "DFLASH2"])
+def test_dflash2_rejects_unregistered_qwen_architecture(tmp_path, algorithm) -> None:
+    config = {**_DFLASH2_CONFIG, "architectures": ["Qwen3DFlash2Model"]}
+    model_path = _write_drafter(tmp_path, config)
+
+    with pytest.raises(ValueError, match="architectures"):
+        _validate_vllm_dflash_drafter_config(model_path, algorithm=algorithm)
+
+    assert _normalize_dflash2_runtime_aliases(config) is False

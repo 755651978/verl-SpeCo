@@ -727,6 +727,12 @@ class DFlashTrainerBackend:
     # checkpoint holds a tensor in a different module type than the overlay does.
     _CHECKPOINT_KEY_ALIASES: dict[str, str] = {}
 
+    # Hot-publish contract: the block drafters read logits off the frozen target
+    # head and keep the target-seeded embedding frozen, so neither belongs in the
+    # published delta. DSpark and Domino inherit this.
+    trains_draft_lm_head = False
+    trains_draft_embeddings = False
+
     def __init__(self, config, target_model_config):
         self.config = config
         self.target_model_config = target_model_config
