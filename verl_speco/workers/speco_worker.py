@@ -49,6 +49,7 @@ from verl.utils.distributed import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.integration.rollout_publish import release_draft_weights_payload
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -2295,7 +2296,7 @@ class SpecoWorker(Worker):
         has_snapshot, weights = self.trainer.pop_model_state_dict_for_publish(
             self.last_global_step
         )
-        if not has_snapshot:
+        if not has_snapshot or not weights:
             logger.debug(
                 "[SpecoWorker replica=%s rank=%s] missing cached publish snapshot at step %s; skip publish.",
                 self.replica_rank,
@@ -2307,6 +2308,7 @@ class SpecoWorker(Worker):
         if self._last_trained_execution_strategy == "rollout_idle_worker":
             publish_leader = self.is_drafter_group_leader
         if not publish_leader:
+            release_draft_weights_payload(weights)
             return None
 
         print(
@@ -2317,4 +2319,24 @@ class SpecoWorker(Worker):
             f"target_worker_ids={self._last_trained_target_worker_ids}",
             flush=True,
         )
-        return {"weights_ref": ray.put(weights)}
+        try:
+            weights_ref = ray.put(weights)
+        finally:
+            reclaim = release_draft_weights_payload(weights)
+            logger.warning(
+                "[speco publish reclaim] role=producer global_steps=%s "
+                "num_weights=%s payload_cleared=%s allocator=%s action=%s "
+                "heap_trimmed=%s elapsed_sec=%.3f memory_before=(%s) "
+                "memory_after=(%s)",
+                self.last_global_step,
+                reclaim["num_weights"],
+                reclaim["payload_cleared"],
+                reclaim.get("allocator"),
+                reclaim.get("reclaim_action"),
+                reclaim.get("heap_trimmed"),
+                float(reclaim.get("elapsed_sec", 0.0) or 0.0),
+                reclaim.get("memory_before"),
+                reclaim.get("memory_after"),
+            )
+
+        return {"weights_ref": weights_ref}

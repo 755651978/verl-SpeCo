@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SPECO adapter for verl v0.8.0 RayPPOTrainer."""
+"""SPECO adapter for the legacy RayPPOTrainer in verl 0.8 and 0.9."""
 
 import hashlib
 import json
@@ -158,6 +158,17 @@ def _get_nested(config, path, default=None):
 def _speco_is_ray_object_ref(value: Any) -> bool:
     object_ref_type = getattr(ray, "ObjectRef", ())
     return bool(object_ref_type) and isinstance(value, object_ref_type)
+
+
+def _speco_alpha_counter(value: int) -> str:
+    """Encode a positive counter with letters so Ray log dedup keeps each sample."""
+
+    value = max(int(value), 1)
+    chars = []
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        chars.append(chr(ord("a") + remainder))
+    return "".join(reversed(chars))
 
 
 def _speco_ref_meta_rows(meta: Any) -> int:
@@ -4579,5 +4590,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_wait_pending_drafter_checkpoint()
 
     def _save_checkpoint(self):
+        # A checkpoint boundary must not retain an async publish payload or let
+        # draft loading overlap actor/drafter serialization. This is redundant
+        # with the normal next-generation barrier by design: save/test order is
+        # controlled by upstream VERL and can change independently.
+        self._speco_wait_pending_drafter_publish()
         self._speco_save_drafter_checkpoint(wait=True)
         return super()._save_checkpoint()
+
+    def _validate(self, *args, **kwargs):
+        # Validation commonly drives KV usage to the configured limit. Ensure
+        # online weight loading and its temporary buffers have completed before
+        # validation admits requests into the rollout engine.
+        self._speco_wait_pending_drafter_publish()
+        return super()._validate(*args, **kwargs)

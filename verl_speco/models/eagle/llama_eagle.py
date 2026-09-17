@@ -1325,31 +1325,26 @@ class LlamaMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        if self.config.pretraining_tp > 1:
-            slice = self.intermediate_size // self.config.pretraining_tp
+        pretraining_tp = int(getattr(self.config, "pretraining_tp", 1))
+        if pretraining_tp > 1:
+            slice = self.intermediate_size // pretraining_tp
             gate_proj_slices = self.gate_proj.weight.split(slice, dim=0)
             up_proj_slices = self.up_proj.weight.split(slice, dim=0)
             down_proj_slices = self.down_proj.weight.split(slice, dim=1)
 
             gate_proj = torch.cat(
-                [
-                    F.linear(x, gate_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
+                [F.linear(x, gate_proj_slices[i]) for i in range(pretraining_tp)],
                 dim=-1,
             )
             up_proj = torch.cat(
-                [
-                    F.linear(x, up_proj_slices[i])
-                    for i in range(self.config.pretraining_tp)
-                ],
+                [F.linear(x, up_proj_slices[i]) for i in range(pretraining_tp)],
                 dim=-1,
             )
 
             intermediate_states = (self.act_fn(gate_proj) * up_proj).split(slice, dim=2)
             down_proj = [
                 F.linear(intermediate_states[i], down_proj_slices[i])
-                for i in range(self.config.pretraining_tp)
+                for i in range(pretraining_tp)
             ]
             down_proj = sum(down_proj)
         else:
@@ -1500,10 +1495,14 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         self.post_init()
 
-        # create vocab buffers
+        # Create vocab buffers. d2t holds OFFSETS, not absolute ids: the target id
+        # of draft id i is `i + d2t[i]`. That is what
+        # `preprocessing.process_token_dict_to_mappings` emits (`used_tokens[i] - i`)
+        # and what the serving engines apply, so the identity mapping used when no
+        # frequency mapping is supplied is all zeros.
         t2d = torch.zeros(self.vocab_size, dtype=torch.bool)
         t2d[: self.draft_vocab_size] = True
-        d2t = torch.arange(self.draft_vocab_size, dtype=torch.int64)
+        d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
