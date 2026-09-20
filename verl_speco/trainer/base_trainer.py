@@ -576,6 +576,10 @@ class DrafterBaseTrainer:
         self._pending_target_lm_head_source_vocab_size: int | None = None
         self._pending_target_lm_head_chunked_apply = False
         self._target_lm_head_weight_step: int | None = None
+        # Version currently materialized in the backend target head. Keep this
+        # separate from ``_target_lm_head_weight_step``: the latter is also set
+        # when a deferred CPU snapshot is merely staged.
+        self._applied_target_lm_head_weight_step: int | None = None
         self._target_lm_head_snapshots: dict[int, dict[str, Any]] = {}
         self._target_lm_head_snapshot_limit = 2
         self._active_training_reservation_id: str | None = None
@@ -1113,6 +1117,9 @@ class DrafterBaseTrainer:
     def _build_draft_model(self):
         """build draft model"""
         logger.debug(f"[Rank {self.rollout_dp_rank}] Building drafter model...")
+        # A rebuilt backend owns a new target-head module even if the selected
+        # logical version did not change, so it must be materialized once.
+        self._applied_target_lm_head_weight_step = None
         # A. 实例化模型（委托给backend）
         pending_target_weight = self._pending_target_lm_head_weight
         if (
@@ -1467,7 +1474,16 @@ class DrafterBaseTrainer:
         return stripped_state_dict or full_state_dict
 
     def _is_checkpoint_leader(self) -> bool:
+        if self._use_replica_local_bubble_group():
+            return self._get_sp_local_rank() == 0
         return self.rollout_dp_rank == 0 and self._get_sp_local_rank() == 0
+
+    def _use_replica_local_bubble_group(self) -> bool:
+        return bool(
+            self._bubble_time_enabled
+            and self.training_device_mesh is None
+            and self.training_process_group is not None
+        )
 
     def _infer_pretrained_save_kwargs(self) -> dict[str, Any]:
         # Save as HuggingFace-compatible PyTorch weights so SGLang and the
@@ -1887,7 +1903,11 @@ class DrafterBaseTrainer:
 
         checkpoint_started = time.perf_counter()
         checkpoint_path = os.path.join(self.checkpoint_dir, f"draft_step_{int(step)}")
-        if self.rollout_dp_rank != 0 and not self._use_flattened_drafter_fsdp_mesh():
+        if (
+            self.rollout_dp_rank != 0
+            and not self._use_flattened_drafter_fsdp_mesh()
+            and not self._use_replica_local_bubble_group()
+        ):
             return {
                 "saved": False,
                 "path": checkpoint_path,
@@ -2136,6 +2156,9 @@ class DrafterBaseTrainer:
         )
         self._pending_target_lm_head_chunked_apply = bool(defer_device_apply)
         self._target_lm_head_weight_step = global_step
+        # A newly received payload may replace an earlier snapshot with the
+        # same logical step. Force one apply before that version can train.
+        self._applied_target_lm_head_weight_step = None
         if global_step is not None:
             version = int(global_step)
             self._target_lm_head_snapshots[version] = {
@@ -2177,6 +2200,26 @@ class DrafterBaseTrainer:
         snapshot = self._target_lm_head_snapshots.get(version)
         if snapshot is None:
             return False
+        if (
+            self._applied_target_lm_head_weight_step == version
+            and self._target_lm_head_module() is not None
+        ):
+            # Cleanup may have moved the already-correct head to CPU. The next
+            # activation only needs the normal module device move; copying the
+            # same cached tensor into it again adds no correctness value.
+            self._pending_target_lm_head_weight = None
+            self._pending_target_lm_head_row_indices = None
+            self._pending_target_lm_head_source_vocab_size = None
+            self._pending_target_lm_head_chunked_apply = False
+            self._target_lm_head_weight_step = version
+            logger.info(
+                "[BubbleTime] reused applied target lm_head: rank=%s "
+                "target_version=%s cached_versions=%s",
+                self.rank,
+                version,
+                sorted(self._target_lm_head_snapshots),
+            )
+            return True
         self._pending_target_lm_head_weight = snapshot["weight"]
         self._pending_target_lm_head_row_indices = snapshot["row_indices"]
         self._pending_target_lm_head_source_vocab_size = snapshot["source_vocab_size"]
@@ -2513,6 +2556,9 @@ class DrafterBaseTrainer:
                 )
                 target_weight = lm_head.weight
             if int(source_row_indices.numel()) <= 0:
+                self._applied_target_lm_head_weight_step = (
+                    self._target_lm_head_weight_step
+                )
                 self._pending_target_lm_head_weight = None
                 self._pending_target_lm_head_row_indices = None
                 self._pending_target_lm_head_source_vocab_size = None
@@ -2544,6 +2590,9 @@ class DrafterBaseTrainer:
                 int(target_weight.shape[0]),
                 target_weight.dtype,
                 target_weight.device,
+            )
+            self._applied_target_lm_head_weight_step = (
+                self._target_lm_head_weight_step
             )
             self._pending_target_lm_head_weight = None
             self._pending_target_lm_head_row_indices = None
@@ -2652,6 +2701,7 @@ class DrafterBaseTrainer:
                 self._target_lm_head_weight_step,
                 probe_norms,
             )
+        self._applied_target_lm_head_weight_step = self._target_lm_head_weight_step
         self._pending_target_lm_head_weight = None
         self._pending_target_lm_head_row_indices = None
         self._pending_target_lm_head_source_vocab_size = None
@@ -4710,8 +4760,14 @@ class DrafterBaseTrainer:
         *,
         sample_last_n_steps: int = 2,
         require_full_batch: bool = False,
+        target_version: int | None = None,
     ) -> dict[str, Any]:
-        """Return a non-mutating snapshot of data that can form training batches."""
+        """Return a non-mutating snapshot of data that can form training batches.
+
+        ``target_version`` pins a Bubble plan to the version selected when the
+        plan was created.  Newer samples may arrive before worker preflight;
+        they must not make an otherwise valid, older plan look stale.
+        """
 
         current_step = int(self.current_rl_step)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
@@ -4740,7 +4796,18 @@ class DrafterBaseTrainer:
                 target_versions = [
                     version for version in target_versions if version in cached_versions
                 ]
-            selected_target_version = max(target_versions) if target_versions else None
+            requested_target_version = (
+                None if target_version is None else int(target_version)
+            )
+            selected_target_version = (
+                requested_target_version
+                if requested_target_version in target_versions
+                else (
+                    max(target_versions)
+                    if target_versions and target_version is None
+                    else None
+                )
+            )
             trainable_data = [
                 item
                 for item in recent_data
@@ -4749,8 +4816,21 @@ class DrafterBaseTrainer:
                 == selected_target_version
             ]
         else:
-            trainable_data = current_step_data
-            selected_target_version = current_step if trainable_data else None
+            requested_target_version = (
+                None if target_version is None else int(target_version)
+            )
+            selected_target_version = (
+                current_step
+                if current_step_data
+                and (
+                    requested_target_version is None
+                    or requested_target_version == current_step
+                )
+                else None
+            )
+            trainable_data = (
+                current_step_data if selected_target_version is not None else []
+            )
 
         batch_size = max(int(self.batch_size), 1)
         trainable_samples = len(trainable_data)

@@ -293,6 +293,18 @@ actor_rollout_ref:
           execution:
             # sync | rollout_idle_worker
             strategy: sync
+          # Optional hybrid Bubble quota. Each training interval creates one
+          # quality target after data becomes trainable. Bubble work repays it
+          # first; old/large debt permits a small same-writer synchronous
+          # top-up at a safe point. target_steps=null reuses training.step.
+          training_quota:
+            enable: false
+            target_steps: null
+            # Grace period counted after the corresponding training interval
+            # boundary, so the full interval remains available to Bubble.
+            max_debt_age_steps: 3
+            max_accumulated_debt: 20
+            max_sync_topup_steps: 2
           idle_worker:
             require_memory_released: true
             drain_before_next_rollout: true

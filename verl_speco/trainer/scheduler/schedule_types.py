@@ -143,9 +143,18 @@ class DrafterScheduleConfig:
     idle_worker_max_publish_lag_steps: int = 2
     idle_worker_max_pending_publish: int = 1
     idle_worker_dynamic_batch_cap: bool = True
-    idle_worker_initial_dynamic_batches: int = 1
+    idle_worker_initial_dynamic_batches: int | None = None
     idle_worker_gen_slowdown_threshold: float = 0.08
     gradient_accumulation_steps: int = 1
+    # Optional hybrid quota for Bubble Time.  Each configured training interval
+    # contributes ``target_steps`` optimizer steps once trainable data exists.
+    # Bubble execution repays the quota first; bounded synchronous top-ups on
+    # the same writer group run only after debt becomes old or reaches its cap.
+    training_quota_enable: bool = False
+    training_quota_target_steps: int | None = None
+    training_quota_max_debt_age_steps: int = 3
+    training_quota_max_accumulated_debt: int = 20
+    training_quota_max_sync_topup_steps: int = 2
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -166,6 +175,12 @@ class DrafterScheduleConfig:
         idle_cfg = scheduler_get("idle_worker", {}) or {}
         idle_get = (
             idle_cfg.get if hasattr(idle_cfg, "get") else lambda key, default: default
+        )
+        training_quota_cfg = scheduler_get("training_quota", {}) or {}
+        training_quota_get = (
+            training_quota_cfg.get
+            if hasattr(training_quota_cfg, "get")
+            else lambda key, default: default
         )
         train_batches = int(get("step", 100))
         strategy_value = execution_get("strategy", get("execution_strategy", "sync"))
@@ -247,8 +262,8 @@ class DrafterScheduleConfig:
             idle_worker_dynamic_batch_cap=bool(
                 idle_get("dynamic_batch_cap", True)
             ),
-            idle_worker_initial_dynamic_batches=max(
-                int(idle_get("initial_dynamic_batches", 1) or 1), 1
+            idle_worker_initial_dynamic_batches=_optional_int(
+                idle_get("initial_dynamic_batches", None)
             ),
             idle_worker_gen_slowdown_threshold=max(
                 float(idle_get("gen_slowdown_threshold", 0.08) or 0.0),
@@ -256,6 +271,19 @@ class DrafterScheduleConfig:
             ),
             gradient_accumulation_steps=max(
                 int(get("gradient_accumulation_steps", 1) or 1), 1
+            ),
+            training_quota_enable=bool(training_quota_get("enable", False)),
+            training_quota_target_steps=_optional_int(
+                training_quota_get("target_steps", None)
+            ),
+            training_quota_max_debt_age_steps=max(
+                int(training_quota_get("max_debt_age_steps", 3) or 0), 0
+            ),
+            training_quota_max_accumulated_debt=max(
+                int(training_quota_get("max_accumulated_debt", 20) or 0), 0
+            ),
+            training_quota_max_sync_topup_steps=max(
+                int(training_quota_get("max_sync_topup_steps", 2) or 0), 0
             ),
         )
 
@@ -569,6 +597,9 @@ class TrainingPlan:
         "replica_local_unavailable": 23,
         "idle_group_not_prewarmed": 24,
         "writer_state_migration_required": 25,
+        "speculative_idle_unconfirmed": 26,
+        "quota_topup_training_ready": 27,
+        "quota_topup_lm_head_prefetch_pending": 28,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -591,6 +622,7 @@ class TrainingPlan:
             "target_worker_ids": self.target_worker_ids,
             "training_group_id": self.training_group_id,
             "idle_batch_estimate_sec": self.idle_batch_estimate_sec,
+            "idle_startup_reserve_sec": self.idle_startup_reserve_sec,
             "idle_tail_reserve_sec": self.idle_tail_reserve_sec,
             "idle_reclaim_penalty_sec": self.idle_reclaim_penalty_sec,
             "idle_confidence": self.idle_confidence.value,
@@ -631,6 +663,9 @@ class TrainingPlan:
                         not self.launch and self.reason == "incomplete_training_group"
                     ),
                     "bubble/window_too_small": int(self.reason == "window_too_small"),
+                    "bubble/speculative_idle_unconfirmed": int(
+                        self.reason == "speculative_idle_unconfirmed"
+                    ),
                     "bubble/idle_reclaim_penalty_active": int(
                         bool(self.idle_reclaim_penalty_sec)
                     ),

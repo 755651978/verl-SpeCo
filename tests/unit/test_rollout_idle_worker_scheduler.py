@@ -139,7 +139,7 @@ def test_idle_worker_plan_requires_complete_training_group() -> None:
     assert plan.metrics()["bubble/skipped_incomplete_group"] == 1
 
 
-def test_speculative_idle_window_uses_stricter_admission_threshold() -> None:
+def test_speculative_idle_window_waits_for_generation_confirmation() -> None:
     now = time.time()
     config = replace(
         _idle_config(),
@@ -176,7 +176,19 @@ def test_speculative_idle_window_uses_stricter_admission_threshold() -> None:
         config, now=now
     )
     assert not speculative_resources.available
-    assert speculative_resources.reason == "window_too_small"
+    assert speculative_resources.reason == "speculative_idle_unconfirmed"
+
+    metrics = speculative.record_generation_completed(
+        now + 0.1,
+        confirm_speculative_idle=True,
+        must_be_ready_at=now + 5.0,
+    )
+    assert metrics["bubble/speculative_idle_confirmed"] == 1
+    confirmed_resources = speculative.select_idle_training_resources(
+        config, now=now + 0.1
+    )
+    assert confirmed_resources.available
+    assert confirmed_resources.idle_confidence is IdleWindowConfidence.CONFIRMED
 
 
 def test_replica_local_plan_accumulates_to_full_collective_batch() -> None:
@@ -207,9 +219,9 @@ def test_replica_local_plan_accumulates_to_full_collective_batch() -> None:
 
     assert plan.launch
     assert plan.gradient_accumulation_steps == 2
-    assert plan.max_batches == 1
-    assert plan.planned_optimizer_steps == 1
-    assert plan.planned_valid_tokens == 200
+    assert plan.max_batches == config.train_batches_per_trigger
+    assert plan.planned_optimizer_steps == config.train_batches_per_trigger
+    assert plan.planned_valid_tokens == 2000
 
 
 def test_auto_idle_worker_groups_do_not_train_half_collective_group() -> None:
@@ -323,6 +335,231 @@ def test_idle_worker_auto_group_config_from_nested_mapping() -> None:
     assert config.idle_worker_group_mode == "auto"
     assert config.idle_worker_group_size == 2
     assert config.idle_worker_training_groups == ()
+
+
+def test_training_quota_config_reuses_training_step_by_default() -> None:
+    config = DrafterScheduleConfig.from_mapping(
+        {
+            "step": 10,
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "training_quota": {
+                    "enable": True,
+                    "target_steps": None,
+                    "max_debt_age_steps": 3,
+                    "max_accumulated_debt": 20,
+                    "max_sync_topup_steps": 2,
+                },
+            },
+        }
+    )
+
+    assert config.training_quota_enable
+    assert config.training_quota_target_steps is None
+    assert config.train_batches_per_trigger == 10
+    assert config.training_quota_max_debt_age_steps == 3
+    assert config.training_quota_max_accumulated_debt == 20
+    assert config.training_quota_max_sync_topup_steps == 2
+
+
+def test_training_quota_waits_then_plans_bounded_topup_on_writer_group() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+    config = replace(
+        _idle_config(),
+        training_quota_enable=True,
+        training_quota_target_steps=10,
+        training_quota_max_debt_age_steps=3,
+        training_quota_max_accumulated_debt=20,
+        training_quota_max_sync_topup_steps=2,
+    )
+    first_context = replace(_context(), global_step=10)
+
+    first_event = scheduler.on_before_actor_update(
+        BeforeActorUpdateContext(
+            schedule_context=first_context,
+            config=config,
+        )
+    )
+
+    assert first_event.training_plan is not None
+    assert not first_event.training_plan.launch
+    assert scheduler._training_quota_debt_steps == 10
+
+    due_event = scheduler.on_before_actor_update(
+        BeforeActorUpdateContext(
+            schedule_context=replace(first_context, global_step=13),
+            config=config,
+        )
+    )
+    plan = due_event.training_plan
+
+    assert plan is not None
+    assert plan.launch
+    assert plan.reason == "quota_topup_training_ready"
+    assert plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+    assert plan.target_worker_ids == ("0", "1")
+    assert plan.max_batches == 2
+    assert plan.deadline_ts is None
+    assert due_event.metrics["bubble/training_quota_topup_requested"] == 1
+
+
+def test_training_quota_does_not_add_debt_for_each_data_version() -> None:
+    scheduler = DrafterScheduler()
+    config = replace(
+        _idle_config(),
+        training_quota_enable=True,
+        training_quota_target_steps=10,
+        training_quota_max_accumulated_debt=20,
+    )
+
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=11),
+        global_step=11,
+        config=config,
+    )
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=12),
+        global_step=12,
+        config=config,
+    )
+
+    assert scheduler._training_quota_last_cycle_step == 15
+    assert scheduler._training_quota_debt_steps == 10
+
+
+def test_training_quota_age_starts_after_interval_boundary() -> None:
+    scheduler = DrafterScheduler()
+    config = replace(
+        _idle_config(),
+        training_interval_steps=5,
+        training_quota_enable=True,
+        training_quota_target_steps=10,
+        training_quota_max_debt_age_steps=3,
+        training_quota_max_accumulated_debt=100,
+    )
+
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=1),
+        global_step=1,
+        config=config,
+    )
+
+    assert scheduler._training_quota_oldest_cycle_step == 5
+    assert scheduler._training_quota_age_steps(4) == 0
+    assert not scheduler._training_quota_due(4, config)
+    assert not scheduler._training_quota_due(7, config)
+    assert scheduler._training_quota_due(8, config)
+
+
+def test_training_quota_debt_cap_still_preserves_first_bubble_interval() -> None:
+    scheduler = DrafterScheduler()
+    config = replace(
+        _idle_config(),
+        training_interval_steps=5,
+        training_quota_enable=True,
+        training_quota_target_steps=10,
+        training_quota_max_debt_age_steps=3,
+        training_quota_max_accumulated_debt=10,
+    )
+
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=1),
+        global_step=1,
+        config=config,
+    )
+
+    assert not scheduler._training_quota_due(4, config)
+    assert scheduler._training_quota_due(5, config)
+
+
+def test_training_quota_background_poll_never_launches_topup() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+    scheduler._training_quota_debt_steps = 10
+    scheduler._training_quota_oldest_cycle_step = 1
+    scheduler._training_quota_last_cycle_step = 10
+    config = replace(
+        _idle_config(),
+        training_quota_enable=True,
+        training_quota_max_debt_age_steps=1,
+        training_quota_max_sync_topup_steps=2,
+    )
+
+    event = scheduler.on_before_actor_update(
+        BeforeActorUpdateContext(
+            schedule_context=_context(),
+            config=config,
+            allow_sync_fallback=False,
+            allow_quota_topup=False,
+        )
+    )
+
+    assert event.training_plan is not None
+    assert not event.training_plan.launch
+    assert event.training_plan.reason != "quota_topup_training_ready"
+
+
+def test_successful_bubble_steps_repay_training_quota_debt() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._training_quota_debt_steps = 10
+    scheduler._training_quota_oldest_cycle_step = 7
+    plan = TrainingPlan(
+        launch=True,
+        reason="quota_topup_training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=2,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        plan_id="quota-plan",
+    )
+    outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=2,
+        worker_results=[],
+        raw_results=[],
+        elapsed_sec=1.0,
+        reason="completed",
+        metrics={},
+    )
+
+    scheduler._record_training_outcome(plan, outcome)
+
+    assert scheduler._training_quota_debt_steps == 8
+    assert scheduler._training_quota_oldest_cycle_step == 7
+
+
+def test_training_quota_topup_uses_blocking_execution_strategy() -> None:
+    class _RecordingStrategy:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, plan, *, executor, runtime_state):
+            self.calls += 1
+            return ExecutionOutcome(raw_results=[], elapsed_sec=0.0)
+
+    scheduler = DrafterScheduler(worker_executor=object())
+    blocking = _RecordingStrategy()
+    asynchronous = _RecordingStrategy()
+    scheduler.sync_execution_strategy = blocking
+    scheduler.rollout_idle_execution_strategy = asynchronous
+    plan = TrainingPlan(
+        launch=True,
+        reason="quota_topup_training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=2,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+    )
+
+    scheduler.execute_training_plan(plan, runtime_state=DrafterRuntimeState())
+
+    assert blocking.calls == 1
+    assert asynchronous.calls == 0
 
 
 def test_metadata_idle_worker_groups_wait_for_all_collective_replicas() -> None:
@@ -498,7 +735,7 @@ def test_idle_worker_auto_budget_bootstraps_one_batch_without_manual_estimate() 
     plan = scheduler.prepare_training_plan(_context(), config)
 
     assert plan.launch
-    assert plan.max_batches == 1
+    assert plan.max_batches == config.train_batches_per_trigger
     assert plan.reason == "training_ready"
     assert plan.idle_batch_estimate_sec == pytest.approx(0.25)
 
@@ -525,7 +762,7 @@ def test_runtime_idle_event_without_deadline_bootstraps_one_batch() -> None:
     plan = scheduler.prepare_training_plan(_context(), config)
 
     assert plan.launch
-    assert plan.max_batches == 1
+    assert plan.max_batches == config.train_batches_per_trigger
     assert plan.idle_window_sec == pytest.approx(
         plan.idle_startup_reserve_sec
         + plan.idle_batch_estimate_sec
@@ -577,7 +814,7 @@ def test_idle_worker_admission_uses_observed_replica_idle_window() -> None:
 
     assert plan.launch
     assert plan.idle_window_sec == pytest.approx(2.0, abs=0.1)
-    assert plan.max_batches == 1
+    assert plan.max_batches == config.train_batches_per_trigger
 
 
 def test_generation_completion_records_real_idle_window() -> None:
@@ -1200,7 +1437,7 @@ def test_idle_worker_prebatch_reclaim_streak_keeps_multi_batch_window() -> None:
 
     assert plan.launch
     assert plan.reason == "training_ready"
-    assert plan.max_batches == 1
+    assert plan.max_batches == config.train_batches_per_trigger
 
 
 def test_idle_worker_reclaim_penalty_decays_on_next_step() -> None:
@@ -1341,7 +1578,7 @@ def test_idle_worker_training_does_not_wait_for_training_interval() -> None:
     assert not plan.interval_matched
     assert plan.launch
     assert plan.reason == "training_ready"
-    assert plan.max_batches == 1
+    assert plan.max_batches == config.train_batches_per_trigger
 
 
 def test_idle_worker_plan_uses_buffered_data_target_version() -> None:
@@ -1653,7 +1890,7 @@ def test_idle_worker_window_is_admission_not_hard_batch_cap() -> None:
     plan = scheduler.prepare_training_plan(_context(), _idle_config())
 
     assert plan.launch
-    assert plan.max_batches == 1
+    assert plan.max_batches == _idle_config().train_batches_per_trigger
     assert plan.target_worker_ids == ("0", "1")
     assert plan.training_group_id == "idle-group-0"
     assert plan.to_worker_payload()["execution_strategy"] == "rollout_idle_worker"
@@ -1687,6 +1924,106 @@ def test_idle_worker_dynamic_cap_grows_after_reaching_cap() -> None:
     scheduler._record_training_outcome(plan, outcome)
 
     assert scheduler._effective_idle_dynamic_batch_cap(config) == 2
+
+
+def test_idle_worker_data_version_rejection_does_not_reduce_dynamic_cap() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler._idle_worker_dynamic_batch_cap = 4
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=4,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="version-race-plan",
+    )
+    outcome = TrainingOutcome(
+        trained=False,
+        successful_steps=0,
+        worker_results=[],
+        raw_results=[{"ready": False, "reason": "data_version_changed"}],
+        elapsed_sec=0.1,
+        reason="data_version_changed",
+        metrics={},
+    )
+
+    scheduler._record_training_outcome(plan, outcome)
+
+    assert scheduler._effective_idle_dynamic_batch_cap(config) == 4
+
+
+def test_idle_worker_prebatch_reclaim_does_not_reduce_dynamic_cap() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler._idle_worker_dynamic_batch_cap = 4
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=4,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="prebatch-reclaim-plan",
+        idle_confidence=IdleWindowConfidence.CONFIRMED,
+    )
+    outcome = TrainingOutcome(
+        trained=False,
+        successful_steps=0,
+        worker_results=[],
+        raw_results=[
+            {"worker_id": "2", "reason": "not_in_training_group"},
+            {"worker_id": "0", "stop_reason": "reclaim_requested"},
+        ],
+        elapsed_sec=0.1,
+        reason="completed",
+        metrics={"bubble/train_reclaimed_before_first_batch": 1},
+    )
+
+    scheduler._record_idle_dynamic_batch_cap(plan, outcome)
+
+    assert scheduler._effective_idle_dynamic_batch_cap(config) == 4
+    assert scheduler._idle_stop_reason(outcome, plan) == "reclaim_requested"
+
+
+def test_idle_worker_expired_preflight_does_not_reduce_dynamic_cap() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    config = _auto_idle_config(2)
+    scheduler._idle_worker_dynamic_batch_cap = 4
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=4,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        training_group_id="idle-group-0",
+        plan_id="expired-plan",
+    )
+    outcome = TrainingOutcome(
+        trained=False,
+        successful_steps=0,
+        worker_results=[],
+        raw_results=[
+            {"worker_id": "0", "reason": "plan_expired_before_preflight"}
+        ],
+        elapsed_sec=0.1,
+        reason="worker_preflight_failed",
+        metrics={},
+    )
+
+    scheduler._record_idle_dynamic_batch_cap(plan, outcome)
+
+    assert scheduler._effective_idle_dynamic_batch_cap(config) == 4
 
 
 def test_idle_worker_dynamic_cap_reduces_on_gen_slowdown() -> None:

@@ -1246,11 +1246,16 @@ class SpecoWorker(Worker):
         self,
         global_step: int,
         wait: bool = True,
+        worker_ids: Optional[tuple[str, ...]] = None,
     ):
         if not self.enable_drafter:
             return {"saved": False, "reason": "disabled"}
         if not self.in_drafter_train_group or self.trainer is None:
             return {"saved": False, "reason": "not_in_training_group"}
+        if worker_ids and str(self.rank) not in {
+            str(worker_id) for worker_id in worker_ids
+        }:
+            return {"saved": False, "reason": "not_checkpoint_group"}
         if global_step is None:
             return {"saved": False, "reason": "missing_global_step"}
         result = self.trainer.save_checkpoint(
@@ -1259,9 +1264,10 @@ class SpecoWorker(Worker):
         )
         if self.is_drafter_group_leader:
             logger.debug(
-                "[speco checkpoint] replica=%s global_step=%s result=%s",
+                "[speco checkpoint] replica=%s global_step=%s workers=%s result=%s",
                 self.replica_rank,
                 global_step,
+                worker_ids,
                 result,
             )
         return result
@@ -1599,6 +1605,48 @@ class SpecoWorker(Worker):
             result["reason"] = "stale_training_plan"
             return result
 
+        if execution_strategy == "rollout_idle_worker":
+            deadline_ts = training_plan.get("deadline_ts")
+            now_ts = time.time()
+            startup_reserve_sec = max(
+                float(training_plan.get("idle_startup_reserve_sec", 0.0) or 0.0),
+                0.0,
+            )
+            batch_estimate_sec = max(
+                float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
+                0.0,
+            )
+            tail_reserve_sec = max(
+                float(training_plan.get("idle_tail_reserve_sec", 0.0) or 0.0),
+                0.0,
+            )
+            required_remaining_sec = (
+                startup_reserve_sec + batch_estimate_sec + tail_reserve_sec
+            )
+            if deadline_ts is not None and (
+                float(deadline_ts) - now_ts < required_remaining_sec
+            ):
+                remaining_sec = float(deadline_ts) - now_ts
+                result.update(
+                    {
+                        "reason": "plan_expired_before_preflight",
+                        "deadline_ts": float(deadline_ts),
+                        "remaining_sec": remaining_sec,
+                        "required_remaining_sec": required_remaining_sec,
+                    }
+                )
+                print(
+                    "[BubbleTime] training_launch_stale: "
+                    f"plan_id={training_plan.get('plan_id', '')} "
+                    f"worker_id={self.rank} rank={self.rank} "
+                    "reason=plan_expired_before_preflight "
+                    f"remaining_s={remaining_sec:.4f} "
+                    f"required_remaining_s={required_remaining_sec:.4f} "
+                    f"deadline_ts={float(deadline_ts):.6f} now_ts={now_ts:.6f}",
+                    flush=True,
+                )
+                return result
+
         snapshot = (training_plan.get("worker_snapshots") or {}).get(str(self.rank))
         if not isinstance(snapshot, dict):
             result["reason"] = "missing_worker_snapshot"
@@ -1606,7 +1654,19 @@ class SpecoWorker(Worker):
         if snapshot.get("worker_incarnation") != self.worker_incarnation:
             result["reason"] = "worker_restarted"
             return result
-        if int(snapshot.get("buffer_version", -1)) != int(self.trainer.buffer_version):
+        # Bubble plans reserve a version-homogeneous sample snapshot below.
+        # Appending a newer version between scheduling and preflight is safe
+        # and must not invalidate the older plan.  A backwards version change
+        # still indicates a reset/restart and remains fail-closed.
+        snapshot_buffer_version = int(snapshot.get("buffer_version", -1))
+        current_buffer_version = int(self.trainer.buffer_version)
+        if (
+            execution_strategy != "rollout_idle_worker"
+            and snapshot_buffer_version != current_buffer_version
+        ) or (
+            execution_strategy == "rollout_idle_worker"
+            and current_buffer_version < snapshot_buffer_version
+        ):
             result["reason"] = "buffer_version_changed"
             return result
         required_target_version = training_plan.get("required_target_version")
@@ -1656,6 +1716,11 @@ class SpecoWorker(Worker):
         data_status = self.trainer.get_training_data_status(
             sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
             require_full_batch=bool(training_plan.get("require_full_batch", False)),
+            target_version=(
+                int(required_target_version)
+                if required_target_version is not None
+                else None
+            ),
         )
         actual_data_version = data_status.get("data_version")
         planned_data_version = training_plan.get("data_version")
@@ -1705,6 +1770,10 @@ class SpecoWorker(Worker):
                 )
                 result["reason"] = "data_reservation_failed"
                 return result
+            # This method contains no await between the directed status query
+            # and reservation, so the Ray actor cannot interleave a collection
+            # call here.  The reservation is the atomic plan-local ownership
+            # boundary; later appends cannot change what this plan trains on.
             print(
                 "[BubbleTime] training_replay_snapshot: "
                 f"plan_id={training_plan.get('plan_id', '')} rank={self.rank} "
@@ -1787,6 +1856,43 @@ class SpecoWorker(Worker):
                         ),
                     )
             return result
+        if execution_strategy == "rollout_idle_worker":
+            deadline_ts = training_plan.get("deadline_ts")
+            now_ts = time.time()
+            required_remaining_sec = max(
+                float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
+                0.0,
+            ) + max(
+                float(training_plan.get("idle_tail_reserve_sec", 0.0) or 0.0),
+                0.0,
+            )
+            if deadline_ts is not None and (
+                float(deadline_ts) - now_ts < required_remaining_sec
+            ):
+                remaining_sec = float(deadline_ts) - now_ts
+                self.trainer.release_training_data_reservation(
+                    str(training_plan.get("plan_id", ""))
+                )
+                await self.trainer.cleanup_training(clear_data=False)
+                result.update(
+                    {
+                        "reason": "plan_expired_during_preflight",
+                        "deadline_ts": float(deadline_ts),
+                        "remaining_sec": remaining_sec,
+                        "required_remaining_sec": required_remaining_sec,
+                    }
+                )
+                print(
+                    "[BubbleTime] training_launch_stale: "
+                    f"plan_id={training_plan.get('plan_id', '')} "
+                    f"worker_id={self.rank} rank={self.rank} "
+                    "reason=plan_expired_during_preflight "
+                    f"remaining_s={remaining_sec:.4f} "
+                    f"required_remaining_s={required_remaining_sec:.4f} "
+                    f"activation_s={result['activation_elapsed_sec']:.4f}",
+                    flush=True,
+                )
+                return result
         ready_ts = time.time()
         preflight_elapsed_sec = ready_ts - preflight_started_ts
         self._prepared_training_activation_elapsed_sec = float(

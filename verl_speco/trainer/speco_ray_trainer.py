@@ -970,7 +970,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         cls, value: Any, *, require_saved: bool
     ) -> None:
         results = cls._speco_flatten_checkpoint_results(value)
-        allowed_skips = {"not_checkpoint_replica", "not_in_training_group"}
+        allowed_skips = {
+            "not_checkpoint_group",
+            "not_checkpoint_replica",
+            "not_in_training_group",
+        }
         failures = [
             result
             for result in results
@@ -989,9 +993,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return None
         if self._speco_ensure_drafter_checkpoint_path() is None:
             return None
+        checkpoint_worker_ids = None
+        if self._speco_rollout_idle_worker_enabled():
+            checkpoint_worker_ids = (
+                self._speco_get_drafter_scheduler().idle_checkpoint_group()
+            )
+            if not checkpoint_worker_ids:
+                raise RuntimeError(
+                    "Bubble drafter checkpoint has no complete writer group"
+                )
         checkpoint_refs = self.speco_save_checkpoint(
             self.global_steps,
             wait=wait,
+            worker_ids=checkpoint_worker_ids,
         )
         if wait:
             results = self._ray_get_if_needed(checkpoint_refs)
@@ -1382,6 +1396,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_try_launch_rollout_idle_training(self) -> dict[str, Any]:
         if not self._speco_rollout_idle_worker_enabled():
             return {}
+        if bool(getattr(self, "_speco_checkpoint_in_progress", False)):
+            return {"bubble/training_blocked_by_checkpoint": 1}
         config = self._speco_drafter_schedule_config()
         pending_publish_count = int(bool(self._pending_drafter_publish_refs)) + int(
             getattr(self, "_speco_deferred_publish_count", 0) or 0
@@ -1421,7 +1437,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 return {"scheduler/pending_training_count": 1}
             head_metrics = self._speco_poll_target_lm_head_prefetch()
-            event = self._speco_on_before_actor_update(allow_sync_fallback=False)
+            event = self._speco_on_before_actor_update(
+                allow_sync_fallback=False,
+                allow_quota_topup=False,
+            )
             plan = event.training_plan
             metrics = dict(event.metrics or {})
             metrics.update(head_metrics)
@@ -1634,18 +1653,28 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             getattr(self, "_speco_runtime_idle_events_this_generation", 0)
         )
         if runtime_idle_events > 0:
-            metrics: dict[str, Any] = {}
             print(
-                "[BubbleTime] idle_window_sample_skipped: "
-                "reason=runtime_idle_events_active "
+                "[BubbleTime] idle_window_closed: "
+                "reason=generation_complete "
                 f"runtime_idle_events_this_generation={runtime_idle_events} "
                 f"generation_complete_ts={generation_complete_ts:.6f}",
                 flush=True,
             )
-        else:
-            metrics = self._speco_get_drafter_scheduler().record_generation_completed(
-                generation_complete_ts
-            )
+        # Request-local vLLM counters only provide speculative idle events.
+        # The outer generation return is the first authoritative boundary at
+        # which no more requests from this generation can be assigned. Close
+        # the measured tail here (rather than at next GENERATION_STARTED) and
+        # promote still-idle workers to confirmed for safe post-generation
+        # Bubble work.
+        metrics = self._speco_get_drafter_scheduler().record_generation_completed(
+            generation_complete_ts,
+            confirm_speculative_idle=(runtime_idle_events > 0),
+            must_be_ready_at=(
+                self._speco_rollout_idle_fallback_deadline_ts()
+                if runtime_idle_events > 0
+                else None
+            ),
+        )
         runtime_state = self._speco_get_drafter_runtime_state()
         active_plan = runtime_state.active_plan
         if active_plan is None or not active_plan.target_worker_ids:
@@ -1882,12 +1911,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             ),
         )
 
-    def _speco_on_before_actor_update(self, *, allow_sync_fallback: bool = True):
+    def _speco_on_before_actor_update(
+        self,
+        *,
+        allow_sync_fallback: bool = True,
+        allow_quota_topup: bool = True,
+    ):
         return self._speco_get_drafter_scheduler().on_before_actor_update(
             BeforeActorUpdateContext(
                 schedule_context=self._speco_drafter_schedule_context(),
                 config=self._speco_drafter_schedule_config(),
                 allow_sync_fallback=allow_sync_fallback,
+                allow_quota_topup=allow_quota_topup,
             )
         )
 
@@ -2887,6 +2922,30 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     )
                 )
 
+        if training_plan is None and self._speco_rollout_idle_worker_enabled():
+            target_version = int(self.global_steps)
+            ready_workers = self._speco_ready_target_lm_head_workers.get(
+                target_version
+            )
+            already_ready = target_version in self._speco_ready_target_lm_head_versions and (
+                (
+                    target_worker_ids is not None
+                    and self._speco_target_lm_head_ready_for_workers(
+                        target_version,
+                        target_worker_ids,
+                    )
+                )
+                or (target_worker_ids is None and ready_workers is None)
+            )
+            if already_ready:
+                print(
+                    "[BubbleTime] target_lm_head_prefetch_skipped: "
+                    f"reason=version_already_ready target_version={target_version} "
+                    f"target_workers={target_worker_ids}",
+                    flush=True,
+                )
+                return {"drafter/target_lm_head_synced": 0}, None
+
         row_selection = self._speco_get_drafter_target_lm_head_row_selection()
         row_indices = (
             row_selection.get("row_indices") if row_selection is not None else None
@@ -3109,6 +3168,53 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_ready_target_lm_head_versions
             ),
         }
+
+    def _speco_wait_target_lm_head_prefetch(self) -> dict[str, Any]:
+        """Finish both stages of a pending target-head prefetch."""
+
+        metrics: dict[str, Any] = {}
+        while self._pending_target_lm_head_sync is not None:
+            pending = self._pending_target_lm_head_sync
+            stage = str(pending.get("stage", "dispatch"))
+            refs = (
+                pending.get("fetch_refs")
+                if stage == "fetch"
+                else pending.get("refs")
+            )
+            self._ray_get_if_needed(refs)
+            metrics.update(self._speco_poll_target_lm_head_prefetch())
+        return metrics
+
+    def _speco_quiesce_bubble_for_checkpoint(self) -> None:
+        """Drain Bubble collectives before entering distributed checkpointing."""
+
+        if not self._speco_rollout_idle_worker_enabled():
+            return
+        started = time.perf_counter()
+        with self._speco_bubble_training_lock():
+            scheduler = self._speco_get_drafter_scheduler()
+            writer_group = scheduler.idle_checkpoint_group()
+            if not writer_group:
+                raise RuntimeError("Bubble checkpoint has no complete writer group")
+            runtime_state = self._speco_get_drafter_runtime_state()
+            active_plan = runtime_state.active_plan
+            if active_plan is not None and active_plan.target_worker_ids:
+                scheduler.request_reclaim(active_plan.target_worker_ids)
+                completed_plan, outcome = self._speco_wait_pending_drafter_training()
+                if outcome is not None and outcome.trained:
+                    self._speco_publish_drafter_weights(
+                        outcome.trained, completed_plan
+                    )
+                    self._speco_publish_boundary()
+            self._speco_wait_target_lm_head_prefetch()
+            self._speco_wait_pending_drafter_publish()
+            self._speco_wait_pending_drafter_publish_rpc()
+        print(
+            "[BubbleTime] checkpoint_quiesced: "
+            f"step={self.global_steps} writer_group={writer_group} "
+            f"elapsed_s={time.perf_counter() - started:.4f}",
+            flush=True,
+        )
 
     def _speco_mark_target_lm_head_version_ready(
         self,
@@ -4150,9 +4256,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                             reason="no_runtime_idle_events",
                         )
                     )
-                    generation_metrics.update(
-                        self._speco_try_launch_rollout_idle_training()
-                    )
+                # Runtime request-local idle events are only admitted after
+                # the outer generation boundary promoted them to confirmed.
+                # Fallback events follow the same single launch point.
+                generation_metrics.update(
+                    self._speco_try_launch_rollout_idle_training()
+                )
                 self._speco_store_rollout_metrics(gen_batch_output)
                 collected = self._speco_collect_generation_samples(gen_batch_output)
                 if collected:
@@ -4379,7 +4488,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collection_outcome = getattr(self, "_speco_last_collection_outcome", None)
             if isinstance(collection_outcome, CollectionOutcome):
                 metrics.update(collection_outcome.metrics())
-            before_actor_event = self._speco_on_before_actor_update()
+            if self._speco_rollout_idle_worker_enabled():
+                # Advance an already-finished previous prefetch before deciding
+                # whether the current collected version needs a new one. This
+                # is timeout=0/non-blocking and avoids dropping a version merely
+                # because completion had not yet been observed by the driver.
+                metrics.update(self._speco_poll_target_lm_head_prefetch())
+            quota_topup_safe = (
+                completed_outcome is None
+                and not pending_drafter_publishes
+                and not self._pending_drafter_publish_refs
+                and self._pending_target_lm_head_sync is None
+            )
+            before_actor_event = self._speco_on_before_actor_update(
+                allow_quota_topup=quota_topup_safe
+            )
             training_plan = before_actor_event.training_plan
             if training_plan is None:
                 raise RuntimeError(
@@ -4424,6 +4547,34 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 # this state machine and only launches once the exact cached
                 # target version is ready on every drafter worker.
                 metrics.update(self._speco_poll_target_lm_head_prefetch())
+            if (
+                training_plan.launch
+                and training_plan.reason == "quota_topup_training_ready"
+                and self._pending_target_lm_head_sync is not None
+            ):
+                # A quota top-up is deliberately subordinate to the PPO
+                # critical path.  Never let its synchronous preflight queue
+                # behind an unfinished target-head transfer; preserve the
+                # debt and retry at a later safe point instead.
+                pending_target_version = self._pending_target_lm_head_sync.get(
+                    "target_version"
+                )
+                print(
+                    "[BubbleTime] training_quota_topup_deferred: "
+                    "reason=target_lm_head_prefetch_pending "
+                    f"plan_id={training_plan.plan_id} "
+                    f"target_version={pending_target_version}",
+                    flush=True,
+                )
+                metrics["bubble/training_quota_topup_deferred"] = 1
+                training_plan = replace(
+                    training_plan,
+                    launch=False,
+                    reason="quota_topup_lm_head_prefetch_pending",
+                    max_batches=0,
+                    publish_after_success=False,
+                )
+                metrics.update(training_plan.metrics())
             if training_plan.launch:
                 drafter_trained, train_metrics = self._speco_train_drafter(
                     training_plan
@@ -4594,9 +4745,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         # draft loading overlap actor/drafter serialization. This is redundant
         # with the normal next-generation barrier by design: save/test order is
         # controlled by upstream VERL and can change independently.
-        self._speco_wait_pending_drafter_publish()
-        self._speco_save_drafter_checkpoint(wait=True)
-        return super()._save_checkpoint()
+        self._speco_checkpoint_in_progress = True
+        try:
+            # Bubble mode may still own rollout resources or have an LM-head /
+            # publish operation in flight. Quiesce those operations first;
+            # the explicit publish wait below also preserves the upstream
+            # barrier for synchronous and rollout-only configurations.
+            self._speco_quiesce_bubble_for_checkpoint()
+            self._speco_wait_pending_drafter_publish()
+            self._speco_save_drafter_checkpoint(wait=True)
+            return super()._save_checkpoint()
+        finally:
+            self._speco_checkpoint_in_progress = False
 
     def _validate(self, *args, **kwargs):
         # Validation commonly drives KV usage to the configured limit. Ensure

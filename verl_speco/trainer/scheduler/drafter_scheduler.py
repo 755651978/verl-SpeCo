@@ -102,6 +102,7 @@ class _IdleWorkerState:
     must_be_ready_at: float | None = None
     event_ts: float = 0.0
     idle_confidence: IdleWindowConfidence = IdleWindowConfidence.SPECULATIVE
+    confirmed_at_generation_boundary: bool = False
 
 
 def _rollout_worker_event_type(value: object) -> RolloutWorkerEventType:
@@ -267,6 +268,9 @@ class DrafterScheduler:
         self._idle_worker_gen_per_token_samples: deque[float] = deque(maxlen=16)
         self._disabled_replica_local_idle_groups: set[tuple[str, ...]] = set()
         self._replica_local_idle_unavailable_reason: str = ""
+        self._training_quota_last_cycle_step: int | None = None
+        self._training_quota_debt_steps: int = 0
+        self._training_quota_oldest_cycle_step: int | None = None
 
     def _effective_idle_batch_estimate_sec(
         self,
@@ -434,6 +438,11 @@ class DrafterScheduler:
         """Return the current Bubble writer group without exposing mutable state."""
 
         return self._current_idle_writer_group(assign_default=False)
+
+    def idle_checkpoint_group(self) -> tuple[str, ...] | None:
+        """Return one complete group that owns the checkpoint operation."""
+
+        return self._current_idle_writer_group(assign_default=True)
 
     def idle_writer_migration_blocked(self) -> bool:
         """Whether the current writer owns state that cannot be failed over."""
@@ -659,17 +668,27 @@ class DrafterScheduler:
         if not config.idle_worker_dynamic_batch_cap:
             return hard_cap
         if self._idle_worker_dynamic_batch_cap is None:
-            self._idle_worker_dynamic_batch_cap = max(
-                int(config.idle_worker_initial_dynamic_batches), 1
+            initial_cap = config.idle_worker_initial_dynamic_batches
+            self._idle_worker_dynamic_batch_cap = (
+                hard_cap if initial_cap is None else max(int(initial_cap), 1)
             )
         return max(min(int(self._idle_worker_dynamic_batch_cap), hard_cap), 1)
 
     @staticmethod
-    def _idle_stop_reason(outcome: TrainingOutcome) -> str:
+    def _idle_stop_reason(
+        outcome: TrainingOutcome,
+        plan: TrainingPlan | None = None,
+    ) -> str:
+        target_worker_ids = {
+            str(worker_id) for worker_id in (plan.target_worker_ids if plan else ())
+        }
         for result in outcome.raw_results:
             if isinstance(result, dict):
+                worker_id = str(result.get("worker_id", result.get("rank", "")))
+                if target_worker_ids and worker_id not in target_worker_ids:
+                    continue
                 reason = str(result.get("stop_reason") or result.get("reason") or "")
-                if reason:
+                if reason and reason not in {"disabled", "not_in_training_group"}:
                     return reason
         return str(outcome.reason or "")
 
@@ -685,11 +704,39 @@ class DrafterScheduler:
             1,
         )
         next_cap = previous
-        stop_reason = self._idle_stop_reason(outcome)
+        stop_reason = self._idle_stop_reason(outcome, plan)
+        # Preflight/data-version failures say nothing about how many batches
+        # fit in an idle window.  Do not poison the runtime capacity estimate
+        # with a data-plane race or a temporarily unavailable snapshot.
+        capacity_neutral_reasons = {
+            "buffer_version_changed",
+            "data_version_changed",
+            "data_reservation_failed",
+            "insufficient_worker_data",
+            "missing_worker_snapshot",
+            "preflight_not_ready",
+            "target_version_mismatch",
+            "target_version_unavailable",
+            "worker_restarted",
+            "plan_expired_before_preflight",
+            "plan_expired_during_preflight",
+        }
+        reported_reasons = {str(outcome.reason or ""), stop_reason}
+        reported_reasons.update(
+            str(result.get("reason") or result.get("stop_reason") or "")
+            for result in outcome.raw_results
+            if isinstance(result, dict)
+        )
+        if reported_reasons & capacity_neutral_reasons:
+            return
         if bool(outcome.metrics.get("bubble/train_reclaimed_before_first_batch", 0)):
-            next_cap = 1
+            # A request-level speculative idle event can be reclaimed before
+            # batch one without saying anything about steady-state capacity.
+            # Keep the cap unchanged; confirmed post-start spill below remains
+            # the only reclaim signal that can reduce it.
+            return
         elif not outcome.trained or outcome.successful_steps <= 0:
-            next_cap = max(1, min(previous, 1))
+            return
         elif stop_reason in {"reclaim_requested", "deadline_reached"}:
             next_cap = max(1, min(previous, max(outcome.successful_steps, 1)))
         elif (
@@ -1086,6 +1133,9 @@ class DrafterScheduler:
     def record_generation_completed(
         self,
         event_ts: float | None = None,
+        *,
+        confirm_speculative_idle: bool = False,
+        must_be_ready_at: float | None = None,
     ) -> dict[str, float | int]:
         """Close runtime idle windows at the real rollout completion boundary."""
 
@@ -1102,15 +1152,40 @@ class DrafterScheduler:
             )
             is not None
         ]
-        if not observed:
-            return {}
-        return {
-            "bubble/observed_idle_windows": len(observed),
-            "bubble/observed_idle_window_min_s": min(observed),
-            "bubble/historical_idle_window_s": (
-                self._effective_historical_idle_window_sec() or 0.0
-            ),
+        promoted = 0
+        if confirm_speculative_idle:
+            for state in self._idle_workers.values():
+                if (
+                    state.status == "idle"
+                    and state.memory_released
+                    and state.idle_confidence is IdleWindowConfidence.SPECULATIVE
+                ):
+                    state.idle_confidence = IdleWindowConfidence.CONFIRMED
+                    state.event_ts = event_ts
+                    state.must_be_ready_at = must_be_ready_at
+                    state.confirmed_at_generation_boundary = True
+                    promoted += 1
+            if promoted:
+                print(
+                    "[BubbleTime] speculative_idle_confirmed: "
+                    f"workers={promoted} generation_complete_ts={event_ts:.6f} "
+                    f"must_be_ready_at={must_be_ready_at}",
+                    flush=True,
+                )
+        metrics: dict[str, float | int] = {
+            "bubble/speculative_idle_confirmed": promoted,
         }
+        if observed:
+            metrics.update(
+                {
+                    "bubble/observed_idle_windows": len(observed),
+                    "bubble/observed_idle_window_min_s": min(observed),
+                    "bubble/historical_idle_window_s": (
+                        self._effective_historical_idle_window_sec() or 0.0
+                    ),
+                }
+            )
+        return metrics
 
     def _record_worker_event_state(
         self,
@@ -1132,11 +1207,13 @@ class DrafterScheduler:
             state.status = "generating"
             state.memory_released = False
             state.must_be_ready_at = None
+            state.confirmed_at_generation_boundary = False
         elif event.event_type is RolloutWorkerEventType.WORKER_IDLE:
             state.status = "idle"
             state.memory_released = event.memory_released
             state.must_be_ready_at = event.must_be_ready_at
             state.idle_confidence = _idle_window_confidence(event.idle_confidence)
+            state.confirmed_at_generation_boundary = False
         elif event.event_type is RolloutWorkerEventType.WORKER_RECLAIM_REQUESTED:
             state.status = "reclaiming"
         elif event.event_type is RolloutWorkerEventType.WORKER_READY:
@@ -1144,6 +1221,7 @@ class DrafterScheduler:
             state.memory_released = False
             state.must_be_ready_at = None
             state.idle_confidence = IdleWindowConfidence.SPECULATIVE
+            state.confirmed_at_generation_boundary = False
 
     def register_idle_training_resource_metadata(
         self,
@@ -1379,6 +1457,7 @@ class DrafterScheduler:
         incomplete_seen = False
         not_prewarmed_seen = False
         window_too_small_seen = False
+        speculative_unconfirmed_seen = False
         writer_state_migration_seen = False
         best_small_window: AvailableTrainingResources | None = None
         ready_candidates: list[
@@ -1444,11 +1523,29 @@ class DrafterScheduler:
                 )
                 else IdleWindowConfidence.SPECULATIVE
             )
+            if group_confidence is IdleWindowConfidence.SPECULATIVE:
+                speculative_unconfirmed_seen = True
+                logger.info(
+                    "[BubbleTime] idle_resource_skip "
+                    "reason=speculative_idle_unconfirmed group_id=idle-group-%s "
+                    "group=%s event_age_s=%s source=request_local_idle",
+                    index,
+                    group,
+                    event_ages,
+                )
+                continue
             has_runtime_deadline = bool(windows)
+            generation_boundary_deadline = all(
+                idle_states[worker_id].confirmed_at_generation_boundary
+                for worker_id in group
+            )
             source = "runtime_deadline" if has_runtime_deadline else "bootstrap_minimum"
             minimum_window = min(windows, default=math.inf)
             historical_remaining = None
-            if historical_window is not None:
+            # The outer generation boundary owns an authoritative post-rollout
+            # lease. Do not let short request-local gaps cap that deadline.
+            # Ordinary runtime deadlines retain the historical safety bound.
+            if historical_window is not None and not generation_boundary_deadline:
                 historical_remaining = min(
                     max(
                         historical_window
@@ -1466,8 +1563,6 @@ class DrafterScheduler:
                 config,
                 worker_ids=group,
             )
-            if group_confidence is IdleWindowConfidence.SPECULATIVE:
-                min_idle_window_sec *= config.idle_worker_speculative_window_multiplier
             if minimum_window < min_idle_window_sec:
                 window_too_small_seen = True
                 logger.warning(
@@ -1610,6 +1705,8 @@ class DrafterScheduler:
         reason = (
             "incomplete_training_group"
             if incomplete_seen
+            else "speculative_idle_unconfirmed"
+            if speculative_unconfirmed_seen
             else "writer_state_migration_required"
             if writer_state_migration_seen
             else "window_too_small"
@@ -1710,6 +1807,11 @@ class DrafterScheduler:
             global_step=context.global_step,
             config=config,
             worker_ids=resources.worker_ids,
+        )
+        self._register_training_quota_cycle(
+            data_status=data_status,
+            global_step=context.global_step,
+            config=config,
         )
         logger.info(
             "[BubbleTime] idle_data_status step=%s group=%s workers=%s "
@@ -1841,6 +1943,188 @@ class DrafterScheduler:
             deadline_ts=None,
             target_worker_ids=(),
             training_group_id="sync-fallback",
+        )
+
+    @staticmethod
+    def _training_quota_target_steps(config: DrafterScheduleConfig) -> int:
+        configured = config.training_quota_target_steps
+        if configured is None:
+            configured = config.train_batches_per_trigger
+        return max(int(configured), 0)
+
+    def _register_training_quota_cycle(
+        self,
+        *,
+        data_status,
+        global_step: object,
+        config: DrafterScheduleConfig,
+    ) -> None:
+        """Add one bounded quality quota per configured training interval."""
+
+        if not config.training_quota_enable or data_status is None:
+            return
+        if (
+            data_status.trainable_batches < max(config.min_trainable_batches, 1)
+            or not data_status.data_version_consistent
+            or (not config.use_logits and not data_status.target_version_consistent)
+            or data_status.data_version is None
+        ):
+            return
+        data_version = int(data_status.data_version)
+        try:
+            interval = int(config.training_interval_steps)
+        except (TypeError, ValueError):
+            interval = 0
+        current_step = _as_int(global_step)
+        # Use the upcoming synchronous trigger as the quota cycle.  This lets
+        # Bubble work performed anywhere inside the interval repay the same
+        # quality target, without creating fresh debt for every collection.
+        cycle_step = (
+            ((max(current_step, 1) - 1) // interval + 1) * interval
+            if interval > 0
+            else data_version
+        )
+        if (
+            self._training_quota_last_cycle_step is not None
+            and cycle_step <= self._training_quota_last_cycle_step
+        ):
+            return
+        target_steps = self._training_quota_target_steps(config)
+        if target_steps <= 0:
+            self._training_quota_last_cycle_step = cycle_step
+            return
+        previous_debt = self._training_quota_debt_steps
+        configured_max_debt = max(
+            int(config.training_quota_max_accumulated_debt), 0
+        )
+        # A cap smaller than one target would silently weaken the requested
+        # minimum. Zero means unbounded; otherwise always retain one full
+        # cycle's target before capping accumulated debt.
+        max_debt = (
+            max(configured_max_debt, target_steps)
+            if configured_max_debt > 0
+            else 0
+        )
+        accumulated = previous_debt + target_steps
+        self._training_quota_debt_steps = (
+            min(accumulated, max_debt) if max_debt > 0 else accumulated
+        )
+        self._training_quota_last_cycle_step = cycle_step
+        if previous_debt <= 0 and self._training_quota_debt_steps > 0:
+            # The cycle deadline, rather than its first data-arrival step, is
+            # the start of debt aging. This leaves the whole interval available
+            # for opportunistic Bubble work before serial top-up is considered.
+            self._training_quota_oldest_cycle_step = cycle_step
+        print(
+            "[BubbleTime] training_quota_registered: "
+            f"step={global_step} quota_cycle_step={cycle_step} "
+            f"data_version={data_version} "
+            f"target_steps={target_steps} debt_before={previous_debt} "
+            f"debt_after={self._training_quota_debt_steps} "
+            f"max_accumulated_debt={max_debt}",
+            flush=True,
+        )
+
+    def _training_quota_age_steps(self, global_step: object) -> int:
+        if self._training_quota_oldest_cycle_step is None:
+            return 0
+        return max(
+            _as_int(global_step) - self._training_quota_oldest_cycle_step,
+            0,
+        )
+
+    def _training_quota_due(
+        self,
+        global_step: object,
+        config: DrafterScheduleConfig,
+    ) -> bool:
+        if not config.training_quota_enable or self._training_quota_debt_steps <= 0:
+            return False
+        interval_boundary_reached = (
+            self._training_quota_oldest_cycle_step is None
+            or _as_int(global_step) >= self._training_quota_oldest_cycle_step
+        )
+        age_due = (
+            interval_boundary_reached
+            and self._training_quota_age_steps(global_step)
+            >= max(int(config.training_quota_max_debt_age_steps), 0)
+        )
+        debt_limit = max(int(config.training_quota_max_accumulated_debt), 0)
+        debt_due = (
+            debt_limit > 0
+            and self._training_quota_debt_steps >= debt_limit
+            and interval_boundary_reached
+        )
+        return age_due or debt_due
+
+    def _plan_training_quota_topup(
+        self,
+        context: DrafterScheduleContext,
+        config: DrafterScheduleConfig,
+    ) -> TrainingPlan | None:
+        """Plan a bounded blocking top-up on the existing Bubble writer group."""
+
+        if (
+            not config.training_quota_enable
+            or context.pending_training_count > 0
+            or config.training_quota_max_sync_topup_steps <= 0
+        ):
+            return None
+        writer_group = self._current_idle_writer_group(assign_default=True)
+        if not writer_group or self._idle_worker_writer_migration_blocked:
+            return None
+        data_status = self.inspect_training_data(
+            global_step=context.global_step,
+            config=config,
+            worker_ids=writer_group,
+        )
+        self._register_training_quota_cycle(
+            data_status=data_status,
+            global_step=context.global_step,
+            config=config,
+        )
+        if not self._training_quota_due(context.global_step, config):
+            return None
+        topup_steps = min(
+            self._training_quota_debt_steps,
+            int(config.training_quota_max_sync_topup_steps),
+        )
+        if topup_steps <= 0:
+            return None
+        topup_context = replace(context, data_status=data_status)
+        plan = self.plan_training(
+            topup_context,
+            replace(
+                config,
+                execution_strategy=DrafterExecutionStrategy.SYNC,
+                training_interval_steps=1,
+                train_batches_per_trigger=topup_steps,
+                min_trainable_batches=min(
+                    max(int(config.min_trainable_batches), 1), topup_steps
+                ),
+            ),
+            require_interval=False,
+        )
+        if not plan.launch:
+            return None
+        print(
+            "[BubbleTime] training_quota_topup_planned: "
+            f"step={context.global_step} workers={writer_group} "
+            f"debt_steps={self._training_quota_debt_steps} "
+            f"debt_age_steps={self._training_quota_age_steps(context.global_step)} "
+            f"topup_steps={topup_steps} data_version={plan.data_version}",
+            flush=True,
+        )
+        # Preserve the rollout-idle worker payload so only the writer group
+        # participates, but execute this specially marked plan synchronously.
+        return replace(
+            plan,
+            reason="quota_topup_training_ready",
+            execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+            target_worker_ids=writer_group,
+            training_group_id="quota-topup",
+            deadline_ts=None,
+            publish_after_success=True,
         )
 
     def _skip_idle_worker_plan(
@@ -2017,6 +2301,18 @@ class DrafterScheduler:
             context.config,
             allow_sync_fallback=context.allow_sync_fallback,
         )
+        if (
+            not plan.launch
+            and context.allow_quota_topup
+            and context.config.execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+        ):
+            quota_plan = self._plan_training_quota_topup(
+                context.schedule_context,
+                context.config,
+            )
+            if quota_plan is not None:
+                plan = quota_plan
         metrics: dict[str, Any] = dict(plan.metrics())
         metrics.update(
             {
@@ -2035,6 +2331,17 @@ class DrafterScheduler:
                 "bubble/sync_fallback_batches": (
                     int(plan.max_batches)
                     if plan.launch and plan.reason == "sync_fallback_training_ready"
+                    else 0
+                ),
+                "bubble/training_quota_debt_steps": int(
+                    self._training_quota_debt_steps
+                ),
+                "bubble/training_quota_topup_requested": int(
+                    plan.reason == "quota_topup_training_ready"
+                ),
+                "bubble/training_quota_topup_batches": (
+                    int(plan.max_batches)
+                    if plan.reason == "quota_topup_training_ready"
                     else 0
                 ),
             }
@@ -2151,11 +2458,7 @@ class DrafterScheduler:
                 micro_batch_estimate * gradient_accumulation_steps
             )
             hard_train_batch_cap = max(int(config.train_batches_per_trigger), 1)
-            train_batch_cap = (
-                1
-                if self._idle_batch_estimate_is_bootstrap(config)
-                else self._effective_idle_dynamic_batch_cap(config)
-            )
+            train_batch_cap = self._effective_idle_dynamic_batch_cap(config)
             base_usable_window = max(
                 resources.minimum_idle_window_sec
                 - deadline_guard_sec
@@ -2471,7 +2774,10 @@ class DrafterScheduler:
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
 
-        if plan.execution_strategy is DrafterExecutionStrategy.SYNC:
+        if (
+            plan.execution_strategy is DrafterExecutionStrategy.SYNC
+            or plan.reason == "quota_topup_training_ready"
+        ):
             return self.sync_execution_strategy.execute(
                 plan,
                 executor=self._worker_executor,
@@ -2533,10 +2839,32 @@ class DrafterScheduler:
         outcome: TrainingOutcome,
     ) -> None:
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
-            self.record_idle_training_outcome(outcome)
+            is_quota_topup = plan.reason == "quota_topup_training_ready"
+            if not is_quota_topup:
+                self.record_idle_training_outcome(outcome)
             self._record_replica_local_unavailable(plan, outcome)
-            self._record_prebatch_reclaim_penalty(plan, outcome)
-            self._record_idle_dynamic_batch_cap(plan, outcome)
+            if not is_quota_topup:
+                self._record_prebatch_reclaim_penalty(plan, outcome)
+                self._record_idle_dynamic_batch_cap(plan, outcome)
+            if (
+                outcome.trained
+                and outcome.successful_steps > 0
+                and self._training_quota_debt_steps > 0
+            ):
+                debt_before = self._training_quota_debt_steps
+                self._training_quota_debt_steps = max(
+                    debt_before - int(outcome.successful_steps), 0
+                )
+                if self._training_quota_debt_steps == 0:
+                    self._training_quota_oldest_cycle_step = None
+                print(
+                    "[BubbleTime] training_quota_repaid: "
+                    f"step={plan.source_global_step} plan_id={plan.plan_id} "
+                    f"reason={plan.reason} successful_steps={outcome.successful_steps} "
+                    f"debt_before={debt_before} "
+                    f"debt_after={self._training_quota_debt_steps}",
+                    flush=True,
+                )
         if outcome.trained and outcome.successful_steps > 0:
             if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
                 group = _normalize_worker_id_group(plan.target_worker_ids)

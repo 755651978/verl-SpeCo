@@ -14,6 +14,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from collections import deque
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +25,7 @@ pytest.importorskip("torch")
 from omegaconf import OmegaConf
 
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer
+from verl_speco.trainer.data_buffer import DataBuffer
 from verl_speco.workers.speco_worker import SpecoWorker
 
 
@@ -35,6 +39,7 @@ class _FakeTrainer:
         self.cleanup_calls = 0
         self.release_after_activation_calls = 0
         self.reserved_plan_id = None
+        self.requested_target_version = None
 
     def select_target_lm_head_version(self, global_step: int) -> bool:
         self._target_lm_head_weight_step = global_step
@@ -52,7 +57,7 @@ class _FakeTrainer:
         return 4
 
     def get_training_data_status(self, **kwargs):
-        del kwargs
+        self.requested_target_version = kwargs.get("target_version")
         return {
             "trainable_batches": 1,
             "trainable_samples": 4,
@@ -109,6 +114,33 @@ def _worker(*, data_version: int) -> SpecoWorker:
     return worker
 
 
+def test_select_target_lm_head_reuses_already_applied_version() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    trainer._target_lm_head_snapshots = {
+        4: {
+            "weight": object(),
+            "row_indices": None,
+            "source_vocab_size": None,
+            "chunked_apply": True,
+        }
+    }
+    trainer._applied_target_lm_head_weight_step = 4
+    trainer._target_lm_head_weight_step = 4
+    trainer._pending_target_lm_head_weight = object()
+    trainer._pending_target_lm_head_row_indices = object()
+    trainer._pending_target_lm_head_source_vocab_size = 10
+    trainer._pending_target_lm_head_chunked_apply = True
+    trainer._target_lm_head_module = lambda: object()
+
+    assert trainer.select_target_lm_head_version(4)
+    assert trainer._target_lm_head_weight_step == 4
+    assert trainer._pending_target_lm_head_weight is None
+    assert trainer._pending_target_lm_head_row_indices is None
+    assert trainer._pending_target_lm_head_source_vocab_size is None
+    assert not trainer._pending_target_lm_head_chunked_apply
+
+
 def _plan() -> dict[str, object]:
     return {
         "launch": True,
@@ -154,6 +186,48 @@ def test_worker_preflight_records_actual_versions_for_training_result() -> None:
     assert worker._prepared_training_plan_id == "plan-4"
     assert worker._prepared_training_data_version == 4
     assert worker._prepared_training_target_version == 4
+
+
+def test_bubble_preflight_allows_newer_buffer_append_and_pins_target_version() -> None:
+    worker = _worker(data_version=4)
+    worker.trainer.buffer_version = 4
+    plan = _plan()
+    plan.update(
+        {
+            "execution_strategy": "rollout_idle_worker",
+            "target_worker_ids": ("0",),
+        }
+    )
+
+    result = asyncio.run(worker.preflight_drafter_training(plan))
+
+    assert result["ready"]
+    assert worker.trainer.requested_target_version == 4
+    assert worker.trainer.reserved_plan_id == "plan-4"
+
+
+def test_bubble_preflight_rejects_expired_plan_before_activation() -> None:
+    worker = _worker(data_version=4)
+    plan = _plan()
+    plan.update(
+        {
+            "execution_strategy": "rollout_idle_worker",
+            "target_worker_ids": ("0",),
+            "deadline_ts": time.time() - 1.0,
+            "idle_startup_reserve_sec": 2.0,
+            "idle_batch_estimate_sec": 1.0,
+            "idle_tail_reserve_sec": 1.0,
+        }
+    )
+
+    result = asyncio.run(worker.preflight_drafter_training(plan))
+
+    assert not result["ready"]
+    assert result["reason"] == "plan_expired_before_preflight"
+    assert result["remaining_sec"] < 0.0
+    assert result["required_remaining_sec"] == 4.0
+    assert worker.trainer.activation_calls == 0
+    assert worker.trainer.reserved_plan_id is None
 
 
 def test_worker_idle_prewarm_keeps_training_model_hot() -> None:
@@ -246,3 +320,72 @@ def test_base_trainer_orig_params_override_is_replica_local_bubble_only() -> Non
     trainer.training_device_mesh = None
     trainer.training_process_group = None
     assert not trainer._replica_local_bubble_fsdp_requires_orig_params()
+
+
+def test_training_data_status_can_pin_an_older_target_version() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.current_rl_step = 5
+    trainer.config = OmegaConf.create(
+        {"rollout": {"drafter": {"training": {"use_logits": False}}}}
+    )
+    trainer.backend = SimpleNamespace(model_type="eagle3")
+    trainer._bubble_time_enabled = True
+    trainer.collected_data = deque()
+    trainer.use_data_buffer = True
+    trainer.data_buffer = DataBuffer(max_size=8)
+    trainer.data_buffer.update_rl_step(4)
+    trainer.data_buffer.add_batch({"target_version": 4, "loss_tokens": 10})
+    trainer.data_buffer.add_batch({"target_version": 4, "loss_tokens": 20})
+    trainer.data_buffer.update_rl_step(5)
+    trainer.data_buffer.add_batch({"target_version": 5, "loss_tokens": 30})
+    trainer._target_lm_head_snapshots = {4: object(), 5: object()}
+    trainer.batch_size = 2
+    trainer.buffer_version = 3
+
+    status = trainer.get_training_data_status(
+        sample_last_n_steps=2,
+        target_version=4,
+    )
+
+    assert status["target_version"] == 4
+    assert status["data_version"] == 4
+    assert status["trainable_samples"] == 2
+    assert status["trainable_batches"] == 1
+    assert status["trainable_valid_tokens"] == 30
+
+
+def test_training_data_status_handles_empty_buffer() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.current_rl_step = 5
+    trainer.config = OmegaConf.create(
+        {"rollout": {"drafter": {"training": {"use_logits": False}}}}
+    )
+    trainer.backend = SimpleNamespace(model_type="eagle3")
+    trainer._bubble_time_enabled = True
+    trainer.collected_data = deque()
+    trainer.use_data_buffer = True
+    trainer.data_buffer = DataBuffer(max_size=8)
+    trainer._target_lm_head_snapshots = {}
+    trainer.batch_size = 2
+    trainer.buffer_version = 0
+
+    status = trainer.get_training_data_status(
+        sample_last_n_steps=2,
+        target_version=4,
+    )
+
+    assert status["target_version"] is None
+    assert status["data_version"] is None
+    assert status["trainable_samples"] == 0
+    assert status["trainable_batches"] == 0
+
+
+def test_replica_local_checkpoint_leader_is_local_group_rank_zero() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer._bubble_time_enabled = True
+    trainer.training_device_mesh = None
+    trainer.training_process_group = object()
+    trainer.rank = 0
+    trainer.rollout_dp_rank = 1
+
+    assert trainer._is_checkpoint_leader()

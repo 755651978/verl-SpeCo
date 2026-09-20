@@ -23,6 +23,7 @@ class BeforeActorUpdateContext:
     schedule_context: DrafterScheduleContext
     config: DrafterScheduleConfig
     allow_sync_fallback: bool = True
+    allow_quota_topup: bool = True
 
 
 @dataclass(frozen=True)

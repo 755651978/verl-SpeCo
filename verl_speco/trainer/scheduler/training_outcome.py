@@ -267,7 +267,10 @@ class TrainingOutcome:
         )
 
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
-        if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+        if (
+            plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and plan.reason != "quota_topup_training_ready"
+        ):
             # Separate Bubble worker work from the time the PPO path waited
             # to reclaim that worker group for a subsequent rollout.
             metrics["timing_s/drafter_async_training_work"] = float(
@@ -281,6 +284,14 @@ class TrainingOutcome:
                     "drafter/trained_any": int(trained),
                     "bubble/sync_fallback_successful_steps": successful_steps,
                     "bubble/sync_fallback_elapsed_s": execution.elapsed_sec,
+                }
+            )
+        if plan.reason == "quota_topup_training_ready":
+            metrics.update(
+                {
+                    "bubble/training_quota_topup_completed": int(trained),
+                    "bubble/training_quota_topup_successful_steps": successful_steps,
+                    "bubble/training_quota_topup_elapsed_s": execution.elapsed_sec,
                 }
             )
         outcome_reason = (
