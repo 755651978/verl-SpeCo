@@ -561,6 +561,9 @@ class DrafterBaseTrainer:
         self._pending_target_lm_head_source_vocab_size: int | None = None
         self._pending_target_lm_head_chunked_apply = False
         self._target_lm_head_weight_step: int | None = None
+        self._target_projection_fingerprint: str | None = None
+        self._target_projection_mode: str | None = None
+        self._target_projection_dynamic = True
         self._cached_target_lm_head_row_indices: dict[str, Any] | None = None
         self._training_timing_accumulator: dict[str, float] = {}
         self._training_timing_steps = 0
@@ -2070,6 +2073,9 @@ class DrafterBaseTrainer:
         row_indices: Optional[torch.Tensor] = None,
         source_vocab_size: Optional[int] = None,
         defer_device_apply: bool = False,
+        projection_fingerprint: Optional[str] = None,
+        projection_mode: Optional[str] = None,
+        projection_dynamic: bool = True,
     ) -> dict[str, Any]:
         """Update the frozen target lm_head used by last-hidden drafter training."""
         if weight is None or not torch.is_tensor(weight):
@@ -2094,6 +2100,13 @@ class DrafterBaseTrainer:
         )
         self._pending_target_lm_head_chunked_apply = bool(defer_device_apply)
         self._target_lm_head_weight_step = global_step
+        self._target_projection_fingerprint = (
+            str(projection_fingerprint) if projection_fingerprint else None
+        )
+        self._target_projection_mode = (
+            str(projection_mode) if projection_mode else "transferred_effective"
+        )
+        self._target_projection_dynamic = bool(projection_dynamic)
         selected_rows = (
             int(self._pending_target_lm_head_row_indices.numel())
             if self._pending_target_lm_head_row_indices is not None
@@ -2112,7 +2125,29 @@ class DrafterBaseTrainer:
             "shape": weight_shape,
             "selected_rows": selected_rows,
             "source_vocab_size": pending_source_vocab_size,
+            "projection_fingerprint": self._target_projection_fingerprint,
+            "projection_mode": self._target_projection_mode,
+            "projection_dynamic": self._target_projection_dynamic,
         }
+
+    def _requires_target_projection_supervision(self) -> bool:
+        """Whether this backend reconstructs target logits from hidden states.
+
+        EAGLE3 with externally collected logits is the only current online
+        backend that does not consume the target output projection.  EAGLE1/2
+        report ``model_type == 'eagle3'`` but reject ``use_logits=True``, so the
+        same check also keeps their hidden-state supervision strict.
+        """
+
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        return not (self.backend.model_type == "eagle3" and use_logits)
+
+    def _requires_same_step_target_projection(self) -> bool:
+        """Reject stale samples until a projection is proven content-static."""
+
+        return self._requires_target_projection_supervision() and bool(
+            getattr(self, "_target_projection_dynamic", True)
+        )
 
     def get_target_lm_head_row_indices(self) -> Optional[dict[str, Any]]:
         """Return target lm_head row indices needed by the current drafter loss."""
@@ -3609,14 +3644,12 @@ class DrafterBaseTrainer:
         min_items_for_batch = 1
 
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
-        same_step_target_head_required = (
-            self.backend.model_type == "eagle3" and not use_logits
-        )
+        same_step_target_head_required = self._requires_same_step_target_projection()
 
         # Determine data source: DataBuffer (cross-step) or collected_data (current step only).
         # last-hidden supervision can only be reconstructed with the exact target
-        # head version that produced those hidden states, so older buffered Eagle3
-        # samples are not valid for the actor head synced for this rollout step.
+        # head version that produced those hidden states. This applies to all
+        # projection-supervised drafters, not only the EAGLE family.
         if self.use_data_buffer and len(self.data_buffer) > 0:
             if min_sample_step is not None or max_sample_step is not None:
                 available_data = self._filter_training_data_by_step(
@@ -4525,8 +4558,7 @@ class DrafterBaseTrainer:
         """Return a non-mutating snapshot of data that can form training batches."""
 
         current_step = int(self.current_rl_step)
-        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
-        same_step_data_required = self.backend.model_type == "eagle3" and not use_logits
+        same_step_data_required = self._requires_same_step_target_projection()
         current_step_data = [
             item
             for item in self.collected_data
@@ -4595,6 +4627,12 @@ class DrafterBaseTrainer:
             "newest_sample_step": max(sample_steps) if sample_steps else None,
             "same_step_data_required": same_step_data_required,
             "target_version": getattr(self, "_target_lm_head_weight_step", None),
+            "target_projection_fingerprint": getattr(
+                self, "_target_projection_fingerprint", None
+            ),
+            "target_projection_dynamic": bool(
+                getattr(self, "_target_projection_dynamic", True)
+            ),
             "buffer_version": self.buffer_version,
             "data_version": max(sample_steps) if sample_steps else None,
             "min_sample_step": effective_min_sample_step,

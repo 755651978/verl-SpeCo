@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -480,6 +481,263 @@ def _select_lm_head_named_tensor(module: Any) -> tuple[str | None, Any | None]:
     return fallback
 
 
+def _actor_uses_peft(worker: Any) -> bool:
+    """Return whether the initialized actor is wrapped by PEFT.
+
+    Do not infer this only from ``lora_rank``: restored adapters and alternative
+    PEFT configurations can be active even when the user-facing config differs.
+    """
+
+    return any(
+        getattr(module, "peft_config", None) is not None
+        for module in _actor_module_candidates(worker)
+    )
+
+
+def _output_projection_module(worker: Any) -> Any | None:
+    """Resolve the actor's effective output module through the model API first."""
+
+    for module in _actor_module_candidates(worker):
+        getter = getattr(module, "get_output_embeddings", None)
+        if callable(getter):
+            try:
+                output = getter()
+            except Exception:  # noqa: BLE001
+                output = None
+            if output is not None:
+                return output
+        for attr in ("lm_head", "embed_tokens"):
+            output = getattr(module, attr, None)
+            if output is not None and getattr(output, "weight", None) is not None:
+                return output
+    return None
+
+
+def _projection_has_adapter(worker: Any) -> bool:
+    """Detect adapters/modules-to-save attached to the output projection.
+
+    Reading ``PeftModel.lm_head.weight`` is not sufficient: PEFT wrappers often
+    delegate that attribute to the unmodified base layer.  In that case a direct
+    export would silently omit the adapter delta.
+    """
+
+    projection = _output_projection_module(worker)
+    if projection is None:
+        return False
+    adapter_attrs = (
+        "lora_A",
+        "lora_B",
+        "lora_embedding_A",
+        "lora_embedding_B",
+        "ia3_l",
+        "lora_magnitude_vector",
+        "modules_to_save",
+    )
+    modules = getattr(projection, "modules", None)
+    candidates = list(modules()) if callable(modules) else [projection]
+    for module in candidates:
+        if type(module).__module__.startswith("peft."):
+            return True
+        for attr in adapter_attrs:
+            value = getattr(module, attr, None)
+            if value is not None and (not hasattr(value, "__len__") or len(value) > 0):
+                return True
+    return False
+
+
+def _projection_weight_is_trainable(worker: Any) -> bool:
+    projection = _output_projection_module(worker)
+    weight = getattr(projection, "weight", None) if projection is not None else None
+    return bool(getattr(weight, "requires_grad", False))
+
+
+def _validate_supported_output_projection(worker: Any) -> None:
+    """Fail closed for affine heads whose bias is not represented by backends."""
+
+    torch = _torch_module()
+    projection = _output_projection_module(worker)
+    bias = getattr(projection, "bias", None) if projection is not None else None
+    if torch.is_tensor(bias):
+        raise RuntimeError(
+            "SPECO target projection sync does not yet support output heads with "
+            "a bias term; refusing to train the drafter with incomplete logits"
+        )
+
+
+def _projection_fingerprint(payload: dict[str, Any]) -> str:
+    """Content identity used to reject partial or inconsistent worker syncs."""
+
+    torch = _torch_module()
+    digest = hashlib.sha256()
+    for key in ("weight", "bias", "row_indices"):
+        tensor = payload.get(key)
+        if not torch.is_tensor(tensor):
+            continue
+        tensor = cast(Any, tensor)
+        value = tensor.detach().to(device="cpu").contiguous()
+        digest.update(key.encode("utf-8"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(value.view(torch.uint8).numpy().tobytes())
+    digest.update(str(payload.get("source_vocab_size")).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _finalize_projection_payload(
+    payload: Optional[dict[str, Any]], *, dynamic: bool
+) -> Optional[dict[str, Any]]:
+    if payload is None:
+        return None
+    result = dict(payload)
+    result["projection_dynamic"] = bool(dynamic)
+    result["projection_mode"] = (
+        "transferred_effective" if dynamic else "static_verified"
+    )
+    result["projection_fingerprint"] = _projection_fingerprint(result)
+    return result
+
+
+def _select_projection_from_params(params: Any) -> tuple[str | None, Any | None]:
+    torch = _torch_module()
+    fallback: tuple[str | None, Any | None] = (None, None)
+    for name, tensor in params:
+        if not torch.is_tensor(tensor):
+            continue
+        name = str(name)
+        if name == "model.embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
+            fallback = (name, tensor)
+        if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
+            return name, tensor
+    return fallback
+
+
+def _materialize_projection_tensor(tensor: Any):
+    full_tensor = getattr(tensor, "full_tensor", None)
+    value = full_tensor() if callable(full_tensor) else tensor
+    return value.detach().clone()
+
+
+def _export_effective_peft_projection(
+    worker: Any, row_indices: Any = None
+) -> Optional[dict[str, Any]]:
+    """Export base+adapter output weights on both verl 0.8 and 0.9.
+
+    verl 0.9 exposes a generator that keeps ``merged_lora_context`` alive while
+    tensors are materialized.  The 0.8 exporter captured ``state_dict`` inside
+    that context but consumed its aliased tensors after restoration, so the
+    compatibility path below explicitly clones the target tensor in-context.
+    """
+
+    torch = _torch_module()
+    engine = worker.actor.engine
+    normalized_rows = _normalize_lm_head_row_indices(row_indices)
+    merged_exporter = getattr(engine, "_merged_lora_per_tensor_param", None)
+    selected_name = None
+    selected_weight = None
+    export_strategy = "verl09_effective_peft"
+    restore_cpu = bool(getattr(engine, "_is_offload_param", False))
+    model_staged = False
+    offload_model = None
+    try:
+        from verl.utils.fsdp_utils import (
+            load_fsdp_model_to_gpu,
+            offload_fsdp_model_to_cpu,
+        )
+
+        # verl 0.9's merged generator is normally entered by
+        # get_per_tensor_param() after staging. We call it directly to avoid
+        # exporting the full model, so reproduce that placement lifecycle.
+        uses_cpu_offload_policy = bool(
+            getattr(engine, "_uses_fsdp2_cpu_offload_policy", False)
+        )
+        should_stage = restore_cpu and (
+            callable(merged_exporter) or not uses_cpu_offload_policy
+        )
+        if should_stage:
+            load_fsdp_model_to_gpu(engine.module)
+            model_staged = True
+            offload_model = offload_fsdp_model_to_cpu
+    except ImportError:
+        if restore_cpu:
+            raise RuntimeError(
+                "SPECO cannot stage an offloaded PEFT actor for effective "
+                "output-projection export"
+            )
+
+    try:
+        if callable(merged_exporter):
+            params = merged_exporter()
+            try:
+                selected_name, selected_weight = _select_projection_from_params(params)
+                if selected_weight is not None:
+                    selected_weight = _materialize_projection_tensor(selected_weight)
+            finally:
+                close = getattr(params, "close", None)
+                if callable(close):
+                    close()
+        else:
+            export_strategy = "verl08_effective_peft_compat"
+            try:
+                from verl.utils.fsdp_utils import (
+                    merged_lora_context,
+                    normalize_peft_param_name,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "SPECO cannot materialize an adapter-modified output projection: "
+                    "verl does not expose merged_lora_context"
+                ) from exc
+            module = getattr(engine, "module", None)
+            if module is None:
+                raise RuntimeError(
+                    "SPECO PEFT projection export requires engine.module"
+                )
+            with merged_lora_context(module, backup_adapters=True):
+                state = normalize_peft_param_name(module.state_dict())
+                selected_name, selected_weight = _select_projection_from_params(
+                    state.items()
+                )
+                if selected_weight is not None:
+                    selected_weight = _materialize_projection_tensor(selected_weight)
+    finally:
+        if model_staged and offload_model is not None:
+            offload_model(engine.module)
+
+    if selected_weight is None:
+        raise RuntimeError(
+            "SPECO could not resolve the effective PEFT output projection"
+        )
+    if selected_weight.dim() != 2:
+        raise RuntimeError("SPECO output projection must be a 2D tensor")
+
+    source_vocab_size = int(selected_weight.shape[0])
+    exported_rows = None
+    selected_rows = None
+    if (
+        normalized_rows is not None
+        and 0 < int(normalized_rows.numel()) < source_vocab_size
+    ):
+        rows = normalized_rows.to(device=selected_weight.device, dtype=torch.long)
+        selected_weight = selected_weight.index_select(0, rows)
+        exported_rows = normalized_rows.to(device="cpu", dtype=torch.long).contiguous()
+        selected_rows = int(exported_rows.numel())
+
+    # All ranks must consume/materialize the same generator collectives.  Only
+    # rank zero owns the host payload forwarded by the trainer.
+    if getattr(worker, "rank", None) != 0:
+        return None
+    return {
+        "name": selected_name,
+        "weight": selected_weight.to(device="cpu", dtype=torch.bfloat16)
+        .clone()
+        .contiguous(),
+        "row_indices": exported_rows,
+        "source_vocab_size": source_vocab_size,
+        "selected_rows": selected_rows,
+        "export_strategy": export_strategy,
+    }
+
+
 def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional[dict]:
     """Best-effort fast path for sparse target lm_head export.
 
@@ -504,13 +762,22 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
                 or int(row_indices_cpu.min().item()) < 0
             ):
                 continue
-            rows_on_device = row_indices_cpu.to(
-                device=selected_weight.device, dtype=torch.long
+            full_tensor = getattr(selected_weight, "full_tensor", None)
+            materialized_weight = (
+                full_tensor() if callable(full_tensor) else selected_weight.detach()
             )
-            selected_rows = selected_weight.detach().index_select(0, rows_on_device)
+            rows_on_device = row_indices_cpu.to(
+                device=materialized_weight.device, dtype=torch.long
+            )
+            selected_rows = materialized_weight.index_select(0, rows_on_device)
             if getattr(worker, "rank", None) != 0:
                 return {"_speco_non_owner_direct_sparse": True}
-            weight = selected_rows.to(device="cpu", dtype=torch.bfloat16).contiguous()
+            weight = (
+                selected_rows.detach()
+                .to(device="cpu", dtype=torch.bfloat16)
+                .clone()
+                .contiguous()
+            )
             logger.warning(
                 "[actor lm_head export] direct_sparse name=%s shape=%s source_vocab=%s selected_rows=%s",
                 selected_name,
@@ -725,6 +992,7 @@ def _export_veomni_actor_lm_head_weight(
         weight = (
             materialized_weight.detach()
             .to(device="cpu", dtype=torch.bfloat16)
+            .clone()
             .contiguous()
         )
         logger.warning(
@@ -783,11 +1051,34 @@ def export_actor_lm_head_weight(
     ):
         return None
 
+    uses_peft = _actor_uses_peft(worker)
+    projection_has_adapter = uses_peft and _projection_has_adapter(worker)
+    projection_dynamic = (
+        not uses_peft
+        or projection_has_adapter
+        or _projection_weight_is_trainable(worker)
+    )
+    _validate_supported_output_projection(worker)
+
     if _is_veomni_actor_worker(worker):
-        return _export_veomni_actor_lm_head_weight(
-            worker,
-            row_indices=row_indices,
-            keep_model_on_device=keep_model_on_device,
+        if projection_has_adapter:
+            raise RuntimeError(
+                "SPECO does not support an adapter-modified VeOmni output projection; "
+                "verl 0.8/0.9 VeOmni weight export does not support LoRA"
+            )
+        return _finalize_projection_payload(
+            _export_veomni_actor_lm_head_weight(
+                worker,
+                row_indices=row_indices,
+                keep_model_on_device=keep_model_on_device,
+            ),
+            dynamic=projection_dynamic,
+        )
+
+    if projection_has_adapter:
+        return _finalize_projection_payload(
+            _export_effective_peft_projection(worker, row_indices=row_indices),
+            dynamic=True,
         )
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
@@ -798,7 +1089,7 @@ def export_actor_lm_head_weight(
         "DSPARK",
     }
     if (
-        is_dflash
+        (is_dflash or uses_peft)
         and normalized_row_indices is not None
         and int(normalized_row_indices.numel()) > 0
     ):
@@ -810,32 +1101,17 @@ def export_actor_lm_head_weight(
         ):
             return None
         if direct_payload is not None:
-            return direct_payload
+            return _finalize_projection_payload(
+                direct_payload, dynamic=projection_dynamic
+            )
 
     per_tensor_param, _ = worker.actor.engine.get_per_tensor_param(
         layered_summon=getattr(worker, "layered_summon", False),
-        base_sync_done=True,
+        # Adapter-only export intentionally omits an unchanged output head.  A
+        # static PEFT head therefore needs the base tensor on its first sync.
+        base_sync_done=not uses_peft,
     )
-    selected_name = None
-    selected_weight = None
-    fallback_name = None
-    fallback_weight = None
-
-    for name, tensor in per_tensor_param:
-        if not torch.is_tensor(tensor):
-            continue
-        name = str(name)
-        if name == "model.embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
-            fallback_name = name
-            fallback_weight = tensor
-        if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
-            selected_name = name
-            selected_weight = tensor
-            break
-
-    if selected_weight is None:
-        selected_name = fallback_name
-        selected_weight = fallback_weight
+    selected_name, selected_weight = _select_projection_from_params(per_tensor_param)
 
     if getattr(worker, "rank", None) != 0:
         return None
@@ -863,7 +1139,10 @@ def export_actor_lm_head_weight(
             )
 
     weight = (
-        selected_weight.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+        selected_weight.detach()
+        .to(device="cpu", dtype=torch.bfloat16)
+        .clone()
+        .contiguous()
     )
     logger.warning(
         "[actor lm_head export] name=%s shape=%s dtype=%s source_vocab=%s selected_rows=%s",
@@ -873,14 +1152,17 @@ def export_actor_lm_head_weight(
         source_vocab_size,
         selected_rows,
     )
-    return {
-        "name": selected_name,
-        "weight": weight,
-        "row_indices": exported_row_indices,
-        "source_vocab_size": source_vocab_size,
-        "selected_rows": selected_rows,
-        "export_strategy": "engine_full_param",
-    }
+    return _finalize_projection_payload(
+        {
+            "name": selected_name,
+            "weight": weight,
+            "row_indices": exported_row_indices,
+            "source_vocab_size": source_vocab_size,
+            "selected_rows": selected_rows,
+            "export_strategy": "engine_full_param",
+        },
+        dynamic=projection_dynamic,
+    )
 
 
 class DraftWeightPublishMixin:

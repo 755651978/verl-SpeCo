@@ -677,6 +677,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return non_null[0] if non_null else None
         return value
 
+    @staticmethod
+    def _flatten_target_sync_results(value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            results: list[dict[str, Any]] = []
+            for item in value:
+                results.extend(SpecoRayPPOTrainer._flatten_target_sync_results(item))
+            return results
+        raise RuntimeError(
+            "SPECO target projection sync returned an invalid worker result: "
+            f"{type(value).__name__}"
+        )
+
     def _speco_online_enabled(self) -> bool:
         return self.is_drafter_training_enabled(self.config)
 
@@ -1947,16 +1963,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         fetch_elapsed = time.perf_counter() - fetch_started
         payload = self._first_non_null(payloads)
         if payload is None:
-            return (
-                {
-                    "drafter/target_lm_head_synced": 0,
-                    "drafter/target_lm_head_selected_rows": selected_rows,
-                    "drafter/target_lm_head_source_vocab_size": source_vocab_size,
-                    "timing_s/drafter_sync_target_lm_head": time.perf_counter()
-                    - sync_started,
-                    "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
-                },
-                None,
+            raise RuntimeError(
+                "SPECO could not export the actor target output projection. "
+                "Drafter training is stopped to avoid using a stale checkpoint head."
             )
 
         export_strategy = (
@@ -1971,7 +1980,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if defer_device_apply:
             payload = dict(payload)
             payload["defer_device_apply"] = True
-        payload_arg, global_step_arg, _ = (
+        payload_arg, global_step_arg, target_sync_bucket_count = (
             self._speco_build_drafter_target_lm_head_sync_args(payload)
         )
         dispatch_started = time.perf_counter()
@@ -1994,6 +2003,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "dispatch_finished": dispatch_started + dispatch_elapsed,
             "dispatch_elapsed": dispatch_elapsed,
             "pre_dispatch_elapsed": dispatch_started - sync_started,
+            "expected_results": target_sync_bucket_count,
+            "expected_global_step": int(self.global_steps),
+            "expected_fingerprint": (
+                payload.get("projection_fingerprint")
+                if isinstance(payload, dict)
+                else None
+            ),
         }
         if defer_device_apply and pending_refs is not None:
             return metrics, pending
@@ -2005,7 +2021,40 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self, pending: dict[str, Any]
     ) -> dict[str, Any]:
         wait_started = time.perf_counter()
-        self._ray_get_if_needed(pending.get("refs"))
+        resolved = self._ray_get_if_needed(pending.get("refs"))
+        results = self._flatten_target_sync_results(resolved)
+        expected_results = int(pending.get("expected_results", 1) or 1)
+        expected_step_value = pending.get("expected_global_step", self.global_steps)
+        if expected_step_value is None:
+            expected_step_value = self.global_steps
+        expected_step = int(expected_step_value)
+        expected_fingerprint = pending.get("expected_fingerprint")
+        failures = []
+        for result in results:
+            accepted = bool(result.get("accepted", False))
+            staged = bool(result.get("applied", False) or result.get("pending", False))
+            step_matches = int(result.get("global_step", -1)) == expected_step
+            fingerprint_matches = (
+                expected_fingerprint is None
+                or result.get("projection_fingerprint") == expected_fingerprint
+            )
+            if not (accepted and staged and step_matches and fingerprint_matches):
+                failures.append(result)
+        replica_ranks = {
+            int(result["replica_rank"])
+            for result in results
+            if result.get("replica_rank") is not None
+        }
+        replicas_consistent = not replica_ranks or replica_ranks == set(
+            range(expected_results)
+        )
+        if len(results) < expected_results or not replicas_consistent or failures:
+            raise RuntimeError(
+                "SPECO target projection worker acknowledgement failed: "
+                f"expected_replicas={expected_results}, actual_results={len(results)}, "
+                f"replica_ranks={sorted(replica_ranks)}, "
+                f"failures={failures}"
+            )
         finished = time.perf_counter()
         wait_elapsed = finished - wait_started
         dispatch_elapsed = float(pending.get("dispatch_elapsed", 0.0) or 0.0)
@@ -2020,6 +2069,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         critical_path_elapsed = pre_dispatch_elapsed + dispatch_elapsed + wait_elapsed
         return {
             "drafter/target_lm_head_synced": 1,
+            "drafter/target_projection_worker_results_consistent": 1,
             "timing_s/drafter_sync_target_lm_head": critical_path_elapsed,
             "timing_s/drafter_sync_target_lm_head_apply": (
                 dispatch_elapsed + wait_elapsed

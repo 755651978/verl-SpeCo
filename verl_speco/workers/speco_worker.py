@@ -47,7 +47,10 @@ from verl.utils.distributed import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
-from verl_speco.integration.rollout_publish import release_draft_weights_payload
+from verl_speco.integration.rollout_publish import (
+    _projection_fingerprint,
+    release_draft_weights_payload,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -1173,12 +1176,40 @@ class SpecoWorker(Worker):
         source_vocab_size = payload.get("source_vocab_size")
         defer_device_apply = bool(payload.get("defer_device_apply", False))
         name = payload.get("name")
+        projection_fingerprint = payload.get("projection_fingerprint")
+        projection_mode = payload.get("projection_mode")
+        projection_dynamic = bool(payload.get("projection_dynamic", True))
+        actual_fingerprint = _projection_fingerprint(payload)
+        if (
+            not projection_fingerprint
+            or str(projection_fingerprint) != actual_fingerprint
+        ):
+            return {
+                "accepted": False,
+                "applied": False,
+                "reason": "projection_fingerprint_mismatch",
+                "worker_id": str(self.rank),
+                "replica_rank": int(self.replica_rank),
+                "worker_incarnation": self.worker_incarnation,
+                "projection_fingerprint": actual_fingerprint,
+            }
         result = self.trainer.sync_target_lm_head_weight(
             weight,
             global_step=global_step,
             row_indices=row_indices,
             source_vocab_size=source_vocab_size,
             defer_device_apply=defer_device_apply,
+            projection_fingerprint=projection_fingerprint,
+            projection_mode=projection_mode,
+            projection_dynamic=projection_dynamic,
+        )
+        result.update(
+            {
+                "worker_id": str(self.rank),
+                "replica_rank": int(self.replica_rank),
+                "worker_incarnation": self.worker_incarnation,
+                "source": name,
+            }
         )
         if self.is_drafter_group_leader:
             logger.debug(

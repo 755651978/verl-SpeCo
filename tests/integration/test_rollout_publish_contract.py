@@ -303,6 +303,153 @@ def test_veomni_lm_head_export_avoids_full_engine_state_dict(
     assert tuple(payload["weight"].shape) == (expected_rows, 3)
 
 
+def test_static_peft_projection_exports_base_head_instead_of_adapter_delta() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.peft_config = {"default": object()}
+            self.lm_head = torch.nn.Linear(3, 6, bias=False)
+            self.lm_head.requires_grad_(False)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    class _Engine:
+        module = _Module()
+
+        @staticmethod
+        def get_per_tensor_param(**kwargs):
+            raise AssertionError("row-restricted static PEFT export should be direct")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={
+            "actor": {"strategy": "fsdp"},
+            "rollout": {"drafter": {"speculative_algorithm": "EAGLE3"}},
+        },
+        actor=SimpleNamespace(engine=_Engine()),
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(worker, row_indices=[1, 4])
+
+    assert payload["projection_mode"] == "static_verified"
+    assert payload["projection_dynamic"] is False
+    assert payload["export_strategy"] == "direct_sparse"
+    assert tuple(payload["weight"].shape) == (2, 3)
+    assert len(payload["projection_fingerprint"]) == 64
+
+
+def test_static_peft_full_projection_requests_base_parameters() -> None:
+    torch = pytest.importorskip("torch")
+    calls = []
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.peft_config = {"default": object()}
+            self.lm_head = torch.nn.Linear(3, 6, bias=False)
+            self.lm_head.requires_grad_(False)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    class _Engine:
+        module = _Module()
+
+        @staticmethod
+        def get_per_tensor_param(**kwargs):
+            calls.append(kwargs)
+            return iter([("lm_head.weight", _Engine.module.lm_head.weight)]), None
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={"actor": {"strategy": "fsdp"}},
+        actor=SimpleNamespace(engine=_Engine()),
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(worker)
+
+    assert calls[0]["base_sync_done"] is False
+    assert payload["projection_mode"] == "static_verified"
+    assert tuple(payload["weight"].shape) == (6, 3)
+
+
+def test_adapter_modified_projection_exports_merged_effective_weight() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _AdapterHead(torch.nn.Linear):
+        def __init__(self):
+            super().__init__(3, 6, bias=False)
+            self.lora_A = torch.nn.ModuleDict(
+                {"default": torch.nn.Linear(3, 2, bias=False)}
+            )
+            self.lora_B = torch.nn.ModuleDict(
+                {"default": torch.nn.Linear(2, 6, bias=False)}
+            )
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.peft_config = {"default": object()}
+            self.lm_head = _AdapterHead()
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    effective = torch.arange(18, dtype=torch.float32).reshape(6, 3)
+
+    class _Engine:
+        module = _Module()
+
+        @staticmethod
+        def _merged_lora_per_tensor_param():
+            yield "lm_head.weight", effective
+
+        @staticmethod
+        def get_per_tensor_param(**kwargs):
+            raise AssertionError("adapter-modified projection must use merged export")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={"actor": {"strategy": "fsdp"}},
+        actor=SimpleNamespace(engine=_Engine()),
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(worker, row_indices=[0, 5])
+
+    assert payload["projection_mode"] == "transferred_effective"
+    assert payload["projection_dynamic"] is True
+    assert payload["export_strategy"] == "verl09_effective_peft"
+    assert torch.equal(payload["weight"].float(), effective[[0, 5]])
+
+
+def test_output_projection_bias_fails_closed() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(3, 6, bias=True)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={"actor": {"strategy": "fsdp"}},
+        actor=SimpleNamespace(engine=SimpleNamespace(module=_Module())),
+    )
+
+    with pytest.raises(RuntimeError, match="bias term"):
+        rollout_publish.export_actor_lm_head_weight(worker)
+
+
 def test_veomni_runtime_validation_checks_initialized_model_contract() -> None:
     torch = pytest.importorskip("torch")
 

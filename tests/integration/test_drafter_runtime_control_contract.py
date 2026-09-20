@@ -296,8 +296,6 @@ def test_no_drafter_run_refuses_and_leaves_vllm_config_untouched(
     assert "no-async-scheduling" not in vllm_engine
     assert "worker_extension_cls" not in vllm_engine
 
-
-
 def test_task_runner_installs_vllm_import_compat_in_its_own_process(
     monkeypatch,
 ) -> None:
@@ -358,8 +356,6 @@ def test_no_drafter_run_does_not_install_vllm_import_compat(monkeypatch) -> None
     # A no-drafter run must never install the SPECO vLLM import-compat mixin;
     # the runner refuses before reaching the import-compat step.
     assert compat_calls == []
-
-
 
 def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
     trainer = _trainer(
@@ -444,11 +440,21 @@ def test_target_head_sync_defers_for_all_lm_head_drafters(
     received = []
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
     trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
-    trainer._speco_build_drafter_target_lm_head_sync_args = (
-        lambda value: (value, trainer.global_steps, 1)
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value: (
+        value,
+        trainer.global_steps,
+        1,
     )
     trainer.speco_sync_target_lm_head_weight = (
         lambda value, global_step=None: received.append((value, global_step))
+        or [
+            {
+                "accepted": True,
+                "pending": True,
+                "global_step": global_step,
+                "projection_fingerprint": value.get("projection_fingerprint"),
+            }
+        ]
     )
 
     metrics = trainer._speco_sync_target_lm_head_weight()
@@ -469,11 +475,26 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
     }
     pending_refs = ["pending-target-sync"]
     resolved = []
-    trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
+
+    def resolve(value):
+        resolved.append(value)
+        if value is pending_refs:
+            return [
+                {
+                    "accepted": True,
+                    "pending": True,
+                    "global_step": trainer.global_steps,
+                }
+            ]
+        return value
+
+    trainer._ray_get_if_needed = resolve
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
     trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
-    trainer._speco_build_drafter_target_lm_head_sync_args = (
-        lambda value: (value, trainer.global_steps, 1)
+    trainer._speco_build_drafter_target_lm_head_sync_args = lambda value: (
+        value,
+        trainer.global_steps,
+        1,
     )
     trainer.speco_sync_target_lm_head_weight = (
         lambda value, global_step=None: pending_refs
@@ -489,6 +510,28 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
 
     assert resolved == [[payload], pending_refs]
     assert metrics["drafter/target_lm_head_synced"] == 1
+
+
+def test_target_head_sync_rejects_inconsistent_worker_ack() -> None:
+    trainer = _trainer({"training_interval_steps": 1}, step=3)
+    trainer._ray_get_if_needed = lambda value: [
+        {
+            "accepted": True,
+            "pending": True,
+            "global_step": 2,
+            "projection_fingerprint": "wrong",
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="worker acknowledgement failed"):
+        trainer._speco_finish_target_lm_head_weight_sync(
+            {
+                "refs": ["pending"],
+                "expected_results": 1,
+                "expected_global_step": 3,
+                "expected_fingerprint": "expected",
+            }
+        )
 
 
 def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
