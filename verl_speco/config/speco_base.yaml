@@ -296,15 +296,22 @@ actor_rollout_ref:
           # Optional hybrid Bubble quota. Each training interval creates one
           # quality target after data becomes trainable. Bubble work repays it
           # first; old/large debt permits a small same-writer synchronous
-          # top-up at a safe point. target_steps=null reuses training.step.
+          # top-up at the next interval boundary. ``training.step`` remains the
+          # per-idle-window cap; target_steps is the per-cycle optimizer target.
+          # Set target_steps=null only when intentionally reusing training.step.
           training_quota:
             enable: false
-            target_steps: null
+            target_steps: 20
             # Grace period counted after the corresponding training interval
-            # boundary, so the full interval remains available to Bubble.
-            max_debt_age_steps: 3
+            # boundary. Zero completes the previous cycle at that boundary.
+            max_debt_age_steps: 0
             max_accumulated_debt: 20
-            max_sync_topup_steps: 2
+            # Strict parity mode may synchronously finish the whole remainder.
+            max_sync_topup_steps: 20
+            # Keep the drafter model/optimizer resident between a partial idle
+            # launch and its boundary top-up. The completing plan still performs
+            # the normal cleanup, so this avoids duplicate offload/reload only.
+            keep_hot_between_plans: true
           idle_worker:
             require_memory_released: true
             drain_before_next_rollout: true

@@ -853,6 +853,14 @@ class DrafterBaseTrainer:
             "domino",
         }
 
+    def _online_input_tail_rows(self) -> int:
+        """Return input rows retained beyond each collected hidden-state row.
+
+        EAGLE-family objectives consume one look-ahead token, while block
+        drafters align input ids, hidden states, and loss-mask rows one-to-one.
+        """
+        return 0 if self._is_block_drafter_backend() else 1
+
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
         if model_type in {"dspark", "domino", "eagle3", "dflash2"}:
@@ -2920,7 +2928,13 @@ class DrafterBaseTrainer:
             or self.pad_token_id
         )
         accepted_any = False
+        input_tail_rows = self._online_input_tail_rows()
         for i in range(batch_size):
+            # Legacy samples without explicit positions were collected from a
+            # next-token hidden-state stream and use ``input_len - 1`` as the
+            # alignment frame for every backend.  Keep that start-position
+            # inference stable; ``input_tail_rows`` only controls the emitted
+            # window length once the start row is known.
             expected_hidden_rows = max(input_seq_length - 1, 0)
             raw_positions_item_for_alignment = None
             if (
@@ -3034,20 +3048,26 @@ class DrafterBaseTrainer:
                     continue
 
                 hidden_position_start = max(int(hidden_positions_item[0].item()), 0)
-                # Phase 3: SGLang hidden_positions is the source of truth.
-                # Hidden row p supervises token p+1 and target row p+1, and
-                # the loss row is p+2, so keep only rows with that token window.
+                # Explicit hidden_positions (SGLang or old-logprob capture) are
+                # the source of truth. EAGLE keeps one look-ahead token; block
+                # drafters use row-aligned inputs.
                 max_hidden_rows = min(
                     selected_hidden_row_end,
                     hidden_seq_length,
-                    max(input_seq_length - hidden_position_start - 1, 0),
+                    max(
+                        input_seq_length
+                        - hidden_position_start
+                        - input_tail_rows,
+                        0,
+                    ),
                 )
                 hidden_start = 0
                 hidden_feature_length = max_hidden_rows
                 hidden_end = hidden_feature_length
                 feature_start = hidden_position_start
                 feature_end = min(
-                    input_seq_length, feature_start + hidden_feature_length + 1
+                    input_seq_length,
+                    feature_start + hidden_feature_length + input_tail_rows,
                 )
             else:
                 if hidden_position_start is None:
@@ -3059,11 +3079,13 @@ class DrafterBaseTrainer:
                 feature_start = min(max(hidden_position_start, 0), input_seq_length)
                 hidden_start = 0
                 hidden_feature_length = min(
-                    hidden_seq_length, max(input_seq_length - feature_start - 1, 0)
+                    hidden_seq_length,
+                    max(input_seq_length - feature_start - input_tail_rows, 0),
                 )
                 hidden_end = hidden_feature_length
                 feature_end = min(
-                    input_seq_length, feature_start + hidden_feature_length + 1
+                    input_seq_length,
+                    feature_start + hidden_feature_length + input_tail_rows,
                 )
 
             target_logprobs_position_start = None
@@ -3106,11 +3128,12 @@ class DrafterBaseTrainer:
                 if hidden_feature_length <= 0:
                     hidden_feature_length = 0
                     hidden_end = hidden_start
-                    feature_end = feature_start + 1
+                    feature_end = feature_start + input_tail_rows
                 else:
                     hidden_end = hidden_start + hidden_feature_length
                     feature_end = min(
-                        input_seq_length, feature_start + hidden_feature_length + 1
+                        input_seq_length,
+                        feature_start + hidden_feature_length + input_tail_rows,
                     )
 
             input_feature_length = feature_end - feature_start
@@ -4726,8 +4749,19 @@ class DrafterBaseTrainer:
         plan_id = self._active_training_reservation_id
         if plan_id is None or not self._last_prepared_training_items:
             return 0
-        consumed = self.data_buffer.consume(plan_id, self._last_prepared_training_items)
+        items = list(self._last_prepared_training_items)
         self._last_prepared_training_items = []
+        # Keep Bubble reservations immutable for the complete plan even when
+        # gradient_accumulation_steps == 1.  The accumulation path already
+        # records used items without consuming them; doing the same here lets
+        # a synchronous quota top-up replay a small, version-homogeneous
+        # snapshot until it reaches its optimizer-step target.  Finalization
+        # consumes every unique item exactly once.
+        replay_used = getattr(self, "_active_training_replay_used_items", None)
+        if replay_used is not None:
+            replay_used.update({id(item): item for item in items})
+            return 0
+        consumed = self.data_buffer.consume(plan_id, items)
         if consumed:
             self._mark_buffer_changed()
             logger.info(
@@ -5372,7 +5406,12 @@ class DrafterBaseTrainer:
         self.clear_pending_publish_state_dict()
         return True, state_dict
 
-    async def cleanup_training(self, clear_data: bool = True):
+    async def cleanup_training(
+        self,
+        clear_data: bool = True,
+        *,
+        keep_hot: bool = False,
+    ):
         # First set training as inactive to prevent further steps
         self._training_active = False
 
@@ -5406,7 +5445,7 @@ class DrafterBaseTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
-        if self.skip_heavy_cleanup_after_drafter_training:
+        if keep_hot or self.skip_heavy_cleanup_after_drafter_training:
             if clear_data:
                 self.collected_data.clear()
                 self.data_buffer.clear()
@@ -5416,8 +5455,9 @@ class DrafterBaseTrainer:
             self._last_ckpt_step = -1
             self.training_steps = 0
             logger.debug(
-                "[Rank %s] Skipped heavy drafter cleanup; model/optimizer stay on runtime device",
+                "[Rank %s] Skipped heavy drafter cleanup; model/optimizer stay on runtime device keep_hot=%s",
                 self.rank,
+                keep_hot,
             )
             return
 

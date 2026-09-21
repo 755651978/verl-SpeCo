@@ -265,6 +265,12 @@ class TrainingOutcome:
         metrics["bubble/train_first_batch_started"] = int(
             any(bool(result.get("first_batch_started", False)) for result in normalized_results)
         )
+        metrics["bubble/training_kept_hot"] = int(
+            any(
+                bool(result.get("kept_training_hot", False))
+                for result in normalized_results
+            )
+        )
 
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
         if (
@@ -287,10 +293,17 @@ class TrainingOutcome:
                 }
             )
         if plan.reason == "quota_topup_training_ready":
+            topup_completed = bool(
+                trained and successful_steps == int(plan.max_batches)
+            )
             metrics.update(
                 {
-                    "bubble/training_quota_topup_completed": int(trained),
+                    "bubble/training_quota_topup_completed": int(topup_completed),
                     "bubble/training_quota_topup_successful_steps": successful_steps,
+                    "bubble/training_quota_topup_shortfall_steps": max(
+                        int(plan.max_batches) - successful_steps,
+                        0,
+                    ),
                     "bubble/training_quota_topup_elapsed_s": execution.elapsed_sec,
                 }
             )

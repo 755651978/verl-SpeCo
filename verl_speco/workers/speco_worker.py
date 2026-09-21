@@ -1616,13 +1616,10 @@ class SpecoWorker(Worker):
                 float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
                 0.0,
             )
-            tail_reserve_sec = max(
-                float(training_plan.get("idle_tail_reserve_sec", 0.0) or 0.0),
-                0.0,
-            )
-            required_remaining_sec = (
-                startup_reserve_sec + batch_estimate_sec + tail_reserve_sec
-            )
+            # ``deadline_ts`` is already the scheduler's latest safe training
+            # boundary after reserving cleanup/tail time.  Requiring the tail
+            # again here rejects otherwise valid windows by double-counting it.
+            required_remaining_sec = startup_reserve_sec + batch_estimate_sec
             if deadline_ts is not None and (
                 float(deadline_ts) - now_ts < required_remaining_sec
             ):
@@ -1859,11 +1856,10 @@ class SpecoWorker(Worker):
         if execution_strategy == "rollout_idle_worker":
             deadline_ts = training_plan.get("deadline_ts")
             now_ts = time.time()
+            # The scheduler has already moved ``deadline_ts`` earlier by the
+            # tail reserve, so only one optimizer batch must fit at this point.
             required_remaining_sec = max(
                 float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
-                0.0,
-            ) + max(
-                float(training_plan.get("idle_tail_reserve_sec", 0.0) or 0.0),
                 0.0,
             )
             if deadline_ts is not None and (
@@ -2341,7 +2337,15 @@ class SpecoWorker(Worker):
                         flush=True,
                     )
                 self.trainer.release_training_data_reservation(plan_id)
-                await self.trainer.cleanup_training(clear_data=False)
+                keep_training_hot = bool(
+                    training_plan.get("keep_training_hot", False)
+                    and result["successful_steps"] > 0
+                )
+                await self.trainer.cleanup_training(
+                    clear_data=False,
+                    keep_hot=keep_training_hot,
+                )
+                result["kept_training_hot"] = int(keep_training_hot)
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0

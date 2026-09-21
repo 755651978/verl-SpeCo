@@ -68,9 +68,12 @@ class _FakeTrainer:
         self.activation_calls += 1
         return True
 
-    async def cleanup_training(self, clear_data: bool = True):
+    async def cleanup_training(
+        self, clear_data: bool = True, *, keep_hot: bool = False
+    ):
         del clear_data
         self.cleanup_calls += 1
+        self.keep_hot = keep_hot
 
     async def release_training_memory_after_activation(self):
         self.release_after_activation_calls += 1
@@ -225,7 +228,9 @@ def test_bubble_preflight_rejects_expired_plan_before_activation() -> None:
     assert not result["ready"]
     assert result["reason"] == "plan_expired_before_preflight"
     assert result["remaining_sec"] < 0.0
-    assert result["required_remaining_sec"] == 4.0
+    # deadline_ts already reserves idle_tail_reserve_sec, so preflight must not
+    # count that reserve a second time.
+    assert result["required_remaining_sec"] == 3.0
     assert worker.trainer.activation_calls == 0
     assert worker.trainer.reserved_plan_id is None
 

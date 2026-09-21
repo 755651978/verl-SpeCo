@@ -144,6 +144,38 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
     ).publish
 
 
+@pytest.mark.parametrize(
+    ("strategy", "expected_collect", "expected_reason"),
+    [
+        ("rollout_idle_worker", True, "collection_enabled"),
+        ("sync", False, "training_interval_not_reached"),
+    ],
+)
+def test_bubble_oldlogprob_collection_uses_only_collection_interval(
+    strategy: str,
+    expected_collect: bool,
+    expected_reason: str,
+) -> None:
+    trainer = _trainer(
+        {
+            "collect_hidden_states_from_old_logprob": True,
+            "collect_interval_steps": 4,
+            "training_interval_steps": 6,
+            "scheduler": {"execution": {"strategy": strategy}},
+        },
+        step=4,
+    )
+
+    plan = trainer._speco_plan_drafter_collection(
+        _speco_ray_trainer.DrafterCollectionSource.OLD_LOGPROB
+    )
+
+    assert plan.collect is expected_collect
+    assert plan.collect_interval_matched
+    assert not plan.training_interval_matched
+    assert plan.reason == expected_reason
+
+
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10
@@ -547,7 +579,7 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
     assert metrics["drafter/target_lm_head_synced"] == 1
 
 
-def test_bubble_target_head_fetch_overlaps_actor_update() -> None:
+def test_bubble_target_head_fetch_completes_before_async_dispatch() -> None:
     trainer = _trainer(
         {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
         step=1,
@@ -568,16 +600,46 @@ def test_bubble_target_head_fetch_overlaps_actor_update() -> None:
     metrics, pending = trainer._speco_start_target_lm_head_weight_sync()
 
     assert pending is not None
-    assert "fetch_refs" in pending
-    assert resolved == []
+    assert "fetch_refs" not in pending
+    assert pending["refs"] == pending_refs
+    assert pending["stage"] == "dispatch"
+    assert pending["target_version"] == trainer.global_steps
+    # The actor payload must be materialized before update_actor can run.  A
+    # Ray ObjectRef alone does not freeze the pre-update model parameters.
+    assert resolved == [[payload]]
     assert metrics["timing_s/drafter_target_lm_head_fetch_submit"] >= 0.0
+    assert metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] >= 0.0
+    assert (
+        metrics["timing_s/drafter_target_lm_head_prefetch_submit_critical_path"]
+        >= metrics["timing_s/drafter_target_lm_head_fetch_critical_path"]
+    )
 
     metrics.update(trainer._speco_finish_target_lm_head_weight_sync(pending))
 
     assert resolved == [[payload], pending_refs]
     assert metrics["drafter/target_lm_head_synced"] == 1
-    assert metrics["timing_s/drafter_target_lm_head_fetch_async_work"] >= 0.0
-    assert metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] >= 0.0
+
+
+def test_bubble_target_head_prefetch_ignores_transient_fallback_plan() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=4,
+    )
+    trainer._speco_last_collected_samples = 31
+
+    # A scheduler event may temporarily select a synchronous fallback plan
+    # when no version is trainable.  Prefetch eligibility must continue to
+    # follow the configured Bubble mode so that the next window can recover.
+    assert trainer._speco_should_prefetch_target_lm_head()
+
+    trainer._speco_last_collected_samples = 0
+    assert not trainer._speco_should_prefetch_target_lm_head()
+
+    trainer.config.actor_rollout_ref.rollout.drafter.training = {
+        "scheduler": {"execution": {"strategy": "sync"}}
+    }
+    trainer._speco_last_collected_samples = 31
+    assert not trainer._speco_should_prefetch_target_lm_head()
 
 
 def test_bubble_target_head_ready_is_scoped_to_synced_workers() -> None:

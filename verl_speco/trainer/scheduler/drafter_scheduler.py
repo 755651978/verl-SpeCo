@@ -1994,21 +1994,13 @@ class DrafterScheduler:
             self._training_quota_last_cycle_step = cycle_step
             return
         previous_debt = self._training_quota_debt_steps
-        configured_max_debt = max(
+        debt_trigger = max(
             int(config.training_quota_max_accumulated_debt), 0
         )
-        # A cap smaller than one target would silently weaken the requested
-        # minimum. Zero means unbounded; otherwise always retain one full
-        # cycle's target before capping accumulated debt.
-        max_debt = (
-            max(configured_max_debt, target_steps)
-            if configured_max_debt > 0
-            else 0
-        )
-        accumulated = previous_debt + target_steps
-        self._training_quota_debt_steps = (
-            min(accumulated, max_debt) if max_debt > 0 else accumulated
-        )
+        # ``max_accumulated_debt`` is an urgency threshold, not permission to
+        # discard optimizer-step obligations.  The due check uses it to force
+        # a top-up, while the ledger always retains the full accumulated debt.
+        self._training_quota_debt_steps = previous_debt + target_steps
         self._training_quota_last_cycle_step = cycle_step
         if previous_debt <= 0 and self._training_quota_debt_steps > 0:
             # The cycle deadline, rather than its first data-arrival step, is
@@ -2021,7 +2013,7 @@ class DrafterScheduler:
             f"data_version={data_version} "
             f"target_steps={target_steps} debt_before={previous_debt} "
             f"debt_after={self._training_quota_debt_steps} "
-            f"max_accumulated_debt={max_debt}",
+            f"max_accumulated_debt={debt_trigger}",
             flush=True,
         )
 
@@ -2125,6 +2117,7 @@ class DrafterScheduler:
             training_group_id="quota-topup",
             deadline_ts=None,
             publish_after_success=True,
+            keep_training_hot=False,
         )
 
     def _skip_idle_worker_plan(
@@ -2302,8 +2295,7 @@ class DrafterScheduler:
             allow_sync_fallback=context.allow_sync_fallback,
         )
         if (
-            not plan.launch
-            and context.allow_quota_topup
+            context.allow_quota_topup
             and context.config.execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
         ):
@@ -2312,6 +2304,11 @@ class DrafterScheduler:
                 context.config,
             )
             if quota_plan is not None:
+                # At the interval boundary, completing the current cycle's
+                # optimizer-step quota takes precedence over starting another
+                # best-effort idle-window launch.  Otherwise quota debt can
+                # leak into the next collection cycle whenever both plans are
+                # simultaneously eligible.
                 plan = quota_plan
         metrics: dict[str, Any] = dict(plan.metrics())
         metrics.update(
@@ -2759,11 +2756,29 @@ class DrafterScheduler:
                 publish_after_success=False,
                 **common,
             )
+        projected_quota_debt = max(
+            self._training_quota_debt_steps - int(budget.max_batches),
+            0,
+        )
+        quota_cycle_incomplete = bool(
+            config.training_quota_enable
+            and config.execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and projected_quota_debt > 0
+        )
         return TrainingPlan(
             launch=True,
             reason=trigger.reason,
-            publish_after_success=self._publish_interval_matched(
-                context.global_step, config
+            # Intermediate quota work is intentionally private. Publishing it
+            # would expose a partially trained drafter and add snapshot/weight
+            # traffic before the boundary top-up publishes the completed cycle.
+            publish_after_success=(
+                not quota_cycle_incomplete
+                and self._publish_interval_matched(context.global_step, config)
+            ),
+            keep_training_hot=bool(
+                quota_cycle_incomplete
+                and config.training_quota_keep_hot_between_plans
             ),
             **common,
         )
@@ -2840,6 +2855,17 @@ class DrafterScheduler:
     ) -> None:
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             is_quota_topup = plan.reason == "quota_topup_training_ready"
+            if is_quota_topup and (
+                not outcome.trained
+                or int(outcome.successful_steps) != int(plan.max_batches)
+            ):
+                raise RuntimeError(
+                    "Bubble training quota top-up did not complete its requested "
+                    "optimizer steps: "
+                    f"requested={plan.max_batches} "
+                    f"completed={outcome.successful_steps} "
+                    f"reason={outcome.reason} plan_id={plan.plan_id}"
+                )
             if not is_quota_topup:
                 self.record_idle_training_outcome(outcome)
             self._record_replica_local_unavailable(plan, outcome)
@@ -2975,8 +3001,8 @@ class DrafterScheduler:
         interval = _as_int(config.publish_interval_steps or 0)
         return interval <= 0 or _as_int(global_step) % interval == 0
 
-    @staticmethod
     def plan_publish(
+        self,
         *,
         global_step: object,
         drafter_trained: bool,
@@ -3007,9 +3033,23 @@ class DrafterScheduler:
                 source_global_step=global_step,
                 asynchronous=asynchronous,
             )
+        if (
+            training_plan is not None
+            and training_plan.execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and config.training_quota_enable
+            and self._training_quota_debt_steps > 0
+        ):
+            return PublishPlan(
+                publish=False,
+                reason="training_quota_incomplete",
+                interval_matched=False,
+                source_global_step=global_step,
+                asynchronous=asynchronous,
+            )
         # Preserve the released path exactly: invalid publish configuration is
         # an error instead of being silently converted into a skipped publish.
-        interval_matched = DrafterScheduler._publish_interval_matched(
+        interval_matched = self._publish_interval_matched(
             global_step, config
         )
         return PublishPlan(

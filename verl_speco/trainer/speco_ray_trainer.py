@@ -1059,6 +1059,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 validation=validation,
                 require_training_interval=(
                     source is DrafterCollectionSource.OLD_LOGPROB
+                    and not self._speco_rollout_idle_worker_enabled()
                 ),
             ),
             self._speco_drafter_schedule_config(),
@@ -1145,6 +1146,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and self._speco_drafter_schedule_config().execution_strategy.value
             == "rollout_idle_worker"
         )
+
+    def _speco_should_prefetch_target_lm_head(self) -> bool:
+        """Return whether the current collection needs an async head snapshot.
+
+        This decision follows the configured execution mode rather than the
+        transient plan selected for the current scheduler event.  In
+        particular, a failed synchronous fallback plan must not prevent a
+        Bubble run from preparing the LM-head version required by the next
+        idle window.
+        """
+        return self._speco_rollout_idle_worker_enabled() and int(
+            getattr(self, "_speco_last_collected_samples", 0) or 0
+        ) > 0
 
     def _speco_rollout_idle_event_bus_name(self) -> str | None:
         training_cfg = self._speco_drafter_training_config()
@@ -2275,6 +2289,27 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         max_tokens_per_owner = collection_plan.max_tokens_per_replica
         if max_tokens_per_owner is not None:
             max_tokens_per_owner = max(max_tokens_per_owner, 0)
+            if self._speco_rollout_idle_worker_enabled():
+                # Old-logprob capture needs one extra hidden row for shifted
+                # supervision.  A common ``N * window_rows`` token budget would
+                # therefore admit only N-1 samples after Bubble concentrates
+                # the Sync owners onto its single writer.  Correct that exact
+                # off-by-one shape without overriding deliberately smaller
+                # token budgets.
+                configured_window_budget = max_per_owner * train_rows
+                required_window_budget = max_per_owner * hidden_rows
+                if (
+                    max_tokens_per_owner == configured_window_budget
+                    and max_tokens_per_owner < required_window_budget
+                ):
+                    print(
+                        "[BubbleTime] collection_writer_token_capacity_raised: "
+                        f"configured_per_owner={max_tokens_per_owner} "
+                        f"required_per_owner={required_window_budget} "
+                        f"samples={max_per_owner} hidden_rows={hidden_rows}",
+                        flush=True,
+                    )
+                    max_tokens_per_owner = required_window_budget
         owner_counts = [0 for _ in range(owner_count)]
         owner_token_counts = [0 for _ in range(owner_count)]
         seed_by_step = bool(training_cfg.get("hidden_state_random_seed_by_step", True))
@@ -2992,56 +3027,43 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             row_indices,
             keep_model_on_device=keep_actor_model_on_device,
         )
-        # Bubble Time needs the actor head from before the PPO update, but the
-        # transfer itself can overlap that update.  Do not ray.get the head on
-        # the trainer critical path; finish it after ``original_update_actor``
-        # and preserve the captured pre-update ObjectRef/version.
-        if (
+        fetch_submit_elapsed = time.perf_counter() - fetch_started
+        bubble_prefetch = (
             training_plan is None
             and self._speco_drafter_schedule_config().execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
-        ):
-            return (
-                {
-                    "drafter/target_lm_head_synced": 0,
-                    "drafter/target_lm_head_selected_rows": selected_rows,
-                    "drafter/target_lm_head_source_vocab_size": source_vocab_size,
-                    "drafter/target_lm_head_target_workers": len(
-                        target_worker_ids or ()
-                    ),
-                    "timing_s/drafter_target_lm_head_fetch_submit": (
-                        time.perf_counter() - fetch_started
-                    ),
-                    "timing_s/drafter_target_lm_head_prefetch_submit_critical_path": (
-                        time.perf_counter() - fetch_started
-                    ),
-                },
-                {
-                    "fetch_refs": payload_refs,
-                    "fetch_started": fetch_started,
-                    "sync_started": sync_started,
-                    "selected_rows": selected_rows,
-                    "source_vocab_size": source_vocab_size,
-                    "target_version": int(self.global_steps),
-                    "target_worker_ids": target_worker_ids,
-                    "stage": "fetch",
-                },
-            )
+        )
+        # An ObjectRef is not a snapshot of actor state.  Resolve the actor-side
+        # export before PPO mutates the model so the cached version is truly the
+        # pre-update lm_head.  Only the subsequent CPU payload dispatch to the
+        # drafter workers is allowed to overlap ``original_update_actor``.
         payloads = self._ray_get_if_needed(payload_refs) or []
         fetch_elapsed = time.perf_counter() - fetch_started
         payload = self._first_non_null(payloads)
         if payload is None:
-            return (
-                {
-                    "drafter/target_lm_head_synced": 0,
-                    "drafter/target_lm_head_selected_rows": selected_rows,
-                    "drafter/target_lm_head_source_vocab_size": source_vocab_size,
-                    "timing_s/drafter_sync_target_lm_head": time.perf_counter()
-                    - sync_started,
-                    "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
-                },
-                None,
-            )
+            metrics = {
+                "drafter/target_lm_head_synced": 0,
+                "drafter/target_lm_head_selected_rows": selected_rows,
+                "drafter/target_lm_head_source_vocab_size": source_vocab_size,
+                "timing_s/drafter_sync_target_lm_head": time.perf_counter()
+                - sync_started,
+                "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
+            }
+            if bubble_prefetch:
+                metrics.update(
+                    {
+                        "timing_s/drafter_target_lm_head_fetch_submit": (
+                            fetch_submit_elapsed
+                        ),
+                        "timing_s/drafter_target_lm_head_fetch_critical_path": (
+                            fetch_elapsed
+                        ),
+                        "timing_s/drafter_target_lm_head_prefetch_submit_critical_path": (
+                            time.perf_counter() - sync_started
+                        ),
+                    }
+                )
+            return metrics, None
 
         metrics, pending = self._speco_dispatch_target_lm_head_payload(
             payload,
@@ -3051,6 +3073,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             source_vocab_size=source_vocab_size,
             target_worker_ids=target_worker_ids,
         )
+        if bubble_prefetch:
+            metrics.update(
+                {
+                    "timing_s/drafter_target_lm_head_fetch_submit": (
+                        fetch_submit_elapsed
+                    ),
+                    "timing_s/drafter_target_lm_head_fetch_critical_path": (
+                        fetch_elapsed
+                    ),
+                    "timing_s/drafter_target_lm_head_prefetch_submit_critical_path": (
+                        time.perf_counter() - sync_started
+                    ),
+                }
+            )
+            if pending is not None:
+                pending["target_version"] = int(self.global_steps)
+                pending["stage"] = "dispatch"
         if (
             pending is not None
             and bool(pending.get("defer_device_apply", False))
@@ -4156,6 +4195,28 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ) -> None:
             if not drafter_trained:
                 return
+            if training_plan is not None and not training_plan.publish_after_success:
+                print(
+                    "[BubbleTime] deferred_publish_skipped: "
+                    f"plan_id={getattr(training_plan, 'plan_id', None)} "
+                    "reason=quota_cycle_incomplete",
+                    flush=True,
+                )
+                return
+            publish_preview = self._speco_get_drafter_scheduler().plan_publish(
+                global_step=self.global_steps,
+                drafter_trained=True,
+                config=self._speco_drafter_schedule_config(),
+                training_plan=training_plan,
+            )
+            if not publish_preview.publish:
+                print(
+                    "[BubbleTime] deferred_publish_skipped: "
+                    f"plan_id={getattr(training_plan, 'plan_id', None)} "
+                    f"reason={publish_preview.reason}",
+                    flush=True,
+                )
+                return
             pending_drafter_publishes.append(
                 {
                     "drafter_trained": drafter_trained,
@@ -4513,11 +4574,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics["drafter/train_interval_matched"] = int(
                 training_plan.interval_matched
             )
-            if (
-                training_plan.execution_strategy
-                is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
-                and int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
-            ):
+            if self._speco_should_prefetch_target_lm_head():
                 # Cache actor head N after collecting step N features and before
                 # actor update N.  The step N+1 bubble selects this immutable
                 # version instead of fetching the live, updated actor head.

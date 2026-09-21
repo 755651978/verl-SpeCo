@@ -224,6 +224,44 @@ def test_replica_local_plan_accumulates_to_full_collective_batch() -> None:
     assert plan.planned_valid_tokens == 2000
 
 
+def test_partial_quota_idle_plan_stays_hot_and_defers_publish() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._training_quota_debt_steps = 20
+    config = replace(
+        _idle_config(),
+        training_interval_steps=1,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_keep_hot_between_plans=True,
+        train_batches_per_trigger=10,
+    )
+    context = DrafterScheduleContext(
+        global_step=5,
+        training_mode="online",
+        collected_samples_this_step=4,
+        oldlogprob_collection_requested=False,
+        data_status=replace(_status("0", batches=4), trainable_valid_tokens=400),
+    )
+    resources = type(
+        "Resources",
+        (),
+        {
+            "training_group_id": "idle-group-0",
+            "worker_ids": ("0", "1"),
+            "minimum_idle_window_sec": 10.0,
+            "idle_confidence": IdleWindowConfidence.CONFIRMED,
+        },
+    )()
+
+    plan = scheduler.plan_training(context, config, resources=resources)
+
+    assert plan.launch
+    assert plan.max_batches == 10
+    assert plan.keep_training_hot
+    assert not plan.publish_after_success
+    assert plan.to_worker_payload()["keep_training_hot"] is True
+
+
 def test_auto_idle_worker_groups_do_not_train_half_collective_group() -> None:
     scheduler = DrafterScheduler()
     deadline_ts = time.time() + 2.8
@@ -362,6 +400,103 @@ def test_training_quota_config_reuses_training_step_by_default() -> None:
     assert config.training_quota_max_sync_topup_steps == 2
 
 
+def test_training_quota_defaults_to_strict_cycle_completion() -> None:
+    config = DrafterScheduleConfig.from_mapping(
+        {
+            "step": 10,
+            "scheduler": {
+                "execution": {"strategy": "rollout_idle_worker"},
+                "training_quota": {"enable": True},
+            },
+        }
+    )
+
+    assert config.training_quota_target_steps == 20
+    assert config.training_quota_max_debt_age_steps == 0
+    assert config.training_quota_max_accumulated_debt == 20
+    assert config.training_quota_max_sync_topup_steps == 20
+
+
+def test_training_quota_completes_remaining_steps_at_interval_boundary() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+    config = replace(
+        _idle_config(),
+        training_interval_steps=4,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_max_debt_age_steps=0,
+        training_quota_max_accumulated_debt=20,
+        training_quota_max_sync_topup_steps=20,
+    )
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=4),
+        global_step=5,
+        config=config,
+    )
+    scheduler._training_quota_debt_steps = 6
+
+    before_boundary = scheduler.on_before_actor_update(
+        BeforeActorUpdateContext(
+            schedule_context=replace(_context(), global_step=7),
+            config=config,
+        )
+    )
+    boundary = scheduler.on_before_actor_update(
+        BeforeActorUpdateContext(
+            schedule_context=replace(_context(), global_step=8),
+            config=config,
+        )
+    )
+
+    assert before_boundary.training_plan is not None
+    assert not before_boundary.training_plan.launch
+    assert boundary.training_plan is not None
+    assert boundary.training_plan.reason == "quota_topup_training_ready"
+    assert boundary.training_plan.max_batches == 6
+
+
+def test_training_quota_topup_preempts_regular_idle_launch_at_boundary() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._idle_worker_writer_group = ("0", "1")
+    config = replace(
+        _idle_config(),
+        training_interval_steps=4,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_max_debt_age_steps=0,
+        training_quota_max_accumulated_debt=20,
+        training_quota_max_sync_topup_steps=20,
+    )
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=4),
+        global_step=5,
+        config=config,
+    )
+    scheduler._training_quota_debt_steps = 6
+    scheduler.prepare_training_plan = lambda *args, **kwargs: TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=8,
+        max_batches=10,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+    )
+
+    boundary = scheduler.on_before_actor_update(
+        BeforeActorUpdateContext(
+            schedule_context=replace(_context(), global_step=8),
+            config=config,
+        )
+    )
+
+    assert boundary.training_plan is not None
+    assert boundary.training_plan.reason == "quota_topup_training_ready"
+    assert boundary.training_plan.max_batches == 6
+
+
 def test_training_quota_waits_then_plans_bounded_topup_on_writer_group() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler._idle_worker_writer_group = ("0", "1")
@@ -426,6 +561,33 @@ def test_training_quota_does_not_add_debt_for_each_data_version() -> None:
 
     assert scheduler._training_quota_last_cycle_step == 15
     assert scheduler._training_quota_debt_steps == 10
+
+
+def test_training_quota_debt_threshold_never_discards_cycle_obligations() -> None:
+    scheduler = DrafterScheduler()
+    config = replace(
+        _idle_config(),
+        training_interval_steps=5,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_max_accumulated_debt=20,
+    )
+
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=1),
+        global_step=1,
+        config=config,
+    )
+    scheduler._register_training_quota_cycle(
+        data_status=replace(_status("0"), data_version=6),
+        global_step=6,
+        config=config,
+    )
+
+    # max_accumulated_debt forces an urgent top-up; it must not turn 40 owed
+    # optimizer steps into 20 by silently truncating the ledger.
+    assert scheduler._training_quota_debt_steps == 40
+    assert scheduler._training_quota_due(6, config)
 
 
 def test_training_quota_age_starts_after_interval_boundary() -> None:
@@ -531,6 +693,38 @@ def test_successful_bubble_steps_repay_training_quota_debt() -> None:
     assert scheduler._training_quota_oldest_cycle_step == 7
 
 
+def test_partial_training_quota_topup_fails_closed_without_repaying_debt() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._training_quota_debt_steps = 10
+    scheduler._training_quota_oldest_cycle_step = 7
+    plan = TrainingPlan(
+        launch=True,
+        reason="quota_topup_training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=10,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
+        plan_id="partial-quota-plan",
+    )
+    outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=1,
+        worker_results=[],
+        raw_results=[],
+        elapsed_sec=1.0,
+        reason="completed",
+        metrics={},
+    )
+
+    with pytest.raises(RuntimeError, match="requested=10 completed=1"):
+        scheduler._record_training_outcome(plan, outcome)
+
+    assert scheduler._training_quota_debt_steps == 10
+    assert scheduler._training_quota_oldest_cycle_step == 7
+
+
 def test_training_quota_topup_uses_blocking_execution_strategy() -> None:
     class _RecordingStrategy:
         def __init__(self) -> None:
@@ -560,6 +754,43 @@ def test_training_quota_topup_uses_blocking_execution_strategy() -> None:
 
     assert blocking.calls == 1
     assert asynchronous.calls == 0
+
+
+def test_publish_waits_until_bubble_training_quota_is_complete() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._training_quota_debt_steps = 3
+    config = replace(
+        _idle_config(),
+        training_quota_enable=True,
+        publish_interval_steps=1,
+    )
+    training_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=8,
+        max_batches=10,
+        publish_after_success=True,
+    )
+
+    blocked = scheduler.plan_publish(
+        global_step=8,
+        drafter_trained=True,
+        config=config,
+        training_plan=training_plan,
+    )
+    scheduler._training_quota_debt_steps = 0
+    ready = scheduler.plan_publish(
+        global_step=8,
+        drafter_trained=True,
+        config=config,
+        training_plan=training_plan,
+    )
+
+    assert not blocked.publish
+    assert blocked.reason == "training_quota_incomplete"
+    assert ready.publish
 
 
 def test_metadata_idle_worker_groups_wait_for_all_collective_replicas() -> None:

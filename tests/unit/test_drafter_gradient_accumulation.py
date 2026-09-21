@@ -4,9 +4,156 @@
 from __future__ import annotations
 
 import asyncio
-from types import MethodType
+from types import MethodType, SimpleNamespace
 
 import pytest
+
+
+def test_single_micro_batch_bubble_reservation_is_replayed_until_finalize() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="drafter replay needs the trainer dependency stack",
+    )
+
+    class _Buffer:
+        def __init__(self) -> None:
+            self.consume_calls = []
+
+        def consume(self, plan_id, items):
+            self.consume_calls.append((plan_id, list(items)))
+            return len(items)
+
+        def __len__(self) -> int:
+            return 2
+
+    trainer = base_trainer.DrafterBaseTrainer.__new__(
+        base_trainer.DrafterBaseTrainer
+    )
+    trainer.rank = 0
+    trainer.data_buffer = _Buffer()
+    trainer._active_training_reservation_id = "quota-plan"
+    trainer._active_training_replay_cursor = 0
+    trainer._active_training_replay_used_items = {}
+    trainer._last_prepared_training_items = []
+    trainer._mark_buffer_changed = lambda: None
+    first = {"sample": 1}
+    second = {"sample": 2}
+
+    # gradient_accumulation_steps == 1 reaches this helper after every
+    # optimizer step. The samples must remain reserved and replayable.
+    trainer._last_prepared_training_items = [first, second]
+    assert trainer._consume_last_training_batch() == 0
+    trainer._last_prepared_training_items = [first, second]
+    assert trainer._consume_last_training_batch() == 0
+    assert trainer.data_buffer.consume_calls == []
+
+    consumed = trainer.finalize_training_data_reservation("quota-plan")
+
+    assert consumed == 2
+    assert trainer.data_buffer.consume_calls == [
+        ("quota-plan", [first, second])
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_input_rows"),
+    [
+        ("dflash", 5),
+        ("dflash2", 5),
+        ("dspark", 5),
+        ("domino", 5),
+        ("eagle3", 6),
+    ],
+)
+def test_online_collection_uses_backend_specific_input_alignment(
+    monkeypatch, model_type: str, expected_input_rows: int
+) -> None:
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="online collection needs the trainer dependency stack",
+    )
+    monkeypatch.setattr(base_trainer, "device_name", "cpu")
+
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type=model_type)
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={
+                    "use_logits": False,
+                    "collect_hidden_states_from_sgl": False,
+                },
+                rollout={},
+            )
+        )
+    )
+    trainer.copy_stream = None
+    trainer.rank = 0
+    trainer.pad_token_id = 0
+    trainer.model_config = SimpleNamespace(pad_token_id=0)
+    trainer.current_rl_step = 1
+    trainer.use_data_buffer = False
+    trainer.collected_data = []
+    trainer.buffer_version = 0
+
+    assert trainer.collect_online_data(
+        {"input_ids": torch.arange(6).unsqueeze(0)},
+        torch.zeros(1, 5, 4),
+    )
+
+    item = trainer.collected_data[0]
+    assert item["input_ids"].size(0) == expected_input_rows
+    assert item["hidden_states"].size(0) == 5
+    assert item["loss_mask"].size(0) == expected_input_rows
+    if model_type in {"dflash", "dflash2", "dspark", "domino"}:
+        assert item["input_ids"].tolist() == [0, 1, 2, 3, 4]
+
+
+def test_block_collection_uses_explicit_hidden_positions_as_source_of_truth(
+    monkeypatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="online collection needs the trainer dependency stack",
+    )
+    monkeypatch.setattr(base_trainer, "device_name", "cpu")
+
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(model_type="dflash")
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={
+                    "use_logits": False,
+                    "collect_hidden_states_from_sgl": False,
+                },
+                rollout={},
+            )
+        )
+    )
+    trainer.copy_stream = None
+    trainer.rank = 0
+    trainer.pad_token_id = 0
+    trainer.model_config = SimpleNamespace(pad_token_id=0)
+    trainer.current_rl_step = 1
+    trainer.use_data_buffer = False
+    trainer.collected_data = []
+    trainer.buffer_version = 0
+
+    assert trainer.collect_online_data(
+        {
+            "input_ids": torch.arange(6).unsqueeze(0),
+            "hidden_positions": torch.arange(1, 6).unsqueeze(0),
+        },
+        torch.zeros(1, 5, 4),
+    )
+
+    item = trainer.collected_data[0]
+    assert item["input_ids"].tolist() == [1, 2, 3, 4, 5]
+    assert item["input_ids"].size(0) == item["hidden_states"].size(0) == 5
+    assert item["loss_mask"].size(0) == 5
 
 
 def test_accumulation_uses_combined_valid_token_mean(monkeypatch) -> None:
@@ -39,9 +186,7 @@ def test_accumulation_uses_combined_valid_token_mean(monkeypatch) -> None:
                 "p_weight": 1.0,
             }
 
-    trainer = base_trainer.DrafterBaseTrainer.__new__(
-        base_trainer.DrafterBaseTrainer
-    )
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
     trainer.model = _Model()
     trainer.backend = _Backend(trainer.model)
     trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=1.0)
