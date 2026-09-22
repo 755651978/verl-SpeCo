@@ -179,6 +179,11 @@ async def run_producer(
     producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
     run_id = str(tq_cfg["run_id"])
     stats = ProducerStats()
+    max_consecutive_feature_drops = config_int(
+        producer_cfg, "max_consecutive_feature_drops", 20
+    )
+    if max_consecutive_feature_drops < 0:
+        raise ValueError("max_consecutive_feature_drops must be >= 0")
     connected = False
     pool = client_pool
     feature_executor: ThreadPoolExecutor | None = None
@@ -460,6 +465,7 @@ async def run_producer(
             current = asyncio.current_task()
             worker = current.get_name() if current is not None else "request-unknown"
             replacement_request = None
+            consecutive_replacements = 0
             while True:
                 if replacement_request is None:
                     mark_stage(worker, "input_queue_get")
@@ -501,14 +507,31 @@ async def run_producer(
                             )
                         except SampleFilteredError as exc:
                             stats.filtered_count += 1
+                            consecutive_replacements += 1
                             logger.warning(
                                 "Standalone TQ Producer filtered generated sample "
-                                "sequence_no=%s sample_id=%s filtered=%s reason=%s",
+                                "sequence_no=%s sample_id=%s filtered=%s "
+                                "consecutive=%s/%s reason=%s",
                                 request.sequence_no,
                                 request.sample_id,
                                 stats.filtered_count,
+                                consecutive_replacements,
+                                max_consecutive_feature_drops,
                                 exc,
                             )
+                            if (
+                                max_samples > 0
+                                and consecutive_replacements
+                                > max_consecutive_feature_drops
+                            ):
+                                raise RuntimeError(
+                                    "Standalone TQ Producer exceeded "
+                                    "max_consecutive_feature_drops="
+                                    f"{max_consecutive_feature_drops} without a "
+                                    "successful feature conversion; aborting "
+                                    "instead of requesting replacement samples "
+                                    "forever"
+                                ) from exc
                             if max_samples > 0:
                                 replacement_request = next_request()
                             continue
@@ -538,18 +561,33 @@ async def run_producer(
                         )
                 except HiddenStateAlignmentError as exc:
                     stats.dropped_count += 1
+                    consecutive_replacements += 1
                     stats.pending_bytes = max(
                         stats.pending_bytes - int(raw.byte_size), 0
                     )
                     await asyncio.to_thread(delete_temporary_result, raw)
                     logger.warning(
                         "Standalone TQ Producer dropped misaligned sample "
-                        "sequence_no=%s sample_id=%s dropped=%s reason=%s",
+                        "sequence_no=%s sample_id=%s dropped=%s consecutive=%s/%s "
+                        "reason=%s",
                         request.sequence_no,
                         request.sample_id,
                         stats.dropped_count,
+                        consecutive_replacements,
+                        max_consecutive_feature_drops,
                         exc,
                     )
+                    if (
+                        max_samples > 0
+                        and consecutive_replacements > max_consecutive_feature_drops
+                    ):
+                        raise RuntimeError(
+                            "Standalone TQ Producer exceeded "
+                            "max_consecutive_feature_drops="
+                            f"{max_consecutive_feature_drops} without a successful "
+                            "feature conversion; aborting instead of requesting "
+                            "replacement samples forever"
+                        ) from exc
                     if max_samples > 0:
                         replacement_request = next_request()
                         logger.info(
@@ -559,6 +597,9 @@ async def run_producer(
                             replacement_request.sample_id,
                         )
                     continue
+                # A successful feature conversion resets the consecutive-replacement
+                # circuit breaker (feature drops and filtered generations).
+                consecutive_replacements = 0
                 mark_stage(worker, "publish_queue_put", request.sample_id)
                 await publish_queue.put(
                     PreparedFeature(
@@ -646,6 +687,14 @@ async def run_producer(
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
 
+        if stats.published_count == 0:
+            logger.error(
+                "Standalone TQ Producer published no samples inputs=%s filtered=%s "
+                "dropped=%s; emitting EOS with total_samples=0",
+                stats.input_count,
+                stats.filtered_count,
+                stats.dropped_count,
+            )
         eos_key, eos_fields, eos_tag = make_eos_record(run_id, stats.published_count)
         await asyncio.to_thread(transport.put_sample, eos_key, eos_fields, tag=eos_tag)
         logger.info(

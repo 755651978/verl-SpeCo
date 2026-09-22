@@ -70,6 +70,11 @@ speco:
     # unparseable row, raise aborts; max_consecutive_errors is the breaker.
     on_error: skip
     max_consecutive_errors: 20
+    # Samples that fail to produce a training payload (misaligned or NaN/Inf
+    # hidden states, or filtered after target generation) are replaced while
+    # max_samples > 0; abort after this many consecutive replacements without a
+    # successful feature conversion instead of requesting replacements forever.
+    max_consecutive_feature_drops: 20
     # Tolerant role cleaning for ShareGPT rows (unknown roles map to assistant,
     # order-violating turns are dropped instead of aborting the run).
     parser_strict_roles: false

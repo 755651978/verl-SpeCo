@@ -258,6 +258,8 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         "speco.standalone_tq_producer.max_inflight_requests=32",
         "speco.standalone_tq_producer.per_endpoint_concurrency=8",
         "speco.standalone_tq_producer.max_feature_length=384",
+        "speco.standalone_tq_producer.max_consecutive_errors=0",
+        "speco.standalone_tq_producer.max_consecutive_feature_drops=5",
     ]
     config = resolve_pipeline_config(args, environ={})
 
@@ -277,6 +279,11 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         in commands.producer
     )
     assert "speco.standalone_tq_producer.max_feature_length=384" in commands.producer
+    assert "speco.standalone_tq_producer.max_consecutive_errors=0" in commands.producer
+    assert (
+        "speco.standalone_tq_producer.max_consecutive_feature_drops=5"
+        in commands.producer
+    )
 
 
 class _FakeRuntimeContext:

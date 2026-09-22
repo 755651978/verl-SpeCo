@@ -96,6 +96,8 @@ _PRODUCER_TUNING_KEYS = frozenset(
         f"{_PRODUCER_PREFIX}.max_sequence_length",
         f"{_PRODUCER_PREFIX}.max_feature_length",
         f"{_PRODUCER_PREFIX}.generation_max_tokens",
+        f"{_PRODUCER_PREFIX}.max_consecutive_errors",
+        f"{_PRODUCER_PREFIX}.max_consecutive_feature_drops",
         _PRODUCER_HIDDEN_DTYPE_KEY,
     }
 )

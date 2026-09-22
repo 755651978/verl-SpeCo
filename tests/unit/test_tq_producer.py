@@ -224,6 +224,22 @@ class _OneMisalignedPool(_Pool):
         return raw
 
 
+class _AlwaysMisalignedPool(_Pool):
+    async def prefill(self, request: Any) -> RawVllmFeature:
+        raw = await super().prefill(request)
+        raw.payload["hidden_states"] = raw.payload["hidden_states"][-1:]
+        return raw
+
+
+class _NanHiddenStatePool(_Pool):
+    async def prefill(self, request: Any) -> RawVllmFeature:
+        raw = await super().prefill(request)
+        raw.payload["hidden_states"] = torch.full_like(
+            raw.payload["hidden_states"], float("nan")
+        )
+        return raw
+
+
 def _write_input(path: Path) -> None:
     records = [
         {"sample_id": "sample-1", "prompt": "Q1: ", "response": "A1"},
@@ -475,6 +491,37 @@ def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) ->
     assert fields["sample__loss_mask"].tolist() == [0.0, 1.0]
 
 
+def test_run_producer_bounds_consecutive_generated_filters(tmp_path: Path) -> None:
+    """A target that always generates untrainable samples must abort, not loop."""
+
+    input_path = tmp_path / "dapo.jsonl"
+    input_path.write_text(
+        json.dumps({"prompt": [{"role": "user", "content": "Q3"}]}) + "\n",
+        encoding="utf-8",
+    )
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    # No generated completion can reach this many supervised tokens, so every
+    # generated sample is filtered after generation and replaced.
+    config["speco"]["standalone_tq_producer"]["min_supervised_tokens"] = 99
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 2
+
+    with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=2"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_ChatTokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert pool.closed and transport.closed
+
+
 def test_run_producer_replaces_misaligned_sample_before_eos(
     tmp_path: Path,
 ) -> None:
@@ -507,6 +554,113 @@ def test_run_producer_replaces_misaligned_sample_before_eos(
     assert eos["total_samples"] == 2
     assert all(not path.exists() for path in pool.paths)
     assert pool.closed and transport.closed
+
+
+@pytest.mark.parametrize(
+    "pool_factory", [_AlwaysMisalignedPool, _NanHiddenStatePool]
+)
+def test_run_producer_bounds_consecutive_feature_drops(
+    tmp_path: Path, pool_factory: type[_Pool]
+) -> None:
+    """A persistently broken endpoint must abort, not replace samples forever."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = pool_factory(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 2
+
+    with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=2"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert pool.closed and transport.closed
+
+
+def test_run_producer_feature_drop_limit_zero_fails_on_first_drop(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 0
+
+    with pytest.raises(RuntimeError, match="max_consecutive_feature_drops=0"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=_Transport(),
+                tokenizer=_Tokenizer(),
+                client_pool=_OneMisalignedPool(tmp_path),
+            )
+        )
+
+
+def test_run_producer_transient_feature_drop_resets_breaker(
+    tmp_path: Path,
+) -> None:
+    """A drop below the bound must not abort once a later conversion succeeds."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneMisalignedPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+    config["speco"]["standalone_tq_producer"]["max_consecutive_feature_drops"] = 1
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.dropped_count == 1
+    assert stats.published_count == 2
+
+
+def test_run_producer_logs_error_when_nothing_is_published(
+    tmp_path: Path, caplog
+) -> None:
+    """A single pass that drops every sample must be visible, not silent."""
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _AlwaysMisalignedPool(tmp_path)
+    config = _config(input_path)
+    # max_samples<=0 means one pass; a single worker avoids the fake pool's
+    # per-sample-id temporary-file race.
+    config["speco"]["standalone_tq_producer"]["max_inflight_requests"] = 1
+
+    with caplog.at_level("ERROR", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.published_count == 0
+    assert stats.dropped_count == 2
+    assert "published no samples" in caplog.text
 
 
 def test_run_producer_put_failure_keeps_temporary_file_and_omits_eos(
