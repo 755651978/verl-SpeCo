@@ -28,6 +28,7 @@ import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 import subprocess
 import sys
@@ -38,6 +39,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 import uuid
+
+from omegaconf import OmegaConf
 
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
@@ -84,23 +87,26 @@ _NNODES_KEYS = (
 _TQ_PREFIX = "actor_rollout_ref.rollout.drafter.training.transfer_queue"
 _FEATURE_STORE_PREFIX = "actor_rollout_ref.rollout.drafter.training.feature_store"
 _PRODUCER_PREFIX = "speco.standalone_tq_producer"
-_PRODUCER_TUNING_KEYS = frozenset(
+# Every user override under this prefix is forwarded to the Producer, except the
+# fields the unified launcher computes and sets itself (paths, identities,
+# endpoints, and the sample budget). Forwarding the whole prefix keeps newly
+# added Producer knobs usable through the launcher without extending an
+# allow-list for each one.
+_PRODUCER_LAUNCHER_OWNED_KEYS = frozenset(
     {
-        f"{_PRODUCER_PREFIX}.request_timeout",
-        f"{_PRODUCER_PREFIX}.max_inflight_requests",
-        f"{_PRODUCER_PREFIX}.per_endpoint_concurrency",
-        f"{_PRODUCER_PREFIX}.input_queue_size",
-        f"{_PRODUCER_PREFIX}.publish_queue_size",
-        f"{_PRODUCER_PREFIX}.max_pending_samples",
-        f"{_PRODUCER_PREFIX}.pending_poll_interval_seconds",
-        f"{_PRODUCER_PREFIX}.max_sequence_length",
-        f"{_PRODUCER_PREFIX}.max_feature_length",
-        f"{_PRODUCER_PREFIX}.generation_max_tokens",
-        f"{_PRODUCER_PREFIX}.max_consecutive_errors",
-        f"{_PRODUCER_PREFIX}.max_consecutive_feature_drops",
-        _PRODUCER_HIDDEN_DTYPE_KEY,
+        f"{_PRODUCER_PREFIX}.input_path",
+        f"{_PRODUCER_PREFIX}.resume_checkpoint_path",
+        f"{_PRODUCER_PREFIX}.tokenizer_path",
+        f"{_PRODUCER_PREFIX}.tokenizer_fingerprint",
+        f"{_PRODUCER_PREFIX}.target_model_id",
+        f"{_PRODUCER_PREFIX}.target_model_revision",
+        f"{_PRODUCER_PREFIX}.target_layer_ids",
+        f"{_PRODUCER_PREFIX}.vllm_endpoints",
+        f"{_PRODUCER_PREFIX}.vllm_model",
+        f"{_PRODUCER_PREFIX}.max_samples",
     }
 )
+_PRODUCER_CONFIG_PATH = Path(__file__).with_name("config") / "speco_base.yaml"
 _INTERNAL_OVERRIDE_KEYS = frozenset(
     {
         f"{_FEATURE_STORE_PREFIX}.type",
@@ -168,6 +174,37 @@ def _split_override(item: str) -> tuple[str, str] | None:
         return None
     key, value = item.split("=", 1)
     return key, value
+
+
+def _is_forwarded_producer_override(key: str) -> bool:
+    """Whether a key selects an option under the Producer config prefix."""
+
+    return key.startswith(f"{_PRODUCER_PREFIX}.")
+
+
+@lru_cache(maxsize=1)
+def _producer_config_keys() -> frozenset[str]:
+    """Every override path the Producer accepts, taken from its config schema.
+
+    Includes intermediate nodes so a nested override such as
+    ``render_boundary`` or a leaf such as ``render_boundary.enabled`` both
+    validate.
+    """
+
+    node: Any = OmegaConf.load(_PRODUCER_CONFIG_PATH)
+    for part in _PRODUCER_PREFIX.split("."):
+        node = node[part]
+    keys: set[str] = set()
+
+    def walk(path: str, value: Any) -> None:
+        keys.add(path)
+        items = getattr(value, "items", None)
+        if callable(items):
+            for key, child in items():
+                walk(f"{path}.{key}", child)
+
+    walk(_PRODUCER_PREFIX, node)
+    return frozenset(keys)
 
 
 def _find_override(overrides: Sequence[str], key: str) -> str | None:
@@ -498,12 +535,21 @@ def build_pipeline_commands(
         "verl_speco.tq_owner",
         *tq_overrides,
     ]
-    producer_tuning_overrides = [
-        item
-        for item in training_args
-        if (parsed := _split_override(item)) is not None
-        and parsed[0] in _PRODUCER_TUNING_KEYS
-    ]
+    producer_tuning_overrides = []
+    for item in training_args:
+        parsed = _split_override(item)
+        if parsed is None or not _is_forwarded_producer_override(parsed[0]):
+            continue
+        key = parsed[0]
+        if key in _PRODUCER_LAUNCHER_OWNED_KEYS:
+            # The launcher computes these and sets them on the Producer command.
+            continue
+        if key not in _producer_config_keys():
+            raise ValueError(
+                f"Unknown Producer override {key!r}; it is not defined under "
+                f"{_PRODUCER_PREFIX} in speco_base.yaml"
+            )
+        producer_tuning_overrides.append(item)
     producer = [
         python_executable,
         "-m",
