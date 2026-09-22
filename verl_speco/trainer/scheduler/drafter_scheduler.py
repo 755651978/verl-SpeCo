@@ -21,7 +21,7 @@ remain unchanged.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 from uuid import uuid4
 
 from verl_speco.trainer.scheduler.schedule_types import (
@@ -64,6 +64,15 @@ from verl_speco.trainer.scheduler.collection_adapter import (
     SGLangCollectionAdapter,
 )
 from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
+from verl_speco.trainer.scheduler.drafter_runtime_state import DrafterRuntimeState
+from verl_speco.trainer.scheduler.standalone_executor import (
+    StandaloneCollectionExecutionStrategy,
+    StandaloneCollectionExecutor,
+    StandaloneCollectionOutcome,
+    StandaloneTrainingExecutionStrategy,
+    StandaloneTrainingExecutor,
+    StandaloneTrainingOutcome,
+)
 
 
 def step_matches_interval(
@@ -100,6 +109,8 @@ class DrafterScheduler:
         worker_executor: DrafterWorkerExecutor | None = None,
         publish_executor: DrafterPublishExecutor | None = None,
         collection_executor: DrafterCollectionExecutor | None = None,
+        standalone_collection_executor: StandaloneCollectionExecutor | None = None,
+        standalone_training_executor: StandaloneTrainingExecutor | None = None,
     ) -> None:
         self.trigger_policy = IntervalAndBufferTrigger()
         self.sync_budget_policy = SyncTrainingBudgetPolicy()
@@ -110,6 +121,10 @@ class DrafterScheduler:
         self._publish_executor = publish_executor
         self.collection_strategy = SyncCollectionStrategy()
         self._collection_executor = collection_executor
+        self.standalone_collection_strategy = StandaloneCollectionExecutionStrategy()
+        self.standalone_training_strategy = StandaloneTrainingExecutionStrategy()
+        self._standalone_collection_executor = standalone_collection_executor
+        self._standalone_training_executor = standalone_training_executor
         self._collection_adapters: dict[
             DrafterCollectionSource, DrafterCollectionAdapter
         ] = {
@@ -121,6 +136,16 @@ class DrafterScheduler:
         """Bind the worker execution port used by all execution strategies."""
 
         self._worker_executor = worker_executor
+
+    def bind_standalone_collection_executor(
+        self, executor: StandaloneCollectionExecutor
+    ) -> None:
+        self._standalone_collection_executor = executor
+
+    def bind_standalone_training_executor(
+        self, executor: StandaloneTrainingExecutor
+    ) -> None:
+        self._standalone_training_executor = executor
 
     @staticmethod
     def plan_queue_collection(
@@ -202,6 +227,56 @@ class DrafterScheduler:
             selected_keys=selected_keys,
             **common,
         )
+
+    def execute_standalone_collection_plan(
+        self,
+        plan: CollectionPlan,
+        *,
+        producer_paused: bool,
+        producer_done: bool,
+    ) -> StandaloneCollectionOutcome:
+        if self._standalone_collection_executor is None:
+            raise RuntimeError("Standalone collection executor has not been bound")
+        return self.standalone_collection_strategy.execute(
+            plan,
+            executor=self._standalone_collection_executor,
+            producer_paused=producer_paused,
+            producer_done=producer_done,
+        )
+
+    def execute_standalone_training_plan(
+        self,
+        plan: TrainingPlan,
+        *,
+        runtime_state: DrafterRuntimeState,
+        selected_entries: Sequence[Any],
+    ) -> StandaloneTrainingOutcome:
+        if self._standalone_training_executor is None:
+            raise RuntimeError("Standalone training executor has not been bound")
+        return self.standalone_training_strategy.execute(
+            plan,
+            executor=self._standalone_training_executor,
+            runtime_state=runtime_state,
+            selected_entries=selected_entries,
+        )
+
+    def complete_standalone_training(
+        self,
+        *,
+        runtime_state: DrafterRuntimeState,
+        completed_keys: Sequence[str],
+        successful: bool,
+    ) -> StandaloneTrainingOutcome:
+        return self.standalone_training_strategy.complete(
+            runtime_state=runtime_state,
+            completed_keys=completed_keys,
+            successful=successful,
+        )
+
+    def stop_standalone_consumer(self) -> Any:
+        if self._standalone_training_executor is None:
+            raise RuntimeError("Standalone training executor has not been bound")
+        return self._standalone_training_executor.stop_consumer()
 
     def bind_publish_executor(self, publish_executor: DrafterPublishExecutor) -> None:
         self._publish_executor = publish_executor

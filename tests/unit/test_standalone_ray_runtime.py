@@ -154,8 +154,11 @@ class _FakeRay:
 
     def wait(self, refs, num_returns, timeout=0):
         assert num_returns == 1
-        consumer = next(ref for ref in refs if ref.name.startswith("consumer"))
-        return [consumer], [ref for ref in refs if ref != consumer]
+        producer = next((ref for ref in refs if ref.name == "producer"), None)
+        completed = producer or next(
+            ref for ref in refs if ref.name.startswith("consumer")
+        )
+        return [completed], [ref for ref in refs if ref != completed]
 
 
 class _Queue:
@@ -175,6 +178,83 @@ class _Store:
 
     def close(self):
         pass
+
+
+class _ReadyStore(_Store):
+    def __init__(self):
+        self.ready = [
+            SimpleNamespace(key=f"sample-{index}", tag={"sequence_no": index})
+            for index in range(4)
+        ]
+
+    def list_ready(self):
+        return list(self.ready)
+
+
+class _RecordingQueue(_Queue):
+    def __init__(self, *, events=None, on_event=None):
+        self.items = [] if events is None else list(events)
+        self.on_event = on_event
+
+    def put(self, value):
+        self.items.append(value)
+
+    def get(self, *, block, timeout):
+        if not self.items:
+            from queue import Empty
+
+            raise Empty
+        value = self.items.pop(0)
+        if self.on_event is not None:
+            self.on_event(value)
+        return value
+
+
+class _FlowRay(_FakeRay):
+    def __init__(self, producer):
+        super().__init__(producer)
+        self.wait_calls = 0
+
+    def wait(self, refs, num_returns, timeout=0):
+        self.wait_calls += 1
+        if self.wait_calls == 1:
+            return [], list(refs)
+        producer = next(ref for ref in refs if ref.name == "producer")
+        return [producer], [ref for ref in refs if ref != producer]
+
+
+def test_scheduler_executes_one_complete_standalone_batch(monkeypatch) -> None:
+    store = _ReadyStore()
+    commands = _RecordingQueue()
+    events = _RecordingQueue(
+        events=[
+            {
+                "kind": "training_completed",
+                "keys": [f"sample-{index}" for index in range(4)],
+                "successful": True,
+            }
+        ],
+        on_event=lambda event: store.ready.clear(),
+    )
+    queues = iter((commands, events))
+    monkeypatch.setattr(
+        "verl_speco.standalone_ray_runtime.compose_runtime_config",
+        lambda overrides: _runtime_config(),
+    )
+    trainer = StandaloneRayTrainer(
+        _commands(),
+        ray_module=_FlowRay(_ProducerHandle()),
+        worker_group_factory=lambda config, **kwargs: _WorkerGroup(),
+        queue_factory=lambda: next(queues),
+        feature_store_factory=lambda config: store,
+    )
+
+    assert trainer.run() == 0
+    assert commands.items[0]["kind"] == "batch"
+    assert commands.items[0]["global_keys"] == [
+        f"sample-{index}" for index in range(4)
+    ]
+    assert commands.items[-1] == {"kind": "stop"}
 
 
 _CONFIG = None
@@ -272,7 +352,7 @@ def test_driver_logging_supports_scheduler_debug(monkeypatch) -> None:
         module_logger.setLevel(original_module_level)
 
 
-def test_trainer_stops_producer_after_all_consumer_workers_finish(monkeypatch) -> None:
+def test_trainer_finishes_after_producer_and_consumers_complete(monkeypatch) -> None:
     producer = _ProducerHandle()
     ray = _FakeRay(producer)
     monkeypatch.setattr(
@@ -288,7 +368,7 @@ def test_trainer_stops_producer_after_all_consumer_workers_finish(monkeypatch) -
     )
 
     assert trainer.run() == 0
-    assert producer.stopped is True
+    assert producer.stopped is False
 
 
 class _FailingRay(_FakeRay):
@@ -296,6 +376,38 @@ class _FailingRay(_FakeRay):
         if ref.name == "consumer-0":
             raise RuntimeError("consumer failed")
         return super().get(ref)
+
+
+class _EarlyConsumerRay(_FakeRay):
+    def wait(self, refs, num_returns, timeout=0):
+        assert num_returns == 1
+        consumer = next(ref for ref in refs if ref.name.startswith("consumer"))
+        return [consumer], [ref for ref in refs if ref != consumer]
+
+    def get(self, ref):
+        if ref.name.startswith("consumer"):
+            return {"optimizer_steps_total": 0}
+        return super().get(ref)
+
+
+def test_trainer_rejects_unexpected_early_consumer_exit(monkeypatch) -> None:
+    producer = _ProducerHandle()
+    monkeypatch.setattr(
+        "verl_speco.standalone_ray_runtime.compose_runtime_config",
+        lambda overrides: _runtime_config(),
+    )
+    trainer = StandaloneRayTrainer(
+        _commands(),
+        ray_module=_EarlyConsumerRay(producer),
+        worker_group_factory=lambda config, **kwargs: _WorkerGroup(),
+        queue_factory=_Queue,
+        feature_store_factory=lambda config: _Store(),
+    )
+
+    with pytest.raises(RuntimeError, match="before receiving"):
+        trainer.run()
+
+    assert producer.stopped is True
 
 
 def test_trainer_propagates_consumer_error_and_stops_producer(monkeypatch) -> None:
@@ -315,4 +427,3 @@ def test_trainer_propagates_consumer_error_and_stops_producer(monkeypatch) -> No
 
     with pytest.raises(RuntimeError, match="consumer failed"):
         trainer.run()
-    assert producer.stopped is True

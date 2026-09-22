@@ -51,6 +51,16 @@ from .lifecycle import (
 from .collection_strategy import CollectionOutcome, DrafterCollectionStrategy
 from .collection_adapter import DrafterCollectionAdapter
 from .training_outcome import TrainingOutcome
+from .standalone_executor import (
+    CallbackStandaloneCollectionExecutor,
+    CallbackStandaloneTrainingExecutor,
+    StandaloneCollectionExecutionStrategy,
+    StandaloneCollectionExecutor,
+    StandaloneCollectionOutcome,
+    StandaloneTrainingExecutionStrategy,
+    StandaloneTrainingExecutor,
+    StandaloneTrainingOutcome,
+)
 
 __all__ = [
     "AfterActorUpdateContext",
@@ -64,6 +74,8 @@ __all__ = [
     "CallbackDrafterWorkerExecutor",
     "CallbackDrafterCollectionExecutor",
     "CallbackDrafterPublishExecutor",
+    "CallbackStandaloneCollectionExecutor",
+    "CallbackStandaloneTrainingExecutor",
     "DrafterCollectionContext",
     "DrafterCollectionSource",
     "DrafterExecutionStrategy",
@@ -84,6 +96,12 @@ __all__ = [
     "QueueScheduleConfig",
     "QueueStatus",
     "SchedulerEventOutcome",
+    "StandaloneCollectionExecutionStrategy",
+    "StandaloneCollectionExecutor",
+    "StandaloneCollectionOutcome",
+    "StandaloneTrainingExecutionStrategy",
+    "StandaloneTrainingExecutor",
+    "StandaloneTrainingOutcome",
     "PublishOutcome",
     "TrainingBudget",
     "TrainingDataStatus",

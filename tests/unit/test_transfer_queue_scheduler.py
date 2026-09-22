@@ -3,9 +3,15 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from verl_speco.trainer.scheduler import (
+    CallbackStandaloneCollectionExecutor,
+    CallbackStandaloneTrainingExecutor,
+    DrafterRuntimeState,
+    DrafterRuntimeStatus,
     DrafterScheduler,
     DrafterTrainingDataSource,
     ProducerAction,
@@ -105,6 +111,87 @@ def test_transfer_queue_training_requires_one_complete_global_batch() -> None:
     assert ready.to_worker_payload()["selected_keys"] == ["sample-0", "sample-1"]
     assert ready.to_worker_payload()["data_source"] == "transfer_queue"
     assert ready.to_worker_payload()["required_samples"] == 16
+
+
+def test_standalone_executors_apply_plans_and_track_runtime_state() -> None:
+    producer_commands = []
+    consumer_commands = []
+    scheduler = DrafterScheduler()
+    scheduler.bind_standalone_collection_executor(
+        CallbackStandaloneCollectionExecutor(
+            pause=lambda: producer_commands.append("pause"),
+            resume=lambda: producer_commands.append("resume"),
+            stop=lambda: producer_commands.append("stop"),
+            resolve=lambda value: value,
+        )
+    )
+    scheduler.bind_standalone_training_executor(
+        CallbackStandaloneTrainingExecutor(
+            submit=lambda plan, entries: consumer_commands.append(
+                (tuple(plan.selected_keys), tuple(entry.key for entry in entries))
+            ),
+            stop=lambda: consumer_commands.append("stop"),
+        )
+    )
+
+    collection = scheduler.plan_queue_collection(_context(ready_samples=32))
+    collection_outcome = scheduler.execute_standalone_collection_plan(
+        collection,
+        producer_paused=False,
+        producer_done=False,
+    )
+
+    keys = tuple(f"sample-{index}" for index in range(16))
+    entries = [SimpleNamespace(key=key) for key in keys]
+    training = scheduler.plan_queue_training(
+        _context(ready_samples=16), selected_keys=keys
+    )
+    runtime_state = DrafterRuntimeState()
+    submitted = scheduler.execute_standalone_training_plan(
+        training,
+        runtime_state=runtime_state,
+        selected_entries=entries,
+    )
+    completed = scheduler.complete_standalone_training(
+        runtime_state=runtime_state,
+        completed_keys=keys,
+        successful=True,
+    )
+
+    assert producer_commands == ["pause"]
+    assert collection_outcome.producer_paused
+    assert consumer_commands == [(keys, keys)]
+    assert submitted.submitted
+    assert completed.completed
+    assert runtime_state.status is DrafterRuntimeStatus.COMPLETED
+
+
+def test_standalone_training_rejects_completion_for_different_keys() -> None:
+    scheduler = DrafterScheduler(
+        standalone_training_executor=CallbackStandaloneTrainingExecutor(
+            submit=lambda plan, entries: None,
+            stop=lambda: None,
+        )
+    )
+    keys = tuple(f"sample-{index}" for index in range(16))
+    plan = scheduler.plan_queue_training(
+        _context(ready_samples=16), selected_keys=keys
+    )
+    runtime_state = DrafterRuntimeState()
+    scheduler.execute_standalone_training_plan(
+        plan,
+        runtime_state=runtime_state,
+        selected_entries=[SimpleNamespace(key=key) for key in keys],
+    )
+
+    with pytest.raises(RuntimeError, match="completed keys"):
+        scheduler.complete_standalone_training(
+            runtime_state=runtime_state,
+            completed_keys=tuple(reversed(keys)),
+            successful=True,
+        )
+
+    assert runtime_state.status is DrafterRuntimeStatus.FAILED
 
 
 @pytest.mark.parametrize(

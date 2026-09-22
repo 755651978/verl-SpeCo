@@ -21,8 +21,11 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from verl_speco.trainer.scheduler import (
+    CallbackStandaloneCollectionExecutor,
+    CallbackStandaloneTrainingExecutor,
+    DrafterRuntimeState,
+    DrafterRuntimeStatus,
     DrafterScheduler,
-    ProducerAction,
     QueueScheduleConfig,
     QueueScheduleContext,
     QueueStatus,
@@ -384,7 +387,8 @@ class StandaloneRayTrainer:
 
         assert self.commands_queue is not None and self.events_queue is not None
         config = self._queue_config()
-        tq_cfg = self.consumer_config.actor_rollout_ref.rollout.drafter.training.transfer_queue
+        training_cfg = self.consumer_config.actor_rollout_ref.rollout.drafter.training
+        tq_cfg = training_cfg.transfer_queue
         store = (
             self.feature_store_factory(tq_cfg)
             if self.feature_store_factory is not None
@@ -392,9 +396,10 @@ class StandaloneRayTrainer:
         )
         store.connect()
         scheduler = DrafterScheduler()
+        runtime_state = DrafterRuntimeState()
         producer_done = False
         producer_paused = False
-        consumer_training = False
+        consumer_stop_requested = False
         pipeline_started = time.monotonic()
         initial_list_started = time.monotonic()
         ready_hint = len(store.list_ready())
@@ -404,6 +409,47 @@ class StandaloneRayTrainer:
         tail_dropped = 0
         completed_steps = 0
         last_published_total = 0
+        world_size = int(
+            self.consumer_config.speco.draft_training.nproc_per_node
+        ) * int(self.consumer_config.speco.draft_training.nnodes)
+
+        def submit_training_command(plan, selected_entries):
+            assignments = build_assignments(
+                selected_entries,
+                batch_size=config.global_batch_size // world_size,
+                world_size=world_size,
+            )
+            command = {
+                "kind": "batch",
+                "global_keys": list(plan.selected_keys),
+                "global_sequence_nos": [
+                    int(entry.tag["sequence_no"]) for entry in selected_entries
+                ],
+                "assignments": [
+                    [
+                        {"key": entry.key, "tag": dict(entry.tag)}
+                        for entry in rank_entries
+                    ]
+                    for rank_entries in assignments
+                ],
+            }
+            self.commands_queue.put(command)
+            return command
+
+        scheduler.bind_standalone_collection_executor(
+            CallbackStandaloneCollectionExecutor(
+                pause=lambda: producer.pause.remote(),
+                resume=lambda: producer.resume.remote(),
+                stop=lambda: producer.stop.remote(),
+                resolve=self.ray.get,
+            )
+        )
+        scheduler.bind_standalone_training_executor(
+            CallbackStandaloneTrainingExecutor(
+                submit=submit_training_command,
+                stop=lambda: self.commands_queue.put({"kind": "stop"}),
+            )
+        )
         logger.info(
             "Standalone scheduler initialized global_batch_size=%s "
             "low_watermark=%s high_watermark=%s ready_samples=%s",
@@ -423,11 +469,12 @@ class StandaloneRayTrainer:
                 config=config,
                 producer_done=producer_done,
                 producer_paused=producer_paused,
-                consumer_training=consumer_training,
+                consumer_training=runtime_state.status
+                in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING},
             )
 
         def reconcile_and_schedule(trigger: str) -> bool:
-            nonlocal ready_hint, producer_paused, consumer_training
+            nonlocal ready_hint, producer_paused, consumer_stop_requested
             nonlocal tq_list_count, tq_list_seconds, producer_pause_count, tail_dropped
             hint_before = ready_hint
             list_started = time.monotonic()
@@ -446,12 +493,13 @@ class StandaloneRayTrainer:
                 list_elapsed,
             )
             collection = scheduler.plan_queue_collection(context(ready_hint))
-            if (
-                collection.producer_action is ProducerAction.PAUSE
-                and not producer_paused
-            ):
-                self.ray.get(producer.pause.remote())
-                producer_paused = True
+            collection_outcome = scheduler.execute_standalone_collection_plan(
+                collection,
+                producer_paused=producer_paused,
+                producer_done=producer_done,
+            )
+            producer_paused = collection_outcome.producer_paused
+            if collection_outcome.changed and producer_paused:
                 producer_pause_count += 1
                 logger.info(
                     "Standalone scheduler producer paused reason=%s ready=%s "
@@ -460,9 +508,7 @@ class StandaloneRayTrainer:
                     ready_hint,
                     config.high_watermark_samples,
                 )
-            elif collection.producer_action is ProducerAction.RUN and producer_paused:
-                self.ray.get(producer.resume.remote())
-                producer_paused = False
+            elif collection_outcome.changed and not producer_paused:
                 logger.info(
                     "Standalone scheduler producer resumed reason=%s ready=%s "
                     "low_watermark=%s",
@@ -479,42 +525,23 @@ class StandaloneRayTrainer:
             )
             if training.launch:
                 selected = ready[: config.global_batch_size]
-                assignments = build_assignments(
-                    selected,
-                    batch_size=config.global_batch_size
-                    // (
-                        int(self.consumer_config.speco.draft_training.nproc_per_node)
-                        * int(self.consumer_config.speco.draft_training.nnodes)
-                    ),
-                    world_size=(
-                        int(self.consumer_config.speco.draft_training.nproc_per_node)
-                        * int(self.consumer_config.speco.draft_training.nnodes)
-                    ),
+                if not consumer_refs:
+                    raise RuntimeError(
+                        "Standalone Consumer exited before the Scheduler could "
+                        "submit the next TrainingPlan"
+                    )
+                training_outcome = scheduler.execute_standalone_training_plan(
+                    training,
+                    runtime_state=runtime_state,
+                    selected_entries=selected,
                 )
-                self.commands_queue.put(
-                    {
-                        "kind": "batch",
-                        "global_keys": list(training.selected_keys),
-                        "global_sequence_nos": [
-                            int(entry.tag["sequence_no"]) for entry in selected
-                        ],
-                        "assignments": [
-                            [
-                                {"key": entry.key, "tag": dict(entry.tag)}
-                                for entry in rank_entries
-                            ]
-                            for rank_entries in assignments
-                        ],
-                    }
-                )
-                consumer_training = True
                 sequence_nos = [int(entry.tag["sequence_no"]) for entry in selected]
                 logger.debug(
                     "Standalone scheduler training dispatched step=%s "
                     "batch_samples=%s ready_before=%s producer_state=%s "
                     "sequence_range=%s-%s",
                     completed_steps + 1,
-                    len(selected),
+                    training_outcome.assigned_samples,
                     ready_hint,
                     "paused"
                     if producer_paused
@@ -526,7 +553,8 @@ class StandaloneRayTrainer:
                 )
             if (
                 producer_done
-                and not consumer_training
+                and runtime_state.status
+                not in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING}
                 and ready_hint < config.global_batch_size
             ):
                 if ready:
@@ -539,23 +567,36 @@ class StandaloneRayTrainer:
                     )
                     store.clear_many([entry.key for entry in ready])
                     ready_hint = 0
-                self.commands_queue.put({"kind": "stop"})
+                scheduler.stop_standalone_consumer()
+                consumer_stop_requested = True
                 return True
             return False
 
         try:
             finished = reconcile_and_schedule("initialization")
-            while consumer_refs and not finished:
-                completed, _ = self.ray.wait(
-                    [producer_ref, *consumer_refs]
-                    if producer_ref is not None
-                    else consumer_refs,
-                    num_returns=1,
-                    timeout=0,
-                )
+            while not finished:
+                wait_refs = list(consumer_refs)
+                if producer_ref is not None:
+                    wait_refs.insert(0, producer_ref)
+                if wait_refs:
+                    completed, _ = self.ray.wait(
+                        wait_refs,
+                        num_returns=1,
+                        timeout=0,
+                    )
+                else:
+                    completed = []
                 if completed:
                     ref = completed[0]
-                    self.ray.get(ref)
+                    try:
+                        result = self.ray.get(ref)
+                    except Exception as error:
+                        if ref != producer_ref and runtime_state.status in {
+                            DrafterRuntimeStatus.SUBMITTED,
+                            DrafterRuntimeStatus.RUNNING,
+                        }:
+                            runtime_state.mark_failed(error)
+                        raise
                     if ref == producer_ref:
                         producer_ref = None
                         producer_done = True
@@ -565,11 +606,34 @@ class StandaloneRayTrainer:
                         )
                         finished = reconcile_and_schedule("producer_done")
                         continue
+                    if not consumer_stop_requested:
+                        results = result if isinstance(result, list) else [result]
+                        max_steps = int(training_cfg.get("max_steps", 0) or 0)
+                        expected_completion = (
+                            bool(results)
+                            and max_steps > 0
+                            and all(
+                                isinstance(item, dict)
+                                and int(item.get("optimizer_steps_total", -1))
+                                >= max_steps
+                                for item in results
+                            )
+                        )
+                        if not expected_completion:
+                            raise RuntimeError(
+                                "Standalone Consumer exited before receiving the "
+                                "Scheduler stop command"
+                            )
                     consumer_refs.remove(ref)
                     continue
                 try:
                     event = self.events_queue.get(block=True, timeout=1.0)
                 except Empty:
+                    if not wait_refs:
+                        raise RuntimeError(
+                            "Standalone pipeline has no live Producer or Consumer "
+                            "and did not receive the expected completion event"
+                        )
                     continue
                 kind = event.get("kind")
                 if kind == "samples_published":
@@ -578,6 +642,10 @@ class StandaloneRayTrainer:
                         continue
                     ready_hint += published_total - last_published_total
                     last_published_total = published_total
+                    consumer_training = runtime_state.status in {
+                        DrafterRuntimeStatus.SUBMITTED,
+                        DrafterRuntimeStatus.RUNNING,
+                    }
                     if (
                         not consumer_training and ready_hint >= config.global_batch_size
                     ) or (
@@ -589,8 +657,12 @@ class StandaloneRayTrainer:
                         )
                         finished = reconcile_and_schedule(trigger)
                 elif kind == "training_completed":
-                    consumer_training = False
-                    consumed = len(event.get("keys", ()))
+                    training_outcome = scheduler.complete_standalone_training(
+                        runtime_state=runtime_state,
+                        completed_keys=event.get("keys", ()),
+                        successful=bool(event.get("successful", False)),
+                    )
+                    consumed = training_outcome.assigned_samples
                     completed_steps += 1
                     ready_hint = max(0, ready_hint - consumed)
                     logger.debug(
@@ -651,7 +723,8 @@ class StandaloneRayTrainer:
                 "Standalone pipeline failed producer_state=%s consumer_training=%s "
                 "ready_hint=%s completed_steps=%s",
                 "paused" if producer_paused else "done" if producer_done else "running",
-                consumer_training,
+                runtime_state.status
+                in {DrafterRuntimeStatus.SUBMITTED, DrafterRuntimeStatus.RUNNING},
                 ready_hint,
                 completed_steps,
             )
