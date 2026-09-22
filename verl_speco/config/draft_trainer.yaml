@@ -23,9 +23,9 @@ speco:
     master_port: null
     standalone: true
     mode: feature_store
-    # Keep subprocess as a rollback path until the event-driven scheduler is
-    # connected. Set to ray to use StandaloneRayTrainer and Ray WorkerGroup.
-    runtime_backend: subprocess
+    # Ray is the default runtime (StandaloneRayTrainer + Ray WorkerGroup);
+    # set to subprocess only as a rollback path for debugging.
+    runtime_backend: ray
     use_ray_controller: false
     scheduler:
       # Zero derives low from half the Producer capacity (but never below one

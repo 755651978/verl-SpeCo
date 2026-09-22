@@ -811,7 +811,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_backend = (
         args.runtime_backend
         or _strip_quotes(
-            _find_override(training_args, _RUNTIME_BACKEND_KEY) or "subprocess"
+            _find_override(training_args, _RUNTIME_BACKEND_KEY) or "ray"
         ).lower()
     )
     if runtime_backend not in {"subprocess", "ray"}:
