@@ -258,6 +258,15 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         "speco.standalone_tq_producer.max_inflight_requests=32",
         "speco.standalone_tq_producer.per_endpoint_concurrency=8",
         "speco.standalone_tq_producer.max_feature_length=384",
+        "speco.standalone_tq_producer.max_consecutive_errors=0",
+        "speco.standalone_tq_producer.max_consecutive_feature_drops=5",
+        "speco.standalone_tq_producer.on_error=raise",
+        "speco.standalone_tq_producer.parser_strict_roles=true",
+        "speco.standalone_tq_producer.min_supervised_tokens=3",
+        "speco.standalone_tq_producer.on_truncated_supervision=drop",
+        "speco.standalone_tq_producer.trust_remote_code=true",
+        "speco.standalone_tq_producer.render_boundary.enabled=true",
+        "speco.standalone_tq_producer.render_boundary.timeout=45",
     ]
     config = resolve_pipeline_config(args, environ={})
 
@@ -268,15 +277,57 @@ def test_pipeline_commands_forward_producer_tuning_overrides() -> None:
         python_executable="python",
     )
 
-    assert (
-        "speco.standalone_tq_producer.max_inflight_requests=32"
-        in commands.producer
+    for override in (
+        "speco.standalone_tq_producer.max_inflight_requests=32",
+        "speco.standalone_tq_producer.per_endpoint_concurrency=8",
+        "speco.standalone_tq_producer.max_feature_length=384",
+        "speco.standalone_tq_producer.max_consecutive_errors=0",
+        "speco.standalone_tq_producer.max_consecutive_feature_drops=5",
+        "speco.standalone_tq_producer.on_error=raise",
+        "speco.standalone_tq_producer.parser_strict_roles=true",
+        "speco.standalone_tq_producer.min_supervised_tokens=3",
+        "speco.standalone_tq_producer.on_truncated_supervision=drop",
+        "speco.standalone_tq_producer.trust_remote_code=true",
+        "speco.standalone_tq_producer.render_boundary.enabled=true",
+        "speco.standalone_tq_producer.render_boundary.timeout=45",
+    ):
+        assert override in commands.producer
+
+
+def test_pipeline_commands_ignore_launcher_owned_producer_overrides() -> None:
+    args = [
+        *_training_args(),
+        "speco.standalone_tq_producer.input_path=/evil.jsonl",
+        "speco.standalone_tq_producer.max_samples=999",
+    ]
+    config = resolve_pipeline_config(args, environ={})
+
+    commands = build_pipeline_commands(
+        config,
+        args,
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
     )
-    assert (
-        "speco.standalone_tq_producer.per_endpoint_concurrency=8"
-        in commands.producer
-    )
-    assert "speco.standalone_tq_producer.max_feature_length=384" in commands.producer
+
+    assert "speco.standalone_tq_producer.input_path=/data/train.jsonl" in commands.producer
+    assert "speco.standalone_tq_producer.input_path=/evil.jsonl" not in commands.producer
+    assert "speco.standalone_tq_producer.max_samples=999" not in commands.producer
+
+
+def test_pipeline_commands_reject_unknown_producer_override() -> None:
+    args = [
+        *_training_args(),
+        "speco.standalone_tq_producer.on_eror=skip",
+    ]
+    config = resolve_pipeline_config(args, environ={})
+
+    with pytest.raises(ValueError, match="Unknown Producer override"):
+        build_pipeline_commands(
+            config,
+            args,
+            ray_address="127.0.0.1:6379",
+            python_executable="python",
+        )
 
 
 class _FakeRuntimeContext:
