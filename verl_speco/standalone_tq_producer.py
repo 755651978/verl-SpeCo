@@ -26,6 +26,7 @@ from typing import Any, Mapping
 
 import torch
 
+from verl_speco.config import config_int
 from verl_speco.integration import transferqueue_bridge as default_transport
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
@@ -338,12 +339,13 @@ async def run_producer(
                 )
             while True:
                 scanned_count = 0
+                considered_count = 0
                 produced_count = 0
                 for source_record in iter_input_records(
                     str(producer_cfg["input_path"]),
                     on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
-                    max_consecutive_errors=int(
-                        producer_cfg.get("max_consecutive_errors", 20) or 20
+                    max_consecutive_errors=config_int(
+                        producer_cfg, "max_consecutive_errors", 20
                     ),
                     parser_strict_roles=bool(
                         producer_cfg.get("parser_strict_roles", False)
@@ -353,7 +355,9 @@ async def run_producer(
                     source_sequence_no += 1
                     scanned_count += 1
                     if sequence_no in consumed_sequence_nos:
+                        # Already consumed by a previous run; not a filtered row.
                         continue
+                    considered_count += 1
                     # iter_input_records restarts sequence_no at zero on every
                     # pass. TQ keys require a run-global sequence number so a
                     # repeated sample never overwrites an earlier pending copy.
@@ -400,11 +404,16 @@ async def run_producer(
                     yield request
                 if scanned_count == 0:
                     raise ValueError("Standalone TQ Producer input contains no samples")
-                if produced_count == 0 and max_samples > 0:
+                if produced_count == 0 and considered_count > 0 and max_samples > 0:
+                    # Only rows that were not already consumed count: an epoch
+                    # that is entirely resume-skipped must advance to the next
+                    # one instead of aborting the run.
                     raise ValueError(
-                        "Standalone TQ Producer filtered every scanned sample "
-                        f"(scanned={scanned_count}) but still needs max_samples="
-                        f"{max_samples}; refusing to rescan the input forever"
+                        "Standalone TQ Producer filtered every newly considered "
+                        f"sample (scanned={scanned_count}, "
+                        f"resumed={scanned_count - considered_count}) but still "
+                        f"needs max_samples={max_samples}; refusing to rescan "
+                        "the input forever"
                     )
                 if max_samples <= 0:
                     return

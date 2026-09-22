@@ -395,6 +395,47 @@ def test_run_producer_skips_consumed_sequences_before_vllm(tmp_path: Path) -> No
     assert sequence_nos == [1, 2]
 
 
+def test_run_producer_resumes_after_a_fully_consumed_epoch(tmp_path: Path) -> None:
+    """A resume whose first pass is entirely consumed must advance epochs.
+
+    Regression: the zero-production guard used to fire before ``epoch += 1``,
+    so a checkpoint that had consumed a whole input epoch could never resume.
+    """
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    checkpoint_path = tmp_path / "draft_step_2"
+    save_standalone_resume(
+        checkpoint_path,
+        [0, 1],
+        optimizer_step=2,
+        input_path=input_path,
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["resume_checkpoint_path"] = str(checkpoint_path)
+    producer_cfg["max_samples"] = 2
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    sequence_nos = sorted(
+        int(tag["sequence_no"])
+        for tag in transport.records.values()
+        if tag.get("record_type") == "sample"
+    )
+    assert stats.published_count == 2
+    assert sequence_nos == [2, 3]
+    assert pool.closed and transport.closed
+
+
 def test_run_producer_generates_response_for_verl_chat_prompt(tmp_path: Path) -> None:
     input_path = tmp_path / "dapo.jsonl"
     input_path.write_text(
@@ -534,7 +575,7 @@ def test_run_producer_errors_when_every_row_is_filtered(tmp_path: Path) -> None:
     # filtered (SampleFilteredError) and no request is produced.
     config["speco"]["standalone_tq_producer"]["min_supervised_tokens"] = 99
 
-    with pytest.raises(ValueError, match="filtered every scanned sample"):
+    with pytest.raises(ValueError, match="filtered every newly considered sample"):
         asyncio.run(
             run_producer(
                 config,
@@ -544,3 +585,48 @@ def test_run_producer_errors_when_every_row_is_filtered(tmp_path: Path) -> None:
             )
         )
 
+
+def test_config_int_preserves_explicit_zero() -> None:
+    from verl_speco.config import config_int
+
+    assert config_int({"max_consecutive_errors": 0}, "max_consecutive_errors", 20) == 0
+    assert config_int({}, "max_consecutive_errors", 20) == 20
+    assert (
+        config_int({"max_consecutive_errors": None}, "max_consecutive_errors", 20) == 20
+    )
+    assert (
+        config_int({"max_consecutive_errors": "7"}, "max_consecutive_errors", 20) == 7
+    )
+
+
+def test_run_producer_preserves_explicit_zero_max_consecutive_errors(
+    tmp_path: Path,
+) -> None:
+    """An explicit ``max_consecutive_errors=0`` must fail on the first bad row.
+
+    Regression: ``config.get(key, 20) or 20`` silently turned ``0`` into ``20``,
+    so the circuit breaker never fired for the documented "fail fast" setting.
+    """
+    input_path = tmp_path / "input.jsonl"
+    input_path.write_text(
+        json.dumps({"sample_id": "sample-1", "prompt": "Q1: ", "response": "A1"})
+        + "\n"
+        + "{not valid json\n",
+        encoding="utf-8",
+    )
+    config = _config(input_path)
+    producer_cfg = config["speco"]["standalone_tq_producer"]
+    producer_cfg["on_error"] = "skip"
+    producer_cfg["max_consecutive_errors"] = 0
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+
+    with pytest.raises(RuntimeError, match="max_consecutive_errors=0"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
