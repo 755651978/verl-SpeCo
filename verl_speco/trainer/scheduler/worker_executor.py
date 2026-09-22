@@ -37,6 +37,7 @@ class DrafterWorkerExecutor(Protocol):
         sample_last_n_steps: int,
         require_full_batch: bool,
         worker_ids: tuple[str, ...] | None = None,
+        target_version: int | None = None,
     ) -> list[TrainingDataStatus]: ...
 
     def prepare_training(self, plan: TrainingPlan) -> dict[str, Any]: ...
@@ -58,7 +59,7 @@ class CallbackDrafterWorkerExecutor:
 
     submit: Callable[[dict[str, object]], Any]
     resolve: Callable[[Any], Any]
-    inspect_data: Callable[[int, bool], Any]
+    inspect_data: Callable[..., Any]
     prepare: Callable[[TrainingPlan], dict[str, Any]]
     activate: Callable[[], Any]
     preflight: Callable[[dict[str, object]], Any]
@@ -97,13 +98,22 @@ class CallbackDrafterWorkerExecutor:
         sample_last_n_steps: int,
         require_full_batch: bool,
         worker_ids: tuple[str, ...] | None = None,
+        target_version: int | None = None,
     ) -> list[TrainingDataStatus]:
         try:
             inspection = self.inspect_data(
-                sample_last_n_steps, require_full_batch, worker_ids
+                sample_last_n_steps,
+                require_full_batch,
+                worker_ids,
+                target_version,
             )
         except TypeError:
-            inspection = self.inspect_data(sample_last_n_steps, require_full_batch)
+            try:
+                inspection = self.inspect_data(
+                    sample_last_n_steps, require_full_batch, worker_ids
+                )
+            except TypeError:
+                inspection = self.inspect_data(sample_last_n_steps, require_full_batch)
         results = self.resolve(inspection) or []
         if not isinstance(results, list):
             results = [results]

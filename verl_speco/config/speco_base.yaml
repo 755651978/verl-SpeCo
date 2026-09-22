@@ -302,16 +302,19 @@ actor_rollout_ref:
           training_quota:
             enable: false
             target_steps: 20
-            # Grace period counted after the corresponding training interval
-            # boundary. Zero completes the previous cycle at that boundary.
-            max_debt_age_steps: 0
+            # Start bounded serial assistance one step after the cycle
+            # boundary, while Bubble work continues to take priority.
+            max_debt_age_steps: 1
+            # Never leave an unpublished cycle waiting indefinitely for its
+            # final Bubble. At this lag, finish the exact remaining quota and
+            # publish, even if the fallback must enter the critical path.
+            max_completion_lag_steps: 3
             max_accumulated_debt: 20
-            # Strict parity mode may synchronously finish the whole remainder.
-            max_sync_topup_steps: 20
-            # Keep the drafter model/optimizer resident between a partial idle
-            # launch and its boundary top-up. The completing plan still performs
-            # the normal cleanup, so this avoids duplicate offload/reload only.
-            keep_hot_between_plans: true
+            # Before the hard lag, serial work is assistance only and leaves
+            # final completion to Bubble. The hard lag may override this cap.
+            max_sync_topup_steps: 2
+            # Full residency competes with rollout KV cache and can cause OOM.
+            keep_hot_between_plans: false
           idle_worker:
             require_memory_released: true
             drain_before_next_rollout: true

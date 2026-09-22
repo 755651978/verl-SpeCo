@@ -271,6 +271,7 @@ class DrafterScheduler:
         self._training_quota_last_cycle_step: int | None = None
         self._training_quota_debt_steps: int = 0
         self._training_quota_oldest_cycle_step: int | None = None
+        self._training_quota_data_version: int | None = None
 
     def _effective_idle_batch_estimate_sec(
         self,
@@ -895,6 +896,7 @@ class DrafterScheduler:
         global_step: object,
         config: DrafterScheduleConfig,
         worker_ids: tuple[str, ...] | None = None,
+        target_version: int | None = None,
     ):
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
@@ -902,6 +904,7 @@ class DrafterScheduler:
             sample_last_n_steps=config.sample_last_n_steps,
             require_full_batch=config.require_full_batch,
             worker_ids=worker_ids,
+            target_version=target_version,
         )
         return self.data_status_policy.aggregate(statuses, global_step=global_step)
 
@@ -1807,6 +1810,11 @@ class DrafterScheduler:
             global_step=context.global_step,
             config=config,
             worker_ids=resources.worker_ids,
+            target_version=(
+                self._training_quota_data_version
+                if self._training_quota_debt_steps > 0
+                else None
+            ),
         )
         self._register_training_quota_cycle(
             data_status=data_status,
@@ -1994,6 +2002,11 @@ class DrafterScheduler:
             self._training_quota_last_cycle_step = cycle_step
             return
         previous_debt = self._training_quota_debt_steps
+        if previous_debt > 0:
+            # Do not charge a new cycle against the old cycle's pinned replay
+            # data. Once this cycle completes, the newest collected version
+            # becomes the next cycle and receives its own target quota.
+            return
         debt_trigger = max(
             int(config.training_quota_max_accumulated_debt), 0
         )
@@ -2007,6 +2020,7 @@ class DrafterScheduler:
             # the start of debt aging. This leaves the whole interval available
             # for opportunistic Bubble work before serial top-up is considered.
             self._training_quota_oldest_cycle_step = cycle_step
+            self._training_quota_data_version = data_version
         print(
             "[BubbleTime] training_quota_registered: "
             f"step={global_step} quota_cycle_step={cycle_step} "
@@ -2044,10 +2058,28 @@ class DrafterScheduler:
         debt_limit = max(int(config.training_quota_max_accumulated_debt), 0)
         debt_due = (
             debt_limit > 0
-            and self._training_quota_debt_steps >= debt_limit
+            and self._training_quota_debt_steps > debt_limit
             and interval_boundary_reached
+            and self._training_quota_age_steps(global_step) > 0
         )
         return age_due or debt_due
+
+    def _training_quota_force_completion_due(
+        self,
+        global_step: object,
+        config: DrafterScheduleConfig,
+    ) -> bool:
+        """Whether drafter freshness now outweighs further Bubble waiting."""
+
+        if not config.training_quota_enable or self._training_quota_debt_steps <= 0:
+            return False
+        if self._training_quota_oldest_cycle_step is None:
+            return True
+        return (
+            _as_int(global_step) >= self._training_quota_oldest_cycle_step
+            and self._training_quota_age_steps(global_step)
+            >= max(int(config.training_quota_max_completion_lag_steps), 0)
+        )
 
     def _plan_training_quota_topup(
         self,
@@ -2059,7 +2091,6 @@ class DrafterScheduler:
         if (
             not config.training_quota_enable
             or context.pending_training_count > 0
-            or config.training_quota_max_sync_topup_steps <= 0
         ):
             return None
         writer_group = self._current_idle_writer_group(assign_default=True)
@@ -2069,17 +2100,31 @@ class DrafterScheduler:
             global_step=context.global_step,
             config=config,
             worker_ids=writer_group,
+            target_version=self._training_quota_data_version,
         )
         self._register_training_quota_cycle(
             data_status=data_status,
             global_step=context.global_step,
             config=config,
         )
-        if not self._training_quota_due(context.global_step, config):
+        force_completion = self._training_quota_force_completion_due(
+            context.global_step, config
+        )
+        if (
+            not force_completion
+            and not self._training_quota_due(context.global_step, config)
+        ):
             return None
-        topup_steps = min(
-            self._training_quota_debt_steps,
-            int(config.training_quota_max_sync_topup_steps),
+        # Normal blocking assistance leaves the final optimizer step to a real
+        # Bubble window. Once the freshness deadline expires, exact completion
+        # and publication take precedence over further critical-path hiding.
+        topup_steps = (
+            int(self._training_quota_debt_steps)
+            if force_completion
+            else min(
+                max(self._training_quota_debt_steps - 1, 0),
+                int(config.training_quota_max_sync_topup_steps),
+            )
         )
         if topup_steps <= 0:
             return None
@@ -2104,20 +2149,26 @@ class DrafterScheduler:
             f"step={context.global_step} workers={writer_group} "
             f"debt_steps={self._training_quota_debt_steps} "
             f"debt_age_steps={self._training_quota_age_steps(context.global_step)} "
-            f"topup_steps={topup_steps} data_version={plan.data_version}",
+            f"topup_steps={topup_steps} force_completion={force_completion} "
+            f"data_version={plan.data_version}",
             flush=True,
         )
         # Preserve the rollout-idle worker payload so only the writer group
         # participates, but execute this specially marked plan synchronously.
         return replace(
             plan,
-            reason="quota_topup_training_ready",
+            reason=(
+                "quota_forced_completion_ready"
+                if force_completion
+                else "quota_topup_training_ready"
+            ),
             execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
             target_worker_ids=writer_group,
             training_group_id="quota-topup",
             deadline_ts=None,
-            publish_after_success=True,
+            publish_after_success=force_completion,
             keep_training_hot=False,
+            retain_replay_session=not force_completion,
         )
 
     def _skip_idle_worker_plan(
@@ -2299,17 +2350,15 @@ class DrafterScheduler:
             and context.config.execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
         ):
-            quota_plan = self._plan_training_quota_topup(
-                context.schedule_context,
-                context.config,
-            )
-            if quota_plan is not None:
-                # At the interval boundary, completing the current cycle's
-                # optimizer-step quota takes precedence over starting another
-                # best-effort idle-window launch.  Otherwise quota debt can
-                # leak into the next collection cycle whenever both plans are
-                # simultaneously eligible.
-                plan = quota_plan
+            # A real rollout-idle launch always wins. Serial top-up is only a
+            # bounded starvation fallback when no Bubble work can launch.
+            if not plan.launch:
+                quota_plan = self._plan_training_quota_topup(
+                    context.schedule_context,
+                    context.config,
+                )
+                if quota_plan is not None:
+                    plan = quota_plan
         metrics: dict[str, Any] = dict(plan.metrics())
         metrics.update(
             {
@@ -2333,13 +2382,47 @@ class DrafterScheduler:
                 "bubble/training_quota_debt_steps": int(
                     self._training_quota_debt_steps
                 ),
+                "bubble/training_quota_debt_age_steps": int(
+                    self._training_quota_age_steps(
+                        context.schedule_context.global_step
+                    )
+                ),
+                "bubble/training_quota_completion_lag_steps": int(
+                    self._training_quota_age_steps(
+                        context.schedule_context.global_step
+                    )
+                ),
+                "bubble/training_quota_data_version": int(
+                    self._training_quota_data_version
+                    if self._training_quota_data_version is not None
+                    else -1
+                ),
                 "bubble/training_quota_topup_requested": int(
-                    plan.reason == "quota_topup_training_ready"
+                    plan.reason
+                    in {
+                        "quota_topup_training_ready",
+                        "quota_forced_completion_ready",
+                    }
                 ),
                 "bubble/training_quota_topup_batches": (
                     int(plan.max_batches)
-                    if plan.reason == "quota_topup_training_ready"
+                    if plan.reason
+                    in {
+                        "quota_topup_training_ready",
+                        "quota_forced_completion_ready",
+                    }
                     else 0
+                ),
+                "bubble/training_quota_force_complete": int(
+                    plan.reason == "quota_forced_completion_ready"
+                ),
+                "bubble/training_quota_force_complete_steps": (
+                    int(plan.max_batches)
+                    if plan.reason == "quota_forced_completion_ready"
+                    else 0
+                ),
+                "bubble/publish_waiting_for_quota": int(
+                    self._training_quota_debt_steps > 0
                 ),
             }
         )
@@ -2623,6 +2706,17 @@ class DrafterScheduler:
                 planned_valid_tokens,
                 limiting_factor,
             )
+        if (
+            resources is not None
+            and config.training_quota_enable
+            and self._training_quota_debt_steps > 0
+            and budget.max_batches > self._training_quota_debt_steps
+        ):
+            budget = replace(
+                budget,
+                max_batches=int(self._training_quota_debt_steps),
+            )
+            planned_optimizer_steps = budget.max_batches
         common: Any = {
             "interval_matched": interval_matched,
             "execution_strategy": execution_strategy,
@@ -2774,12 +2868,19 @@ class DrafterScheduler:
             # traffic before the boundary top-up publishes the completed cycle.
             publish_after_success=(
                 not quota_cycle_incomplete
-                and self._publish_interval_matched(context.global_step, config)
+                and (
+                    self._publish_interval_matched(context.global_step, config)
+                    or (
+                        config.training_quota_enable
+                        and self._training_quota_debt_steps > 0
+                    )
+                )
             ),
             keep_training_hot=bool(
                 quota_cycle_incomplete
                 and config.training_quota_keep_hot_between_plans
             ),
+            retain_replay_session=quota_cycle_incomplete,
             **common,
         )
 
@@ -2791,7 +2892,11 @@ class DrafterScheduler:
 
         if (
             plan.execution_strategy is DrafterExecutionStrategy.SYNC
-            or plan.reason == "quota_topup_training_ready"
+            or plan.reason
+            in {
+                "quota_topup_training_ready",
+                "quota_forced_completion_ready",
+            }
         ):
             return self.sync_execution_strategy.execute(
                 plan,
@@ -2854,7 +2959,10 @@ class DrafterScheduler:
         outcome: TrainingOutcome,
     ) -> None:
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
-            is_quota_topup = plan.reason == "quota_topup_training_ready"
+            is_quota_topup = plan.reason in {
+                "quota_topup_training_ready",
+                "quota_forced_completion_ready",
+            }
             if is_quota_topup and (
                 not outcome.trained
                 or int(outcome.successful_steps) != int(plan.max_batches)
@@ -2883,6 +2991,7 @@ class DrafterScheduler:
                 )
                 if self._training_quota_debt_steps == 0:
                     self._training_quota_oldest_cycle_step = None
+                    self._training_quota_data_version = None
                 print(
                     "[BubbleTime] training_quota_repaid: "
                     f"step={plan.source_global_step} plan_id={plan.plan_id} "
@@ -3049,13 +3158,23 @@ class DrafterScheduler:
             )
         # Preserve the released path exactly: invalid publish configuration is
         # an error instead of being silently converted into a skipped publish.
-        interval_matched = self._publish_interval_matched(
+        quota_completed_plan = bool(
+            training_plan is not None
+            and training_plan.execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and config.training_quota_enable
+            and training_plan.publish_after_success
+            and self._training_quota_debt_steps == 0
+        )
+        interval_matched = quota_completed_plan or self._publish_interval_matched(
             global_step, config
         )
         return PublishPlan(
             publish=interval_matched,
             reason=(
-                "publish_interval_reached"
+                "training_quota_complete"
+                if quota_completed_plan
+                else "publish_interval_reached"
                 if interval_matched
                 else "publish_interval_not_reached"
             ),

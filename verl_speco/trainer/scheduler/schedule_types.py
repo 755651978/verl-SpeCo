@@ -148,14 +148,15 @@ class DrafterScheduleConfig:
     gradient_accumulation_steps: int = 1
     # Optional hybrid quota for Bubble Time.  Each configured training interval
     # contributes ``target_steps`` optimizer steps once trainable data exists.
-    # Bubble execution repays the quota first; synchronous top-ups on the same
-    # writer group complete any remainder at the interval boundary by default.
+    # Bubble execution repays the quota first. Bounded synchronous assistance
+    # reduces old debt; a hard lag eventually completes and publishes it.
     training_quota_enable: bool = False
     training_quota_target_steps: int | None = 20
-    training_quota_max_debt_age_steps: int = 0
+    training_quota_max_debt_age_steps: int = 1
+    training_quota_max_completion_lag_steps: int = 3
     training_quota_max_accumulated_debt: int = 20
-    training_quota_max_sync_topup_steps: int = 20
-    training_quota_keep_hot_between_plans: bool = True
+    training_quota_max_sync_topup_steps: int = 2
+    training_quota_keep_hot_between_plans: bool = False
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -278,16 +279,19 @@ class DrafterScheduleConfig:
                 training_quota_get("target_steps", 20)
             ),
             training_quota_max_debt_age_steps=max(
-                int(training_quota_get("max_debt_age_steps", 0) or 0), 0
+                int(training_quota_get("max_debt_age_steps", 1) or 0), 0
+            ),
+            training_quota_max_completion_lag_steps=max(
+                int(training_quota_get("max_completion_lag_steps", 3) or 0), 0
             ),
             training_quota_max_accumulated_debt=max(
                 int(training_quota_get("max_accumulated_debt", 20) or 0), 0
             ),
             training_quota_max_sync_topup_steps=max(
-                int(training_quota_get("max_sync_topup_steps", 20) or 0), 0
+                int(training_quota_get("max_sync_topup_steps", 2) or 0), 0
             ),
             training_quota_keep_hot_between_plans=bool(
-                training_quota_get("keep_hot_between_plans", True)
+                training_quota_get("keep_hot_between_plans", False)
             ),
         )
 
@@ -575,6 +579,7 @@ class TrainingPlan:
     planned_optimizer_steps: int = 0
     planned_valid_tokens: int = 0
     keep_training_hot: bool = False
+    retain_replay_session: bool = False
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
@@ -605,6 +610,7 @@ class TrainingPlan:
         "speculative_idle_unconfirmed": 26,
         "quota_topup_training_ready": 27,
         "quota_topup_lm_head_prefetch_pending": 28,
+        "quota_forced_completion_ready": 29,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -635,6 +641,7 @@ class TrainingPlan:
             "planned_optimizer_steps": self.planned_optimizer_steps,
             "planned_valid_tokens": self.planned_valid_tokens,
             "keep_training_hot": self.keep_training_hot,
+            "retain_replay_session": self.retain_replay_session,
         }
 
     def metrics(self) -> dict[str, int]:
@@ -661,6 +668,9 @@ class TrainingPlan:
                 {
                     "bubble/keep_training_hot_requested": int(
                         self.keep_training_hot
+                    ),
+                    "bubble/replay_session_retained": int(
+                        self.retain_replay_session
                     ),
                     "bubble/planned_batches": int(self.max_batches),
                     "bubble/idle_training_groups": int(bool(self.training_group_id)),

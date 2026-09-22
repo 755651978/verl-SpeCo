@@ -55,6 +55,56 @@ def test_single_micro_batch_bubble_reservation_is_replayed_until_finalize() -> N
     ]
 
 
+def test_quota_cycle_reuses_full_snapshot_across_bubble_plans() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="drafter replay needs the trainer dependency stack",
+    )
+    data_buffer_module = pytest.importorskip("verl_speco.trainer.data_buffer")
+
+    trainer = base_trainer.DrafterBaseTrainer.__new__(
+        base_trainer.DrafterBaseTrainer
+    )
+    trainer.rank = 0
+    trainer.batch_size = 4
+    trainer.data_buffer = data_buffer_module.DataBuffer(max_size=32)
+    trainer._mark_buffer_changed = lambda: None
+    for sample_id in range(8):
+        trainer.data_buffer._current_step = 4
+        trainer.data_buffer.add_batch(
+            {
+                "target_version": 4,
+                "_speco_global_sample_id": sample_id,
+            }
+        )
+
+    first = trainer.reserve_training_data(
+        plan_id="bubble-1",
+        target_version=4,
+        max_batches=1,
+        retain_replay_session=True,
+    )
+    assert first["reserved_samples"] == 8
+    trainer._active_training_replay_cursor = 4
+    assert trainer.finalize_training_data_reservation("bubble-1", consume=False) == 0
+    trainer.release_training_data_reservation("bubble-1")
+
+    second = trainer.reserve_training_data(
+        plan_id="bubble-2",
+        target_version=4,
+        max_batches=1,
+        retain_replay_session=False,
+    )
+    assert second["reserved_samples"] == 8
+    assert trainer._active_training_replay_cursor == 4
+    trainer._active_training_replay_used_items = {
+        id(item): item for item in trainer.data_buffer.get_all_data()
+    }
+    assert trainer.finalize_training_data_reservation("bubble-2", consume=True) == 8
+    trainer.release_training_data_reservation("bubble-2")
+    assert len(trainer.data_buffer) == 0
+
+
 @pytest.mark.parametrize(
     ("model_type", "expected_input_rows"),
     [

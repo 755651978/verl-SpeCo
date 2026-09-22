@@ -4674,17 +4674,47 @@ class DrafterBaseTrainer:
         target_version: int,
         max_batches: int,
         require_full_batch: bool = False,
+        retain_replay_session: bool = False,
     ) -> dict[str, Any]:
-        """Reserve version-matched samples so concurrent plans cannot reuse them."""
+        """Reserve a version-homogeneous quota-cycle replay session."""
 
         max_samples = max(int(max_batches), 0) * max(int(self.batch_size), 1)
-        reserved = self.data_buffer.reserve(
-            str(plan_id),
-            target_version=int(target_version),
-            max_samples=max_samples,
-        )
+        sessions = getattr(self, "_training_replay_sessions", None)
+        if sessions is None:
+            sessions = self._training_replay_sessions = {}
+        session = sessions.get(int(target_version))
+        if session is not None:
+            reserved = self.data_buffer.reserve_samples(
+                str(plan_id), list(session["items"])
+            )
+        else:
+            # A retained cycle owns every currently available sample for this
+            # target version. A short first Bubble window must not shrink the
+            # whole cycle to one batch and overfit it in later windows.
+            reserve_limit = (
+                len(
+                    self.data_buffer.get_available_data(
+                        target_version=int(target_version)
+                    )
+                )
+                if retain_replay_session
+                else max_samples
+            )
+            reserved = self.data_buffer.reserve(
+                str(plan_id),
+                target_version=int(target_version),
+                max_samples=reserve_limit,
+            )
+            if reserved:
+                session = {
+                    "items": list(reserved),
+                    "cursor": 0,
+                    "used_items": {},
+                }
+                sessions[int(target_version)] = session
         if require_full_batch and len(reserved) < max(int(self.batch_size), 1):
             self.data_buffer.release_reservation(str(plan_id))
+            sessions.pop(int(target_version), None)
             reserved = []
         self._active_training_reservation_id = str(plan_id) if reserved else None
         self._active_training_target_version = int(target_version) if reserved else None
@@ -4693,8 +4723,12 @@ class DrafterBaseTrainer:
         # items after every optimizer step artificially capped a Bubble plan at
         # the number of distinct micro-batches.  Keep the reservation stable
         # until the plan completes and consume each *unique* item once then.
-        self._active_training_replay_cursor = 0
-        self._active_training_replay_used_items: dict[int, dict[str, Any]] = {}
+        self._active_training_replay_cursor = int(
+            session.get("cursor", 0) if session is not None else 0
+        )
+        self._active_training_replay_used_items = (
+            session.get("used_items", {}) if session is not None else {}
+        )
         logger.warning(
             "[BubbleTime] reserve training data: rank=%s plan_id=%s target_version=%s "
             "reserved_samples=%s max_samples=%s",
@@ -4706,15 +4740,25 @@ class DrafterBaseTrainer:
         )
         return {"reserved_samples": len(reserved), "target_version": target_version}
 
-    def finalize_training_data_reservation(self, plan_id: str) -> int:
-        """Consume unique replayed items after a Bubble training plan finishes."""
+    def finalize_training_data_reservation(
+        self, plan_id: str, *, consume: bool = True
+    ) -> int:
+        """Persist or consume the replay session after a Bubble plan."""
 
         if self._active_training_reservation_id != str(plan_id):
             return 0
-        used_items = list(
-            getattr(self, "_active_training_replay_used_items", {}).values()
-        )
+        target_version = self._active_training_target_version
+        sessions = getattr(self, "_training_replay_sessions", {})
+        session = sessions.get(target_version)
+        if session is not None:
+            session["cursor"] = int(self._active_training_replay_cursor)
+            session["used_items"] = self._active_training_replay_used_items
+        if not consume:
+            return 0
+        used_items = list(self._active_training_replay_used_items.values())
         consumed = self.data_buffer.consume(str(plan_id), used_items)
+        if target_version is not None:
+            sessions.pop(target_version, None)
         self._active_training_replay_used_items = {}
         self._active_training_replay_cursor = 0
         if consumed:
@@ -4819,8 +4863,20 @@ class DrafterBaseTrainer:
             self.data_buffer.get_available_data() if self.use_data_buffer else []
         )
         if self.use_data_buffer and buffer_data:
+            requested_target_version = (
+                None if target_version is None else int(target_version)
+            )
             recent_steps = 0 if same_step_data_required else int(sample_last_n_steps)
-            recent_data = self.data_buffer.get_data_from_last_n_steps(recent_steps)
+            # A quota cycle pins one target version until its optimizer-step
+            # target is complete. Do not age that retained replay session out
+            # through sample_last_n_steps while it is still being repaid.
+            recent_data = (
+                self.data_buffer.get_available_data(
+                    target_version=requested_target_version
+                )
+                if requested_target_version is not None
+                else self.data_buffer.get_data_from_last_n_steps(recent_steps)
+            )
             target_versions = [
                 int(item.get("target_version", item.get("step", current_step)))
                 for item in recent_data
@@ -4830,9 +4886,6 @@ class DrafterBaseTrainer:
                 target_versions = [
                     version for version in target_versions if version in cached_versions
                 ]
-            requested_target_version = (
-                None if target_version is None else int(target_version)
-            )
             selected_target_version = (
                 requested_target_version
                 if requested_target_version in target_versions

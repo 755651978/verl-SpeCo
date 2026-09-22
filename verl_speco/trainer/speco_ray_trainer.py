@@ -606,10 +606,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         sample_last_n_steps: int,
         require_full_batch: bool,
         worker_ids: tuple[str, ...] | None = None,
+        target_version: int | None = None,
     ):
         return self._require_speco_worker_group().get_drafter_training_data_status(
             sample_last_n_steps,
             require_full_batch,
+            target_version,
         )
 
     def speco_activate_drafter_training_model(self):

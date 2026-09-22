@@ -126,6 +126,24 @@ class DataBuffer:
             sample["_drafter_reserved_by"] = str(reservation_id)
         return selected
 
+    def reserve_samples(
+        self,
+        reservation_id: str,
+        samples: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Re-reserve an existing replay session under a new plan id."""
+
+        buffer_ids = {id(sample) for sample in self.buffer}
+        selected = [
+            sample
+            for sample in samples
+            if id(sample) in buffer_ids
+            and sample.get("_drafter_reserved_by") in {None, str(reservation_id)}
+        ]
+        for sample in selected:
+            sample["_drafter_reserved_by"] = str(reservation_id)
+        return selected
+
     def release_reservation(self, reservation_id: str) -> int:
         released = 0
         for sample in self.buffer:

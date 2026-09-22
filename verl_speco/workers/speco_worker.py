@@ -1488,6 +1488,7 @@ class SpecoWorker(Worker):
         self,
         sample_last_n_steps: int = 2,
         require_full_batch: bool = False,
+        target_version: int | None = None,
     ):
         if not self.enable_drafter:
             return {"available": False, "reason": "disabled"}
@@ -1496,6 +1497,7 @@ class SpecoWorker(Worker):
         status = self.trainer.get_training_data_status(
             sample_last_n_steps=sample_last_n_steps,
             require_full_batch=require_full_batch,
+            target_version=target_version,
         )
         status.update(
             {
@@ -1756,6 +1758,9 @@ class SpecoWorker(Worker):
                     )
                 ),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
+                retain_replay_session=bool(
+                    training_plan.get("retain_replay_session", False)
+                ),
             )
             if int(reservation.get("reserved_samples", 0)) <= 0:
                 logger.warning(
@@ -1776,7 +1781,7 @@ class SpecoWorker(Worker):
                 f"plan_id={training_plan.get('plan_id', '')} rank={self.rank} "
                 f"samples={reservation.get('reserved_samples', 0)} "
                 f"planned_optimizer_steps={training_plan.get('max_batches', 0)} "
-                "mode=plan_local_replay",
+                "mode=quota_cycle_replay",
                 flush=True,
             )
 
@@ -2299,7 +2304,11 @@ class SpecoWorker(Worker):
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
-                    if prepare_publish:
+                    publish_quota_completed = bool(
+                        result["successful_steps"] >= max_batches
+                        and not result.get("error")
+                    )
+                    if prepare_publish and publish_quota_completed:
                         snapshot_ts = time.time()
                         cached = self.trainer.prepare_model_state_dict_for_publish(
                             self.last_global_step
@@ -2314,6 +2323,9 @@ class SpecoWorker(Worker):
                                 result["publish_snapshot_elapsed_sec"],
                             )
                     else:
+                        # A final Bubble or forced-completion plan may still be
+                        # interrupted. Never cache a partially trained snapshot;
+                        # the scheduler keeps its quota debt and retries it.
                         self.trainer.clear_pending_publish_state_dict()
                 else:
                     self.trainer.clear_pending_publish_state_dict()
@@ -2323,11 +2335,25 @@ class SpecoWorker(Worker):
                 finalize_reservation = getattr(
                     self.trainer, "finalize_training_data_reservation", None
                 )
+                completed_plan = bool(
+                    result.get("successful_steps", 0) >= max_batches
+                    and not result.get("error")
+                )
+                retain_replay_session = bool(
+                    training_plan.get("retain_replay_session", False)
+                    or not completed_plan
+                )
                 replay_consumed = (
-                    int(finalize_reservation(plan_id))
+                    int(
+                        finalize_reservation(
+                            plan_id,
+                            consume=not retain_replay_session,
+                        )
+                    )
                     if callable(finalize_reservation)
                     else 0
                 )
+                result["replay_session_retained"] = int(retain_replay_session)
                 result["replay_consumed_samples"] = replay_consumed
                 if replay_consumed:
                     print(
