@@ -521,3 +521,26 @@ def test_pool_close_failure_does_not_skip_transport_close(tmp_path: Path) -> Non
         )
 
     assert pool.closed and transport.closed
+
+
+def test_run_producer_errors_when_every_row_is_filtered(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    # No feature window can reach this many supervised tokens, so every row is
+    # filtered (SampleFilteredError) and no request is produced.
+    config["speco"]["standalone_tq_producer"]["min_supervised_tokens"] = 99
+
+    with pytest.raises(ValueError, match="filtered every scanned sample"):
+        asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
