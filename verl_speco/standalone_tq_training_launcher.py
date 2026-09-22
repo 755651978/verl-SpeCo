@@ -39,6 +39,10 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 import uuid
 
+from verl_speco.draft_train_launcher import (
+    normalize_training_args,
+    resolve_launch_config,
+)
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
@@ -84,6 +88,7 @@ _NNODES_KEYS = (
 _TQ_PREFIX = "actor_rollout_ref.rollout.drafter.training.transfer_queue"
 _FEATURE_STORE_PREFIX = "actor_rollout_ref.rollout.drafter.training.feature_store"
 _PRODUCER_PREFIX = "speco.standalone_tq_producer"
+_RUNTIME_BACKEND_KEY = "speco.draft_training.runtime_backend"
 _PRODUCER_TUNING_KEYS = frozenset(
     {
         f"{_PRODUCER_PREFIX}.request_timeout",
@@ -96,6 +101,7 @@ _PRODUCER_TUNING_KEYS = frozenset(
         f"{_PRODUCER_PREFIX}.max_sequence_length",
         f"{_PRODUCER_PREFIX}.max_feature_length",
         f"{_PRODUCER_PREFIX}.generation_max_tokens",
+        f"{_PRODUCER_PREFIX}.vllm_success_log_interval",
         _PRODUCER_HIDDEN_DTYPE_KEY,
     }
 )
@@ -121,6 +127,7 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.expected_feature.target_layer_ids",
         f"{_TQ_PREFIX}.expected_feature.hidden_states_layout",
         f"{_TQ_PREFIX}.expected_feature.hidden_dtype",
+        _RUNTIME_BACKEND_KEY,
     }
 )
 
@@ -150,6 +157,8 @@ class PipelineCommands:
     owner: list[str]
     producer: list[str]
     consumer: list[str]
+    producer_overrides: tuple[str, ...]
+    consumer_overrides: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -502,10 +511,7 @@ def build_pipeline_commands(
         if (parsed := _split_override(item)) is not None
         and parsed[0] in _PRODUCER_TUNING_KEYS
     ]
-    producer = [
-        python_executable,
-        "-m",
-        "verl_speco.standalone_tq_producer",
+    producer_overrides = [
         f"{_ALGORITHM_KEY}={config.algorithm}",
         *tq_overrides,
         *producer_tuning_overrides,
@@ -568,11 +574,27 @@ def build_pipeline_commands(
         consumer_internal.append(
             f"{algorithm_layer_ids_key}={_hydra_list(config.target_layer_ids)}"
         )
+    # The subprocess path normally passes through draft_train_launcher, which
+    # removes user-facing aliases such as num_gpus_per_node before Hydra sees
+    # them. Ray composes Hydra directly, so apply the exact same normalization.
+    launch_config = resolve_launch_config(list(training_args))
+    normalized_training_args = normalize_training_args(
+        list(training_args), launch_config
+    )
+    consumer_overrides = _replace_internal_overrides(
+        normalized_training_args, consumer_internal
+    )
+    producer = [
+        python_executable,
+        "-m",
+        "verl_speco.standalone_tq_producer",
+        *producer_overrides,
+    ]
     consumer = [
         python_executable,
         "-m",
         "verl_speco.draft_train_launcher",
-        *_replace_internal_overrides(training_args, consumer_internal),
+        *consumer_overrides,
     ]
     return PipelineCommands(
         vllm=vllm,
@@ -580,6 +602,8 @@ def build_pipeline_commands(
         owner=owner,
         producer=producer,
         consumer=consumer,
+        producer_overrides=tuple(producer_overrides),
+        consumer_overrides=tuple(consumer_overrides),
     )
 
 
@@ -776,8 +800,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--python-executable", default=sys.executable)
+    parser.add_argument(
+        "--runtime-backend",
+        choices=("subprocess", "ray"),
+        default=None,
+        help="Override speco.draft_training.runtime_backend.",
+    )
     args, training_args = parser.parse_known_args(argv)
     logging.basicConfig(level=logging.INFO)
+    runtime_backend = (
+        args.runtime_backend
+        or _strip_quotes(
+            _find_override(training_args, _RUNTIME_BACKEND_KEY) or "subprocess"
+        ).lower()
+    )
+    if runtime_backend not in {"subprocess", "ray"}:
+        parser.error(f"{_RUNTIME_BACKEND_KEY} must be either subprocess or ray")
 
     try:
         config = resolve_pipeline_config(training_args)
@@ -813,6 +851,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python_executable=args.python_executable,
             )
             logger.info("Using task-local Ray control plane at %s", ray_session.address)
+            if runtime_backend == "ray":
+                from verl_speco.standalone_ray_runtime import run_ray_pipeline
+
+                return run_ray_pipeline(
+                    commands,
+                    ray_module=ray_session.module,
+                    ray_address=ray_session.address,
+                )
             return run_pipeline(commands, ray_address=ray_session.address)
         finally:
             ray_session.close()

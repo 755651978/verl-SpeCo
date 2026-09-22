@@ -182,6 +182,9 @@ def test_preflight_accepts_verl_prompt_parquet(monkeypatch, tmp_path) -> None:
 def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     args = [
         *_training_args(),
+        "speco.draft_training.runtime_backend=ray",
+        "speco.draft_training.num_gpus_per_node=8",
+        "speco.draft_training.num_nodes=1",
         "actor_rollout_ref.rollout.drafter.training.feature_store.type=torch_shard",
         "actor_rollout_ref.rollout.drafter.training.transfer_queue.run_id=user-value",
     ]
@@ -211,6 +214,11 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
     ]
     assert any(item.endswith("feature_store.type=tq") for item in commands.consumer)
     assert not any("run_id=user-value" in item for item in commands.consumer)
+    assert not any("runtime_backend" in item for item in commands.consumer_overrides)
+    assert not any("num_gpus_per_node" in item for item in commands.consumer_overrides)
+    assert not any("num_nodes" in item for item in commands.consumer_overrides)
+    assert "speco.draft_training.nproc_per_node=8" in commands.consumer_overrides
+    assert "speco.draft_training.nnodes=1" in commands.consumer_overrides
     assert any(f"run_id={config.run_id}" in item for item in commands.consumer)
     expected_contract = " ".join(commands.consumer)
     assert "expected_feature.algorithm=DSPARK" in expected_contract

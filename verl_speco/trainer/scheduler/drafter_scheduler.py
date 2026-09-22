@@ -32,7 +32,10 @@ from verl_speco.trainer.scheduler.schedule_types import (
     DrafterExecutionStrategy,
     DrafterScheduleConfig,
     DrafterScheduleContext,
+    DrafterTrainingDataSource,
+    ProducerAction,
     PublishPlan,
+    QueueScheduleContext,
     TrainingPlan,
     _as_int,
 )
@@ -118,6 +121,87 @@ class DrafterScheduler:
         """Bind the worker execution port used by all execution strategies."""
 
         self._worker_executor = worker_executor
+
+    @staticmethod
+    def plan_queue_collection(
+        context: QueueScheduleContext,
+    ) -> CollectionPlan:
+        """Build a queue Producer plan with high/low-watermark backpressure."""
+
+        status = context.queue_status
+        config = context.config
+        if context.producer_done:
+            action = ProducerAction.STOP
+            reason = "producer_done"
+        elif status.ready_samples >= config.high_watermark_samples:
+            action = ProducerAction.PAUSE
+            reason = "high_watermark_reached"
+        elif status.ready_samples <= config.low_watermark_samples:
+            action = ProducerAction.RUN
+            reason = "low_watermark_reached"
+        elif context.producer_paused:
+            action = ProducerAction.PAUSE
+            reason = "watermark_hysteresis_paused"
+        else:
+            action = ProducerAction.RUN
+            reason = "watermark_hysteresis_running"
+        return CollectionPlan(
+            collect=action is ProducerAction.RUN,
+            reason=reason,
+            source=DrafterCollectionSource.TRANSFER_QUEUE,
+            source_global_step=0,
+            collect_interval_matched=True,
+            training_interval_matched=True,
+            sample_rate=1.0,
+            max_samples_per_replica=None,
+            max_tokens_per_replica=None,
+            hidden_window_mode="front",
+            hidden_window_tokens_per_sample=None,
+            hidden_window_min_rows=0,
+            producer_action=action,
+            max_new_samples=None,
+        )
+
+    @staticmethod
+    def plan_queue_training(
+        context: QueueScheduleContext,
+        *,
+        selected_keys: tuple[str, ...] = (),
+    ) -> TrainingPlan:
+        """Plan at most one complete standalone global batch."""
+
+        status = context.queue_status
+        config = context.config
+        common: dict[str, Any] = {
+            "interval_matched": True,
+            "execution_strategy": DrafterExecutionStrategy.SYNC,
+            "source_global_step": 0,
+            "max_batches": 1,
+            "publish_after_success": False,
+            "min_batches": 1,
+            "require_full_batch": True,
+            "data_filter_reason": "transfer_queue",
+            "data_source": DrafterTrainingDataSource.TRANSFER_QUEUE,
+            "required_samples": config.global_batch_size,
+        }
+        if context.consumer_training:
+            return TrainingPlan(
+                launch=False,
+                reason="consumer_training",
+                **common,
+            )
+        if status.ready_samples < config.global_batch_size:
+            return TrainingPlan(
+                launch=False,
+                reason="insufficient_ready_samples",
+                **common,
+            )
+        return TrainingPlan(
+            launch=True,
+            reason="training_ready",
+            selected_keys=selected_keys,
+            **common,
+        )
 
     def bind_publish_executor(self, publish_executor: DrafterPublishExecutor) -> None:
         self._publish_executor = publish_executor
