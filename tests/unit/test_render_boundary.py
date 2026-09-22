@@ -140,6 +140,42 @@ def test_producer_uses_render_boundary_for_loss_mask() -> None:
     assert request.loss_mask.tolist() == [0, 0, 0, 0, 1, 1]
 
 
+def test_producer_render_boundary_renders_history_only_when_needed() -> None:
+    record = InputRecord(
+        sequence_no=0,
+        sample_id="s0",
+        prompt=({"role": "user", "content": "hi"},),
+        response="yo",
+        source_metadata={},
+    )
+    config = {"max_feature_length": 0, "max_sequence_length": 0}
+
+    stable_calls: list[bool] = []
+
+    def stable_render(messages, *, add_generation_prompt, tools=None, max_length=None):
+        stable_calls.append(add_generation_prompt)
+        return _fake_render(messages, add_generation_prompt=add_generation_prompt)
+
+    tokenize_record_with_render_boundary(record, object(), config, stable_render)
+    # The prompt render already extends into the full render, so the history
+    # render is skipped.
+    assert len(stable_calls) == 2
+
+    fallback_calls: list[int] = []
+
+    def fallback_render(messages, *, add_generation_prompt, tools=None, max_length=None):
+        fallback_calls.append(len(messages))
+        if add_generation_prompt:
+            return [1, 7, 8, 2]
+        if len(messages) > 1:
+            return [1, 7, 8, 99, 24, 14]
+        return [1, 7, 8]
+
+    tokenize_record_with_render_boundary(record, object(), config, fallback_render)
+    # A non-prefix-stable template still needs the history render for validation.
+    assert len(fallback_calls) == 3
+
+
 def test_producer_render_boundary_requires_response() -> None:
     record = InputRecord(
         sequence_no=0,

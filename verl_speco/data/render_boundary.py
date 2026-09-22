@@ -39,7 +39,7 @@ __all__ = [
     "render_conversation",
 ]
 
-DEFAULT_RENDER_TIMEOUT = 30.0
+DEFAULT_RENDER_TIMEOUT = 10.0
 
 
 class BoundaryUnstableError(ValueError):

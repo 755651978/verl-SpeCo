@@ -135,5 +135,6 @@ jobs:
           tests/unit/test_producer_input_tolerance.py
           tests/unit/test_render_boundary.py
           tests/unit/test_tq_producer.py
+          tests/unit/test_standalone_tq_training_launcher.py
           -q
 

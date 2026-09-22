@@ -335,7 +335,7 @@ async def run_producer(
                     )
                 render_fn = build_render_fn(
                     str(endpoints[0]),
-                    timeout=float(render_boundary_cfg.get("timeout", 30.0) or 30.0),
+                    timeout=float(render_boundary_cfg.get("timeout", 10.0) or 10.0),
                 )
                 logger.info(
                     "Standalone TQ Producer using render-boundary loss masks "
@@ -432,9 +432,20 @@ async def run_producer(
                 )
 
         requests = iter(iter_requests())
+        # Tokenization (and the synchronous vLLM /render calls it can make when
+        # render-boundary is enabled) runs inside this generator. Advance it on a
+        # worker thread so a slow render never blocks the event loop, which also
+        # drives the other workers, the publisher and the heartbeat.
+        request_generation_lock = asyncio.Lock()
 
         def next_request() -> Any:
-            request = next(requests)
+            try:
+                request = next(requests)
+            except StopIteration:
+                # ``StopIteration`` cannot be raised across the thread/future
+                # boundary used by ``asyncio.to_thread``; signal exhaustion
+                # with a sentinel instead.
+                return _INPUT_DONE
             stats.input_count += 1
             if _should_log_sample_progress(stats.input_count):
                 logger.info(
@@ -444,12 +455,15 @@ async def run_producer(
                 )
             return request
 
+        async def next_request_async() -> Any:
+            async with request_generation_lock:
+                return await asyncio.to_thread(next_request)
+
         async def read_inputs() -> None:
             initial_count = 0
             while max_samples <= 0 or initial_count < max_samples:
-                try:
-                    request = next_request()
-                except StopIteration:
+                request = await next_request_async()
+                if request is _INPUT_DONE:
                     break
                 mark_stage("input", "input_queue_put", request.sample_id)
                 await input_queue.put(request)
@@ -533,7 +547,7 @@ async def run_producer(
                                     "forever"
                                 ) from exc
                             if max_samples > 0:
-                                replacement_request = next_request()
+                                replacement_request = await next_request_async()
                             continue
                     finally:
                         # The generation request may still produce a prompt-only
@@ -589,7 +603,7 @@ async def run_producer(
                             "replacement samples forever"
                         ) from exc
                     if max_samples > 0:
-                        replacement_request = next_request()
+                        replacement_request = await next_request_async()
                         logger.info(
                             "Standalone TQ Producer replacing dropped sample "
                             "with sequence_no=%s sample_id=%s",

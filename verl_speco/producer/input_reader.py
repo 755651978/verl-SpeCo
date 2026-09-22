@@ -349,7 +349,7 @@ def _iter_parquet_payloads(input_path: Path) -> Iterator[tuple[str, Any]]:
             yield f"{input_path}:row {row_number}", payload
 
 
-def build_render_fn(endpoint: str, *, timeout: float = 30.0) -> Any:
+def build_render_fn(endpoint: str, *, timeout: float = 10.0) -> Any:
     """Build a ``render_fn(messages, add_generation_prompt=...)`` for vLLM /render."""
     from verl_speco.data.render_boundary import render_conversation
 
@@ -403,9 +403,15 @@ def tokenize_record_with_render_boundary(
         add_generation_prompt=False,
         max_length=max_length,
     )
-    history_ids = render_fn(
-        messages, add_generation_prompt=False, max_length=max_length
-    )
+    history_ids = None
+    if full_ids[: len(prompt_ids)] != prompt_ids:
+        # The history render only feeds the fallback path for templates whose
+        # generation-prompt render is not a prefix of the full render; skip the
+        # third round-trip when the prompt render already extends into the full
+        # one.
+        history_ids = render_fn(
+            messages, add_generation_prompt=False, max_length=max_length
+        )
     boundary = boundary_from_renders(prompt_ids, full_ids, history_ids)
     if len(full_ids) <= boundary:
         raise ValueError(

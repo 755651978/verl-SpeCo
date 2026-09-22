@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -520,6 +521,60 @@ def test_run_producer_bounds_consecutive_generated_filters(tmp_path: Path) -> No
         )
 
     assert pool.closed and transport.closed
+
+
+def test_run_producer_renders_off_the_event_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The synchronous /render calls must not run on the event-loop thread."""
+
+    import verl_speco.standalone_tq_producer as producer_module
+
+    input_path = tmp_path / "chat.jsonl"
+    input_path.write_text(
+        json.dumps(
+            {
+                "sample_id": "chat-1",
+                "prompt": [{"role": "user", "content": "Q1"}],
+                "response": "A1",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    render_threads: list[int] = []
+
+    def fake_render(messages, *, add_generation_prompt, max_length=None):
+        render_threads.append(threading.get_ident())
+        if add_generation_prompt:
+            return [1, 2, 3]
+        if len(messages) > 1:
+            return [1, 2, 3, 4, 5]
+        return [1, 2, 3]
+
+    def fake_build_render_fn(endpoint, *, timeout):
+        return fake_render
+
+    monkeypatch.setattr(producer_module, "build_render_fn", fake_build_render_fn)
+
+    transport = _Transport()
+    pool = _Pool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["render_boundary"] = {"enabled": True}
+    main_thread = threading.main_thread().ident
+
+    stats = asyncio.run(
+        run_producer(
+            config,
+            transport=transport,
+            tokenizer=_Tokenizer(),
+            client_pool=pool,
+        )
+    )
+
+    assert stats.published_count == 1
+    assert render_threads
+    assert all(ident != main_thread for ident in render_threads)
 
 
 def test_run_producer_replaces_misaligned_sample_before_eos(
