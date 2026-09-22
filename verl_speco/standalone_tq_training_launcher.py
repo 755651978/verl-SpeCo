@@ -403,6 +403,22 @@ def start_ray_session(
     return RaySession(module=ray_runtime, address=address)
 
 
+def _validate_runtime_backend_topology(
+    runtime_backend: str, training_args: Sequence[str]
+) -> None:
+    """Reject multi-node Ray jobs until external-cluster ownership is supported."""
+
+    if runtime_backend != "ray":
+        return
+    nnodes = _positive_int_override(training_args, _NNODES_KEYS, default=1)
+    if nnodes != 1:
+        raise ValueError(
+            "Standalone Ray backend currently requires "
+            "speco.draft_training.nnodes=1 because the launcher starts a "
+            "task-local single-node Ray runtime"
+        )
+
+
 def _hydra_list(values: Sequence[Any]) -> str:
     return "[" + ",".join(str(value) for value in values) + "]"
 
@@ -819,6 +835,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         config = resolve_pipeline_config(training_args)
+        _validate_runtime_backend_topology(runtime_backend, training_args)
         if args.dry_run:
             commands = build_pipeline_commands(
                 config,

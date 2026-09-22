@@ -13,6 +13,7 @@ from verl_speco.trainer.scheduler import (
     DrafterRuntimeState,
     DrafterRuntimeStatus,
     DrafterScheduler,
+    DrafterExecutionStrategy,
     DrafterTrainingDataSource,
     ProducerAction,
     QueueScheduleContext,
@@ -103,6 +104,8 @@ def test_transfer_queue_training_requires_one_complete_global_batch() -> None:
     assert not insufficient.launch
     assert insufficient.reason == "insufficient_ready_samples"
     assert ready.launch
+    assert ready.execution_strategy is DrafterExecutionStrategy.STANDALONE_ASYNC
+    assert ready.metrics()["drafter/schedule_strategy"] == 2
     assert ready.max_batches == 1
     assert ready.require_full_batch
     assert ready.data_source is DrafterTrainingDataSource.TRANSFER_QUEUE

@@ -16,6 +16,7 @@ from verl_speco.trainer.scheduler.drafter_runtime_state import (
 from verl_speco.trainer.scheduler.schedule_types import (
     CollectionPlan,
     DrafterCollectionSource,
+    DrafterExecutionStrategy,
     DrafterTrainingDataSource,
     ProducerAction,
     TrainingPlan,
@@ -139,6 +140,10 @@ class StandaloneTrainingExecutionStrategy:
         if plan.data_source is not DrafterTrainingDataSource.TRANSFER_QUEUE:
             raise ValueError(
                 "Standalone training execution requires a TransferQueue plan"
+            )
+        if plan.execution_strategy is not DrafterExecutionStrategy.STANDALONE_ASYNC:
+            raise ValueError(
+                "Standalone training execution requires STANDALONE_ASYNC strategy"
             )
         if not plan.launch:
             return StandaloneTrainingOutcome(submitted=False, reason=plan.reason)

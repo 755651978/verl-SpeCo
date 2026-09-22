@@ -16,7 +16,10 @@ from verl_speco.standalone_ray_runtime import (
     StandaloneRayTrainer,
     _configure_driver_logging,
 )
-from verl_speco.standalone_tq_training_launcher import PipelineCommands
+from verl_speco.standalone_tq_training_launcher import (
+    PipelineCommands,
+    _validate_runtime_backend_topology,
+)
 
 
 def _commands() -> PipelineCommands:
@@ -96,6 +99,17 @@ def test_producer_actor_coalesces_publish_notifications_as_cumulative_total(
     assert events.items == [
         {"kind": "samples_published", "published_total": 3}
     ]
+
+
+def test_ray_backend_rejects_multi_node_local_runtime() -> None:
+    with pytest.raises(ValueError, match="nnodes=1"):
+        _validate_runtime_backend_topology(
+            "ray", ["speco.draft_training.nnodes=2"]
+        )
+
+    _validate_runtime_backend_topology(
+        "subprocess", ["speco.draft_training.nnodes=2"]
+    )
 
 
 @dataclass(frozen=True)

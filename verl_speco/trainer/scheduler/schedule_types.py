@@ -35,13 +35,14 @@ def _as_float(value: object) -> float:
 class DrafterExecutionStrategy(str, Enum):
     """Supported drafter-training execution strategies.
 
-    PR 1 intentionally executes only ``SYNC``. ``ROLLOUT_IDLE_WORKER`` is
-    reserved in the contract so the later bubble-time implementation can reuse
-    the same plan type without changing the released synchronous path.
+    ``SYNC`` blocks until co-training workers return. ``STANDALONE_ASYNC``
+    submits a Consumer command and completes later through an event.
+    ``ROLLOUT_IDLE_WORKER`` is reserved for bubble-time execution.
     """
 
     SYNC = "sync"
     ROLLOUT_IDLE_WORKER = "rollout_idle_worker"
+    STANDALONE_ASYNC = "standalone_async"
 
 
 class DrafterTrainingDataSource(str, Enum):
@@ -465,6 +466,7 @@ class TrainingPlan:
         strategy_code = {
             DrafterExecutionStrategy.SYNC: 0,
             DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER: 1,
+            DrafterExecutionStrategy.STANDALONE_ASYNC: 2,
         }[self.execution_strategy]
         metrics = {
             "drafter/scheduler_used": 1,

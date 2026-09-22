@@ -199,7 +199,7 @@ class DrafterScheduler:
         config = context.config
         common: dict[str, Any] = {
             "interval_matched": True,
-            "execution_strategy": DrafterExecutionStrategy.SYNC,
+            "execution_strategy": DrafterExecutionStrategy.STANDALONE_ASYNC,
             "source_global_step": 0,
             "max_batches": 1,
             "publish_after_success": False,
