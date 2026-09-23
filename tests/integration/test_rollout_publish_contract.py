@@ -588,7 +588,6 @@ def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
     if release_method == "cleanup_training":
         trainer._pending_checkpoint_future = None
         trainer._pending_full_checkpoint_future = None
-        trainer.skip_heavy_cleanup_after_drafter_training = False
         trainer._get_sp_group = lambda: None
         trainer._get_dp_group = lambda: None
         trainer.training_device_mesh = None

@@ -245,9 +245,6 @@ class DrafterScheduler:
         self._metadata_idle_training_groups: tuple[tuple[str, ...], ...] = ()
         self._metadata_full_collective_idle_groups: tuple[tuple[str, ...], ...] = ()
         self._replica_idle_worker_groups: dict[int, tuple[str, ...]] = {}
-        self._last_successful_training_step: int | None = None
-        self._last_successful_training_ts: float | None = None
-        self._training_progress_start_ts: float = time.time()
         self._idle_worker_batch_estimate_sec: float | None = None
         self._idle_worker_batch_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_reclaim_samples_sec: deque[float] = deque(maxlen=32)
@@ -272,6 +269,10 @@ class DrafterScheduler:
         self._training_quota_debt_steps: int = 0
         self._training_quota_oldest_cycle_step: int | None = None
         self._training_quota_data_version: int | None = None
+        # A successful collection owns the next quality quota even before its
+        # target LM-head snapshot becomes trainable. Keep that collection
+        # single-flight so later intervals do not produce unusable data.
+        self._training_quota_collection_step: int | None = None
 
     def _effective_idle_batch_estimate_sec(
         self,
@@ -1736,8 +1737,6 @@ class DrafterScheduler:
         self,
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
-        *,
-        allow_sync_fallback: bool = True,
     ) -> TrainingPlan:
         """Build a plan while avoiding worker RPCs for cheap skip conditions."""
 
@@ -1746,7 +1745,6 @@ class DrafterScheduler:
             return self.prepare_idle_worker_training_plan(
                 context,
                 config,
-                allow_sync_fallback=allow_sync_fallback,
             )
         if (
             context.training_mode == "collect_only"
@@ -1773,10 +1771,21 @@ class DrafterScheduler:
         self,
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
-        *,
-        allow_sync_fallback: bool = True,
     ) -> TrainingPlan:
         self._decay_idle_reclaim_penalty(context.global_step)
+        if (
+            config.training_quota_enable
+            and self._training_quota_collection_step is not None
+            and self._training_quota_debt_steps <= 0
+        ):
+            return self._skip_idle_worker_plan(
+                context,
+                config,
+                AvailableTrainingResources(
+                    available=False,
+                    reason="training_quota_publish_pending",
+                ),
+            )
         resources = self.select_idle_training_resources(config)
         if not resources.available:
             if self._idle_worker_writer_migration_blocked:
@@ -1784,7 +1793,6 @@ class DrafterScheduler:
                     available=False,
                     reason="writer_state_migration_required",
                 )
-                allow_sync_fallback = False
             if (
                 not self._idle_worker_writer_migration_blocked
                 and
@@ -1801,10 +1809,6 @@ class DrafterScheduler:
                     f"detail={self._replica_local_idle_unavailable_reason}",
                     flush=True,
                 )
-            if allow_sync_fallback and self._should_sync_fallback(
-                context.global_step, config
-            ):
-                return self._plan_sync_fallback_training(context, config)
             return self._skip_idle_worker_plan(context, config, resources)
         data_status = context.data_status or self.inspect_training_data(
             global_step=context.global_step,
@@ -1850,108 +1854,7 @@ class DrafterScheduler:
             resources=resources,
             require_interval=False,
         )
-        if (
-            allow_sync_fallback
-            and plan.reason == "window_too_small"
-            and self._should_sync_fallback(context.global_step, config)
-        ):
-            logger.warning(
-                "[BubbleTime] sync_fallback_after_small_window: step=%s "
-                "idle_window_s=%s usable_window_s=%s window_batches=%s "
-                "trainable_batches=%s starvation_steps=%s",
-                context.global_step,
-                plan.idle_window_sec,
-                plan.idle_usable_window_sec,
-                plan.idle_window_batches,
-                plan.idle_trainable_batches,
-                self._steps_without_training(context.global_step),
-            )
-            return self._plan_sync_fallback_training(
-                DrafterScheduleContext(
-                    global_step=context.global_step,
-                    training_mode=context.training_mode,
-                    collected_samples_this_step=context.collected_samples_this_step,
-                    oldlogprob_collection_requested=(
-                        context.oldlogprob_collection_requested
-                    ),
-                    data_status=data_status,
-                    pending_training_count=context.pending_training_count,
-                ),
-                config,
-            )
         return plan
-
-    def _steps_without_training(self, global_step: object) -> int:
-        try:
-            step = _as_int(global_step)
-        except (TypeError, ValueError):
-            return 0
-        if self._last_successful_training_step is None:
-            return max(step, 0)
-        return max(step - self._last_successful_training_step, 0)
-
-    def _seconds_without_training(self) -> float:
-        last_ts = self._last_successful_training_ts or self._training_progress_start_ts
-        return max(time.time() - last_ts, 0.0)
-
-    def _should_sync_fallback(
-        self,
-        global_step: object,
-        config: DrafterScheduleConfig,
-    ) -> bool:
-        if not config.idle_worker_fallback_to_sync:
-            return False
-        max_steps = config.max_steps_without_training
-        if max_steps is not None and self._steps_without_training(global_step) >= max(
-            int(max_steps), 1
-        ):
-            return True
-        max_seconds = config.idle_worker_max_seconds_without_training
-        if max_seconds is not None and self._seconds_without_training() >= max(
-            float(max_seconds), 0.0
-        ):
-            return True
-        return False
-
-    def _plan_sync_fallback_training(
-        self,
-        context: DrafterScheduleContext,
-        config: DrafterScheduleConfig,
-    ) -> TrainingPlan:
-        data_status = context.data_status or self.inspect_training_data(
-            global_step=context.global_step,
-            config=config,
-            worker_ids=None,
-        )
-        fallback_context = DrafterScheduleContext(
-            global_step=context.global_step,
-            training_mode=context.training_mode,
-            collected_samples_this_step=context.collected_samples_this_step,
-            oldlogprob_collection_requested=context.oldlogprob_collection_requested,
-            data_status=data_status,
-            pending_training_count=context.pending_training_count,
-        )
-        plan = self.plan_training(
-            fallback_context,
-            replace(config, training_interval_steps=1),
-        )
-        fallback_reason = (
-            "sync_fallback_training_ready"
-            if plan.launch
-            else (
-                "sync_fallback_no_trainable_batch"
-                if plan.reason == "no_trainable_batch"
-                else plan.reason
-            )
-        )
-        return replace(
-            plan,
-            reason=fallback_reason,
-            execution_strategy=DrafterExecutionStrategy.SYNC,
-            deadline_ts=None,
-            target_worker_ids=(),
-            training_group_id="sync-fallback",
-        )
 
     @staticmethod
     def _training_quota_target_steps(config: DrafterScheduleConfig) -> int:
@@ -1959,6 +1862,82 @@ class DrafterScheduler:
         if configured is None:
             configured = config.train_batches_per_trigger
         return max(int(configured), 0)
+
+    def training_quota_blocks_collection(
+        self,
+        global_step: object,
+        config: DrafterScheduleConfig,
+    ) -> bool:
+        """Whether a prior Bubble collection still owns the training quota.
+
+        Multiple request-local commits from the same rollout step remain
+        valid. Only later rollout steps are back-pressured.
+        """
+
+        if (
+            not config.training_quota_enable
+            or config.execution_strategy
+            is not DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            or self._training_quota_target_steps(config) <= 0
+        ):
+            return False
+        collection_step = self._training_quota_collection_step
+        if collection_step is None:
+            return self._training_quota_debt_steps > 0
+        # Once training has repaid the quota, keep every collection source
+        # blocked until the corresponding publication is acknowledged.
+        # Same-step request-local commits are valid only while debt remains.
+        if self._training_quota_debt_steps <= 0:
+            return True
+        try:
+            current_step = _as_int(global_step)
+        except (TypeError, ValueError):
+            return True
+        return current_step != collection_step
+
+    def record_collection_outcome(
+        self,
+        plan: CollectionPlan,
+        outcome,
+        config: DrafterScheduleConfig,
+    ) -> None:
+        """Claim one single-flight Bubble quota after a durable collection."""
+
+        if (
+            not outcome.collected
+            or not config.training_quota_enable
+            or config.execution_strategy
+            is not DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            or self._training_quota_target_steps(config) <= 0
+        ):
+            return
+        collection_step = _as_int(plan.source_global_step)
+        if self._training_quota_collection_step is None:
+            self._training_quota_collection_step = collection_step
+        elif self._training_quota_collection_step != collection_step:
+            raise RuntimeError(
+                "A new drafter collection completed while the previous "
+                "training quota was still active: "
+                f"active_step={self._training_quota_collection_step} "
+                f"new_step={collection_step}"
+            )
+        versions = {
+            int(result.data_version)
+            for result in (getattr(outcome, "worker_results", None) or [])
+            if result.data_version is not None
+        }
+        if len(versions) > 1:
+            raise RuntimeError(
+                "Drafter collection committed inconsistent data versions: "
+                f"versions={tuple(sorted(versions))}"
+            )
+        data_version = next(iter(versions), collection_step)
+        self._register_training_quota_version(
+            data_version=data_version,
+            global_step=plan.source_global_step,
+            config=config,
+            advance_completed_cycle=True,
+        )
 
     def _register_training_quota_cycle(
         self,
@@ -1978,7 +1957,20 @@ class DrafterScheduler:
             or data_status.data_version is None
         ):
             return
-        data_version = int(data_status.data_version)
+        self._register_training_quota_version(
+            data_version=int(data_status.data_version),
+            global_step=global_step,
+            config=config,
+        )
+
+    def _register_training_quota_version(
+        self,
+        *,
+        data_version: int,
+        global_step: object,
+        config: DrafterScheduleConfig,
+        advance_completed_cycle: bool = False,
+    ) -> None:
         try:
             interval = int(config.training_interval_steps)
         except (TypeError, ValueError):
@@ -1996,10 +1988,18 @@ class DrafterScheduler:
             self._training_quota_last_cycle_step is not None
             and cycle_step <= self._training_quota_last_cycle_step
         ):
-            return
+            if (
+                advance_completed_cycle
+                and self._training_quota_debt_steps <= 0
+                and interval > 0
+            ):
+                cycle_step = self._training_quota_last_cycle_step + interval
+            else:
+                return
         target_steps = self._training_quota_target_steps(config)
         if target_steps <= 0:
             self._training_quota_last_cycle_step = cycle_step
+            self._training_quota_collection_step = None
             return
         previous_debt = self._training_quota_debt_steps
         if previous_debt > 0:
@@ -2167,7 +2167,6 @@ class DrafterScheduler:
             training_group_id="quota-topup",
             deadline_ts=None,
             publish_after_success=force_completion,
-            keep_training_hot=False,
             retain_replay_session=not force_completion,
         )
 
@@ -2319,6 +2318,12 @@ class DrafterScheduler:
                 reason="training_interval_not_reached",
                 **common,
             )
+        if self.training_quota_blocks_collection(context.global_step, config):
+            return CollectionPlan(
+                collect=False,
+                reason="training_quota_incomplete",
+                **common,
+            )
         if config.collection_sample_rate <= 0:
             return CollectionPlan(collect=False, reason="sample_rate_zero", **common)
         return CollectionPlan(collect=True, reason="collection_enabled", **common)
@@ -2343,16 +2348,21 @@ class DrafterScheduler:
         plan = self.prepare_training_plan(
             context.schedule_context,
             context.config,
-            allow_sync_fallback=context.allow_sync_fallback,
         )
         if (
             context.allow_quota_topup
             and context.config.execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
         ):
-            # A real rollout-idle launch always wins. Serial top-up is only a
-            # bounded starvation fallback when no Bubble work can launch.
-            if not plan.launch:
+            force_completion_due = self._training_quota_force_completion_due(
+                context.schedule_context.global_step,
+                context.config,
+            )
+            # Before the hard freshness bound, a real rollout-idle launch wins
+            # and serial top-up remains bounded. At the hard bound, force
+            # completion even when another deadline-limited Bubble plan could
+            # launch; otherwise repeated partial plans can postpone publication.
+            if force_completion_due or not plan.launch:
                 quota_plan = self._plan_training_quota_topup(
                     context.schedule_context,
                     context.config,
@@ -2364,21 +2374,6 @@ class DrafterScheduler:
             {
                 "scheduler/train_requested": int(plan.launch),
                 "scheduler/planned_batches": int(plan.max_batches),
-                "bubble/starvation_steps": self._steps_without_training(
-                    context.schedule_context.global_step
-                ),
-                "bubble/starvation_seconds": self._seconds_without_training(),
-                "bubble/sync_fallback_requested": int(
-                    plan.reason.startswith("sync_fallback")
-                ),
-                "bubble/sync_fallback_launched": int(
-                    plan.launch and plan.reason == "sync_fallback_training_ready"
-                ),
-                "bubble/sync_fallback_batches": (
-                    int(plan.max_batches)
-                    if plan.launch and plan.reason == "sync_fallback_training_ready"
-                    else 0
-                ),
                 "bubble/training_quota_debt_steps": int(
                     self._training_quota_debt_steps
                 ),
@@ -2395,6 +2390,11 @@ class DrafterScheduler:
                 "bubble/training_quota_data_version": int(
                     self._training_quota_data_version
                     if self._training_quota_data_version is not None
+                    else -1
+                ),
+                "bubble/training_quota_collection_step": int(
+                    self._training_quota_collection_step
+                    if self._training_quota_collection_step is not None
                     else -1
                 ),
                 "bubble/training_quota_topup_requested": int(
@@ -2876,10 +2876,6 @@ class DrafterScheduler:
                     )
                 )
             ),
-            keep_training_hot=bool(
-                quota_cycle_incomplete
-                and config.training_quota_keep_hot_between_plans
-            ),
             retain_replay_session=quota_cycle_incomplete,
             **common,
         )
@@ -3000,6 +2996,7 @@ class DrafterScheduler:
                     f"debt_after={self._training_quota_debt_steps}",
                     flush=True,
                 )
+
         if outcome.trained and outcome.successful_steps > 0:
             if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
                 group = _normalize_worker_id_group(plan.target_worker_ids)
@@ -3033,11 +3030,6 @@ class DrafterScheduler:
                         writer_group,
                         tuple(sorted(self._idle_worker_hot_prewarmed_groups)),
                     )
-            try:
-                self._last_successful_training_step = _as_int(plan.source_global_step)
-            except (TypeError, ValueError):
-                self._last_successful_training_step = None
-            self._last_successful_training_ts = time.time()
             training_loop_sec = max(
                 float(
                     outcome.metrics.get("timing_s/drafter_worker_training_loop", 0.0)
@@ -3090,6 +3082,12 @@ class DrafterScheduler:
                     outcome.successful_steps,
                     outcome.elapsed_sec,
                 )
+
+    def record_training_quota_publish_completed(self) -> None:
+        """Release collection backpressure only after publication succeeds."""
+
+        if self._training_quota_debt_steps <= 0:
+            self._training_quota_collection_step = None
 
     def request_reclaim(self, worker_ids: tuple[str, ...]) -> Any:
         if self._worker_executor is None:

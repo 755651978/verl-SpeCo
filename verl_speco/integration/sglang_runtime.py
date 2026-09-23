@@ -1505,6 +1505,7 @@ class _SpecoSGLangHttpServerMixin:
         clean_params = dict(sampling_params)
         clean_params.pop("_verl_global_steps", None)
         clean_params.pop("_verl_skip_drafter_collection", None)
+        clean_params.pop("_verl_skip_rollout_idle_event", None)
         return clean_params
 
     async def set_global_steps(self, global_steps: int):
@@ -1750,7 +1751,10 @@ class _SpecoSGLangHttpServerMixin:
         video_data: Optional[list[Any]] = None,
     ):
         skip_rollout_idle_event = bool(
-            sampling_params.get("_verl_skip_drafter_collection", False)
+            sampling_params.get(
+                "_verl_skip_rollout_idle_event",
+                sampling_params.get("_verl_skip_drafter_collection", False),
+            )
         )
         drafter_cfg = self._speco_drafter_cfg()
         active_requests = int(getattr(self, "_speco_rollout_active_requests", 0) or 0)

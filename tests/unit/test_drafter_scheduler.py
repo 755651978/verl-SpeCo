@@ -13,6 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from verl_speco.trainer.scheduler import (
@@ -135,6 +137,83 @@ def test_oldlogprob_collection_plan_preserves_training_interval_requirement() ->
     assert plan.collect_interval_matched
     assert not plan.training_interval_matched
     assert plan.reason == "training_interval_not_reached"
+
+
+def test_bubble_collection_is_single_flight_until_quota_completes() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(
+        collect_interval_steps=2,
+        training_interval_steps=4,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+    )
+    first = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    scheduler.record_collection_outcome(
+        first,
+        SimpleNamespace(collected=True),
+        config,
+    )
+    assert scheduler._training_quota_debt_steps == 20
+    assert scheduler._training_quota_data_version == 2
+
+    same_step = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    next_interval = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=4,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert same_step.collect
+    assert not next_interval.collect
+    assert next_interval.reason == "training_quota_incomplete"
+    assert next_interval.metrics()["drafter/collection_plan_reason"] == 10
+
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_oldest_cycle_step = None
+    scheduler._training_quota_data_version = None
+    awaiting_publish = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.OLD_LOGPROB,
+        ),
+        config,
+    )
+    assert not awaiting_publish.collect
+    assert awaiting_publish.reason == "training_quota_incomplete"
+
+    scheduler.record_training_quota_publish_completed()
+    next_cycle = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=4,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    scheduler.record_collection_outcome(
+        next_cycle,
+        SimpleNamespace(collected=True),
+        config,
+    )
+
+    assert next_cycle.collect
+    assert scheduler._training_quota_last_cycle_step == 8
+    assert scheduler._training_quota_debt_steps == 20
 
 
 @pytest.mark.parametrize(

@@ -513,9 +513,6 @@ class DrafterBaseTrainer:
         self.is_offload_optimizer = bool(
             training_cfg.get("is_offload_optimizer", False)
         )
-        self.skip_heavy_cleanup_after_drafter_training = bool(
-            training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
-        )
         self.park_hccl_after_drafter_training = bool(
             training_cfg.get("park_hccl_after_drafter_training", False)
         )
@@ -5462,8 +5459,6 @@ class DrafterBaseTrainer:
     async def cleanup_training(
         self,
         clear_data: bool = True,
-        *,
-        keep_hot: bool = False,
     ):
         # First set training as inactive to prevent further steps
         self._training_active = False
@@ -5498,22 +5493,6 @@ class DrafterBaseTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
-        if keep_hot or self.skip_heavy_cleanup_after_drafter_training:
-            if clear_data:
-                self.collected_data.clear()
-                self.data_buffer.clear()
-                self._mark_buffer_changed()
-            self._training_initialized = False
-            self._training_active = False
-            self._last_ckpt_step = -1
-            self.training_steps = 0
-            logger.debug(
-                "[Rank %s] Skipped heavy drafter cleanup; model/optimizer stay on runtime device keep_hot=%s",
-                self.rank,
-                keep_hot,
-            )
-            return
-
         # Training and publish collectives have completed before cleanup. These
         # process groups stay alive across triggers, so barriers here only
         # serialize ranks and can add timeout windows without releasing memory.

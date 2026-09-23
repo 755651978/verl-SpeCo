@@ -111,7 +111,6 @@ actor_rollout_ref:
         batch_size_per_gpu: 4
         training_interval_steps: 5
         min_trainable_batches: 1
-        max_steps_without_training: null
         require_full_batch: false
         publish_interval_steps: 0
         publish_async: false
@@ -122,7 +121,6 @@ actor_rollout_ref:
         draft_update_pause_generation: true
         draft_update_flush_before: true
         draft_update_flush_after: true
-        skip_heavy_cleanup_after_drafter_training: false
         # Keep trainer objects resident while releasing idle NPU HCCL memory.
         park_hccl_after_drafter_training: false
         save_full_drafter_checkpoint: true
@@ -313,23 +311,15 @@ actor_rollout_ref:
             # Before the hard lag, serial work is assistance only and leaves
             # final completion to Bubble. The hard lag may override this cap.
             max_sync_topup_steps: 2
-            # Full residency competes with rollout KV cache and can cause OOM.
-            keep_hot_between_plans: false
           idle_worker:
             require_memory_released: true
             drain_before_next_rollout: true
-            fallback_to_sync: false
             # Last-resort Bubble fallback. If every replica-local group is
             # disabled (for example OOM during activation), allow the scheduler
             # to require the full drafter collective to be idle. Disabled by
             # default because it reduces Bubble granularity and can reintroduce
             # rollout wake-up memory pressure.
             full_collective_fallback: false
-            # Optional starvation guard. When fallback_to_sync is true, a
-            # sync fallback can be launched at a trainer safe point after
-            # max_steps_without_training or this wall-clock limit.
-            # Fallback batch count reuses training.step.
-            max_seconds_without_training: null
             event_bus_name: null
             event_poll_interval_sec: 0.05
             # Runtime request completion is speculative until the replica

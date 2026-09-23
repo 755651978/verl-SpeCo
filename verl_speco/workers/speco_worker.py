@@ -1465,7 +1465,7 @@ class SpecoWorker(Worker):
         logger.warning(
             "[BubbleTime] idle_prewarm_succeeded: worker_id=%s rank=%s "
             "replica_rank=%s elapsed_s=%.3f group=%s target_workers=%s "
-            "keep_hot=True",
+            "resident_until_training=True",
             self.rank,
             self.rank,
             self.replica_rank,
@@ -1478,7 +1478,8 @@ class SpecoWorker(Worker):
             f"worker_id={self.rank} rank={self.rank} "
             f"replica_rank={self.replica_rank} elapsed_s={result['elapsed_sec']:.3f} "
             f"group={tuple(getattr(self, 'training_group_ranks', []))} "
-            f"target_workers={tuple(sorted(target_worker_ids))} keep_hot=True",
+            f"target_workers={tuple(sorted(target_worker_ids))} "
+            "resident_until_training=True",
             flush=True,
         )
         return result
@@ -2363,15 +2364,7 @@ class SpecoWorker(Worker):
                         flush=True,
                     )
                 self.trainer.release_training_data_reservation(plan_id)
-                keep_training_hot = bool(
-                    training_plan.get("keep_training_hot", False)
-                    and result["successful_steps"] > 0
-                )
-                await self.trainer.cleanup_training(
-                    clear_data=False,
-                    keep_hot=keep_training_hot,
-                )
-                result["kept_training_hot"] = int(keep_training_hot)
+                await self.trainer.cleanup_training(clear_data=False)
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0

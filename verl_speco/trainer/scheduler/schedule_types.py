@@ -113,7 +113,6 @@ class DrafterScheduleConfig:
     hidden_window_tokens_per_sample: int | None = 512
     hidden_window_min_rows: int = 512
     min_trainable_batches: int = 1
-    max_steps_without_training: int | None = None
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
     execution_strategy: DrafterExecutionStrategy = DrafterExecutionStrategy.SYNC
@@ -127,9 +126,7 @@ class DrafterScheduleConfig:
     # reported that the complete rollout worker group is idle.
     idle_worker_require_runtime_idle_events: bool = False
     idle_worker_drain_before_next_rollout: bool = True
-    idle_worker_fallback_to_sync: bool = False
     idle_worker_full_collective_fallback: bool = False
-    idle_worker_max_seconds_without_training: float | None = None
     # Retain a small amount of ready data, then stop creating newer target-head
     # versions until the buffer has been consumed by Bubble training.
     idle_worker_collection_target_batches: int | None = 2
@@ -156,7 +153,6 @@ class DrafterScheduleConfig:
     training_quota_max_completion_lag_steps: int = 3
     training_quota_max_accumulated_debt: int = 20
     training_quota_max_sync_topup_steps: int = 2
-    training_quota_keep_hot_between_plans: bool = False
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -209,9 +205,6 @@ class DrafterScheduleConfig:
             ),
             hidden_window_min_rows=int(get("hidden_state_window_min_rows", 512)),
             min_trainable_batches=int(get("min_trainable_batches", 1)),
-            max_steps_without_training=_optional_int(
-                get("max_steps_without_training", None)
-            ),
             require_full_batch=bool(get("require_full_batch", False)),
             sample_last_n_steps=int(get("sample_last_n_steps", 2)),
             execution_strategy=DrafterExecutionStrategy(strategy_value),
@@ -233,12 +226,8 @@ class DrafterScheduleConfig:
             idle_worker_drain_before_next_rollout=bool(
                 idle_get("drain_before_next_rollout", True)
             ),
-            idle_worker_fallback_to_sync=bool(idle_get("fallback_to_sync", False)),
             idle_worker_full_collective_fallback=bool(
                 idle_get("full_collective_fallback", False)
-            ),
-            idle_worker_max_seconds_without_training=_optional_float(
-                idle_get("max_seconds_without_training", None)
             ),
             idle_worker_collection_target_batches=_optional_int(
                 idle_get("collection_target_batches", 2)
@@ -289,9 +278,6 @@ class DrafterScheduleConfig:
             ),
             training_quota_max_sync_topup_steps=max(
                 int(training_quota_get("max_sync_topup_steps", 2) or 0), 0
-            ),
-            training_quota_keep_hot_between_plans=bool(
-                training_quota_get("keep_hot_between_plans", False)
             ),
         )
 
@@ -353,6 +339,7 @@ class CollectionPlan:
         "collection_enabled": 7,
         "buffer_target_reached": 8,
         "writer_state_migration_required": 9,
+        "training_quota_incomplete": 10,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -578,7 +565,6 @@ class TrainingPlan:
     gradient_accumulation_steps: int = 1
     planned_optimizer_steps: int = 0
     planned_valid_tokens: int = 0
-    keep_training_hot: bool = False
     retain_replay_session: bool = False
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
@@ -601,8 +587,6 @@ class TrainingPlan:
         "incomplete_training_group": 17,
         "window_too_small": 18,
         "missing_training_group_metadata": 19,
-        "sync_fallback_training_ready": 20,
-        "sync_fallback_no_trainable_batch": 21,
         "target_lm_head_not_ready": 22,
         "replica_local_unavailable": 23,
         "idle_group_not_prewarmed": 24,
@@ -611,6 +595,7 @@ class TrainingPlan:
         "quota_topup_training_ready": 27,
         "quota_topup_lm_head_prefetch_pending": 28,
         "quota_forced_completion_ready": 29,
+        "training_quota_publish_pending": 30,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -640,7 +625,6 @@ class TrainingPlan:
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "planned_optimizer_steps": self.planned_optimizer_steps,
             "planned_valid_tokens": self.planned_valid_tokens,
-            "keep_training_hot": self.keep_training_hot,
             "retain_replay_session": self.retain_replay_session,
         }
 
@@ -666,9 +650,6 @@ class TrainingPlan:
         if self.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             metrics.update(
                 {
-                    "bubble/keep_training_hot_requested": int(
-                        self.keep_training_hot
-                    ),
                     "bubble/replay_session_retained": int(
                         self.retain_replay_session
                     ),

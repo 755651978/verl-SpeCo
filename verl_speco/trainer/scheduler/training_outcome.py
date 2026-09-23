@@ -118,7 +118,17 @@ class TrainingOutcome:
         publish_leaders = [
             result for result in participating_results if result.is_publish_leader
         ]
-        publish_snapshot_consistent = not plan.publish_after_success or (
+        # A deadline/reclaim may stop an otherwise valid Bubble plan after it
+        # has completed only part of ``max_batches``.  Such optimizer steps
+        # must still repay the training quota even though the worker correctly
+        # did not cache a publish snapshot.  Require the snapshot only once the
+        # plan has completed all requested steps and is therefore publishable.
+        publish_snapshot_required = bool(
+            plan.publish_after_success
+            and trained
+            and successful_steps >= int(plan.max_batches)
+        )
+        publish_snapshot_consistent = not publish_snapshot_required or (
             len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
         )
         result_consistent = not strict_consistency or (
@@ -141,9 +151,6 @@ class TrainingOutcome:
             "drafter/idle_trained": int(
                 plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
                 and trained
-            ),
-            "drafter/sync_fallback_trained": int(
-                plan.reason.startswith("sync_fallback") and trained
             ),
             "drafter/train_successful_steps_max": successful_steps,
             "drafter/train_successful_valid_tokens_max": max(
@@ -195,10 +202,17 @@ class TrainingOutcome:
             "drafter/train_source_steps_consistent": int(source_steps_consistent),
             "drafter/train_data_versions_consistent": int(data_versions_consistent),
             "drafter/train_target_versions_consistent": int(target_versions_consistent),
+            "drafter/train_trained_consistent": int(trained_consistent),
             "drafter/train_successful_steps_consistent": int(
                 successful_steps_consistent
             ),
             "drafter/train_optimizer_steps_consistent": int(optimizer_steps_consistent),
+            "drafter/train_publish_snapshot_required": int(
+                publish_snapshot_required
+            ),
+            "drafter/train_publish_snapshot_consistent": int(
+                publish_snapshot_consistent
+            ),
             "drafter/train_publish_leader_count": len(publish_leaders),
             "drafter/train_publish_leader_snapshot_ready": int(
                 len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
@@ -265,13 +279,6 @@ class TrainingOutcome:
         metrics["bubble/train_first_batch_started"] = int(
             any(bool(result.get("first_batch_started", False)) for result in normalized_results)
         )
-        metrics["bubble/training_kept_hot"] = int(
-            any(
-                bool(result.get("kept_training_hot", False))
-                for result in normalized_results
-            )
-        )
-
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
         if (
             plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
@@ -285,16 +292,6 @@ class TrainingOutcome:
             # to reclaim that worker group for a subsequent rollout.
             metrics["timing_s/drafter_async_training_work"] = float(
                 metrics.get("timing_s/drafter_worker_elapsed", 0.0)
-            )
-        if plan.reason.startswith("sync_fallback"):
-            metrics.update(
-                {
-                    "bubble/sync_fallback_completed": int(trained),
-                    "drafter/sync_fallback_trained": int(trained),
-                    "drafter/trained_any": int(trained),
-                    "bubble/sync_fallback_successful_steps": successful_steps,
-                    "bubble/sync_fallback_elapsed_s": execution.elapsed_sec,
-                }
             )
         if plan.reason in {
             "quota_topup_training_ready",

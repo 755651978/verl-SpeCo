@@ -229,7 +229,7 @@ def test_replica_local_plan_accumulates_to_full_collective_batch() -> None:
     assert plan.planned_valid_tokens == 2000
 
 
-def test_partial_quota_idle_plan_stays_hot_and_defers_publish() -> None:
+def test_partial_quota_idle_plan_retains_replay_and_defers_publish() -> None:
     scheduler = DrafterScheduler()
     scheduler._training_quota_debt_steps = 20
     config = replace(
@@ -237,7 +237,6 @@ def test_partial_quota_idle_plan_stays_hot_and_defers_publish() -> None:
         training_interval_steps=1,
         training_quota_enable=True,
         training_quota_target_steps=20,
-        training_quota_keep_hot_between_plans=True,
         train_batches_per_trigger=10,
     )
     context = DrafterScheduleContext(
@@ -264,10 +263,27 @@ def test_partial_quota_idle_plan_stays_hot_and_defers_publish() -> None:
 
     assert plan.launch
     assert plan.max_batches == 10
-    assert plan.keep_training_hot
     assert not plan.publish_after_success
     assert plan.retain_replay_session
-    assert plan.to_worker_payload()["keep_training_hot"] is True
+
+
+def test_completed_quota_blocks_training_until_publish_ack() -> None:
+    scheduler = DrafterScheduler()
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_collection_step = 4
+    config = replace(
+        _idle_config(),
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+    )
+
+    plan = scheduler.prepare_training_plan(
+        replace(_context(), global_step=4),
+        config,
+    )
+
+    assert not plan.launch
+    assert plan.reason == "training_quota_publish_pending"
 
 
 def test_final_quota_idle_plan_is_capped_and_publishes_in_bubble() -> None:
@@ -463,7 +479,6 @@ def test_training_quota_defaults_prioritize_bubble_completion() -> None:
     assert config.training_quota_max_completion_lag_steps == 3
     assert config.training_quota_max_accumulated_debt == 20
     assert config.training_quota_max_sync_topup_steps == 2
-    assert not config.training_quota_keep_hot_between_plans
 
 
 def test_training_quota_topup_leaves_final_step_for_bubble_publish() -> None:
@@ -598,6 +613,7 @@ def test_training_quota_hard_deadline_finishes_and_publishes() -> None:
     scheduler._training_quota_oldest_cycle_step = 8
     scheduler._training_quota_last_cycle_step = 8
     scheduler._training_quota_data_version = 10
+    scheduler._training_quota_collection_step = 10
     config = replace(
         _idle_config(),
         training_quota_enable=True,
@@ -607,6 +623,19 @@ def test_training_quota_hard_deadline_finishes_and_publishes() -> None:
         # Disabling soft top-ups must not disable the hard freshness bound.
         training_quota_max_sync_topup_steps=0,
         publish_interval_steps=4,
+    )
+    # Even if a normal deadline-limited Bubble plan is launchable, the hard
+    # freshness bound must replace it with an exact, blocking completion plan.
+    scheduler.prepare_training_plan = lambda *args, **kwargs: TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=11,
+        max_batches=6,
+        deadline_ts=time.time() + 10.0,
+        publish_after_success=True,
+        target_worker_ids=("0", "1"),
     )
 
     event = scheduler.on_before_actor_update(
@@ -647,8 +676,13 @@ def test_training_quota_hard_deadline_finishes_and_publishes() -> None:
 
     assert scheduler._training_quota_debt_steps == 0
     assert scheduler._training_quota_data_version is None
+    assert scheduler._training_quota_collection_step == 10
     assert publish.publish
     assert publish.reason == "training_quota_complete"
+
+    scheduler.record_training_quota_publish_completed()
+
+    assert scheduler._training_quota_collection_step is None
 
 
 def test_partial_forced_completion_does_not_repay_or_publish() -> None:
@@ -835,7 +869,6 @@ def test_training_quota_background_poll_never_launches_topup() -> None:
         BeforeActorUpdateContext(
             schedule_context=_context(),
             config=config,
-            allow_sync_fallback=False,
             allow_quota_topup=False,
         )
     )
@@ -1268,7 +1301,7 @@ def test_generation_completion_records_real_idle_window() -> None:
     assert len(scheduler._replica_idle_window_samples_sec) == 2
 
 
-def test_small_idle_window_uses_sync_fallback_after_starvation() -> None:
+def test_small_idle_window_does_not_launch_training() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     deadline_ts = time.time() + 0.35
     for worker_id in ("0", "1"):
@@ -1281,11 +1314,7 @@ def test_small_idle_window_uses_sync_fallback_after_starvation() -> None:
                 must_be_ready_at=deadline_ts,
             )
         )
-    config = replace(
-        _idle_config(),
-        idle_worker_fallback_to_sync=True,
-        max_steps_without_training=4,
-    )
+    config = _idle_config()
     context = DrafterScheduleContext(
         global_step=4,
         training_mode="online",
@@ -1294,43 +1323,6 @@ def test_small_idle_window_uses_sync_fallback_after_starvation() -> None:
     )
 
     plan = scheduler.prepare_training_plan(context, config)
-
-    assert plan.launch
-    assert plan.reason == "sync_fallback_training_ready"
-    assert plan.execution_strategy is DrafterExecutionStrategy.SYNC
-    assert plan.target_worker_ids == ()
-
-
-def test_small_idle_window_does_not_sync_fallback_inside_idle_loop() -> None:
-    scheduler = _scheduler_with_statuses(("0", "1"))
-    deadline_ts = time.time() + 0.35
-    for worker_id in ("0", "1"):
-        scheduler.on_worker_event(
-            RolloutWorkerEvent(
-                RolloutWorkerEventType.WORKER_IDLE,
-                worker_id=worker_id,
-                replica_rank=int(worker_id),
-                memory_released=True,
-                must_be_ready_at=deadline_ts,
-            )
-        )
-    config = replace(
-        _idle_config(),
-        idle_worker_fallback_to_sync=True,
-        max_steps_without_training=4,
-    )
-    context = DrafterScheduleContext(
-        global_step=4,
-        training_mode="online",
-        collected_samples_this_step=0,
-        oldlogprob_collection_requested=False,
-    )
-
-    plan = scheduler.prepare_training_plan(
-        context,
-        config,
-        allow_sync_fallback=False,
-    )
 
     assert not plan.launch
     assert plan.reason == "window_too_small"
@@ -1737,7 +1729,6 @@ def test_replica_local_activation_failure_disables_idle_group() -> None:
     next_plan = scheduler.prepare_training_plan(
         _context(),
         config,
-        allow_sync_fallback=False,
     )
 
     assert outcome.metrics["bubble/replica_local_unavailable"] == 1
@@ -1793,7 +1784,6 @@ def test_idle_worker_prebatch_reclaim_penalty_blocks_marginal_window() -> None:
     next_plan = scheduler.prepare_training_plan(
         _context(),
         config,
-        allow_sync_fallback=False,
     )
 
     assert not next_plan.launch
@@ -1822,7 +1812,6 @@ def test_idle_worker_prebatch_reclaim_penalty_allows_large_window() -> None:
     plan = scheduler.prepare_training_plan(
         replace(_context(), global_step=11),
         config,
-        allow_sync_fallback=False,
     )
 
     assert plan.launch
@@ -1850,7 +1839,6 @@ def test_idle_worker_prebatch_reclaim_streak_keeps_multi_batch_window() -> None:
     plan = scheduler.prepare_training_plan(
         replace(_context(), global_step=10),
         config,
-        allow_sync_fallback=False,
     )
 
     assert plan.launch
@@ -1957,7 +1945,6 @@ def test_idle_worker_success_resets_prebatch_reclaim_penalty() -> None:
     plan = scheduler.prepare_training_plan(
         replace(_context(), global_step=11),
         config,
-        allow_sync_fallback=False,
     )
 
     assert plan.launch
@@ -2067,134 +2054,6 @@ def test_idle_worker_publish_is_async_after_weight_update() -> None:
     assert publish_plan.asynchronous
 
 
-def test_idle_worker_starvation_guard_launches_sync_fallback_at_safe_point() -> None:
-    scheduler = _scheduler_with_statuses(("0", "1"))
-    scheduler.on_worker_event(
-        RolloutWorkerEvent(
-            RolloutWorkerEventType.GENERATION_STARTED,
-            worker_id="0",
-            replica_rank=0,
-        )
-    )
-    config = replace(
-        _auto_idle_config(1),
-        idle_worker_group_size=None,
-        idle_worker_fallback_to_sync=True,
-        max_steps_without_training=2,
-    )
-
-    plan = scheduler.prepare_training_plan(_context(), config)
-
-    assert plan.launch
-    assert plan.execution_strategy is DrafterExecutionStrategy.SYNC
-    assert plan.reason == "sync_fallback_training_ready"
-    assert plan.max_batches == config.train_batches_per_trigger
-    assert plan.training_group_id == "sync-fallback"
-
-    event = scheduler.on_before_actor_update(
-        BeforeActorUpdateContext(
-            schedule_context=_context(),
-            config=config,
-        )
-    )
-
-    assert event.metrics is not None
-    assert event.metrics["bubble/sync_fallback_requested"] == 1
-    assert event.metrics["bubble/sync_fallback_launched"] == 1
-    assert event.metrics["bubble/sync_fallback_batches"] == (
-        config.train_batches_per_trigger
-    )
-
-
-def test_idle_worker_starvation_guard_is_disabled_for_background_poll() -> None:
-    scheduler = _scheduler_with_statuses(("0", "1"))
-    scheduler.on_worker_event(
-        RolloutWorkerEvent(
-            RolloutWorkerEventType.GENERATION_STARTED,
-            worker_id="0",
-            replica_rank=0,
-        )
-    )
-    config = replace(
-        _auto_idle_config(1),
-        idle_worker_group_size=None,
-        idle_worker_fallback_to_sync=True,
-        max_steps_without_training=2,
-    )
-
-    plan = scheduler.prepare_training_plan(
-        _context(),
-        config,
-        allow_sync_fallback=False,
-    )
-
-    assert not plan.launch
-    assert plan.reason == "missing_training_group_metadata"
-
-
-def test_sync_fallback_training_outcome_reports_bubble_metrics() -> None:
-    state = DrafterRuntimeState()
-    plan = TrainingPlan(
-        launch=True,
-        reason="sync_fallback_training_ready",
-        interval_matched=True,
-        execution_strategy=DrafterExecutionStrategy.SYNC,
-        source_global_step=10,
-        max_batches=1,
-        publish_after_success=True,
-        data_version=10,
-        required_target_version=10,
-        plan_id="fallback-plan",
-        worker_snapshots={
-            "0": {
-                "buffer_version": 1,
-                "data_version": 10,
-                "worker_incarnation": "worker-0",
-                "trainable_samples": 5,
-            }
-        },
-    )
-    state.submit(plan, started_at=time.time())
-    state.mark_running()
-
-    outcome = TrainingOutcome.from_execution(
-        ExecutionOutcome(
-            raw_results=[
-                {
-                    "trained": True,
-                    "triggered": True,
-                    "source_global_step": 10,
-                    "execution_strategy": "sync",
-                    "attempted_steps": 1,
-                    "successful_steps": 1,
-                    "optimizer_step": 1,
-                    "buffer_size_before": 5,
-                    "buffer_size_after": 4,
-                    "elapsed_sec": 0.5,
-                    "reason": "trained",
-                    "publish_snapshot_cached": True,
-                    "worker_id": "0",
-                    "worker_incarnation": "worker-0",
-                    "plan_id": "fallback-plan",
-                    "data_version": 10,
-                    "target_version": 10,
-                    "is_publish_leader": True,
-                }
-            ],
-            elapsed_sec=0.5,
-        ),
-        runtime_state=state,
-        plan=plan,
-    )
-
-    assert outcome.trained
-    assert outcome.metrics["drafter/trained_any"] == 1
-    assert outcome.metrics["drafter/sync_fallback_trained"] == 1
-    assert outcome.metrics["bubble/sync_fallback_completed"] == 1
-    assert outcome.metrics["bubble/sync_fallback_successful_steps"] == 1
-    assert outcome.metrics["bubble/sync_fallback_elapsed_s"] == 0.5
-
-
 def test_forced_completion_metrics_are_blocking_not_async_work() -> None:
     state = DrafterRuntimeState()
     plan = TrainingPlan(
@@ -2256,26 +2115,6 @@ def test_forced_completion_metrics_are_blocking_not_async_work() -> None:
     assert "timing_s/drafter_async_training_work" not in outcome.metrics
 
 
-def test_idle_worker_starvation_guard_config_from_nested_mapping() -> None:
-    config = DrafterScheduleConfig.from_mapping(
-        {
-            "max_steps_without_training": 20,
-            "scheduler": {
-                "idle_worker": {
-                    "fallback_to_sync": True,
-                    "max_seconds_without_training": 60.5,
-                    "require_runtime_idle_events": True,
-                },
-            },
-        }
-    )
-
-    assert config.idle_worker_fallback_to_sync is True
-    assert config.idle_worker_require_runtime_idle_events is True
-    assert config.max_steps_without_training == 20
-    assert config.idle_worker_max_seconds_without_training == 60.5
-
-
 def test_scheduler_duplicate_tuning_subtrees_do_not_override_training_fields() -> None:
     config = DrafterScheduleConfig.from_mapping(
         {
@@ -2288,7 +2127,6 @@ def test_scheduler_duplicate_tuning_subtrees_do_not_override_training_fields() -
             "max_collect_samples_per_step_per_replica": 6,
             "max_collect_tokens_per_step_per_replica": 7,
             "min_trainable_batches": 8,
-            "max_steps_without_training": 9,
             "require_full_batch": False,
             "sample_last_n_steps": 10,
             "scheduler": {
@@ -2301,7 +2139,6 @@ def test_scheduler_duplicate_tuning_subtrees_do_not_override_training_fields() -
                 "trigger": {
                     "interval_steps": 30,
                     "min_trainable_batches": 80,
-                    "max_steps_without_training": 90,
                 },
                 "budget": {
                     "max_batches": 50,
@@ -2325,7 +2162,6 @@ def test_scheduler_duplicate_tuning_subtrees_do_not_override_training_fields() -
     assert config.max_collect_samples_per_replica == 6
     assert config.max_collect_tokens_per_replica == 7
     assert config.min_trainable_batches == 8
-    assert config.max_steps_without_training == 9
     assert config.require_full_batch is False
     assert config.sample_last_n_steps == 10
 
@@ -2934,6 +2770,77 @@ def test_trainer_can_skip_reclaim_drain_when_configured() -> None:
     assert metrics == {"bubble/reclaim_requested": 1}
     assert events == [("worker-0", "worker-1")]
     assert drain_calls == []
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_post_generation_event_drain_never_launches_new_training() -> None:
+    trainer = _trainer_with_idle_config()
+    trainer._speco_drain_rollout_idle_events = lambda: {
+        "bubble/runtime_worker_events_drained": 1
+    }
+    trainer._speco_try_launch_rollout_idle_training = lambda: pytest.fail(
+        "post-generation event drain must not launch drafter training"
+    )
+    trainer._speco_record_rollout_idle_metrics = lambda metrics: None
+
+    metrics = trainer._speco_service_rollout_idle_events(allow_launch=False)
+
+    assert metrics["bubble/post_generation_launch_suppressed"] == 1
+
+
+@pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
+def test_post_rollout_reclaim_hands_completion_to_safe_publish_callback() -> None:
+    trainer = _trainer_with_idle_config()
+    trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"][
+        "scheduler"
+    ]["idle_worker"]["drain_before_next_rollout"] = False
+    events = []
+    trainer._drafter_scheduler.bind_worker_executor(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: None,
+            resolve=lambda value: value,
+            inspect_data=lambda sample_last_n_steps, require_full_batch: [],
+            prepare=lambda plan: {},
+            activate=lambda: [],
+            preflight=lambda payload: [],
+            abort_preflight=lambda plan_id: [],
+            reclaim=lambda worker_ids: events.append(("reclaim", worker_ids)),
+        )
+    )
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=10,
+        max_batches=1,
+        publish_after_success=True,
+        target_worker_ids=("worker-0", "worker-1"),
+    )
+    outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=1,
+        raw_results=[],
+        elapsed_sec=0.1,
+        reason="completed",
+        metrics={},
+    )
+    trainer._drafter_runtime_state.submit(plan, started_at=time.time())
+    trainer._drafter_runtime_state.mark_running()
+    trainer._speco_wait_pending_drafter_training = lambda: (plan, outcome)
+
+    metrics = trainer._speco_reclaim_rollout_idle_workers_before_post_rollout(
+        on_completed=lambda completed_plan, completed_outcome: events.append(
+            ("completed", completed_plan, completed_outcome)
+        )
+        or {"bubble/deferred_publish_enqueued": 1}
+    )
+
+    assert events[0] == ("reclaim", ("worker-0", "worker-1"))
+    assert events[1] == ("completed", plan, outcome)
+    assert metrics["bubble/reclaim_drained"] == 1
+    assert metrics["bubble/deferred_publish_enqueued"] == 1
+    assert metrics["timing_s/drafter_critical_path_before_post_rollout"] >= 0.0
 
 
 def test_writer_failover_is_blocked_after_optimizer_state_exists() -> None:

@@ -279,7 +279,7 @@ def test_deferred_bubble_publish_drains_before_next_generation() -> None:
     trainer._speco_emit_rollout_generation_started = lambda: {}
     trainer._speco_start_rollout_idle_event_loop = lambda: (None, None)
     trainer._speco_stop_rollout_idle_event_loop = lambda *args: None
-    trainer._speco_service_rollout_idle_events = lambda: {}
+    trainer._speco_service_rollout_idle_events = lambda **kwargs: {}
     trainer._speco_emit_rollout_generation_completed = lambda output: {}
     trainer._speco_store_rollout_metrics = lambda output: None
     trainer._speco_collect_generation_samples = lambda output: 0
