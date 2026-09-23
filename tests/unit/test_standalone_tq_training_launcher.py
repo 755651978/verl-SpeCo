@@ -238,7 +238,8 @@ def test_pipeline_commands_hide_and_replace_tq_overrides() -> None:
         "vllm_endpoints=[http://127.0.0.1:8000/v1]" in item
         for item in commands.producer
     )
-    assert any("max_samples=40" in item for item in commands.producer)
+    # 10 steps * default batch_size_per_gpu=4 * 8 GPUs * 1 node.
+    assert any("max_samples=320" in item for item in commands.producer)
 
 
 def test_pipeline_commands_pass_all_external_vllm_endpoints_to_producer() -> None:
