@@ -49,8 +49,10 @@ from verl_speco.integration.sglang_adapter import (
 )
 from verl_speco.integration.rollout_idle_events import (
     SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
+    acquire_rollout_resource_lease,
     emit_rollout_drafter_sample,
     emit_rollout_idle_event,
+    release_rollout_resource_lease,
 )
 from verl_speco.trainer.scheduler import (
     CollectionPlan,
@@ -206,6 +208,21 @@ def _rollout_idle_worker_id_for_replica(
     if 0 <= int(replica_rank) < len(flattened):
         return flattened[int(replica_rank)]
     return str(replica_rank)
+
+
+def _rollout_idle_worker_ids_for_replica(
+    drafter_cfg: dict[str, Any],
+    replica_rank: int,
+) -> tuple[str, ...]:
+    """Resolve the complete colocated training group owned by a replica."""
+
+    idle_cfg = _rollout_idle_worker_config(drafter_cfg)
+    groups = idle_cfg.get("training_groups") or []
+    if 0 <= int(replica_rank) < len(groups):
+        group = tuple(str(worker_id) for worker_id in groups[int(replica_rank)] or ())
+        if group:
+            return group
+    return (_rollout_idle_worker_id_for_replica(drafter_cfg, replica_rank),)
 
 
 def _emit_rollout_idle_worker_event(
@@ -1750,24 +1767,67 @@ class _SpecoSGLangHttpServerMixin:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
     ):
-        skip_rollout_idle_event = bool(
-            sampling_params.get(
-                "_verl_skip_rollout_idle_event",
-                sampling_params.get("_verl_skip_drafter_collection", False),
-            )
-        )
         drafter_cfg = self._speco_drafter_cfg()
-        active_requests = int(getattr(self, "_speco_rollout_active_requests", 0) or 0)
-        self._speco_rollout_active_requests = active_requests + 1
-        if not skip_rollout_idle_event:
-            self._speco_rollout_cycle_reported = True
-        if not skip_rollout_idle_event and active_requests == 0:
-            self._speco_rollout_release_verified = True
-            _emit_rollout_idle_worker_event(
-                drafter_cfg=drafter_cfg,
-                replica_rank=int(self.replica_rank),
-                event_type="GENERATION_STARTED",
+        replica_rank = int(self.replica_rank)
+        lease_lock = getattr(self, "_speco_rollout_lease_lock", None)
+        if lease_lock is None:
+            lease_lock = asyncio.Lock()
+            self._speco_rollout_lease_lock = lease_lock
+        async with lease_lock:
+            active_requests = int(
+                getattr(self, "_speco_rollout_active_requests", 0) or 0
             )
+            # Collection may be disabled for validation/quota backpressure,
+            # but those requests still use the same rollout devices and must
+            # participate in the resource lease.
+            self._speco_rollout_cycle_reported = True
+            if active_requests == 0:
+                self._speco_rollout_release_verified = True
+                bus_name = _rollout_idle_event_bus_name(drafter_cfg)
+                lease_workers = _rollout_idle_worker_ids_for_replica(
+                    drafter_cfg,
+                    replica_rank,
+                )
+                lease_acquired, lease_wait_s = await acquire_rollout_resource_lease(
+                    bus_name,
+                    worker_ids=lease_workers,
+                    event={
+                        "worker_id": _rollout_idle_worker_id_for_replica(
+                            drafter_cfg, replica_rank
+                        ),
+                        "replica_rank": replica_rank,
+                        "memory_released": False,
+                        "idle_confidence": "confirmed",
+                        "release_source": "runtime_request_started",
+                    },
+                )
+                self._speco_rollout_resource_lease_active = lease_acquired
+                self._speco_rollout_resource_lease_workers = lease_workers
+                if lease_acquired:
+                    logger.warning(
+                        "[BubbleTime] rollout_resource_lease_acquired "
+                        "runtime=sglang replica_rank=%s workers=%s wait_s=%.4f",
+                        replica_rank,
+                        lease_workers,
+                        lease_wait_s,
+                    )
+                else:
+                    # Compatibility fallback for an event bus created by an
+                    # older process. Such events remain speculative and cannot
+                    # admit training without the atomic lease protocol.
+                    logger.warning(
+                        "[BubbleTime] rollout_resource_lease_unavailable "
+                        "runtime=sglang replica_rank=%s workers=%s "
+                        "fallback=speculative_event",
+                        replica_rank,
+                        lease_workers,
+                    )
+                    _emit_rollout_idle_worker_event(
+                        drafter_cfg=drafter_cfg,
+                        replica_rank=replica_rank,
+                        event_type="GENERATION_STARTED",
+                    )
+            self._speco_rollout_active_requests = active_requests + 1
         request_completed = False
         try:
             output = await self._speco_generate_request(
@@ -1782,29 +1842,76 @@ class _SpecoSGLangHttpServerMixin:
         finally:
             if not request_completed:
                 self._speco_rollout_release_verified = False
-            remaining_requests = max(
-                int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
-                0,
-            )
-            self._speco_rollout_active_requests = remaining_requests
-            cycle_reported = bool(getattr(self, "_speco_rollout_cycle_reported", False))
-            if cycle_reported and remaining_requests == 0:
-                release_verified = bool(
-                    getattr(self, "_speco_rollout_release_verified", False)
+            async with lease_lock:
+                remaining_requests = max(
+                    int(getattr(self, "_speco_rollout_active_requests", 1) or 1)
+                    - 1,
+                    0,
                 )
-                _emit_rollout_idle_worker_event(
-                    drafter_cfg=drafter_cfg,
-                    replica_rank=int(self.replica_rank),
-                    event_type="WORKER_IDLE",
-                    memory_released=release_verified,
-                    release_source=(
-                        "runtime_request_finalized"
-                        if release_verified
-                        else "runtime_request_failed"
-                    ),
+                self._speco_rollout_active_requests = remaining_requests
+                cycle_reported = bool(
+                    getattr(self, "_speco_rollout_cycle_reported", False)
                 )
-                self._speco_rollout_cycle_reported = False
-                self._speco_rollout_release_verified = False
+                if cycle_reported and remaining_requests == 0:
+                    release_verified = bool(
+                        getattr(self, "_speco_rollout_release_verified", False)
+                    )
+                    lease_active = bool(
+                        getattr(self, "_speco_rollout_resource_lease_active", False)
+                    )
+                    released = False
+                    if lease_active:
+                        released = await release_rollout_resource_lease(
+                            _rollout_idle_event_bus_name(drafter_cfg),
+                            worker_ids=tuple(
+                                getattr(
+                                    self,
+                                    "_speco_rollout_resource_lease_workers",
+                                    (),
+                                )
+                            ),
+                            event={
+                                "worker_id": _rollout_idle_worker_id_for_replica(
+                                    drafter_cfg, replica_rank
+                                ),
+                                "replica_rank": replica_rank,
+                                "memory_released": release_verified,
+                                "release_source": (
+                                    "runtime_request_finalized"
+                                    if release_verified
+                                    else "runtime_request_failed"
+                                ),
+                            },
+                        )
+                    if not released:
+                        if lease_active:
+                            logger.warning(
+                                "[BubbleTime] rollout_resource_lease_release_failed "
+                                "runtime=sglang replica_rank=%s workers=%s "
+                                "fallback=speculative_event",
+                                replica_rank,
+                                tuple(
+                                    getattr(
+                                        self,
+                                        "_speco_rollout_resource_lease_workers",
+                                        (),
+                                    )
+                                ),
+                            )
+                        _emit_rollout_idle_worker_event(
+                            drafter_cfg=drafter_cfg,
+                            replica_rank=replica_rank,
+                            event_type="WORKER_IDLE",
+                            memory_released=release_verified,
+                            release_source=(
+                                "runtime_request_finalized"
+                                if release_verified
+                                else "runtime_request_failed"
+                            ),
+                        )
+                    self._speco_rollout_resource_lease_active = False
+                    self._speco_rollout_cycle_reported = False
+                    self._speco_rollout_release_verified = False
 
     async def _speco_generate_request(
         self,

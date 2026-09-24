@@ -216,6 +216,105 @@ def test_bubble_collection_is_single_flight_until_quota_completes() -> None:
     assert scheduler._training_quota_debt_steps == 20
 
 
+def test_adaptive_quota_keeps_full_target_but_skips_healthy_refresh() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(
+        collect_interval_steps=2,
+        training_interval_steps=4,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_trigger_mode="adaptive",
+        training_quota_acceptance_drop_ratio=0.03,
+        training_quota_min_refresh_interval_steps=2,
+        training_quota_max_refresh_interval_steps=10,
+    )
+    first = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=2,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    scheduler.record_collection_outcome(
+        first,
+        SimpleNamespace(collected=True),
+        config,
+    )
+
+    assert first.collect
+    assert scheduler._training_quota_debt_steps == 20
+
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_data_version = None
+    scheduler.record_training_quota_publish_completed(global_step=4)
+    scheduler.record_step_metrics(
+        {"drafter/spec_decode/mean_acceptance_length": 3.5},
+        config,
+        global_step=5,
+    )
+    healthy = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=6,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert not healthy.collect
+    assert healthy.reason == "quality_refresh_not_due"
+
+    scheduler.record_step_metrics(
+        {"drafter/spec_decode/mean_acceptance_length": 3.3},
+        config,
+        global_step=7,
+    )
+    degraded = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=8,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert degraded.collect
+    assert degraded.reason == "collection_enabled"
+
+
+def test_adaptive_quota_forces_refresh_at_maximum_age() -> None:
+    scheduler = DrafterScheduler()
+    config = DrafterScheduleConfig(
+        collect_interval_steps=2,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        training_quota_enable=True,
+        training_quota_trigger_mode="adaptive",
+        training_quota_min_refresh_interval_steps=2,
+        training_quota_max_refresh_interval_steps=6,
+    )
+    scheduler._quality_last_publish_step = 4
+    scheduler._quality_acceptance_baseline = 3.5
+    scheduler._quality_latest_acceptance = 3.5
+
+    before_max_age = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=8,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+    at_max_age = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=10,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        config,
+    )
+
+    assert not before_max_age.collect
+    assert before_max_age.reason == "quality_refresh_not_due"
+    assert at_max_age.collect
+
+
 @pytest.mark.parametrize(
     ("context", "config", "reason"),
     [

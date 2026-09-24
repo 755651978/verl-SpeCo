@@ -293,24 +293,35 @@ actor_rollout_ref:
             strategy: sync
           # Optional hybrid Bubble quota. Each training interval creates one
           # quality target after data becomes trainable. Bubble work repays it
-          # first; old/large debt permits a small same-writer synchronous
-          # top-up at the next interval boundary. ``training.step`` remains the
+          # across real rollout-idle windows. ``training.step`` remains the
           # per-idle-window cap; target_steps is the per-cycle optimizer target.
           # Set target_steps=null only when intentionally reusing training.step.
           training_quota:
             enable: false
             target_steps: 20
-            # Start bounded serial assistance one step after the cycle
-            # boundary, while Bubble work continues to take priority.
+            # interval: strict Bubble-vs-Sync equivalence experiment.
+            # adaptive: production mode; each selected refresh still executes
+            # all 20 optimizer steps on one immutable data version.
+            trigger_mode: adaptive
+            acceptance_drop_ratio: 0.03
+            loss_increase_ratio: 0.10
+            min_refresh_interval_steps: 2
+            # A forced refresh prevents a healthy accept-length signal from
+            # leaving the drafter permanently stale.
+            max_refresh_interval_steps: 10
+            # Age thresholds are also exported as observability metrics. They
+            # only permit serial assistance when the fallback below is enabled.
             max_debt_age_steps: 1
-            # Never leave an unpublished cycle waiting indefinitely for its
-            # final Bubble. At this lag, finish the exact remaining quota and
-            # publish, even if the fallback must enter the critical path.
+            # With critical-path fallback enabled, this is the hard completion
+            # deadline. Production mode leaves debt pending for later bubbles.
             max_completion_lag_steps: 3
             max_accumulated_debt: 20
-            # Before the hard lag, serial work is assistance only and leaves
-            # final completion to Bubble. The hard lag may override this cap.
+            # Used only when critical-path fallback is explicitly enabled.
             max_sync_topup_steps: 2
+            # Production Bubble must not borrow PPO/rollout critical-path
+            # resources. Set true only for strict freshness experiments that
+            # explicitly accept Sync-like blocking completion.
+            allow_critical_path_fallback: false
           idle_worker:
             require_memory_released: true
             drain_before_next_rollout: true
@@ -329,6 +340,11 @@ actor_rollout_ref:
             # rollout may keep serving an older drafter version.
             max_publish_lag_steps: 2
             max_pending_publish: 1
+            # Repeated per-token generation slowdown means the predicted idle
+            # window was unsafe. Pause new Bubble launches briefly instead of
+            # continuing to interfere at a one-batch cap.
+            gen_slowdown_patience: 2
+            gen_slowdown_cooldown_steps: 2
             # Explicit training_groups wins.  With group_mode=auto, the
             # scheduler forms stable collective groups from known rollout
             # workers and only trains when a full group is idle.

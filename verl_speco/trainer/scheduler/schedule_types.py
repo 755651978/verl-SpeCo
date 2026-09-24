@@ -142,17 +142,32 @@ class DrafterScheduleConfig:
     idle_worker_dynamic_batch_cap: bool = True
     idle_worker_initial_dynamic_batches: int | None = None
     idle_worker_gen_slowdown_threshold: float = 0.08
+    idle_worker_gen_slowdown_patience: int = 2
+    idle_worker_gen_slowdown_cooldown_steps: int = 2
     gradient_accumulation_steps: int = 1
     # Optional hybrid quota for Bubble Time.  Each configured training interval
     # contributes ``target_steps`` optimizer steps once trainable data exists.
-    # Bubble execution repays the quota first. Bounded synchronous assistance
-    # reduces old debt; a hard lag eventually completes and publishes it.
+    # Bubble execution repays the quota first. Optional critical-path fallback
+    # exists for compatibility, but production isolation keeps it disabled.
     training_quota_enable: bool = False
     training_quota_target_steps: int | None = 20
     training_quota_max_debt_age_steps: int = 1
     training_quota_max_completion_lag_steps: int = 3
     training_quota_max_accumulated_debt: int = 20
     training_quota_max_sync_topup_steps: int = 2
+    # ``interval`` is the strict Sync-equivalence mode: every eligible
+    # interval receives the full quota. ``adaptive`` keeps the exact same
+    # quota size and data-version semantics, but opens a new quota only when
+    # speculative-decoding quality drops or the maximum refresh age expires.
+    training_quota_trigger_mode: str = "interval"
+    training_quota_acceptance_drop_ratio: float = 0.03
+    training_quota_loss_increase_ratio: float = 0.10
+    training_quota_min_refresh_interval_steps: int = 2
+    training_quota_max_refresh_interval_steps: int = 10
+    # Critical-path completion is useful as a compatibility fallback, but it
+    # defeats Bubble Time's resource-isolation contract. Production Bubble
+    # configurations should leave this disabled.
+    training_quota_allow_critical_path_fallback: bool = True
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -260,6 +275,12 @@ class DrafterScheduleConfig:
                 float(idle_get("gen_slowdown_threshold", 0.08) or 0.0),
                 0.0,
             ),
+            idle_worker_gen_slowdown_patience=max(
+                int(idle_get("gen_slowdown_patience", 2) or 1), 1
+            ),
+            idle_worker_gen_slowdown_cooldown_steps=max(
+                int(idle_get("gen_slowdown_cooldown_steps", 2) or 0), 0
+            ),
             gradient_accumulation_steps=max(
                 int(get("gradient_accumulation_steps", 1) or 1), 1
             ),
@@ -278,6 +299,28 @@ class DrafterScheduleConfig:
             ),
             training_quota_max_sync_topup_steps=max(
                 int(training_quota_get("max_sync_topup_steps", 2) or 0), 0
+            ),
+            training_quota_trigger_mode=str(
+                training_quota_get("trigger_mode", "interval") or "interval"
+            )
+            .strip()
+            .lower(),
+            training_quota_acceptance_drop_ratio=max(
+                float(training_quota_get("acceptance_drop_ratio", 0.03) or 0.0),
+                0.0,
+            ),
+            training_quota_loss_increase_ratio=max(
+                float(training_quota_get("loss_increase_ratio", 0.10) or 0.0),
+                0.0,
+            ),
+            training_quota_min_refresh_interval_steps=max(
+                int(training_quota_get("min_refresh_interval_steps", 2) or 0), 0
+            ),
+            training_quota_max_refresh_interval_steps=max(
+                int(training_quota_get("max_refresh_interval_steps", 10) or 0), 0
+            ),
+            training_quota_allow_critical_path_fallback=bool(
+                training_quota_get("allow_critical_path_fallback", True)
             ),
         )
 
@@ -340,6 +383,7 @@ class CollectionPlan:
         "buffer_target_reached": 8,
         "writer_state_migration_required": 9,
         "training_quota_incomplete": 10,
+        "quality_refresh_not_due": 11,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -596,6 +640,7 @@ class TrainingPlan:
         "quota_topup_lm_head_prefetch_pending": 28,
         "quota_forced_completion_ready": 29,
         "training_quota_publish_pending": 30,
+        "generation_slowdown_cooldown": 31,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
