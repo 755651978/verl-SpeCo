@@ -4,9 +4,73 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from types import MethodType, SimpleNamespace
 
 import pytest
+
+
+def test_dflash_lm_head_rows_prefer_newer_collected_version_when_step_lags() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="drafter row selection needs the trainer dependency stack",
+    )
+    torch = pytest.importorskip("torch")
+    trainer = base_trainer.DrafterBaseTrainer.__new__(
+        base_trainer.DrafterBaseTrainer
+    )
+    trainer.backend = SimpleNamespace(model_type="dflash")
+    trainer.current_rl_step = 1
+    trainer.use_data_buffer = False
+    trainer.data_buffer = []
+    trainer.collected_data = deque(
+        [
+            {"step": 1, "target_version": 1, "input_ids": torch.tensor([[1, 2]])},
+            {"step": 2, "target_version": 2, "input_ids": torch.tensor([[7, 8]])},
+            {"step": 2, "target_version": 2, "input_ids": torch.tensor([[8, 9]])},
+        ]
+    )
+    trainer._block_drafter_config_value = (
+        lambda suffix, default: "restricted_ce" if suffix == "loss_mode" else default
+    )
+    trainer._target_lm_head_vocab_size = lambda: 100
+
+    rows = trainer._build_target_lm_head_row_indices_from_dflash_data()
+
+    assert rows is not None
+    assert rows["selected_rows"] == 3
+    assert rows["row_indices"].tolist() == [7, 8, 9]
+
+
+def test_dflash_lm_head_rows_fall_back_to_latest_collected_version() -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="drafter row selection needs the trainer dependency stack",
+    )
+    torch = pytest.importorskip("torch")
+    trainer = base_trainer.DrafterBaseTrainer.__new__(
+        base_trainer.DrafterBaseTrainer
+    )
+    trainer.backend = SimpleNamespace(model_type="dflash")
+    trainer.current_rl_step = 1
+    trainer.use_data_buffer = False
+    trainer.data_buffer = []
+    trainer.collected_data = deque(
+        [
+            {"step": 2, "target_version": 2, "input_ids": torch.tensor([[7, 8]])},
+            {"step": 2, "target_version": 2, "input_ids": torch.tensor([[8, 9]])},
+        ]
+    )
+    trainer._block_drafter_config_value = (
+        lambda suffix, default: "restricted_ce" if suffix == "loss_mode" else default
+    )
+    trainer._target_lm_head_vocab_size = lambda: 100
+
+    rows = trainer._build_target_lm_head_row_indices_from_dflash_data()
+
+    assert rows is not None
+    assert rows["selected_rows"] == 3
+    assert rows["row_indices"].tolist() == [7, 8, 9]
 
 
 def test_single_micro_batch_bubble_reservation_is_replayed_until_finalize() -> None:

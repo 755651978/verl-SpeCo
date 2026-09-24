@@ -493,6 +493,7 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
     if row_indices_cpu is None or int(row_indices_cpu.numel()) <= 0:
         return None
 
+    last_error: Exception | None = None
     for module in _actor_module_candidates(worker):
         selected_name, selected_weight = _select_lm_head_named_tensor(module)
         if selected_weight is None:
@@ -504,10 +505,18 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
                 or int(row_indices_cpu.min().item()) < 0
             ):
                 continue
-            rows_on_device = row_indices_cpu.to(
-                device=selected_weight.device, dtype=torch.long
-            )
-            selected_rows = selected_weight.detach().index_select(0, rows_on_device)
+            if callable(getattr(selected_weight, "to_local", None)):
+                selected_rows = _materialize_veomni_lm_head_rows(
+                    selected_weight,
+                    row_indices_cpu,
+                )
+            else:
+                rows_on_device = row_indices_cpu.to(
+                    device=selected_weight.device, dtype=torch.long
+                )
+                selected_rows = selected_weight.detach().index_select(
+                    0, rows_on_device
+                )
             if getattr(worker, "rank", None) != 0:
                 return {"_speco_non_owner_direct_sparse": True}
             weight = selected_rows.to(device="cpu", dtype=torch.bfloat16).contiguous()
@@ -529,10 +538,13 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
                 "export_strategy": "direct_sparse",
             }
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Direct sparse lm_head export failed for %s: %s", selected_name, exc
-            )
+            last_error = exc
             continue
+    if last_error is not None:
+        logger.warning(
+            "[actor lm_head export] direct_sparse_unavailable reason=%s",
+            last_error,
+        )
     return None
 
 

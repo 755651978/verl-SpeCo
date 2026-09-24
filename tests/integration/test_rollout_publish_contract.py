@@ -357,6 +357,38 @@ def test_veomni_lm_head_export_avoids_full_engine_state_dict(
     assert tuple(payload["weight"].shape) == (expected_rows, 3)
 
 
+def test_dflash_lm_head_sparse_export_avoids_full_engine_state_dict() -> None:
+    torch = pytest.importorskip("torch")
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = torch.nn.Linear(3, 6, bias=False)
+
+    class _Engine:
+        module = _Module()
+
+        @staticmethod
+        def get_per_tensor_param(**kwargs):
+            raise AssertionError("Sparse lm_head export must not enumerate full params")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={"rollout": {"drafter": {"speculative_algorithm": "DFLASH"}}},
+        actor=SimpleNamespace(engine=_Engine()),
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(
+        worker,
+        row_indices=[1, 4],
+    )
+
+    assert payload["export_strategy"] == "direct_sparse"
+    assert payload["selected_rows"] == 2
+    assert tuple(payload["weight"].shape) == (2, 3)
+
+
 def test_veomni_runtime_validation_checks_initialized_model_contract() -> None:
     torch = pytest.importorskip("torch")
 

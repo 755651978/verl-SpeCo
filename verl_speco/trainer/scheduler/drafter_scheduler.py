@@ -474,14 +474,25 @@ class DrafterScheduler:
 
         Returning ``None`` preserves the legacy/sync broadcast behavior.  In
         Bubble replica-local mode, keep the heavy target head cache limited to
-        the single writer group.  This prevents multiple independent
-        replica-local optimizer/model states from publishing over each other.
+        the single writer group once a writer lease exists.  Before the first
+        lease, cache all legal candidates so the earliest genuinely idle group
+        can become the writer without fetching the live actor head from inside
+        the rollout bubble.
         """
 
         groups: list[tuple[str, ...]] = []
         writer_group = self._current_idle_writer_group(assign_default=False)
         if writer_group is not None:
             groups.append(writer_group)
+        elif self._metadata_idle_training_groups:
+            groups.extend(
+                normalized
+                for group in self._metadata_idle_training_groups
+                if (
+                    normalized := _normalize_worker_id_group(group)
+                )
+                and normalized not in self._disabled_replica_local_idle_groups
+            )
         if not groups:
             for group in self._metadata_idle_training_groups:
                 normalized = _normalize_worker_id_group(group)
@@ -1421,11 +1432,17 @@ class DrafterScheduler:
                 seen_full_collective_groups.add(fallback_group)
             if training_ranks in self._disabled_replica_local_idle_groups:
                 continue
-            full_group = _normalize_worker_id_group(
-                record.get("full_collective_ranks", ())
-            )
-            if not full_group:
+            idle_collective_scope = str(
+                record.get("idle_collective_scope", "") or ""
+            ).strip().lower()
+            if idle_collective_scope == "replica_local":
                 full_group = training_ranks
+            else:
+                full_group = _normalize_worker_id_group(
+                    record.get("full_collective_ranks", ())
+                )
+                if not full_group:
+                    full_group = training_ranks
             if full_group and full_group not in seen_groups:
                 full_groups.append(full_group)
                 seen_groups.add(full_group)
@@ -1468,10 +1485,23 @@ class DrafterScheduler:
         }
 
     def idle_worker_metrics(self) -> dict[str, float | int]:
+        complete_groups = 0
+        for group in self._metadata_idle_training_groups:
+            worker_ids = _normalize_worker_id_group(group)
+            if worker_ids and all(
+                (
+                    state := self._idle_workers.get(worker_id)
+                ) is not None
+                and state.status == "idle"
+                and state.memory_released
+                for worker_id in worker_ids
+            ):
+                complete_groups += 1
         return {
             "bubble/idle_workers": sum(
                 int(state.status == "idle") for state in self._idle_workers.values()
-            )
+            ),
+            "bubble/idle_training_groups": complete_groups,
         }
 
     def rollout_idle_replica_ranks(self) -> tuple[int, ...]:
@@ -1647,22 +1677,7 @@ class DrafterScheduler:
         writer_group = self._current_idle_writer_group(assign_default=False)
         writer_has_private_state = (
             writer_group is not None
-            and (
-                self._idle_worker_writer_state_version is not None
-                # Prewarming makes this group the only one with a resident
-                # training model. Migrating to a cold peer before the first
-                # optimizer step turns an idle window into a long activation
-                # stall and can expire the entire Bubble budget.
-                or writer_group in self._idle_worker_hot_prewarmed_groups
-                # Bubble collection is single-writer. Pin that data owner as
-                # soon as a quota exists, before the first optimizer step;
-                # otherwise an earlier-idle peer can steal the writer lease
-                # and inspect an empty buffer.
-                or (
-                    self._training_quota_debt_steps > 0
-                    and self._training_quota_data_version is not None
-                )
-            )
+            and self._idle_worker_writer_state_version is not None
         )
         for index, group in enumerate(groups):
             group = _normalize_worker_id_group(group)
@@ -1758,6 +1773,15 @@ class DrafterScheduler:
                 config,
                 worker_ids=group,
             )
+            if (
+                source == "historical_observed"
+                and historical_window is not None
+                and historical_window < min_idle_window_sec
+                and config.training_quota_enable
+                and self._training_quota_debt_steps > 0
+            ):
+                minimum_window = min_idle_window_sec
+                source = "quota_bootstrap_minimum"
             if minimum_window < min_idle_window_sec:
                 window_too_small_seen = True
                 logger.warning(
@@ -1789,6 +1813,7 @@ class DrafterScheduler:
                     worker_ids=group,
                     minimum_idle_window_sec=minimum_window,
                     idle_confidence=group_confidence,
+                    idle_window_source=source,
                 )
                 if (
                     best_small_window is None
@@ -1896,6 +1921,7 @@ class DrafterScheduler:
                 worker_ids=chosen_group,
                 minimum_idle_window_sec=chosen_window,
                 idle_confidence=chosen_confidence,
+                idle_window_source=chosen_source,
             )
         reason = (
             "incomplete_training_group"
@@ -2841,6 +2867,10 @@ class DrafterScheduler:
                 - tail_reserve_sec,
                 0.0,
             )
+            has_hard_runtime_deadline = (
+                getattr(resources, "idle_window_source", "runtime_deadline")
+                == "runtime_deadline"
+            )
             window_batches = int(
                 math.floor(usable_window / optimizer_step_estimate)
             )
@@ -2878,7 +2908,11 @@ class DrafterScheduler:
             budget = TrainingBudget(
                 max_batches=max_batches,
                 min_batches=budget.min_batches,
-                deadline_ts=time.time() + worker_deadline_window,
+                deadline_ts=(
+                    time.time() + worker_deadline_window
+                    if has_hard_runtime_deadline
+                    else None
+                ),
                 require_full_batch=budget.require_full_batch,
                 sample_last_n_steps=budget.sample_last_n_steps,
                 reason=idle_budget_reason,
@@ -2899,8 +2933,8 @@ class DrafterScheduler:
                 "admission_window_batches=%s trainable_batches=%s replay_seed_available=%s "
                 "trainable_micro_batches=%s gradient_accumulation_steps=%s "
                 "dynamic_train_batch_cap=%s hard_train_batch_cap=%s sync_budget_batches=%s "
-                "planned_batches=%s window_mode=%s reason=%s estimate_source=%s "
-                "prebatch_reclaim_streak=%s",
+                "planned_batches=%s window_mode=%s reason=%s window_source=%s "
+                "estimate_source=%s prebatch_reclaim_streak=%s",
                 context.global_step,
                 resources.training_group_id,
                 resources.worker_ids,
@@ -2925,6 +2959,7 @@ class DrafterScheduler:
                 max_batches,
                 "admission",
                 budget.reason,
+                getattr(resources, "idle_window_source", "runtime_deadline"),
                 (
                     "bootstrap"
                     if self._idle_batch_estimate_is_bootstrap(config)
@@ -2961,6 +2996,7 @@ class DrafterScheduler:
                 f"planned_valid_tokens={planned_valid_tokens} "
                 f"planned_batches={max_batches} window_mode=admission "
                 f"reason={budget.reason} "
+                f"window_source={getattr(resources, 'idle_window_source', 'runtime_deadline')} "
                 "prebatch_reclaim_streak="
                 f"{self._idle_worker_prebatch_reclaim_streak}",
                 flush=True,
@@ -3050,6 +3086,11 @@ class DrafterScheduler:
                 self._effective_idle_reclaim_penalty_sec()
                 if resources is not None
                 else None
+            ),
+            "idle_window_source": (
+                getattr(resources, "idle_window_source", "runtime_deadline")
+                if resources is not None
+                else ""
             ),
             "idle_window_batches": (
                 int(

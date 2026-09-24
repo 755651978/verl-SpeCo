@@ -86,6 +86,10 @@ class AvailableTrainingResources:
     worker_ids: tuple[str, ...] = ()
     minimum_idle_window_sec: float = 0.0
     idle_confidence: IdleWindowConfidence = IdleWindowConfidence.CONFIRMED
+    # Where the window came from.  ``runtime_deadline`` is a hard runtime
+    # boundary; bootstrap/historical windows are estimates protected by the
+    # rollout-training lease and cooperative reclaim.
+    idle_window_source: str = ""
 
 
 class DrafterCollectionSource(str, Enum):
@@ -605,6 +609,7 @@ class TrainingPlan:
     idle_tail_reserve_sec: float | None = None
     idle_reclaim_penalty_sec: float | None = None
     idle_trainable_batches: int | None = None
+    idle_window_source: str = ""
     idle_confidence: IdleWindowConfidence = IdleWindowConfidence.SPECULATIVE
     gradient_accumulation_steps: int = 1
     planned_optimizer_steps: int = 0
@@ -666,6 +671,7 @@ class TrainingPlan:
             "idle_startup_reserve_sec": self.idle_startup_reserve_sec,
             "idle_tail_reserve_sec": self.idle_tail_reserve_sec,
             "idle_reclaim_penalty_sec": self.idle_reclaim_penalty_sec,
+            "idle_window_source": self.idle_window_source,
             "idle_confidence": self.idle_confidence.value,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "planned_optimizer_steps": self.planned_optimizer_steps,

@@ -1623,8 +1623,17 @@ class SpecoWorker(Worker):
             # boundary after reserving cleanup/tail time.  Requiring the tail
             # again here rejects otherwise valid windows by double-counting it.
             required_remaining_sec = startup_reserve_sec + batch_estimate_sec
+            # Ray dispatch and Python scheduling can consume a few milliseconds
+            # between the trainer-side admission decision and this worker-side
+            # preflight.  Treat tiny underflows as still admissible; the tail
+            # reserve plus cooperative reclaim remain the safety boundary.
+            deadline_tolerance_sec = min(
+                max(batch_estimate_sec * 0.10, 0.05),
+                0.25,
+            )
             if deadline_ts is not None and (
-                float(deadline_ts) - now_ts < required_remaining_sec
+                float(deadline_ts) - now_ts
+                < required_remaining_sec - deadline_tolerance_sec
             ):
                 remaining_sec = float(deadline_ts) - now_ts
                 result.update(
@@ -1868,8 +1877,13 @@ class SpecoWorker(Worker):
                 float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
                 0.0,
             )
+            deadline_tolerance_sec = min(
+                max(required_remaining_sec * 0.10, 0.05),
+                0.25,
+            )
             if deadline_ts is not None and (
-                float(deadline_ts) - now_ts < required_remaining_sec
+                float(deadline_ts) - now_ts
+                < required_remaining_sec - deadline_tolerance_sec
             ):
                 remaining_sec = float(deadline_ts) - now_ts
                 self.trainer.release_training_data_reservation(

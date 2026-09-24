@@ -2986,7 +2986,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         if not self._speco_rollout_idle_worker_enabled():
             return None
-        writer_group = self._speco_get_drafter_scheduler().idle_writer_group()
+        writer_group = self._speco_get_drafter_scheduler().target_lm_head_sync_worker_ids(
+            full_collective_fallback=bool(
+                self._speco_drafter_schedule_config().idle_worker_full_collective_fallback
+            )
+        )
         mapping = self._speco_owner_route_mapping()
         if not writer_group or not mapping:
             return None

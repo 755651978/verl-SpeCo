@@ -2289,10 +2289,39 @@ class DrafterBaseTrainer:
             items = self.data_buffer.get_data_from_last_n_steps(sample_last_n)
             if items:
                 return items
-        return [
+        # Bubble Time can append old-logprob collected samples with an explicit
+        # source ``step``/``target_version`` before the drafter worker's local
+        # ``current_rl_step`` has been advanced to that PPO step.  Do not let
+        # that transient bookkeeping skew disable row-restricted target-head
+        # sync; use the newest homogeneous collected version for row discovery.
+        versioned_items = [
             item
             for item in self.collected_data
-            if int(item.get("step", current_step)) == current_step
+            if item.get("target_version", item.get("step")) is not None
+        ]
+        if not versioned_items:
+            return [
+                item
+                for item in self.collected_data
+                if int(item.get("step", current_step)) == current_step
+            ]
+        newest_version = max(
+            int(item.get("target_version", item.get("step", current_step)))
+            for item in versioned_items
+        )
+        if newest_version <= current_step:
+            current_items = [
+                item
+                for item in self.collected_data
+                if int(item.get("step", current_step)) == current_step
+            ]
+            if current_items:
+                return current_items
+        return [
+            item
+            for item in versioned_items
+            if int(item.get("target_version", item.get("step", current_step)))
+            == newest_version
         ]
 
     def _build_target_lm_head_row_indices_from_dflash_data(
