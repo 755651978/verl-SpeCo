@@ -3261,6 +3261,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and self._speco_drafter_schedule_config().execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
         )
+        if bubble_prefetch:
+            target_version = int(self.global_steps)
+            pending = {
+                "stage": "fetch",
+                "fetch_refs": payload_refs,
+                "sync_started": sync_started,
+                "fetch_started": fetch_started,
+                "target_version": target_version,
+                "global_step": target_version,
+                "selected_rows": selected_rows,
+                "source_vocab_size": source_vocab_size,
+                "target_worker_ids": target_worker_ids,
+            }
+            return {
+                "drafter/target_lm_head_synced": 0,
+                "drafter/target_lm_head_selected_rows": selected_rows,
+                "drafter/target_lm_head_source_vocab_size": source_vocab_size,
+                "drafter/target_lm_head_target_workers": (
+                    len(target_worker_ids) if target_worker_ids is not None else 0
+                ),
+                "timing_s/drafter_target_lm_head_fetch_submit": (
+                    fetch_submit_elapsed
+                ),
+                "timing_s/drafter_target_lm_head_prefetch_submit_critical_path": (
+                    time.perf_counter() - sync_started
+                ),
+            }, pending
         # An ObjectRef is not a snapshot of actor state.  Resolve the actor-side
         # export before PPO mutates the model so the cached version is truly the
         # pre-update lm_head.  Only the subsequent CPU payload dispatch to the
@@ -4618,6 +4645,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     # overlap window. Fail closed instead of moving drafter
                     # work onto the PPO critical path.
                     generation_metrics["bubble/no_confirmed_idle_window"] = 1
+                elif self._speco_rollout_idle_worker_enabled():
+                    # Old-log-prob collection feeds the next Bubble quota, so
+                    # a confirmed post-rollout idle window should immediately
+                    # train from the previous ready snapshot.  Do this before
+                    # post-generation storage/collection work so the scheduler
+                    # sees the fresh runtime deadline instead of an expired
+                    # window_s=0.
+                    generation_metrics.update(
+                        self._speco_try_launch_rollout_idle_training()
+                    )
                 self._speco_store_rollout_metrics(gen_batch_output)
                 collected = self._speco_collect_generation_samples(gen_batch_output)
                 if collected:

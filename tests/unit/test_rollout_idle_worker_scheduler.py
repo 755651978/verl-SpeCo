@@ -630,7 +630,7 @@ def test_training_quota_without_bubble_progress_waits_then_uses_full_collective(
     assert forced_plan.max_batches == 10
     assert forced_plan.deadline_ts is None
     assert forced_plan.publish_after_success
-    assert forced_plan.hot_bootstrap_worker_ids == ("0", "1")
+    assert forced_plan.hot_bootstrap_worker_ids == ("0", "1", "2", "3")
     assert forced_event.metrics["bubble/training_quota_force_complete"] == 1
 
     scheduler._record_training_outcome(
@@ -646,12 +646,59 @@ def test_training_quota_without_bubble_progress_waits_then_uses_full_collective(
         ),
     )
     assert scheduler._training_quota_debt_steps == 0
-    assert scheduler.idle_writer_group() == ("0", "1")
-    assert scheduler._idle_worker_writer_state_version == 20
-    assert ("0", "1") in scheduler._idle_worker_hot_prewarmed_groups
+    assert scheduler.idle_writer_group() is None
+    assert scheduler._idle_worker_writer_state_version is None
+    assert ("0", "1", "2", "3") in scheduler._idle_worker_hot_prewarmed_groups
 
 
-def test_full_collective_hot_bootstrap_prefers_authoritative_publish_replica() -> None:
+def test_full_collective_bootstrap_does_not_pin_next_idle_writer() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._metadata_idle_training_groups = (("0",), ("1",))
+    scheduler._replica_idle_worker_groups = {0: ("0",), 1: ("1",)}
+    scheduler._record_training_outcome(
+        TrainingPlan(
+            launch=True,
+            reason="quota_forced_completion_ready",
+            interval_matched=True,
+            execution_strategy=DrafterExecutionStrategy.SYNC,
+            source_global_step=4,
+            max_batches=10,
+            publish_after_success=True,
+            hot_bootstrap_worker_ids=("0", "1"),
+        ),
+        TrainingOutcome(
+            trained=True,
+            successful_steps=10,
+            worker_results=[],
+            raw_results=[],
+            elapsed_sec=1.0,
+            reason="completed",
+            metrics={},
+        ),
+    )
+    now = time.time()
+    scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="1",
+            replica_rank=1,
+            memory_released=True,
+            event_ts=now,
+        )
+    )
+    scheduler._replica_idle_window_samples_sec[1] = deque((4.0,), maxlen=32)
+
+    plan = scheduler.prepare_idle_worker_training_plan(
+        replace(_context(), data_status=_status("1", batches=4)),
+        replace(_auto_idle_config(1), training_interval_steps=1),
+    )
+
+    assert plan.launch
+    assert plan.target_worker_ids == ("1",)
+    assert scheduler.idle_writer_group() == ("1",)
+
+
+def test_full_collective_hot_bootstrap_prefers_idle_capacity() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler._metadata_idle_training_groups = (("0",), ("1",))
     scheduler._global_publish_leader_worker_id = "0"
@@ -661,7 +708,7 @@ def test_full_collective_hot_bootstrap_prefers_authoritative_publish_replica() -
         1: deque((2.5,), maxlen=32),
     }
 
-    assert scheduler._best_idle_bootstrap_group() == ("0",)
+    assert scheduler._best_idle_bootstrap_group() == ("1",)
 
 
 def test_full_collective_hot_bootstrap_uses_idle_capacity_without_leader_metadata() -> None:
@@ -876,6 +923,61 @@ def test_training_quota_hard_deadline_finishes_and_publishes() -> None:
     scheduler.record_training_quota_publish_completed()
 
     assert scheduler._training_quota_collection_step is None
+
+
+def test_quota_publish_releases_writer_for_next_longer_idle_group() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._metadata_idle_training_groups = (("0",), ("1",))
+    scheduler._idle_worker_writer_group = ("0",)
+    scheduler._idle_worker_writer_state_version = 10
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_collection_step = 10
+    now = time.time()
+    scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="0",
+            replica_rank=0,
+            memory_released=True,
+            idle_confidence=IdleWindowConfidence.CONFIRMED,
+            must_be_ready_at=now + 1.0,
+            event_ts=now,
+        )
+    )
+    scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="1",
+            replica_rank=1,
+            memory_released=True,
+            idle_confidence=IdleWindowConfidence.CONFIRMED,
+            must_be_ready_at=now + 5.0,
+            event_ts=now,
+        )
+    )
+    config = replace(
+        _auto_idle_config(1),
+        training_quota_enable=True,
+        idle_worker_initial_batch_estimate_sec=0.1,
+        idle_worker_deadline_guard_sec=0.0,
+    )
+
+    pinned = scheduler.select_idle_training_resources(config, now=now)
+
+    assert pinned.available
+    assert pinned.worker_ids == ("0",)
+
+    scheduler.record_training_quota_publish_completed(global_step=10)
+
+    assert scheduler.idle_writer_group() is None
+    assert scheduler._idle_worker_writer_state_version is None
+    assert not scheduler._idle_worker_writer_migration_blocked
+    assert scheduler._training_quota_collection_step is None
+
+    next_group = scheduler.select_idle_training_resources(config, now=now)
+
+    assert next_group.available
+    assert next_group.worker_ids == ("1",)
 
 
 def test_partial_forced_completion_does_not_repay_or_publish() -> None:
@@ -1432,7 +1534,7 @@ def test_idle_worker_auto_budget_bootstraps_one_batch_without_manual_estimate() 
     assert plan.idle_batch_estimate_sec == pytest.approx(0.25)
 
 
-def test_runtime_idle_event_without_deadline_bootstraps_one_batch() -> None:
+def test_non_quota_idle_writer_without_deadline_bootstraps_one_batch() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler._metadata_full_collective_idle_groups = (("0", "1", "2", "3"),)
     for worker_id in ("0", "1"):
@@ -1456,16 +1558,35 @@ def test_runtime_idle_event_without_deadline_bootstraps_one_batch() -> None:
 
     assert plan.launch
     assert plan.max_batches == 1
-    assert plan.idle_window_sec == pytest.approx(
-        plan.idle_startup_reserve_sec
-        + plan.idle_batch_estimate_sec
-        + plan.idle_tail_reserve_sec
-        + 0.05
+    assert plan.reason == "training_ready"
+
+
+def test_quota_cold_idle_writer_without_deadline_waits_for_runtime_window() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._metadata_full_collective_idle_groups = (("0", "1", "2", "3"),)
+    scheduler._training_quota_debt_steps = 10
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=int(worker_id),
+                memory_released=True,
+                must_be_ready_at=None,
+            )
+        )
+    config = replace(
+        _auto_idle_config(2),
+        training_quota_enable=True,
+        idle_worker_min_idle_window_sec=None,
+        idle_worker_initial_batch_estimate_sec=None,
+        idle_worker_deadline_guard_sec=None,
     )
-    # Report optimizer-step capacity, not micro-batch capacity.  This must
-    # match the admission calculation when gradient accumulation is enabled.
-    assert plan.gradient_accumulation_steps == 2
-    assert plan.idle_window_batches == 1
+
+    plan = scheduler.prepare_training_plan(_context(), config)
+
+    assert not plan.launch
+    assert plan.reason == "cold_writer_wait_for_runtime_deadline"
 
 
 def test_resource_lease_does_not_override_short_historical_request_gaps() -> None:
@@ -1585,7 +1706,7 @@ def test_active_quota_does_not_override_tiny_historical_request_gap() -> None:
     assert plan.reason == "incomplete_training_group"
 
 
-def test_active_quota_can_use_first_idle_group_before_first_optimizer_step() -> None:
+def test_active_quota_waits_for_runtime_deadline_before_first_optimizer_step() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler._metadata_idle_training_groups = (("0",), ("1",))
     scheduler._idle_worker_writer_group = ("1",)
@@ -1615,9 +1736,9 @@ def test_active_quota_can_use_first_idle_group_before_first_optimizer_step() -> 
         ),
     )
 
-    assert plan.launch
-    assert plan.target_worker_ids == ("0",)
-    assert scheduler.idle_writer_group() == ("0",)
+    assert not plan.launch
+    assert plan.reason == "cold_writer_wait_for_runtime_deadline"
+    assert scheduler.idle_writer_group() == ("1",)
 
 
 def test_active_quota_keeps_writer_after_first_optimizer_step() -> None:
@@ -1654,6 +1775,42 @@ def test_active_quota_keeps_writer_after_first_optimizer_step() -> None:
     assert plan.launch
     assert plan.target_worker_ids == ("1",)
     assert scheduler.idle_writer_group() == ("1",)
+
+
+def test_generation_boundary_confirms_already_confirmed_runtime_idle() -> None:
+    scheduler = _scheduler_with_statuses(("0",))
+    scheduler._metadata_idle_training_groups = (("0",),)
+    config = replace(
+        _auto_idle_config(1),
+        idle_worker_initial_batch_estimate_sec=0.5,
+        idle_worker_deadline_guard_sec=0.0,
+        idle_worker_min_idle_window_sec=0.1,
+    )
+    scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="0",
+            replica_rank=0,
+            memory_released=True,
+            idle_confidence=IdleWindowConfidence.CONFIRMED,
+            event_ts=100.0,
+        )
+    )
+    scheduler._replica_idle_window_samples_sec[0] = deque((2.0,), maxlen=32)
+
+    metrics = scheduler.record_generation_completed(
+        102.0,
+        confirm_speculative_idle=True,
+        must_be_ready_at=104.0,
+    )
+    resources = scheduler.select_idle_training_resources(config, now=103.0)
+
+    assert metrics["bubble/speculative_idle_confirmed"] == 0
+    assert metrics["bubble/generation_boundary_idle_confirmed"] == 1
+    assert resources.available
+    assert resources.worker_ids == ("0",)
+    assert resources.idle_window_source == "runtime_deadline"
+    assert resources.minimum_idle_window_sec == pytest.approx(1.0)
 
 
 def test_idle_worker_admission_uses_observed_replica_idle_window() -> None:
@@ -1844,24 +2001,59 @@ def test_idle_worker_prebatch_reclaim_splits_setup_and_tail_reserves() -> None:
 
     scheduler.record_idle_training_outcome(outcome)
 
-    assert scheduler._effective_idle_startup_reserve_sec(config) == pytest.approx(22.0)
-    assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(3.0)
+    # A pre-batch reclaim is a failed admission, not a representative Bubble
+    # training cost.  It must not poison future startup/tail reserves.
+    assert scheduler._effective_idle_startup_reserve_sec(config) == pytest.approx(0.0)
+    assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(0.0)
 
     final_outcome = replace(
         outcome,
         trained=True,
         successful_steps=1,
         metrics={
+            "bubble/train_first_batch_started": 1,
             "timing_s/drafter_worker_cleanup": 1.0,
             "timing_s/drafter_publish_snapshot": 4.0,
         },
     )
     scheduler.record_idle_training_outcome(final_outcome, final=True)
 
-    assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(3.0)
+    assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(0.0)
     assert scheduler._effective_idle_tail_reserve_sec(
         config, final=True
     ) == pytest.approx(5.0)
+
+
+def test_prebatch_reclaim_penalty_is_capped_by_batch_estimate() -> None:
+    scheduler = DrafterScheduler()
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        source_global_step=3,
+        max_batches=4,
+        publish_after_success=False,
+        idle_batch_estimate_sec=0.5,
+    )
+    outcome = TrainingOutcome(
+        trained=False,
+        successful_steps=0,
+        worker_results=[],
+        raw_results=[],
+        elapsed_sec=24.0,
+        reason="submitted_async",
+        metrics={
+            "bubble/train_reclaimed_before_first_batch": 1,
+            "timing_s/drafter_worker_preflight": 10.7,
+            "timing_s/drafter_worker_preflight_to_stop": 0.1,
+            "timing_s/drafter_worker_elapsed": 3.2,
+        },
+    )
+
+    scheduler._record_prebatch_reclaim_penalty(plan, outcome)
+
+    assert scheduler._effective_idle_reclaim_penalty_sec() == pytest.approx(1.5)
 
 
 def test_idle_worker_prewarm_removes_bootstrap_startup_reserve() -> None:
@@ -2323,7 +2515,7 @@ def test_replica_local_activation_failure_disables_idle_group() -> None:
     assert next_plan.reason == "replica_local_unavailable"
 
 
-def test_idle_worker_prebatch_reclaim_penalty_blocks_marginal_window() -> None:
+def test_idle_worker_prebatch_reclaim_penalty_does_not_block_usable_window() -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     config = _auto_idle_config(2)
     failed_plan = TrainingPlan(
@@ -2372,8 +2564,8 @@ def test_idle_worker_prebatch_reclaim_penalty_blocks_marginal_window() -> None:
         config,
     )
 
-    assert not next_plan.launch
-    assert next_plan.reason == "window_too_small"
+    assert next_plan.launch
+    assert next_plan.reason == "training_ready"
     assert next_plan.idle_reclaim_penalty_sec == pytest.approx(2.3)
     assert next_plan.metrics()["bubble/idle_reclaim_penalty_active"] == 1
     assert next_plan.metrics()["bubble/idle_reclaim_penalty_s"] == pytest.approx(2.3)
@@ -3498,6 +3690,8 @@ def test_writer_failover_is_blocked_after_optimizer_state_exists() -> None:
 def test_quota_debt_does_not_expand_an_insufficient_historical_window() -> None:
     scheduler = _scheduler_with_statuses(("0",))
     scheduler._metadata_idle_training_groups = (("0",),)
+    scheduler._idle_worker_writer_group = ("0",)
+    scheduler._idle_worker_writer_state_version = 1
     scheduler._training_quota_debt_steps = 10
     scheduler.on_worker_event(
         RolloutWorkerEvent(
@@ -3536,6 +3730,8 @@ def test_quota_debt_does_not_expand_an_insufficient_historical_window() -> None:
 def test_historical_window_strictly_limits_planned_batches() -> None:
     scheduler = _scheduler_with_statuses(("0",))
     scheduler._metadata_idle_training_groups = (("0",),)
+    scheduler._idle_worker_writer_group = ("0",)
+    scheduler._idle_worker_writer_state_version = 1
     scheduler._training_quota_debt_steps = 10
     scheduler.on_worker_event(
         RolloutWorkerEvent(
