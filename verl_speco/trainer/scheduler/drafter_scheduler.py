@@ -245,19 +245,31 @@ class DrafterScheduler:
         self._idle_workers: dict[str, _IdleWorkerState] = {}
         self._metadata_idle_training_groups: tuple[tuple[str, ...], ...] = ()
         self._metadata_full_collective_idle_groups: tuple[tuple[str, ...], ...] = ()
+        self._global_publish_leader_worker_id: str | None = None
         self._replica_idle_worker_groups: dict[int, tuple[str, ...]] = {}
         self._idle_worker_batch_estimate_sec: float | None = None
         self._idle_worker_batch_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_reclaim_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_startup_samples_sec: deque[float] = deque(maxlen=32)
-        self._idle_worker_tail_samples_sec: deque[float] = deque(maxlen=32)
+        # Intermediate plans only release their plan-local reservation and keep
+        # the writer hot.  Final plans additionally materialize the publish
+        # snapshot.  Mixing both paths makes one expensive publish permanently
+        # shrink every later partial Bubble window.
+        self._idle_worker_partial_tail_samples_sec: deque[float] = deque(maxlen=32)
+        self._idle_worker_final_tail_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_hot_prewarmed_groups: set[tuple[str, ...]] = set()
         self._idle_worker_writer_group: tuple[str, ...] | None = None
         self._idle_worker_writer_state_version: int | None = None
         self._idle_worker_writer_migration_blocked: bool = False
         self._idle_worker_group_success_counts: dict[tuple[str, ...], int] = {}
         self._replica_idle_started_at: dict[int, float] = {}
-        self._replica_idle_window_samples_sec: deque[float] = deque(maxlen=32)
+        # Keep rollout-tail history replica-local.  Pooling samples globally
+        # lets the replica that finishes last (and therefore has an almost
+        # zero tail) suppress useful Bubble windows on every earlier replica.
+        self._replica_idle_window_samples_sec: dict[int, deque[float]] = {}
+        self._replica_idle_event_delivery_lag_sec: dict[int, float] = {}
+        self._replica_last_observed_idle_window_sec: dict[int, float] = {}
+        self._replica_idle_window_close_source: dict[int, str] = {}
         self._idle_worker_prebatch_reclaim_streak: int = 0
         self._idle_worker_reclaim_penalty_sec: float = 0.0
         self._idle_worker_reclaim_penalty_last_step: int | None = None
@@ -333,12 +345,12 @@ class DrafterScheduler:
     ) -> float:
         """Reserve activation and preflight work before the first batch."""
 
-        historical = _conservative_percentile(self._idle_worker_startup_samples_sec)
-        if historical > 0.0:
-            return historical
         group = _normalize_worker_id_group(worker_ids)
         if group and group in self._idle_worker_hot_prewarmed_groups:
             return 0.0
+        historical = _conservative_percentile(self._idle_worker_startup_samples_sec)
+        if historical > 0.0:
+            return historical
         if self._idle_batch_estimate_is_bootstrap(config):
             return _BOOTSTRAP_IDLE_STARTUP_RESERVE_SEC
         return 0.0
@@ -393,8 +405,10 @@ class DrafterScheduler:
                     )
             if active and successful and not failed:
                 self._idle_worker_hot_prewarmed_groups.add(target_group)
-                if self._idle_worker_writer_group is None:
-                    self._idle_worker_writer_group = target_group
+                # Prewarming proves only that this group can host the trainer.
+                # Metadata order must not elect the mutable-state writer: it
+                # is unrelated to which rollout replica exposes a useful idle
+                # window once training data becomes available.
             logger.warning(
                 "[BubbleTime] idle_prewarm_completed: group=%s active=%s "
                 "successful=%s failed=%s writer_group=%s hot_groups=%s",
@@ -413,6 +427,12 @@ class DrafterScheduler:
                 f"hot_groups={tuple(sorted(self._idle_worker_hot_prewarmed_groups))}",
                 flush=True,
             )
+            # Prewarming every replica-local trainer keeps one complete model
+            # and optimizer resident per rollout group before an owner exists.
+            # That consumes generation memory and can turn a Bubble
+            # optimization into an OOM or a throughput regression. Warm one
+            # candidate without granting it the writer lease; the first real
+            # trainable idle plan is still free to elect any other group.
             if target_group in self._idle_worker_hot_prewarmed_groups:
                 break
         return all_results
@@ -518,10 +538,20 @@ class DrafterScheduler:
         )
         return worker_ids or None
 
-    def _effective_idle_tail_reserve_sec(self, config: DrafterScheduleConfig) -> float:
-        """Reserve snapshot and cleanup work after the final batch."""
+    def _effective_idle_tail_reserve_sec(
+        self,
+        config: DrafterScheduleConfig,
+        *,
+        final: bool = False,
+    ) -> float:
+        """Reserve the plan tail without mixing partial and final publish cost."""
 
-        historical = _conservative_percentile(self._idle_worker_tail_samples_sec)
+        samples = (
+            self._idle_worker_final_tail_samples_sec
+            if final
+            else self._idle_worker_partial_tail_samples_sec
+        )
+        historical = _conservative_percentile(samples)
         if historical > 0.0:
             return historical
         if self._idle_batch_estimate_is_bootstrap(config):
@@ -540,7 +570,12 @@ class DrafterScheduler:
             len(self._idle_worker_reclaim_samples_sec),
         )
 
-    def record_idle_training_outcome(self, outcome: TrainingOutcome) -> None:
+    def record_idle_training_outcome(
+        self,
+        outcome: TrainingOutcome,
+        *,
+        final: bool = False,
+    ) -> None:
         """Learn conservative admission overhead, including empty plans.
 
         A reclaim before batch 1 is a particularly important signal: the
@@ -563,18 +598,26 @@ class DrafterScheduler:
         )
         if setup_sec > 0.0:
             self._idle_worker_startup_samples_sec.append(setup_sec)
+        tail_samples = (
+            self._idle_worker_final_tail_samples_sec
+            if final
+            else self._idle_worker_partial_tail_samples_sec
+        )
         if tail_sec > 0.0:
-            self._idle_worker_tail_samples_sec.append(tail_sec)
+            tail_samples.append(tail_sec)
         if setup_sec <= 0.0 and tail_sec <= 0.0:
             return
         logger.debug(
             "[BubbleTime] idle_overhead_updated: reason=%s setup_s=%.3f "
-            "tail_s=%.3f setup_reserve_s=%.3f tail_reserve_s=%.3f",
+            "tail_s=%.3f tail_kind=%s setup_reserve_s=%.3f "
+            "partial_tail_reserve_s=%.3f final_tail_reserve_s=%.3f",
             outcome.reason,
             setup_sec,
             tail_sec,
+            "final" if final else "partial",
             _conservative_percentile(self._idle_worker_startup_samples_sec),
-            _conservative_percentile(self._idle_worker_tail_samples_sec),
+            _conservative_percentile(self._idle_worker_partial_tail_samples_sec),
+            _conservative_percentile(self._idle_worker_final_tail_samples_sec),
         )
 
     def _disable_replica_local_idle_group(
@@ -645,15 +688,96 @@ class DrafterScheduler:
             reason=reason,
         )
 
-    def _effective_historical_idle_window_sec(self) -> float | None:
-        if not self._replica_idle_window_samples_sec:
-            return None
-        # Use the lower tail.  A deadline based on a long-tail average would
-        # start work that cannot be reclaimed before shorter rollout cycles.
-        return _conservative_percentile(
-            self._replica_idle_window_samples_sec,
-            quantile=0.1,
+    def _replica_ranks_for_worker_group(
+        self,
+        worker_ids: tuple[str, ...] | None,
+    ) -> tuple[int, ...]:
+        """Resolve the rollout replicas that own one training group."""
+
+        group = _normalize_worker_id_group(worker_ids)
+        if not group:
+            return ()
+        ranks = {
+            int(state.replica_rank)
+            for worker_id in group
+            if (state := self._idle_workers.get(worker_id)) is not None
+        }
+        if ranks:
+            return tuple(sorted(ranks))
+        group_members = set(group)
+        return tuple(
+            sorted(
+                int(replica_rank)
+                for replica_rank, replica_workers in self._replica_idle_worker_groups.items()
+                if group_members.intersection(replica_workers)
+            )
         )
+
+    def _effective_historical_idle_window_sec(
+        self,
+        *,
+        replica_rank: int | None = None,
+        worker_ids: tuple[str, ...] | None = None,
+    ) -> float | None:
+        """Return a conservative idle tail for only the requested replica/group."""
+
+        if replica_rank is not None:
+            replica_ranks = (int(replica_rank),)
+        elif worker_ids:
+            replica_ranks = self._replica_ranks_for_worker_group(worker_ids)
+        else:
+            replica_ranks = tuple(sorted(self._replica_idle_window_samples_sec))
+        conservative_windows = [
+            _conservative_percentile(
+                self._replica_idle_window_samples_sec[rank],
+                quantile=0.1,
+            )
+            for rank in replica_ranks
+            if self._replica_idle_window_samples_sec.get(rank)
+        ]
+        if not conservative_windows:
+            return None
+        # A multi-replica collective is bounded by its shortest member, while
+        # unrelated replica-local groups never contaminate one another.
+        return min(conservative_windows)
+
+    def _best_idle_bootstrap_group(self) -> tuple[str, ...] | None:
+        """Choose one safe replica to retain after a cold fallback.
+
+        Replica-local trainers do not share optimizer state across rollout
+        replicas. The group containing the global publish leader is therefore
+        the authoritative state after a sync fallback and must win even when a
+        different replica has a larger measured idle window.
+        """
+
+        candidates = []
+        for raw_group in self._metadata_idle_training_groups:
+            group = _normalize_worker_id_group(raw_group)
+            if group and group not in self._disabled_replica_local_idle_groups:
+                candidates.append(group)
+        if not candidates:
+            return self._current_idle_writer_group(assign_default=True)
+        publish_leader = self._global_publish_leader_worker_id
+        if publish_leader is not None:
+            for group in candidates:
+                if publish_leader in group:
+                    return group
+        writer_group = self._current_idle_writer_group(assign_default=False)
+
+        def candidate_key(group: tuple[str, ...]) -> tuple[float, int]:
+            historical = self._effective_historical_idle_window_sec(worker_ids=group)
+            return (
+                float(historical) if historical is not None else -1.0,
+                int(group == writer_group),
+            )
+
+        # Prefer measured rollout capacity.  A prior writer wins exact ties;
+        # metadata order remains the deterministic fallback without history.
+        _, best_group = max(
+            enumerate(candidates),
+            key=lambda item: (candidate_key(item[1]), -item[0]),
+        )
+        return best_group
 
     def _effective_idle_min_window_sec(
         self,
@@ -1106,6 +1230,8 @@ class DrafterScheduler:
                 event_ts=event.event_ts,
             )
         event_ts = event.event_ts if event.event_ts is not None else time.time()
+        delivery_lag_sec = max(time.time() - event_ts, 0.0)
+        self._replica_idle_event_delivery_lag_sec[event.replica_rank] = delivery_lag_sec
         if event.event_type is RolloutWorkerEventType.WORKER_IDLE:
             if event.memory_released:
                 self._replica_idle_started_at[event.replica_rank] = event_ts
@@ -1280,14 +1406,21 @@ class DrafterScheduler:
         if idle_started_at is None or event_ts <= idle_started_at:
             return None
         observed_window = event_ts - idle_started_at
-        self._replica_idle_window_samples_sec.append(observed_window)
+        samples = self._replica_idle_window_samples_sec.setdefault(
+            int(replica_rank), deque(maxlen=32)
+        )
+        samples.append(observed_window)
+        self._replica_last_observed_idle_window_sec[int(replica_rank)] = observed_window
+        self._replica_idle_window_close_source[int(replica_rank)] = str(source)
         logger.warning(
             "[BubbleTime] observed replica idle window: replica_rank=%s "
-            "window_s=%.3f conservative_window_s=%.3f samples=%s source=%s",
+            "window_s=%.3f conservative_window_s=%.3f samples=%s "
+            "event_delivery_lag_s=%.3f source=%s",
             replica_rank,
             observed_window,
-            self._effective_historical_idle_window_sec(),
-            len(self._replica_idle_window_samples_sec),
+            self._effective_historical_idle_window_sec(replica_rank=replica_rank),
+            len(samples),
+            self._replica_idle_event_delivery_lag_sec.get(replica_rank, 0.0),
             source,
         )
         return observed_window
@@ -1303,7 +1436,7 @@ class DrafterScheduler:
 
         event_ts = time.time() if event_ts is None else float(event_ts)
         observed = [
-            window
+            (replica_rank, window)
             for replica_rank in tuple(self._replica_idle_started_at)
             if (
                 window := self._record_observed_replica_idle_window(
@@ -1338,15 +1471,35 @@ class DrafterScheduler:
             "bubble/speculative_idle_confirmed": promoted,
         }
         if observed:
+            observed_windows = [window for _, window in observed]
             metrics.update(
                 {
                     "bubble/observed_idle_windows": len(observed),
-                    "bubble/observed_idle_window_min_s": min(observed),
+                    "bubble/observed_idle_window_min_s": min(observed_windows),
+                    "bubble/observed_idle_window_max_s": max(observed_windows),
+                    "bubble/observed_idle_window_mean_s": (
+                        sum(observed_windows) / len(observed_windows)
+                    ),
                     "bubble/historical_idle_window_s": (
                         self._effective_historical_idle_window_sec() or 0.0
                     ),
                 }
             )
+            for replica_rank, window in observed:
+                metrics[f"bubble/replica_{replica_rank}_observed_idle_window_s"] = window
+                metrics[f"bubble/replica_{replica_rank}_historical_idle_window_s"] = (
+                    self._effective_historical_idle_window_sec(
+                        replica_rank=replica_rank
+                    )
+                    or 0.0
+                )
+                metrics[f"bubble/replica_{replica_rank}_idle_event_delivery_lag_s"] = (
+                    self._replica_idle_event_delivery_lag_sec.get(replica_rank, 0.0)
+                )
+        # Also surface windows that were closed by a later GENERATION_STARTED
+        # event before the outer generation boundary. Those request-gap
+        # samples still drive admission and must not be invisible in step logs.
+        metrics.update(self.idle_worker_metrics())
         return metrics
 
     def _record_worker_event_state(
@@ -1404,6 +1557,7 @@ class DrafterScheduler:
         full_collective_groups: list[tuple[str, ...]] = []
         seen_groups: set[tuple[str, ...]] = set()
         seen_full_collective_groups: set[tuple[str, ...]] = set()
+        global_publish_leaders: list[str] = []
         for record in records:
             if not bool(record.get("in_drafter_train_group", False)):
                 continue
@@ -1411,6 +1565,12 @@ class DrafterScheduler:
             training_ranks = _normalize_worker_id_group(
                 record.get("training_group_ranks", ())
             )
+            if bool(record.get("is_global_publish_leader", False)):
+                leader_worker_id = str(
+                    record.get("worker_id", record.get("rank", ""))
+                )
+                if leader_worker_id:
+                    global_publish_leaders.append(leader_worker_id)
             if replica_rank is not None and training_ranks:
                 replica_group_members.setdefault(int(replica_rank), set()).update(
                     training_ranks
@@ -1453,6 +1613,9 @@ class DrafterScheduler:
         self._replica_idle_worker_groups = replica_groups
         self._metadata_idle_training_groups = tuple(full_groups)
         self._metadata_full_collective_idle_groups = tuple(full_collective_groups)
+        self._global_publish_leader_worker_id = (
+            global_publish_leaders[0] if global_publish_leaders else None
+        )
         metadata_summary = [
             {
                 "rank": record.get("rank"),
@@ -1463,6 +1626,9 @@ class DrafterScheduler:
                 "full_collective_ranks": record.get("full_collective_ranks", ()),
                 "sync_collective_ranks": record.get("sync_collective_ranks", ()),
                 "idle_collective_scope": record.get("idle_collective_scope", ""),
+                "is_global_publish_leader": bool(
+                    record.get("is_global_publish_leader", False)
+                ),
                 "reason": record.get("reason", ""),
             }
             for record in records
@@ -1497,12 +1663,41 @@ class DrafterScheduler:
                 for worker_id in worker_ids
             ):
                 complete_groups += 1
-        return {
+        metrics: dict[str, float | int] = {
             "bubble/idle_workers": sum(
                 int(state.status == "idle") for state in self._idle_workers.values()
             ),
             "bubble/idle_training_groups": complete_groups,
         }
+        source_codes = {
+            "generation_started": 1,
+            "generation_completed": 2,
+        }
+        replica_ranks = set(self._replica_idle_worker_groups)
+        replica_ranks.update(self._replica_idle_window_samples_sec)
+        replica_ranks.update(self._replica_last_observed_idle_window_sec)
+        for replica_rank in sorted(replica_ranks):
+            prefix = f"bubble/replica_{replica_rank}"
+            metrics[f"{prefix}_observed_idle_window_s"] = float(
+                self._replica_last_observed_idle_window_sec.get(replica_rank, 0.0)
+            )
+            metrics[f"{prefix}_historical_idle_window_s"] = float(
+                self._effective_historical_idle_window_sec(
+                    replica_rank=replica_rank
+                )
+                or 0.0
+            )
+            metrics[f"{prefix}_idle_event_delivery_lag_s"] = float(
+                self._replica_idle_event_delivery_lag_sec.get(replica_rank, 0.0)
+            )
+            metrics[f"{prefix}_idle_window_samples"] = len(
+                self._replica_idle_window_samples_sec.get(replica_rank, ())
+            )
+            metrics[f"{prefix}_idle_window_close_source"] = source_codes.get(
+                self._replica_idle_window_close_source.get(replica_rank, ""),
+                0,
+            )
+        return metrics
 
     def rollout_idle_replica_ranks(self) -> tuple[int, ...]:
         """Return rollout replicas with registered drafter training resources."""
@@ -1717,7 +1912,9 @@ class DrafterScheduler:
                 round(max(now - idle_states[worker_id].event_ts, 0.0), 3)
                 for worker_id in group
             )
-            historical_window = self._effective_historical_idle_window_sec()
+            historical_window = self._effective_historical_idle_window_sec(
+                worker_ids=group
+            )
             group_confidence = (
                 IdleWindowConfidence.CONFIRMED
                 if all(
@@ -1773,21 +1970,13 @@ class DrafterScheduler:
                 config,
                 worker_ids=group,
             )
-            if (
-                source == "historical_observed"
-                and historical_window is not None
-                and historical_window < min_idle_window_sec
-                and config.training_quota_enable
-                and self._training_quota_debt_steps > 0
-            ):
-                minimum_window = min_idle_window_sec
-                source = "quota_bootstrap_minimum"
             if minimum_window < min_idle_window_sec:
                 window_too_small_seen = True
                 logger.warning(
                     "[BubbleTime] idle_resource_skip reason=window_too_small "
                     "group_id=idle-group-%s group=%s minimum_window_s=%.3f "
                     "min_required_s=%.3f historical_window_s=%s source=%s "
+                    "replica_ranks=%s replica_history_s=%s "
                     "startup_reserve_s=%.3f tail_reserve_s=%.3f "
                     "batch_estimate_s=%.3f guard_s=%.3f reclaim_penalty_s=%.3f "
                     "prebatch_reclaim_streak=%s now=%.3f idle_state=%s",
@@ -1797,6 +1986,13 @@ class DrafterScheduler:
                     min_idle_window_sec,
                     historical_window,
                     source,
+                    self._replica_ranks_for_worker_group(group),
+                    {
+                        replica_rank: self._effective_historical_idle_window_sec(
+                            replica_rank=replica_rank
+                        )
+                        for replica_rank in self._replica_ranks_for_worker_group(group)
+                    },
                     self._effective_idle_startup_reserve_sec(config, group),
                     self._effective_idle_tail_reserve_sec(config),
                     self._effective_idle_batch_estimate_sec(config),
@@ -1805,6 +2001,15 @@ class DrafterScheduler:
                     self._idle_worker_prebatch_reclaim_streak,
                     now,
                     _idle_state_summary(self._idle_workers, now=now),
+                )
+                print(
+                    "[BubbleTime] idle_resource_window_too_small: "
+                    f"group_id=idle-group-{index} group={group} "
+                    f"replica_ranks={self._replica_ranks_for_worker_group(group)} "
+                    f"window_s={minimum_window:.3f} "
+                    f"historical_window_s={historical_window} "
+                    f"event_age_s={event_ages} source={source}",
+                    flush=True,
                 )
                 small_window = AvailableTrainingResources(
                     False,
@@ -1826,6 +2031,7 @@ class DrafterScheduler:
                 "[BubbleTime] idle_resource_ready group_id=idle-group-%s group=%s "
                 "minimum_window_s=%.3f min_required_s=%.3f "
                 "historical_window_s=%s source=%s "
+                "replica_ranks=%s replica_history_s=%s "
                 "prebatch_reclaim_streak=%s now=%.3f",
                 index,
                 group,
@@ -1833,6 +2039,13 @@ class DrafterScheduler:
                 min_idle_window_sec,
                 historical_window,
                 source,
+                self._replica_ranks_for_worker_group(group),
+                {
+                    replica_rank: self._effective_historical_idle_window_sec(
+                        replica_rank=replica_rank
+                    )
+                    for replica_rank in self._replica_ranks_for_worker_group(group)
+                },
                 self._idle_worker_prebatch_reclaim_streak,
                 now,
             )
@@ -1858,33 +2071,6 @@ class DrafterScheduler:
                 ready_candidates,
                 key=lambda item: (item[2], min(item[4], default=0.0), -item[0]),
             )
-            if writer_group != chosen_group:
-                previous_writer = writer_group
-                if self._idle_worker_writer_state_version is None:
-                    self._idle_worker_writer_group = chosen_group
-                    writer_group = chosen_group
-                    logger.warning(
-                        "[BubbleTime] idle_writer_lease_migrated: from=%s to=%s "
-                        "group_id=idle-group-%s window_s=%.3f event_age_s=%s "
-                        "source=%s reason=best_idle_candidate_no_private_state",
-                        previous_writer,
-                        chosen_group,
-                        chosen_index,
-                        chosen_window,
-                        chosen_ages,
-                        chosen_source,
-                    )
-                    print(
-                        "[BubbleTime] idle_writer_lease_migrated: "
-                        f"from={previous_writer} to={chosen_group} "
-                        f"group_id=idle-group-{chosen_index} "
-                        f"window_s={chosen_window:.3f} event_age_s={chosen_ages} "
-                        f"source={chosen_source} "
-                        "reason=best_idle_candidate_no_private_state",
-                        flush=True,
-                    )
-                else:
-                    writer_state_migration_seen = True
             logger.warning(
                 "[BubbleTime] idle_resource_selected: group_id=idle-group-%s "
                 "group=%s window_s=%.3f confidence=%s event_age_s=%s "
@@ -1909,8 +2095,12 @@ class DrafterScheduler:
             print(
                 "[BubbleTime] idle_resource_selected: "
                 f"group_id=idle-group-{chosen_index} group={chosen_group} "
+                "replica_ranks="
+                f"{self._replica_ranks_for_worker_group(chosen_group)} "
                 f"window_s={chosen_window:.3f} confidence={chosen_confidence.value} "
                 f"event_age_s={chosen_ages} writer_group={writer_group} "
+                "historical_window_s="
+                f"{self._effective_historical_idle_window_sec(worker_ids=chosen_group)} "
                 f"source={chosen_source}",
                 flush=True,
             )
@@ -2071,6 +2261,29 @@ class DrafterScheduler:
             resources=resources,
             require_interval=False,
         )
+        if plan.launch and self._idle_worker_writer_state_version is None:
+            # Idle observations before collection must not pin all future
+            # Bubble work. Elect the writer only for the first plan that can
+            # actually consume a training batch.
+            chosen_group = _normalize_worker_id_group(plan.target_worker_ids)
+            if chosen_group and chosen_group != self._idle_worker_writer_group:
+                previous_writer = self._idle_worker_writer_group
+                self._idle_worker_writer_group = chosen_group
+                logger.warning(
+                    "[BubbleTime] idle_writer_elected: from=%s to=%s "
+                    "plan_id=%s step=%s reason=first_trainable_idle_window",
+                    previous_writer,
+                    chosen_group,
+                    plan.plan_id,
+                    plan.source_global_step,
+                )
+                print(
+                    "[BubbleTime] idle_writer_elected: "
+                    f"from={previous_writer} to={chosen_group} "
+                    f"plan_id={plan.plan_id} step={plan.source_global_step} "
+                    "reason=first_trainable_idle_window",
+                    flush=True,
+                )
         return plan
 
     @staticmethod
@@ -2320,22 +2533,25 @@ class DrafterScheduler:
             or not config.training_quota_allow_critical_path_fallback
         ):
             return None
-        writer_group = self._current_idle_writer_group(assign_default=True)
-        if not writer_group or self._idle_worker_writer_migration_blocked:
-            return None
-        writer_data_status = self.inspect_training_data(
-            global_step=context.global_step,
-            config=config,
-            worker_ids=writer_group,
-            target_version=self._training_quota_data_version,
-        )
-        # The first boundary inspection is also what opens a quota cycle when
-        # no request-local idle event was available yet.
-        self._register_training_quota_cycle(
-            data_status=writer_data_status,
-            global_step=context.global_step,
-            config=config,
-        )
+        writer_group = self._current_idle_writer_group(assign_default=False)
+        if self._training_quota_debt_steps <= 0:
+            # Preserve the boundary-inspection fallback for callers that did
+            # not observe a collection outcome, but never elect a writer just
+            # to perform that probe. With no existing owner, inspect all
+            # workers and leave the first useful rollout bubble free to choose.
+            boundary_data_status = self.inspect_training_data(
+                global_step=context.global_step,
+                config=config,
+                worker_ids=writer_group,
+                target_version=self._training_quota_data_version,
+            )
+            self._register_training_quota_cycle(
+                data_status=boundary_data_status,
+                global_step=context.global_step,
+                config=config,
+            )
+            if self._training_quota_debt_steps <= 0:
+                return None
         force_completion = self._training_quota_force_completion_due(
             context.global_step, config
         )
@@ -2356,6 +2572,43 @@ class DrafterScheduler:
         # freshness bound, then match Sync with one full-collective call.
         if completed_bubble_steps == 0 and not force_completion:
             return None
+
+        if full_collective_fallback:
+            bootstrap_group = (
+                self._current_idle_writer_group(assign_default=False)
+                if self._idle_worker_writer_state_version is not None
+                else self._best_idle_bootstrap_group()
+            )
+            if bootstrap_group:
+                writer_group = bootstrap_group
+                self._idle_worker_writer_group = bootstrap_group
+                print(
+                    "[BubbleTime] full_collective_hot_bootstrap_selected: "
+                    f"group={bootstrap_group} "
+                    "replica_ranks="
+                    f"{self._replica_ranks_for_worker_group(bootstrap_group)} "
+                    "historical_window_s="
+                    f"{self._effective_historical_idle_window_sec(worker_ids=bootstrap_group)} "
+                    "selection_reason="
+                    f"{'global_publish_leader' if self._global_publish_leader_worker_id in bootstrap_group else 'idle_capacity'}",
+                    flush=True,
+                )
+
+        # Do not elect a writer while merely probing whether a top-up is due.
+        # Before the first real Bubble optimizer step, assigning the first hot
+        # group here pins target-head prefetch and all later idle admission to
+        # metadata order rather than the replica that actually becomes idle.
+        writer_group = writer_group or self._current_idle_writer_group(
+            assign_default=True
+        )
+        if not writer_group or self._idle_worker_writer_migration_blocked:
+            return None
+        writer_data_status = self.inspect_training_data(
+            global_step=context.global_step,
+            config=config,
+            worker_ids=writer_group,
+            target_version=self._training_quota_data_version,
+        )
 
         data_status = (
             self.inspect_training_data(
@@ -2446,6 +2699,7 @@ class DrafterScheduler:
                 deadline_ts=None,
                 publish_after_success=True,
                 retain_replay_session=False,
+                hot_bootstrap_worker_ids=writer_group,
             )
         # Preserve the rollout-idle worker payload so only the writer group
         # participates, but execute this specially marked plan synchronously.
@@ -2823,6 +3077,11 @@ class DrafterScheduler:
         budget = self.sync_budget_policy.make_budget(context, config)
         gradient_accumulation_steps = 1
         planned_optimizer_steps = budget.max_batches
+        idle_tail_reserve_sec = (
+            self._effective_idle_tail_reserve_sec(config)
+            if resources is not None
+            else None
+        )
         planned_valid_tokens = (
             context.data_status.trainable_valid_tokens
             if context.data_status is not None
@@ -2838,7 +3097,7 @@ class DrafterScheduler:
                 config,
                 resources.worker_ids,
             )
-            tail_reserve_sec = self._effective_idle_tail_reserve_sec(config)
+            tail_reserve_sec = float(idle_tail_reserve_sec or 0.0)
             reclaim_penalty_sec = self._effective_idle_reclaim_penalty_sec()
             micro_batch_estimate = self._effective_idle_batch_estimate_sec(config)
             optimizer_step_estimate = (
@@ -2871,9 +3130,7 @@ class DrafterScheduler:
                 getattr(resources, "idle_window_source", "runtime_deadline")
                 == "runtime_deadline"
             )
-            window_batches = int(
-                math.floor(usable_window / optimizer_step_estimate)
-            )
+            window_batches = int(math.floor(usable_window / optimizer_step_estimate))
             trainable_micro_batches = (
                 context.data_status.trainable_batches if context.data_status else 0
             )
@@ -2883,18 +3140,97 @@ class DrafterScheduler:
             # just as Sync re-samples its DataBuffer.  Distinct samples are an
             # admission requirement, not an upper bound on plan length.
             replay_seed_available = trainable_batches > 0
-            # ``window_batches`` is only an admission signal: prove that at
-            # least one optimizer step can start and finish.  Once launched,
-            # the worker keeps training up to the dynamic cap and exits at
-            # reclaim/deadline boundaries, matching FastRL's cooperative loop.
+            # Only an authoritative runtime deadline may rely on cooperative
+            # reclaim after admission. Historical/bootstrap windows are
+            # estimates, so their planned optimizer work must fit completely
+            # inside the estimated window.
+            def _window_limited_batch_cap(available_window_batches: int) -> int:
+                cap = min(train_batch_cap, sync_budget_batches)
+                if not has_hard_runtime_deadline:
+                    cap = min(cap, max(available_window_batches, 0))
+                return cap if available_window_batches > 0 else 0
+
             max_batches = (
-                min(
-                    train_batch_cap,
-                    sync_budget_batches,
-                )
-                if window_batches > 0 and replay_seed_available
+                _window_limited_batch_cap(window_batches)
+                if replay_seed_available
                 else 0
             )
+
+            # A completing plan pays snapshot/publish staging cost; an
+            # intermediate plan does not. Re-evaluate the capacity with the
+            # final-tail history only when this plan can actually close the
+            # current quota (or publish in non-quota mode).
+            projected_debt = max(
+                self._training_quota_debt_steps - int(max_batches),
+                0,
+            )
+            uses_final_tail = bool(
+                max_batches > 0
+                and (
+                    (
+                        config.training_quota_enable
+                        and self._training_quota_debt_steps > 0
+                        and projected_debt == 0
+                    )
+                    or (
+                        not config.training_quota_enable
+                        and self._publish_interval_matched(context.global_step, config)
+                    )
+                )
+            )
+            if uses_final_tail:
+                final_tail_reserve_sec = self._effective_idle_tail_reserve_sec(
+                    config,
+                    final=True,
+                )
+                final_base_usable_window = max(
+                    resources.minimum_idle_window_sec
+                    - deadline_guard_sec
+                    - startup_reserve_sec
+                    - final_tail_reserve_sec,
+                    0.0,
+                )
+                final_usable_window = max(
+                    final_base_usable_window - reclaim_penalty_sec,
+                    0.0,
+                )
+                final_window_batches = int(
+                    math.floor(final_usable_window / optimizer_step_estimate)
+                )
+                final_max_batches = (
+                    _window_limited_batch_cap(final_window_batches)
+                    if replay_seed_available
+                    else 0
+                )
+                final_projected_debt = max(
+                    self._training_quota_debt_steps - int(final_max_batches),
+                    0,
+                )
+                still_final = bool(
+                    (
+                        config.training_quota_enable
+                        and self._training_quota_debt_steps > 0
+                        and final_projected_debt == 0
+                    )
+                    or (
+                        not config.training_quota_enable
+                        and final_max_batches > 0
+                        and self._publish_interval_matched(context.global_step, config)
+                    )
+                )
+                if still_final:
+                    tail_reserve_sec = final_tail_reserve_sec
+                    idle_tail_reserve_sec = final_tail_reserve_sec
+                    base_usable_window = final_base_usable_window
+                    usable_window = final_usable_window
+                    window_batches = final_window_batches
+                    max_batches = final_max_batches
+                    worker_deadline_window = max(
+                        resources.minimum_idle_window_sec
+                        - deadline_guard_sec
+                        - final_tail_reserve_sec,
+                        0.0,
+                    )
             if max_batches > 0:
                 idle_budget_reason = "idle_worker_budget_ready"
             elif window_batches <= 0:
@@ -3073,7 +3409,7 @@ class DrafterScheduler:
                             config,
                             resources.worker_ids,
                         )
-                        - self._effective_idle_tail_reserve_sec(config),
+                            - float(idle_tail_reserve_sec or 0.0),
                         0.0,
                     )
                     - self._effective_idle_reclaim_penalty_sec(),
@@ -3103,7 +3439,7 @@ class DrafterScheduler:
                                     config,
                                     resources.worker_ids,
                                 )
-                                - self._effective_idle_tail_reserve_sec(config),
+                                - float(idle_tail_reserve_sec or 0.0),
                                 0.0,
                             )
                             - self._effective_idle_reclaim_penalty_sec(),
@@ -3133,7 +3469,7 @@ class DrafterScheduler:
                 else None
             ),
             "idle_tail_reserve_sec": (
-                self._effective_idle_tail_reserve_sec(config)
+                float(idle_tail_reserve_sec or 0.0)
                 if resources is not None
                 else None
             ),
@@ -3306,7 +3642,15 @@ class DrafterScheduler:
             )
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             if not is_quota_topup:
-                self.record_idle_training_outcome(outcome)
+                completed_final_plan = bool(
+                    plan.publish_after_success
+                    and outcome.trained
+                    and int(outcome.successful_steps) >= int(plan.max_batches)
+                )
+                self.record_idle_training_outcome(
+                    outcome,
+                    final=completed_final_plan,
+                )
             self._record_replica_local_unavailable(plan, outcome)
             if not is_quota_topup:
                 self._record_prebatch_reclaim_penalty(plan, outcome)
@@ -3340,6 +3684,31 @@ class DrafterScheduler:
             )
 
         if outcome.trained and outcome.successful_steps > 0:
+            bootstrap_group = _normalize_worker_id_group(
+                plan.hot_bootstrap_worker_ids
+            )
+            if bootstrap_group:
+                # Every worker just completed the same full-collective quota.
+                # The selected replica therefore owns an equivalent, current
+                # optimizer state and may safely become the sole hot writer.
+                self._idle_worker_writer_group = bootstrap_group
+                self._idle_worker_writer_state_version = _as_int(
+                    plan.source_global_step
+                )
+                self._idle_worker_hot_prewarmed_groups.add(bootstrap_group)
+                logger.warning(
+                    "[BubbleTime] full_collective_hot_bootstrap_completed: "
+                    "group=%s source_step=%s successful_steps=%s",
+                    bootstrap_group,
+                    plan.source_global_step,
+                    outcome.successful_steps,
+                )
+                print(
+                    "[BubbleTime] full_collective_hot_bootstrap_completed: "
+                    f"group={bootstrap_group} source_step={plan.source_global_step} "
+                    f"successful_steps={outcome.successful_steps}",
+                    flush=True,
+                )
             if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
                 group = _normalize_worker_id_group(plan.target_worker_ids)
                 if group:

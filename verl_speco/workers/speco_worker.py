@@ -1529,6 +1529,7 @@ class SpecoWorker(Worker):
             "full_collective_ranks": [],
             "sync_collective_ranks": [],
             "idle_collective_scope": "",
+            "is_global_publish_leader": False,
             "reason": "",
         }
         if not self.enable_drafter:
@@ -1557,6 +1558,7 @@ class SpecoWorker(Worker):
                     if self._use_replica_local_idle_training()
                     else "full_collective"
                 ),
+                "is_global_publish_leader": bool(self.is_global_publish_leader),
                 "reason": "ok",
             }
         )
@@ -1950,6 +1952,23 @@ class SpecoWorker(Worker):
             self.trainer.release_training_data_reservation(str(plan_id))
             await self.trainer.cleanup_training(clear_data=False)
         return {"aborted": was_prepared, "rank": self.rank}
+
+    def _should_keep_drafter_training_hot(
+        self,
+        training_plan: dict[str, object],
+        *,
+        execution_strategy: str,
+        successful_steps: int,
+    ) -> bool:
+        if int(successful_steps) <= 0:
+            return False
+        if execution_strategy == "rollout_idle_worker":
+            return True
+        bootstrap_workers = {
+            str(worker_id)
+            for worker_id in training_plan.get("hot_bootstrap_worker_ids", ())
+        }
+        return str(self.rank) in bootstrap_workers
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def train_drafter(self, training_plan=None):
@@ -2378,7 +2397,27 @@ class SpecoWorker(Worker):
                         flush=True,
                     )
                 self.trainer.release_training_data_reservation(plan_id)
-                await self.trainer.cleanup_training(clear_data=False)
+                # Keep only a canonical state that has actually advanced.
+                # Expired, aborted, or zero-step attempts are cleaned up by
+                # their respective paths and never leave extra hot replicas.
+                keep_hot = self._should_keep_drafter_training_hot(
+                    training_plan,
+                    execution_strategy=execution_strategy,
+                    successful_steps=int(result.get("successful_steps", 0) or 0),
+                )
+                await self.trainer.cleanup_training(
+                    clear_data=False,
+                    keep_hot=keep_hot,
+                )
+                result["training_residency_retained"] = int(keep_hot)
+                if keep_hot and execution_strategy == "sync":
+                    print(
+                        "[BubbleTime] full_collective_worker_kept_hot: "
+                        f"rank={self.rank} plan_id={plan_id} "
+                        f"source_step={training_plan.get('source_global_step')} "
+                        "reason=authoritative_publish_replica_bootstrap",
+                        flush=True,
+                    )
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0

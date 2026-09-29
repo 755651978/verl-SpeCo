@@ -1678,6 +1678,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"launch={getattr(plan, 'launch', False)} "
                 f"reason={getattr(plan, 'reason', None)} "
                 f"max_batches={getattr(plan, 'max_batches', 0)} "
+                f"group_id={getattr(plan, 'training_group_id', '')} "
+                f"workers={getattr(plan, 'target_worker_ids', ())} "
                 f"idle_window_s={getattr(plan, 'idle_window_sec', None)} "
                 f"usable_window_s={getattr(plan, 'idle_usable_window_sec', None)} "
                 f"window_batches={getattr(plan, 'idle_window_batches', None)} "
@@ -1687,6 +1689,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"tail_reserve_s={getattr(plan, 'idle_tail_reserve_sec', None)} "
                 f"reclaim_penalty_s={getattr(plan, 'idle_reclaim_penalty_sec', None)} "
                 f"deadline_ts={getattr(plan, 'deadline_ts', None)} "
+                f"window_source={getattr(plan, 'idle_window_source', '')} "
                 "worker_deadline_in_s="
                 f"{max(float(getattr(plan, 'deadline_ts', 0.0) or 0.0) - time.time(), 0.0):.3f} "
                 f"idle_workers={metrics.get('bubble/idle_workers', 0)} "
@@ -3755,26 +3758,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_drafter_schedule_config().execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
         ):
-            try:
-                self._speco_get_drafter_scheduler().prewarm_idle_training_workers()
-            except Exception:
-                logger.exception(
-                    "[BubbleTime] idle prewarm failed before fit; "
-                    "continuing with on-idle activation"
-                )
-                print(
-                    "[BubbleTime] idle_prewarm_failed_before_fit: "
-                    "fallback=on_idle_activation",
-                    flush=True,
-                )
-                return
+            # Do not place a complete model and optimizer on an arbitrary
+            # rollout group before a real idle lease exists. If another group
+            # wins the first trainable window, both copies would remain hot
+            # and steal generation memory. The admission budget already
+            # reserves cold-start time; activate the elected writer inside its
+            # first genuine rollout bubble, then retain only that state.
             logger.warning(
-                "[BubbleTime] completed before-fit idle prewarm: "
-                "reason=rollout_idle_worker_hot_activation"
+                "[BubbleTime] deferred before-fit idle activation: "
+                "reason=wait_for_first_trainable_idle_lease"
             )
             print(
-                "[BubbleTime] completed before-fit idle prewarm: "
-                "reason=rollout_idle_worker_hot_activation",
+                "[BubbleTime] idle_prewarm_deferred: "
+                "reason=wait_for_first_trainable_idle_lease",
                 flush=True,
             )
             return

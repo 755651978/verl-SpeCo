@@ -247,6 +247,88 @@ def test_worker_idle_prewarm_keeps_training_model_hot() -> None:
     assert worker.trainer.cleanup_calls == 0
 
 
+def test_aborted_bubble_preflight_cleans_up_training_residency() -> None:
+    worker = _worker(data_version=4)
+    plan = _plan()
+    plan.update(
+        {
+            "execution_strategy": "rollout_idle_worker",
+            "target_worker_ids": ("0",),
+        }
+    )
+
+    result = asyncio.run(worker.preflight_drafter_training(plan))
+    abort_result = asyncio.run(worker.abort_drafter_training_preflight("plan-4"))
+
+    assert result["ready"]
+    assert abort_result["aborted"]
+    assert worker.trainer.cleanup_calls == 1
+    assert not worker.trainer.keep_hot
+
+
+def test_full_collective_hot_bootstrap_retains_only_selected_worker() -> None:
+    selected = _worker(data_version=4)
+    selected.rank = 1
+    other = _worker(data_version=4)
+    plan = {"hot_bootstrap_worker_ids": ("1",)}
+
+    assert selected._should_keep_drafter_training_hot(
+        plan,
+        execution_strategy="sync",
+        successful_steps=10,
+    )
+    assert not other._should_keep_drafter_training_hot(
+        plan,
+        execution_strategy="sync",
+        successful_steps=10,
+    )
+    assert not selected._should_keep_drafter_training_hot(
+        plan,
+        execution_strategy="sync",
+        successful_steps=0,
+    )
+
+
+def test_cleanup_keep_hot_does_not_offload_training_state(monkeypatch) -> None:
+    class _Optimizer:
+        def __init__(self) -> None:
+            self.zeroed = False
+
+        def zero_grad(self, *, set_to_none: bool) -> None:
+            assert set_to_none
+            self.zeroed = True
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    trainer.model = object()
+    trainer.optimizer = _Optimizer()
+    trainer.collected_data = [object()]
+    trainer.data_buffer = [object()]
+    trainer._pending_checkpoint_future = None
+    trainer._pending_full_checkpoint_future = None
+    trainer._full_checkpoint_executor = None
+    trainer._training_initialized = True
+    trainer._training_active = True
+    trainer._last_ckpt_step = 3
+    trainer.training_steps = 7
+    trainer._mark_buffer_changed = lambda: None
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.base_trainer.offload_fsdp_model_to_cpu",
+        lambda model: pytest.fail("hot cleanup must not offload the model"),
+    )
+
+    asyncio.run(trainer.cleanup_training(clear_data=False, keep_hot=True))
+
+    assert trainer.optimizer.zeroed
+    assert trainer.collected_data
+    assert trainer.data_buffer
+    assert trainer._training_initialized
+    assert not trainer._training_active
+    assert trainer._last_ckpt_step == 3
+    assert trainer.training_steps == 7
+
+
 def test_bubble_publish_uses_replica_local_group_leader(monkeypatch) -> None:
     worker = _worker(data_version=4)
     worker.last_trained_step = 4

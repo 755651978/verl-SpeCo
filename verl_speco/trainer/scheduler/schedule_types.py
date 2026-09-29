@@ -615,6 +615,11 @@ class TrainingPlan:
     planned_optimizer_steps: int = 0
     planned_valid_tokens: int = 0
     retain_replay_session: bool = False
+    # A zero-progress full-collective fallback can seed exactly one
+    # replica-local writer with the synchronized model/optimizer state. Other
+    # ranks clean up normally, avoiding both the next cold start and all-rank
+    # training residency.
+    hot_bootstrap_worker_ids: tuple[str, ...] = ()
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
@@ -677,6 +682,7 @@ class TrainingPlan:
             "planned_optimizer_steps": self.planned_optimizer_steps,
             "planned_valid_tokens": self.planned_valid_tokens,
             "retain_replay_session": self.retain_replay_session,
+            "hot_bootstrap_worker_ids": self.hot_bootstrap_worker_ids,
         }
 
     def metrics(self) -> dict[str, int]:
@@ -698,6 +704,10 @@ class TrainingPlan:
             "drafter/schedule_require_full_batch": int(self.require_full_batch),
             "drafter/schedule_sample_last_n_steps": int(self.sample_last_n_steps),
         }
+        if self.hot_bootstrap_worker_ids:
+            metrics["bubble/hot_bootstrap_workers"] = len(
+                self.hot_bootstrap_worker_ids
+            )
         if self.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             metrics.update(
                 {

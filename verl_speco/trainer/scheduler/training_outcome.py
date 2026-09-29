@@ -279,6 +279,12 @@ class TrainingOutcome:
         metrics["bubble/train_first_batch_started"] = int(
             any(bool(result.get("first_batch_started", False)) for result in normalized_results)
         )
+        metrics["bubble/training_residency_retained"] = int(
+            any(
+                bool(result.get("training_residency_retained", False))
+                for result in normalized_results
+            )
+        )
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
         if (
             plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER

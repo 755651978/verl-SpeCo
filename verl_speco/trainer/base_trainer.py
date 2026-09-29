@@ -5488,6 +5488,8 @@ class DrafterBaseTrainer:
     async def cleanup_training(
         self,
         clear_data: bool = True,
+        *,
+        keep_hot: bool = False,
     ):
         # First set training as inactive to prevent further steps
         self._training_active = False
@@ -5525,6 +5527,22 @@ class DrafterBaseTrainer:
         # Training and publish collectives have completed before cleanup. These
         # process groups stay alive across triggers, so barriers here only
         # serialize ranks and can add timeout windows without releasing memory.
+
+        if keep_hot:
+            # A Bubble writer that has actually advanced optimizer state will
+            # be reused for the remaining quota. Keep that single canonical
+            # state resident so the next idle lease does not spend most of its
+            # budget reloading model and optimizer tensors.
+            if clear_data:
+                self.collected_data.clear()
+                self.data_buffer.clear()
+                self._mark_buffer_changed()
+            if self._full_checkpoint_executor is not None:
+                self._full_checkpoint_executor.shutdown(wait=False)
+                self._full_checkpoint_executor = None
+            self._training_initialized = True
+            self._training_active = False
+            return
 
         if self.model is not None:
             try:
