@@ -1515,13 +1515,16 @@ class DrafterBaseTrainer:
         if (
             getattr(self.backend, "model_type", None) == "dspark"
             and "confidence_head." in name
-            and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
-            in {"1", "true", "yes"}
+            and (
+                os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
+                in {"1", "true", "yes"}
+                or float(getattr(self.backend, "confidence_head_alpha", 0.0)) <= 0.0
+            )
         ):
-            # The supported MRV2 runtime has no confidence-head contract, and
-            # the current trainer rejects positive confidence loss. A head
-            # inherited from an older checkpoint is frozen and must not enter
-            # the native fixed-K online update payload.
+            # The supported vLLM/MRV2 runtime has no confidence-head hot-update
+            # contract. The current trainer also rejects positive confidence
+            # loss, so a head inherited from an older checkpoint is frozen and
+            # must not enter the online update payload.
             return True
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,

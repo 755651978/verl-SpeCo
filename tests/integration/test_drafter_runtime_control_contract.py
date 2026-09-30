@@ -664,6 +664,33 @@ def test_bubble_target_head_ready_is_scoped_to_synced_workers() -> None:
     assert trainer._speco_target_lm_head_ready_for_workers(4, ("2", "3"))
 
 
+def test_sglang_bubble_owner_count_covers_routed_writer_owner() -> None:
+    trainer = _trainer(
+        {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}},
+        step=6,
+    )
+    trainer._speco_owner_bucket_count = lambda: 1
+
+    owner_count = trainer._speco_sglang_collection_owner_count(
+        [{"replica_rank": 0}],
+        [1],
+    )
+
+    assert owner_count == 2
+
+
+def test_sglang_sync_owner_count_keeps_replica_derived_count() -> None:
+    trainer = _trainer({"scheduler": {"execution": {"strategy": "sync"}}}, step=6)
+    trainer._speco_owner_bucket_count = lambda: 4
+
+    owner_count = trainer._speco_sglang_collection_owner_count(
+        [{"replica_rank": 0}],
+        None,
+    )
+
+    assert owner_count == 1
+
+
 def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
     trainer = _trainer({"training_interval_steps": 1, "use_logits": True}, step=1)
 

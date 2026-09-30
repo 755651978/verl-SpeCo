@@ -538,6 +538,39 @@ def test_mrv2_dspark_publish_excludes_frozen_confidence_head(monkeypatch) -> Non
     }
 
 
+def test_dspark_publish_excludes_untrained_confidence_head_without_mrv2_env(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    torch = pytest.importorskip("torch")
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish state filtering needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.backend = SimpleNamespace(
+        model_type="dspark",
+        trains_draft_lm_head=False,
+        trains_draft_embeddings=False,
+        confidence_head_alpha=0.0,
+    )
+    trainer.training_device_mesh = None
+    trainer._frozen_param_names = []
+    trainer.model = SimpleNamespace(
+        state_dict=lambda: {
+            "draft_model.confidence_head.proj.weight": torch.ones(1, 2),
+            "draft_model.confidence_head.proj.bias": torch.ones(1),
+            "draft_model.markov_head.markov_w1.weight": torch.ones(2, 2),
+        }
+    )
+
+    assert set(trainer._get_trainable_state_dict()) == {
+        "draft_model.markov_head.markov_w1.weight"
+    }
+
+
 def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:
     base_trainer = pytest.importorskip(
         "verl_speco.trainer.base_trainer",

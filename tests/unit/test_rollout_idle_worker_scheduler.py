@@ -980,6 +980,99 @@ def test_quota_publish_releases_writer_for_next_longer_idle_group() -> None:
     assert next_group.worker_ids == ("1",)
 
 
+def test_released_writer_does_not_switch_to_stale_drafter_group() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._metadata_idle_training_groups = (("0",), ("1",))
+    scheduler._idle_worker_writer_group = ("0",)
+    scheduler._idle_worker_writer_state_version = 10
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_collection_step = 10
+    now = time.time()
+    scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="0",
+            replica_rank=0,
+            memory_released=True,
+            idle_confidence=IdleWindowConfidence.CONFIRMED,
+            must_be_ready_at=now + 1.0,
+            event_ts=now,
+        )
+    )
+    scheduler.on_worker_event(
+        RolloutWorkerEvent(
+            RolloutWorkerEventType.WORKER_IDLE,
+            worker_id="1",
+            replica_rank=1,
+            memory_released=True,
+            idle_confidence=IdleWindowConfidence.CONFIRMED,
+            must_be_ready_at=now + 5.0,
+            event_ts=now,
+        )
+    )
+    config = replace(
+        _auto_idle_config(1),
+        training_quota_enable=True,
+        idle_worker_initial_batch_estimate_sec=0.1,
+        idle_worker_deadline_guard_sec=0.0,
+    )
+
+    scheduler.record_rollout_drafter_publish_completed(
+        10,
+        acknowledgements=[
+            {"published": True, "published_version": 10, "worker_rank": 0}
+        ],
+    )
+    scheduler.record_training_quota_publish_completed(global_step=10)
+
+    next_group = scheduler.select_idle_training_resources(config, now=now)
+
+    assert next_group.available
+    assert next_group.worker_ids == ("0",)
+
+
+def test_released_writer_can_switch_to_acknowledged_latest_group() -> None:
+    scheduler = _scheduler_with_statuses(("0", "1"))
+    scheduler._metadata_idle_training_groups = (("0",), ("1",))
+    scheduler._idle_worker_writer_group = ("0",)
+    scheduler._idle_worker_writer_state_version = 10
+    scheduler._training_quota_debt_steps = 0
+    scheduler._training_quota_collection_step = 10
+    now = time.time()
+    for worker_id, replica_rank, ready_delta in (("0", 0, 1.0), ("1", 1, 5.0)):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=replica_rank,
+                memory_released=True,
+                idle_confidence=IdleWindowConfidence.CONFIRMED,
+                must_be_ready_at=now + ready_delta,
+                event_ts=now,
+            )
+        )
+    config = replace(
+        _auto_idle_config(1),
+        training_quota_enable=True,
+        idle_worker_initial_batch_estimate_sec=0.1,
+        idle_worker_deadline_guard_sec=0.0,
+    )
+
+    scheduler.record_rollout_drafter_publish_completed(
+        10,
+        acknowledgements=[
+            {"published": True, "published_version": 10, "worker_rank": 0},
+            {"published": True, "published_version": 10, "worker_rank": 1},
+        ],
+    )
+    scheduler.record_training_quota_publish_completed(global_step=10)
+
+    next_group = scheduler.select_idle_training_resources(config, now=now)
+
+    assert next_group.available
+    assert next_group.worker_ids == ("1",)
+
+
 def test_partial_forced_completion_does_not_repay_or_publish() -> None:
     scheduler = DrafterScheduler()
     scheduler._training_quota_debt_steps = 6

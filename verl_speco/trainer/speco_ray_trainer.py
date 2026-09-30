@@ -1418,18 +1418,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if not collection_plan.collect:
                 metrics["bubble/direct_sample_not_planned"] = len(samples)
                 return metrics
+            routed_owners = (
+                [
+                    owner_ranks[index % len(owner_ranks)]
+                    for index in range(len(samples))
+                ]
+                if (owner_ranks := self._speco_bubble_collection_owner_ranks())
+                else None
+            )
             payload = self._speco_get_drafter_scheduler().prepare_collection_payload(
                 source=DrafterCollectionSource.SGLANG,
                 samples=samples,
-                owners=(
-                    [
-                        owner_ranks[index % len(owner_ranks)]
-                        for index in range(len(samples))
-                    ]
-                    if (owner_ranks := self._speco_bubble_collection_owner_ranks())
-                    else None
+                owners=routed_owners,
+                owner_count=self._speco_sglang_collection_owner_count(
+                    samples,
+                    routed_owners,
                 ),
-                owner_count=self._speco_num_rollout_replicas(samples),
                 dispatch_bucket_count=self._speco_dispatch_bucket_count(),
                 raw_samples=len(samples),
                 collection_id=collection_plan.collection_id,
@@ -2871,6 +2875,28 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         rollout_dp = int(_get_nested(rollout_cfg, ("data_parallel_size",), 1) or 1)
         return max(sample_max, rollout_dp, 1)
 
+    def _speco_sglang_collection_owner_count(
+        self,
+        samples: list[dict],
+        owners: list[int] | tuple[int, ...] | None = None,
+    ) -> int:
+        """Return the owner bucket count for SGLang sample collection.
+
+        Sync SGLang collection buckets by ``replica_rank`` and should keep the
+        legacy replica-derived count.  Bubble Time may route a sparse direct
+        event batch (for example, one sample from replica 0) to the current
+        writer owner (for example, owner 1).  In that routed case, the payload
+        must expose enough owner buckets for the explicit owner IDs.
+        """
+
+        owner_count = self._speco_num_rollout_replicas(samples)
+        if owners:
+            owner_count = max(owner_count, max(int(owner) for owner in owners) + 1)
+            routed_owner_count = self._speco_owner_bucket_count()
+            if routed_owner_count is not None:
+                owner_count = max(owner_count, int(routed_owner_count))
+        return max(int(owner_count), 1)
+
     def _speco_collect_generation_samples(self, gen_batch_output: Any) -> int:
         self._speco_last_raw_drafter_samples = 0
         direct_collected = int(
@@ -2907,7 +2933,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not collection_plan.collect:
             return 0
 
-        num_replicas = self._speco_num_rollout_replicas(samples)
         dispatch_bucket_count = self._speco_dispatch_bucket_count()
         bubble_owner_ranks = self._speco_bubble_collection_owner_ranks()
         routed_owners = None
@@ -2930,7 +2955,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             source=DrafterCollectionSource.SGLANG,
             samples=samples,
             owners=routed_owners,
-            owner_count=num_replicas,
+            owner_count=self._speco_sglang_collection_owner_count(
+                samples,
+                routed_owners,
+            ),
             dispatch_bucket_count=dispatch_bucket_count,
             raw_samples=len(samples),
             collection_id=collection_plan.collection_id,
@@ -3839,6 +3867,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 if isinstance(acknowledgements, (list, tuple))
                 else [acknowledgements]
             )
+            completed_publish_acks = ack_items
             explicit_acks = [ack for ack in ack_items if isinstance(ack, dict)]
             failed_acks = [
                 ack
@@ -3901,6 +3930,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     raise RuntimeError(
                         f"Staged drafter publish commit failed: {failed_commits}"
                     )
+                completed_publish_acks = commit_items
+            source_versions = {
+                int(context.get("source_global_step"))
+                for context in contexts
+                if context.get("source_global_step") is not None
+            }
+            if len(source_versions) == 1:
+                self._speco_get_drafter_scheduler().record_rollout_drafter_publish_completed(
+                    next(iter(source_versions)),
+                    acknowledgements=completed_publish_acks,
+                )
         except Exception:
             logger.exception(
                 "[BubbleTime] publish_failed: plan_ids=%s",
@@ -4124,6 +4164,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"source_step={publish_plan.source_global_step} "
                 f"workers={getattr(training_plan, 'target_worker_ids', ())} mode=sync",
                 flush=True,
+            )
+            scheduler.record_rollout_drafter_publish_completed(
+                publish_plan.source_global_step
             )
             scheduler.record_training_quota_publish_completed(self.global_steps)
         elif publish_plan is not None and publish_outcome is not None:

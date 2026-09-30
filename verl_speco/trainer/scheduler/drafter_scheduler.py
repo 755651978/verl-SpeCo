@@ -281,6 +281,8 @@ class DrafterScheduler:
         self._idle_worker_writer_group: tuple[str, ...] | None = None
         self._idle_worker_writer_state_version: int | None = None
         self._idle_worker_writer_migration_blocked: bool = False
+        self._latest_published_drafter_version: int | None = None
+        self._rollout_worker_drafter_versions: dict[str, int] = {}
         self._idle_worker_group_success_counts: dict[tuple[str, ...], int] = {}
         self._replica_idle_started_at: dict[int, float] = {}
         # Keep rollout-tail history replica-local.  Pooling samples globally
@@ -504,6 +506,119 @@ class DrafterScheduler:
         """Whether the current writer owns state that cannot be failed over."""
 
         return self._idle_worker_writer_migration_blocked
+
+    def _known_rollout_training_worker_ids(self) -> tuple[str, ...]:
+        worker_ids = {
+            worker_id
+            for group in (
+                self._metadata_idle_training_groups
+                or self._metadata_full_collective_idle_groups
+            )
+            for worker_id in _normalize_worker_id_group(group)
+        }
+        if not worker_ids:
+            worker_ids.update(self._idle_workers)
+        return tuple(sorted(worker_ids, key=_natural_worker_sort_key))
+
+    @staticmethod
+    def _flatten_publish_acknowledgements(value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            flattened: list[dict[str, Any]] = []
+            for item in value:
+                flattened.extend(
+                    DrafterScheduler._flatten_publish_acknowledgements(item)
+                )
+            return flattened
+        return []
+
+    def record_rollout_drafter_publish_completed(
+        self,
+        source_version: object,
+        *,
+        acknowledgements: Any = None,
+        worker_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, float | int]:
+        """Record rollout workers that acknowledged the live drafter version.
+
+        Bubble writer switching is safe only after the candidate rollout group
+        has already applied the latest published drafter weights.  This method
+        intentionally records only completed live publishes, not staged-only
+        acknowledgements.
+        """
+
+        try:
+            published_version = _as_int(source_version)
+        except (TypeError, ValueError):
+            return {}
+        self._latest_published_drafter_version = published_version
+        ack_workers: set[str] = set()
+        stale_or_failed_acks = 0
+        for ack in self._flatten_publish_acknowledgements(acknowledgements):
+            if not bool(ack.get("published", False)):
+                stale_or_failed_acks += 1
+                continue
+            ack_version = ack.get("published_version", source_version)
+            try:
+                if _as_int(ack_version) != published_version:
+                    stale_or_failed_acks += 1
+                    continue
+            except (TypeError, ValueError):
+                stale_or_failed_acks += 1
+                continue
+            worker_id = ack.get("worker_id", ack.get("worker_rank", ack.get("rank")))
+            if worker_id is None:
+                stale_or_failed_acks += 1
+                continue
+            ack_workers.add(str(worker_id))
+        if worker_ids:
+            ack_workers.update(str(worker_id) for worker_id in worker_ids)
+        elif acknowledgements is None:
+            # Synchronous publish already waited for the rollout update RPC but
+            # older executors do not expose per-worker ack payloads. Mark the
+            # known training workers so writer selection remains compatible.
+            ack_workers.update(self._known_rollout_training_worker_ids())
+        for worker_id in ack_workers:
+            self._rollout_worker_drafter_versions[worker_id] = published_version
+        logger.warning(
+            "[BubbleTime] rollout_drafter_versions_updated: "
+            "published_version=%s workers=%s stale_or_failed_acks=%s versions=%s",
+            published_version,
+            tuple(sorted(ack_workers, key=_natural_worker_sort_key)),
+            stale_or_failed_acks,
+            dict(sorted(self._rollout_worker_drafter_versions.items())),
+        )
+        print(
+            "[BubbleTime] rollout_drafter_versions_updated: "
+            f"published_version={published_version} "
+            f"workers={tuple(sorted(ack_workers, key=_natural_worker_sort_key))} "
+            f"stale_or_failed_acks={stale_or_failed_acks} "
+            f"versions={dict(sorted(self._rollout_worker_drafter_versions.items()))}",
+            flush=True,
+        )
+        return {
+            "bubble/published_drafter_version": published_version,
+            "bubble/published_drafter_workers": len(ack_workers),
+            "bubble/publish_stale_or_failed_acks": stale_or_failed_acks,
+        }
+
+    def _drafter_version_ready_for_writer_group(
+        self, group: tuple[str, ...]
+    ) -> tuple[bool, dict[str, int | None]]:
+        latest = self._latest_published_drafter_version
+        versions = {
+            worker_id: self._rollout_worker_drafter_versions.get(worker_id)
+            for worker_id in _normalize_worker_id_group(group)
+        }
+        if latest is None:
+            return True, versions
+        return all(
+            version is not None and int(version) >= latest
+            for version in versions.values()
+        ), versions
 
     def target_lm_head_sync_worker_ids(
         self,
@@ -2072,6 +2187,7 @@ class DrafterScheduler:
         window_too_small_seen = False
         speculative_unconfirmed_seen = False
         writer_state_migration_seen = False
+        stale_drafter_version_seen = False
         best_small_window: AvailableTrainingResources | None = None
         ready_candidates: list[
             tuple[
@@ -2104,6 +2220,29 @@ class DrafterScheduler:
                     tuple(sorted(self._idle_worker_hot_prewarmed_groups)),
                 )
                 continue
+            if not writer_has_private_state:
+                version_ready, group_versions = (
+                    self._drafter_version_ready_for_writer_group(group)
+                )
+                if not version_ready:
+                    stale_drafter_version_seen = True
+                    logger.info(
+                        "[BubbleTime] idle_group_stale_drafter_version "
+                        "group_id=idle-group-%s group=%s latest_published=%s "
+                        "worker_versions=%s reason=stale_drafter_version",
+                        index,
+                        group,
+                        self._latest_published_drafter_version,
+                        group_versions,
+                    )
+                    print(
+                        "[BubbleTime] idle_group_stale_drafter_version: "
+                        f"group_id=idle-group-{index} group={group} "
+                        f"latest_published={self._latest_published_drafter_version} "
+                        f"worker_versions={group_versions}",
+                        flush=True,
+                    )
+                    continue
             missing = [worker_id for worker_id in group if worker_id not in idle_states]
             if missing:
                 incomplete_seen = True
@@ -2334,6 +2473,8 @@ class DrafterScheduler:
             if speculative_unconfirmed_seen
             else "writer_state_migration_required"
             if writer_state_migration_seen
+            else "stale_drafter_version"
+            if stale_drafter_version_seen
             else "window_too_small"
             if window_too_small_seen
             else "idle_group_not_prewarmed"
