@@ -335,9 +335,7 @@ class DrafterScheduleConfig:
             idle_worker_max_pending_publish=max(
                 int(idle_get("max_pending_publish", 1) or 1), 1
             ),
-            idle_worker_dynamic_batch_cap=bool(
-                idle_get("dynamic_batch_cap", True)
-            ),
+            idle_worker_dynamic_batch_cap=bool(idle_get("dynamic_batch_cap", True)),
             idle_worker_initial_dynamic_batches=_optional_int(
                 idle_get("initial_dynamic_batches", None)
             ),
@@ -775,7 +773,7 @@ class TrainingPlan:
             "selected_keys": list(self.selected_keys),
         }
 
-    def metrics(self) -> dict[str, int]:
+    def metrics(self) -> dict[str, float | int]:
         """Return numeric observability fields accepted by metric backends."""
 
         strategy_code = {
@@ -783,7 +781,7 @@ class TrainingPlan:
             DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER: 1,
             DrafterExecutionStrategy.STANDALONE_ASYNC: 2,
         }[self.execution_strategy]
-        metrics = {
+        metrics: dict[str, float | int] = {
             "drafter/scheduler_used": 1,
             "drafter/schedule_launch": int(self.launch),
             "drafter/schedule_interval_matched": int(self.interval_matched),
@@ -796,15 +794,11 @@ class TrainingPlan:
             "drafter/schedule_sample_last_n_steps": int(self.sample_last_n_steps),
         }
         if self.hot_bootstrap_worker_ids:
-            metrics["bubble/hot_bootstrap_workers"] = len(
-                self.hot_bootstrap_worker_ids
-            )
+            metrics["bubble/hot_bootstrap_workers"] = len(self.hot_bootstrap_worker_ids)
         if self.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             metrics.update(
                 {
-                    "bubble/replay_session_retained": int(
-                        self.retain_replay_session
-                    ),
+                    "bubble/replay_session_retained": int(self.retain_replay_session),
                     "bubble/planned_batches": int(self.max_batches),
                     "bubble/idle_training_groups": int(bool(self.training_group_id)),
                     "bubble/no_idle_worker": int(self.reason == "no_idle_worker"),
@@ -896,7 +890,5 @@ class TrainingResult:
             data_version=_optional_int(value.get("data_version")),
             target_version=_optional_int(value.get("target_version")),
             is_publish_leader=bool(value.get("is_publish_leader", False)),
-            successful_valid_tokens=_as_int(
-                value.get("successful_valid_tokens", 0)
-            ),
+            successful_valid_tokens=_as_int(value.get("successful_valid_tokens", 0)),
         )

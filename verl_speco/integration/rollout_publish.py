@@ -514,9 +514,7 @@ def _export_actor_lm_head_rows_direct(worker: Any, row_indices: Any) -> Optional
                 rows_on_device = row_indices_cpu.to(
                     device=selected_weight.device, dtype=torch.long
                 )
-                selected_rows = selected_weight.detach().index_select(
-                    0, rows_on_device
-                )
+                selected_rows = selected_weight.detach().index_select(0, rows_on_device)
             if getattr(worker, "rank", None) != 0:
                 return {"_speco_non_owner_direct_sparse": True}
             weight = selected_rows.to(device="cpu", dtype=torch.bfloat16).contiguous()
@@ -1012,7 +1010,7 @@ class DraftWeightPublishMixin:
         # Two-phase Bubble publication: materialize the immutable snapshot in
         # actor-rollout workers, but do not mutate the live inference engine.
         # The trainer commits this staged payload only at a generation boundary.
-        self._speco_staged_draft_weights = weights
+        setattr(self, "_speco_staged_draft_weights", weights)
         self._speco_staged_draft_version = global_steps
         self._speco_staged_draft_weights_used_ref = used_ref
         return {
@@ -1023,9 +1021,7 @@ class DraftWeightPublishMixin:
         }
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
-    async def commit_staged_draft_weights(
-        self, global_steps: int | None = None
-    ):
+    async def commit_staged_draft_weights(self, global_steps: int | None = None):
         if not drafter_rollout_enabled(self.config):
             return {"published": False, "reason": "drafter_disabled"}
         weights = getattr(self, "_speco_staged_draft_weights", None)
@@ -1053,7 +1049,7 @@ class DraftWeightPublishMixin:
                 global_steps=staged_version,
             )
         finally:
-            self._speco_staged_draft_weights = None
+            setattr(self, "_speco_staged_draft_weights", None)
             self._speco_staged_draft_version = None
             self._speco_staged_draft_weights_used_ref = False
             if used_ref:

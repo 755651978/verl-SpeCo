@@ -114,7 +114,7 @@ async def _resolve_ray_object_ref(value):
 async def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
     if not chunks:
         return None
-    unique_refs = {}
+    unique_refs: dict[Any, Any] = {}
     for chunk in chunks:
         if not isinstance(chunk, dict):
             continue
@@ -596,7 +596,9 @@ class SpecoWorker(Worker):
 
         if self._use_replica_local_idle_training():
             trainer_config = self._replica_local_idle_trainer_config()
-            trainer_backend = build_trainer_backend(trainer_config, trainer_config.model)
+            trainer_backend = build_trainer_backend(
+                trainer_config, trainer_config.model
+            )
             logger.warning(
                 "[BubbleTime] replica_local_training_mesh: rank=%s replica_rank=%s "
                 "training_group_ranks=%s sync_collective_ranks=%s "
@@ -1966,7 +1968,9 @@ class SpecoWorker(Worker):
             return True
         bootstrap_workers = {
             str(worker_id)
-            for worker_id in training_plan.get("hot_bootstrap_worker_ids", ())
+            for worker_id in cast(
+                Any, training_plan.get("hot_bootstrap_worker_ids", ())
+            )
         }
         return str(self.rank) in bootstrap_workers
 
@@ -2243,9 +2247,8 @@ class SpecoWorker(Worker):
                         remaining_micro_batches = max(
                             gradient_accumulation_steps - int(micro_index), 1
                         )
-                        micro_batch_estimate_sec = (
-                            idle_batch_estimate_sec
-                            / max(gradient_accumulation_steps, 1)
+                        micro_batch_estimate_sec = idle_batch_estimate_sec / max(
+                            gradient_accumulation_steps, 1
                         )
                         if (
                             float(deadline_ts) - time.time()
@@ -2267,15 +2270,12 @@ class SpecoWorker(Worker):
                     if step_ok:
                         result["successful_steps"] += 1
                         result["successful_valid_tokens"] += int(
-                            getattr(
-                                self.trainer, "_last_optimizer_valid_tokens", 0
-                            )
+                            getattr(self.trainer, "_last_optimizer_valid_tokens", 0)
                             or 0
                         )
                     else:
                         result["reason"] = (
-                            accumulation_stop_reason
-                            or "training_step_returned_false"
+                            accumulation_stop_reason or "training_step_returned_false"
                         )
                         result["stop_reason"] = result["reason"]
                         if (

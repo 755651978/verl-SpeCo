@@ -118,8 +118,7 @@ class SyncCollectionStrategy:
             raise
 
         expected_by_owner = {
-            str(owner): len(bucket)
-            for owner, bucket in enumerate(payload.buckets)
+            str(owner): len(bucket) for owner, bucket in enumerate(payload.buckets)
         }
         staged_by_owner = {result.worker_id: result.staged_samples for result in staged}
         stage_ids = [result.worker_id for result in staged]

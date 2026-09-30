@@ -489,6 +489,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_rollout_idle_metrics: dict[str, Any] = {}
         self._speco_direct_sample_ids: set[str] = set()
         self._speco_direct_collected_samples = 0
+        self._speco_runtime_reclaim_requested_plan_id: str | None = None
+        self._speco_rollout_training_lease: tuple[str, tuple[str, ...]] | None = None
         self._speco_runtime_idle_callback_verified = False
         # A rollout event loop may drain events several times while one
         # generation is active.  Keep generation-scoped totals separately
@@ -1200,9 +1202,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         transient plan selected for the current scheduler event, so a Bubble
         run prepares the LM-head version required by the next idle window.
         """
-        return self._speco_rollout_idle_worker_enabled() and int(
-            getattr(self, "_speco_last_collected_samples", 0) or 0
-        ) > 0
+        return (
+            self._speco_rollout_idle_worker_enabled()
+            and int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
+        )
 
     def _speco_rollout_idle_event_bus_name(self) -> str | None:
         training_cfg = self._speco_drafter_training_config()
@@ -1309,9 +1312,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     runtime_state.status is DrafterRuntimeStatus.RUNNING
                     and active_plan is not None
                     and set(replica_workers).intersection(active_plan.target_worker_ids)
-                    and getattr(
-                        self, "_speco_runtime_reclaim_requested_plan_id", None
-                    )
+                    and getattr(self, "_speco_runtime_reclaim_requested_plan_id", None)
                     != active_plan.plan_id
                 ):
                     scheduler.request_reclaim(active_plan.target_worker_ids)
@@ -1333,12 +1334,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 # produced at least one complete collective group.  A single
                 # replica callback is insufficient proof for group training.
                 self._speco_runtime_idle_callback_verified = True
-            if (
-                event_type == RolloutWorkerEventType.WORKER_IDLE.value
-            ):
-                self._speco_runtime_idle_events_this_generation = int(
-                    getattr(self, "_speco_runtime_idle_events_this_generation", 0)
-                ) + 1
+            if event_type == RolloutWorkerEventType.WORKER_IDLE.value:
+                self._speco_runtime_idle_events_this_generation = (
+                    int(getattr(self, "_speco_runtime_idle_events_this_generation", 0))
+                    + 1
+                )
         if sample_events:
             self._speco_runtime_sample_events_this_generation = int(
                 getattr(self, "_speco_runtime_sample_events_this_generation", 0)
@@ -1379,7 +1379,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 continue
             try:
-                event_step = int(event.get("global_step"))
+                event_step = int(cast(Any, event.get("global_step")))
             except (TypeError, ValueError):
                 event_step = -1
             if event_step != current_step:
@@ -1419,10 +1419,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 metrics["bubble/direct_sample_not_planned"] = len(samples)
                 return metrics
             routed_owners = (
-                [
-                    owner_ranks[index % len(owner_ranks)]
-                    for index in range(len(samples))
-                ]
+                [owner_ranks[index % len(owner_ranks)] for index in range(len(samples))]
                 if (owner_ranks := self._speco_bubble_collection_owner_ranks())
                 else None
             )
@@ -1445,9 +1442,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     len(samples),
                     outcome.reason,
                 )
-                metrics["bubble/direct_sample_rejected"] = (
-                    metrics.get("bubble/direct_sample_rejected", 0) + len(samples)
-                )
+                metrics["bubble/direct_sample_rejected"] = metrics.get(
+                    "bubble/direct_sample_rejected", 0
+                ) + len(samples)
                 return metrics
             self._speco_direct_sample_ids.update(sample_ids)
             self._speco_direct_collected_samples += outcome.collected_samples
@@ -1456,11 +1453,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "[BubbleTime] direct_sample_batch_committed: count=%s replicas=%s "
                 "source_step=%s collected=%s",
                 len(samples),
-                tuple(
-                    sorted(
-                        {str(sample.get("replica_rank")) for sample in samples}
-                    )
-                ),
+                tuple(sorted({str(sample.get("replica_rank")) for sample in samples})),
                 current_step,
                 outcome.collected_samples,
             )
@@ -1664,9 +1657,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     }
                 )
             elif (
-                plan is not None
-                and plan.launch
-                and required_target_version is not None
+                plan is not None and plan.launch and required_target_version is not None
             ):
                 logger.debug(
                     "[BubbleTime] target_lm_head_ready_gate: plan_id=%s "
@@ -1887,7 +1878,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return metrics
 
     @staticmethod
-    def _speco_generation_output_replica_ranks(gen_batch_output: Any) -> tuple[int, ...]:
+    def _speco_generation_output_replica_ranks(
+        gen_batch_output: Any,
+    ) -> tuple[int, ...]:
         non_tensor_batch = getattr(gen_batch_output, "non_tensor_batch", None)
         if not isinstance(non_tensor_batch, dict):
             return ()
@@ -1963,8 +1956,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         replica_ranks = self._speco_fallback_idle_replica_ranks(gen_batch_output)
         if not replica_ranks:
             print(
-                "[BubbleTime] fallback_idle: skipped "
-                f"reason={reason} no_replica_ranks",
+                f"[BubbleTime] fallback_idle: skipped reason={reason} no_replica_ranks",
                 flush=True,
             )
             logger.warning(
@@ -1979,7 +1971,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         scheduler = self._speco_get_drafter_scheduler()
         for replica_rank in replica_ranks:
             fallback_worker_id = (
-                worker_ids[replica_rank] if 0 <= replica_rank < len(worker_ids) else None
+                worker_ids[replica_rank]
+                if 0 <= replica_rank < len(worker_ids)
+                else None
             )
             for worker_id in scheduler.rollout_idle_worker_ids_for_replica(
                 replica_rank,
@@ -2040,11 +2034,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         config = self._speco_drafter_schedule_config()
         scheduler = self._speco_get_drafter_scheduler()
         should_drain = force_drain or config.idle_worker_drain_before_next_rollout
-        drain_started = (
-            time.perf_counter()
-            if should_drain
-            else None
-        )
+        drain_started = time.perf_counter() if should_drain else None
         scheduler.request_reclaim(active_plan.target_worker_ids)
         metrics: dict[str, Any] = {"bubble/reclaim_requested": 1}
         if not should_drain:
@@ -2899,9 +2889,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_collect_generation_samples(self, gen_batch_output: Any) -> int:
         self._speco_last_raw_drafter_samples = 0
-        direct_collected = int(
-            getattr(self, "_speco_direct_collected_samples", 0) or 0
-        )
+        direct_collected = int(getattr(self, "_speco_direct_collected_samples", 0) or 0)
         self._speco_last_collected_samples = direct_collected
         collection_plan = self._speco_plan_drafter_collection(
             DrafterCollectionSource.SGLANG
@@ -2914,7 +2902,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return 0
         all_samples = pop_drafter_samples(gen_batch_output)
         self._speco_last_raw_drafter_samples = len(all_samples)
-        committed_ids = getattr(self, "_speco_direct_sample_ids", set())
+        committed_ids = cast(set[str], getattr(self, "_speco_direct_sample_ids", set()))
         samples = [
             sample
             for sample in all_samples
@@ -3215,18 +3203,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         if training_plan is None and self._speco_rollout_idle_worker_enabled():
             target_version = int(self.global_steps)
-            ready_workers = self._speco_ready_target_lm_head_workers.get(
-                target_version
-            )
-            already_ready = target_version in self._speco_ready_target_lm_head_versions and (
-                (
-                    target_worker_ids is not None
-                    and self._speco_target_lm_head_ready_for_workers(
-                        target_version,
-                        target_worker_ids,
+            ready_workers = self._speco_ready_target_lm_head_workers.get(target_version)
+            already_ready = (
+                target_version in self._speco_ready_target_lm_head_versions
+                and (
+                    (
+                        target_worker_ids is not None
+                        and self._speco_target_lm_head_ready_for_workers(
+                            target_version,
+                            target_worker_ids,
+                        )
                     )
+                    or (target_worker_ids is None and ready_workers is None)
                 )
-                or (target_worker_ids is None and ready_workers is None)
             )
             if already_ready:
                 print(
@@ -3309,9 +3298,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "drafter/target_lm_head_target_workers": (
                     len(target_worker_ids) if target_worker_ids is not None else 0
                 ),
-                "timing_s/drafter_target_lm_head_fetch_submit": (
-                    fetch_submit_elapsed
-                ),
+                "timing_s/drafter_target_lm_head_fetch_submit": (fetch_submit_elapsed),
                 "timing_s/drafter_target_lm_head_prefetch_submit_critical_path": (
                     time.perf_counter() - sync_started
                 ),
@@ -3499,9 +3486,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             pending = self._pending_target_lm_head_sync
             stage = str(pending.get("stage", "dispatch"))
             refs = (
-                pending.get("fetch_refs")
-                if stage == "fetch"
-                else pending.get("refs")
+                pending.get("fetch_refs") if stage == "fetch" else pending.get("refs")
             )
             self._ray_get_if_needed(refs)
             metrics.update(self._speco_poll_target_lm_head_prefetch())
@@ -3524,9 +3509,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 scheduler.request_reclaim(active_plan.target_worker_ids)
                 completed_plan, outcome = self._speco_wait_pending_drafter_training()
                 if outcome is not None and outcome.trained:
-                    self._speco_publish_drafter_weights(
-                        outcome.trained, completed_plan
-                    )
+                    self._speco_publish_drafter_weights(outcome.trained, completed_plan)
                     self._speco_publish_boundary()
             self._speco_wait_target_lm_head_prefetch()
             self._speco_wait_pending_drafter_publish()
@@ -3547,7 +3530,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         """Record only target-head versions that can still exist on workers."""
 
         try:
-            version = int(target_version)
+            version = int(cast(Any, target_version))
         except (TypeError, ValueError):
             return ()
         self._speco_ready_target_lm_head_versions.add(version)
@@ -3582,7 +3565,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         worker_ids: tuple[str, ...],
     ) -> bool:
         try:
-            version = int(target_version)
+            version = int(cast(Any, target_version))
         except (TypeError, ValueError):
             return False
         if version not in self._speco_ready_target_lm_head_versions:
@@ -3619,7 +3602,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             payload = dict(payload)
             payload["defer_device_apply"] = True
             if target_worker_ids:
-                payload["target_worker_ids"] = tuple(str(worker_id) for worker_id in target_worker_ids)
+                payload["target_worker_ids"] = tuple(
+                    str(worker_id) for worker_id in target_worker_ids
+                )
         payload_arg, global_step_arg, _ = (
             self._speco_build_drafter_target_lm_head_sync_args(payload)
         )
@@ -3685,9 +3670,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 source_vocab_size=int(pending["source_vocab_size"]),
                 target_worker_ids=pending.get("target_worker_ids"),
             )
-            metrics["timing_s/drafter_target_lm_head_fetch_async_work"] = (
-                fetch_elapsed
-            )
+            metrics["timing_s/drafter_target_lm_head_fetch_async_work"] = fetch_elapsed
             metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] = (
                 fetch_finished - fetch_wait_started
             )
@@ -3853,9 +3836,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not self._pending_drafter_publish_refs:
             return 0
         pending_refs = self._pending_drafter_publish_refs
-        contexts = list(
-            getattr(self, "_pending_drafter_publish_contexts", []) or []
-        )
+        contexts = list(getattr(self, "_pending_drafter_publish_contexts", []) or [])
         wait_started = time.perf_counter()
         stage_elapsed_sec = 0.0
         commit_elapsed_sec = 0.0
@@ -3880,13 +3861,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     f"Drafter publish staging was not acknowledged: {failed_acks}"
                 )
             staged_only = bool(explicit_acks) and all(
-                bool(ack.get("staged", False))
-                and not bool(ack.get("published", False))
+                bool(ack.get("staged", False)) and not bool(ack.get("published", False))
                 for ack in explicit_acks
             )
             if staged_only:
                 source_versions = {
-                    int(context.get("source_global_step"))
+                    int(cast(Any, context.get("source_global_step")))
                     for context in contexts
                     if context.get("source_global_step") is not None
                 }
@@ -3995,7 +3975,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             contexts = list(self._pending_drafter_publish_contexts or [])
             oldest_step = min(
                 (
-                    int(context.get("source_global_step"))
+                    int(cast(Any, context.get("source_global_step")))
                     for context in contexts
                     if context.get("source_global_step") is not None
                 ),
@@ -4010,9 +3990,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return {
             "bubble/publish_pending": 0,
             "bubble/publish_acknowledged": completed,
-            "bubble/published_version": int(
-                self._speco_published_drafter_version or 0
-            ),
+            "bubble/published_version": int(self._speco_published_drafter_version or 0),
         }
 
     def _speco_publish_boundary(self) -> dict[str, Any]:
@@ -4038,8 +4016,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "bubble/publish_pending": 0,
                 "bubble/publish_acknowledged": completed,
                 "bubble/publish_forced_by_lag": 1,
-                "timing_s/drafter_publish_lag_wait": time.perf_counter()
-                - wait_started,
+                "timing_s/drafter_publish_lag_wait": time.perf_counter() - wait_started,
             }
         )
         return metrics
@@ -4058,16 +4035,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self, payload: Any, global_step: object, asynchronous: bool
     ) -> None:
         two_phase = bool(
-            asynchronous
-            and getattr(self, "_speco_two_phase_publish_active", False)
+            asynchronous and getattr(self, "_speco_two_phase_publish_active", False)
         )
         method_name = (
             "stage_draft_weights_async"
             if two_phase
             else (
-                "update_draft_weights_async"
-                if asynchronous
-                else "update_draft_weights"
+                "update_draft_weights_async" if asynchronous else "update_draft_weights"
             )
         )
         update_result = self._speco_actor_rollout_method(method_name)(
@@ -4115,9 +4089,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and publish_plan.asynchronous
             and publish_outcome.published
         ):
-            pending_contexts = getattr(
-                self, "_pending_drafter_publish_contexts", None
-            )
+            pending_contexts = getattr(self, "_pending_drafter_publish_contexts", None)
             if not isinstance(pending_contexts, list):
                 pending_contexts = []
                 self._pending_drafter_publish_contexts = pending_contexts
@@ -4409,9 +4381,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         pending_drafter_publishes: list[dict[str, Any]] = []
 
-        def drain_deferred_drafter_publishes(
-            *, safe_point: str
-        ) -> dict[str, Any]:
+        def drain_deferred_drafter_publishes(*, safe_point: str) -> dict[str, Any]:
             """Publish every completed Bubble plan at a rollout-safe boundary.
 
             ``checkpoint_manager.update_weights`` is an opportunistic early
@@ -4477,12 +4447,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         metrics[key] = float(metrics.get(key, 0.0)) + float(value)
                     else:
                         metrics[key] = value
-                metrics["timing_s/drafter_publish_critical_path"] = float(
-                    metrics.get("timing_s/drafter_publish_critical_path", 0.0)
-                ) + publish_elapsed
-                metrics["timing_s/drafter_publish_safe_point"] = float(
-                    metrics.get("timing_s/drafter_publish_safe_point", 0.0)
-                ) + publish_elapsed
+                metrics["timing_s/drafter_publish_critical_path"] = (
+                    float(metrics.get("timing_s/drafter_publish_critical_path", 0.0))
+                    + publish_elapsed
+                )
+                metrics["timing_s/drafter_publish_safe_point"] = (
+                    float(metrics.get("timing_s/drafter_publish_safe_point", 0.0))
+                    + publish_elapsed
+                )
             return metrics
 
         def defer_drafter_publish(
@@ -4547,9 +4519,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         safe_point="before_next_generation"
                     )
                 )
-            collection_boundary = (
-                not input_is_validation
-                and scheduler.should_collect(self.global_steps, config)
+            collection_boundary = not input_is_validation and scheduler.should_collect(
+                self.global_steps, config
             )
             if (
                 collection_boundary
@@ -4557,28 +4528,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self.global_steps,
                     config,
                 )
-                and (
-                    self._pending_drafter_publish_refs
-                    or pending_drafter_publishes
-                )
+                and (self._pending_drafter_publish_refs or pending_drafter_publishes)
             ):
                 publish_wait_started = time.perf_counter()
                 # At most one publish RPC may be staged at once.  A completed
                 # wait lets the next locally deferred plan enter staging.
-                while (
-                    self._pending_drafter_publish_refs
-                    or pending_drafter_publishes
-                ):
+                while self._pending_drafter_publish_refs or pending_drafter_publishes:
                     if self._pending_drafter_publish_refs:
                         completed = self._speco_wait_pending_drafter_publish()
-                        generation_metrics["bubble/publish_acknowledged"] = (
-                            int(
-                                generation_metrics.get(
-                                    "bubble/publish_acknowledged", 0
-                                )
-                            )
-                            + int(completed)
-                        )
+                        generation_metrics["bubble/publish_acknowledged"] = int(
+                            generation_metrics.get("bubble/publish_acknowledged", 0)
+                        ) + int(completed)
                     if pending_drafter_publishes:
                         generation_metrics.update(
                             drain_deferred_drafter_publishes(
@@ -4586,9 +4546,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                             )
                         )
                 generation_metrics["bubble/publish_forced_by_collection"] = 1
-                generation_metrics[
-                    "timing_s/drafter_publish_collection_wait"
-                ] = time.perf_counter() - publish_wait_started
+                generation_metrics["timing_s/drafter_publish_collection_wait"] = (
+                    time.perf_counter() - publish_wait_started
+                )
 
             skip_collection_for_quota = (
                 not input_is_validation
@@ -4656,6 +4616,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 runtime_sample_events,
             )
             if not is_validation_generation:
+
                 def handle_post_rollout_completion(completed_plan, outcome):
                     if defer_publish_until_update_weights:
                         defer_drafter_publish(

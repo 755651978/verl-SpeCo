@@ -2788,9 +2788,7 @@ class DrafterBaseTrainer:
                 target_weight.dtype,
                 target_weight.device,
             )
-            self._applied_target_lm_head_weight_step = (
-                self._target_lm_head_weight_step
-            )
+            self._applied_target_lm_head_weight_step = self._target_lm_head_weight_step
             self._pending_target_lm_head_weight = None
             self._pending_target_lm_head_row_indices = None
             self._pending_target_lm_head_source_vocab_size = None
@@ -3244,9 +3242,7 @@ class DrafterBaseTrainer:
                     selected_hidden_row_end,
                     hidden_seq_length,
                     max(
-                        input_seq_length
-                        - hidden_position_start
-                        - input_tail_rows,
+                        input_seq_length - hidden_position_start - input_tail_rows,
                         0,
                     ),
                 )
@@ -5154,9 +5150,13 @@ class DrafterBaseTrainer:
         """Reserve a version-homogeneous quota-cycle replay session."""
 
         max_samples = max(int(max_batches), 0) * max(int(self.batch_size), 1)
-        sessions = getattr(self, "_training_replay_sessions", None)
+        sessions = cast(
+            dict[int, dict[str, Any]] | None,
+            getattr(self, "_training_replay_sessions", None),
+        )
         if sessions is None:
-            sessions = self._training_replay_sessions = {}
+            sessions = {}
+            setattr(self, "_training_replay_sessions", sessions)
         session = sessions.get(int(target_version))
         if session is not None:
             reserved = self.data_buffer.reserve_samples(
@@ -5415,6 +5415,7 @@ class DrafterBaseTrainer:
                 continue
             loss_mask = item.get("loss_mask")
             if torch.is_tensor(loss_mask):
+                loss_mask = cast(Any, loss_mask)
                 trainable_valid_tokens += max(
                     int(loss_mask.detach().float().sum().item()), 0
                 )
@@ -5467,9 +5468,9 @@ class DrafterBaseTrainer:
         previous_collected_data = self.collected_data
         previous_current_step = self.current_rl_step
         previous_use_data_buffer = self.use_data_buffer
-        previous_reservation_id = self._active_training_reservation_id
-        previous_target_version = self._active_training_target_version
-        previous_prepared_items = self._last_prepared_training_items
+        previous_reservation_id = getattr(self, "_active_training_reservation_id", None)
+        previous_target_version = getattr(self, "_active_training_target_version", None)
+        previous_prepared_items = getattr(self, "_last_prepared_training_items", [])
         maxlen = max(
             len(samples),
             int(self.config.rollout.drafter.training.get("current_max_samples", 2000)),
@@ -5576,9 +5577,7 @@ class DrafterBaseTrainer:
             logger.exception(f"Accumulated training step {step} failed with error: {e}")
             return False
 
-        self._consume_training_items(
-            [item for items in batch_items for item in items]
-        )
+        self._consume_training_items([item for items in batch_items for item in items])
         self._last_prepared_training_items = []
         return True
 
@@ -5775,9 +5774,7 @@ class DrafterBaseTrainer:
 
         optimizer_ts = time.time()
         if accumulation_steps > 1:
-            accumulation_denom = float(
-                max(self._current_accumulation_valid_tokens, 1)
-            )
+            accumulation_denom = float(max(self._current_accumulation_valid_tokens, 1))
             for parameter in self.model.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(accumulation_denom)
@@ -5796,9 +5793,7 @@ class DrafterBaseTrainer:
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.optimizer_steps_total += 1
-        self._last_optimizer_valid_tokens = int(
-            self._current_accumulation_valid_tokens
-        )
+        self._last_optimizer_valid_tokens = int(self._current_accumulation_valid_tokens)
         self.optimizer.zero_grad(set_to_none=True)
         self.record_training_timing(
             "timing_s/drafter_optimizer", time.time() - optimizer_ts

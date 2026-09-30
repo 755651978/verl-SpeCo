@@ -1844,8 +1844,7 @@ class _SpecoSGLangHttpServerMixin:
                 self._speco_rollout_release_verified = False
             async with lease_lock:
                 remaining_requests = max(
-                    int(getattr(self, "_speco_rollout_active_requests", 1) or 1)
-                    - 1,
+                    int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
                     0,
                 )
                 self._speco_rollout_active_requests = remaining_requests
@@ -2550,14 +2549,12 @@ class _SpecoSGLangHttpServerMixin:
                         f"{collection_global_steps}:{self.replica_rank}:{request_id}"
                     )
                     drafter_sample["_speco_sample_id"] = sample_id
-                    direct_event_emitted = (
-                        emit_rollout_drafter_sample(
-                            _rollout_idle_event_bus_name(drafter_cfg),
-                            drafter_sample,
-                            sample_id=sample_id,
-                            replica_rank=int(self.replica_rank),
-                            global_step=collection_global_steps,
-                        )
+                    direct_event_emitted = emit_rollout_drafter_sample(
+                        _rollout_idle_event_bus_name(drafter_cfg),
+                        drafter_sample,
+                        sample_id=sample_id,
+                        replica_rank=int(self.replica_rank),
+                        global_step=collection_global_steps,
                     )
                     drafter_sample["_speco_direct_event_emitted"] = direct_event_emitted
                     logger.debug(

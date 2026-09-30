@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from verl_speco.trainer.scheduler.drafter_runtime_state import (
     DrafterRuntimeState,
@@ -207,9 +207,7 @@ class TrainingOutcome:
                 successful_steps_consistent
             ),
             "drafter/train_optimizer_steps_consistent": int(optimizer_steps_consistent),
-            "drafter/train_publish_snapshot_required": int(
-                publish_snapshot_required
-            ),
+            "drafter/train_publish_snapshot_required": int(publish_snapshot_required),
             "drafter/train_publish_snapshot_consistent": int(
                 publish_snapshot_consistent
             ),
@@ -256,7 +254,7 @@ class TrainingOutcome:
                     result.get("reason") == "reclaim_requested"
                     or result.get("stop_reason") == "reclaim_requested"
                 )
-                and int(result.get("attempted_steps", 0) or 0) == 0
+                and int(cast(Any, result.get("attempted_steps", 0) or 0)) == 0
                 for result in normalized_results
             )
         )
@@ -277,7 +275,10 @@ class TrainingOutcome:
             "no_trainable_batch" in stop_reasons
         )
         metrics["bubble/train_first_batch_started"] = int(
-            any(bool(result.get("first_batch_started", False)) for result in normalized_results)
+            any(
+                bool(result.get("first_batch_started", False))
+                for result in normalized_results
+            )
         )
         metrics["bubble/training_residency_retained"] = int(
             any(

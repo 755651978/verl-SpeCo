@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -56,7 +56,7 @@ def _event_bus_actor_class(ray):
             event: dict[str, Any],
         ) -> tuple[str, ...]:
             try:
-                replica_rank = int(event.get("replica_rank"))
+                replica_rank = int(cast(Any, event.get("replica_rank")))
             except (TypeError, ValueError):
                 replica_rank = -1
             return self._replica_groups.get(
@@ -128,7 +128,9 @@ def _event_bus_actor_class(ray):
                 self._rollout_owners.get(worker_id, 0) <= 0 for worker_id in group
             )
             for worker_id in group:
-                self._rollout_owners[worker_id] = self._rollout_owners.get(worker_id, 0) + 1
+                self._rollout_owners[worker_id] = (
+                    self._rollout_owners.get(worker_id, 0) + 1
+                )
             if was_idle and group not in self._pending_rollout_groups:
                 started = dict(event)
                 started["event_type"] = "GENERATION_STARTED"
@@ -151,7 +153,9 @@ def _event_bus_actor_class(ray):
                     self._rollout_owners[worker_id] = remaining
                 else:
                     self._rollout_owners.pop(worker_id, None)
-            idle = all(self._rollout_owners.get(worker_id, 0) <= 0 for worker_id in group)
+            idle = all(
+                self._rollout_owners.get(worker_id, 0) <= 0 for worker_id in group
+            )
             if idle:
                 released = dict(event)
                 released.update(

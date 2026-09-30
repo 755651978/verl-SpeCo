@@ -218,9 +218,7 @@ async def _speco_worker_run_agent_loop(
         sampling_params,
         global_steps=trajectory.get("step"),
         validate=bool(trajectory.get("validate", False)),
-        skip_drafter_collection=bool(
-            trajectory.get("skip_drafter_collection", False)
-        ),
+        skip_drafter_collection=bool(trajectory.get("skip_drafter_collection", False)),
     )
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):

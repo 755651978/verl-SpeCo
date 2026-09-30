@@ -1,5 +1,7 @@
 # Bubble Time Drafter Training
 
+Last updated: 09/30/2026
+
 Bubble Time is the rollout-idle execution path for online drafter co-training.
 Its goal is to keep the same drafter-training quality target as synchronous
 training, while moving as much drafter optimizer work as possible into rollout

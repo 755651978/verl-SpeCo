@@ -27,7 +27,7 @@ import time
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 from uuid import uuid4
 
 from verl_speco.trainer.scheduler.schedule_types import (
@@ -158,7 +158,7 @@ def _normalize_worker_id_group(value: object) -> tuple[str, ...]:
     if isinstance(value, (str, bytes)):
         return (str(value),)
     try:
-        worker_ids = [str(worker_id) for worker_id in value]  # type: ignore[union-attr]
+        worker_ids = [str(worker_id) for worker_id in cast(Iterable[object], value)]
     except TypeError:
         return (str(value),)
     return tuple(dict.fromkeys(sorted(worker_ids, key=_natural_worker_sort_key)))
@@ -391,8 +391,7 @@ class DrafterScheduler:
                 "[BubbleTime] idle_prewarm_skipped: reason=no_training_group_metadata"
             )
             print(
-                "[BubbleTime] idle_prewarm_skipped: "
-                "reason=no_training_group_metadata",
+                "[BubbleTime] idle_prewarm_skipped: reason=no_training_group_metadata",
                 flush=True,
             )
             return []
@@ -482,12 +481,18 @@ class DrafterScheduler:
             return None
         for group in sorted(self._idle_worker_hot_prewarmed_groups):
             normalized = _normalize_worker_id_group(group)
-            if normalized and normalized not in self._disabled_replica_local_idle_groups:
+            if (
+                normalized
+                and normalized not in self._disabled_replica_local_idle_groups
+            ):
                 self._idle_worker_writer_group = normalized
                 return normalized
         for group in self._metadata_idle_training_groups:
             normalized = _normalize_worker_id_group(group)
-            if normalized and normalized not in self._disabled_replica_local_idle_groups:
+            if (
+                normalized
+                and normalized not in self._disabled_replica_local_idle_groups
+            ):
                 self._idle_worker_writer_group = normalized
                 return normalized
         return None
@@ -630,15 +635,16 @@ class DrafterScheduler:
             groups.extend(
                 normalized
                 for group in self._metadata_idle_training_groups
-                if (
-                    normalized := _normalize_worker_id_group(group)
-                )
+                if (normalized := _normalize_worker_id_group(group))
                 and normalized not in self._disabled_replica_local_idle_groups
             )
         if not groups:
             for group in self._metadata_idle_training_groups:
                 normalized = _normalize_worker_id_group(group)
-                if normalized and normalized not in self._disabled_replica_local_idle_groups:
+                if (
+                    normalized
+                    and normalized not in self._disabled_replica_local_idle_groups
+                ):
                     groups.append(normalized)
                     break
         if (
@@ -856,7 +862,7 @@ class DrafterScheduler:
         """Return a conservative idle tail for only the requested replica/group."""
 
         if replica_rank is not None:
-            replica_ranks = (int(replica_rank),)
+            replica_ranks: tuple[int, ...] = (int(replica_rank),)
         elif worker_ids:
             replica_ranks = self._replica_ranks_for_worker_group(worker_ids)
         else:
@@ -903,7 +909,10 @@ class DrafterScheduler:
         return best_group
 
     def _all_idle_training_worker_ids(self) -> tuple[str, ...]:
-        groups = self._metadata_idle_training_groups or self._metadata_full_collective_idle_groups
+        groups = (
+            self._metadata_idle_training_groups
+            or self._metadata_full_collective_idle_groups
+        )
         collected: list[str] = []
         for raw_group in groups:
             group = _normalize_worker_id_group(raw_group)
@@ -959,8 +968,7 @@ class DrafterScheduler:
             self._effective_idle_deadline_guard_sec(config)
             + self._effective_idle_startup_reserve_sec(config, worker_ids)
             + self._effective_idle_tail_reserve_sec(config)
-            + optimizer_step_estimate_sec
-            * max(int(min_batches), 1),
+            + optimizer_step_estimate_sec * max(int(min_batches), 1),
         )
 
     def _effective_idle_dynamic_batch_cap(
@@ -1042,9 +1050,8 @@ class DrafterScheduler:
             return
         elif stop_reason in {"reclaim_requested", "deadline_reached"}:
             next_cap = max(1, min(previous, max(outcome.successful_steps, 1)))
-        elif (
-            stop_reason == "max_batches_reached"
-            or outcome.successful_steps >= max(int(plan.max_batches), 1)
+        elif stop_reason == "max_batches_reached" or outcome.successful_steps >= max(
+            int(plan.max_batches), 1
         ):
             next_cap = max(previous, max(int(plan.max_batches), 1) * 2)
         self._idle_worker_dynamic_batch_cap = max(int(next_cap), 1)
@@ -1067,11 +1074,16 @@ class DrafterScheduler:
     ) -> dict[str, float | int]:
         """Record quality feedback and fail closed on generation interference."""
 
-        if config.execution_strategy is not DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+        if (
+            config.execution_strategy
+            is not DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+        ):
             return {}
         observed_step = global_step
         if observed_step is None:
-            observed_step = metrics.get("training/global_step", metrics.get("global_step"))
+            observed_step = metrics.get(
+                "training/global_step", metrics.get("global_step")
+            )
         try:
             if observed_step is not None:
                 self._last_observed_global_step = _as_int(observed_step)
@@ -1097,8 +1109,7 @@ class DrafterScheduler:
                 and self._last_observed_global_step is not None
                 and (
                     self._quality_last_publish_step is None
-                    or self._last_observed_global_step
-                    > self._quality_last_publish_step
+                    or self._last_observed_global_step > self._quality_last_publish_step
                 )
             ) or (
                 not self._quality_pending_acceptance_baseline
@@ -1107,7 +1118,10 @@ class DrafterScheduler:
                 self._quality_acceptance_baseline = acceptance
                 if self._quality_pending_acceptance_baseline:
                     self._quality_pending_acceptance_baseline = False
-            elif acceptance > self._quality_acceptance_baseline:
+            elif (
+                self._quality_acceptance_baseline is not None
+                and acceptance > self._quality_acceptance_baseline
+            ):
                 # Track improvements slowly, but never adapt the baseline
                 # downward and hide a real quality regression.
                 self._quality_acceptance_baseline = (
@@ -1134,14 +1148,18 @@ class DrafterScheduler:
         result.update(self._quality_gate_metrics(config))
         if gen_ms is None or gen_ms <= 0:
             return result
-        idle_active = any(
-            bool(metrics.get(key, 0))
-            for key in (
-                "drafter/idle_trained",
-                "scheduler/train_launched",
-                "drafter/runtime_inflight",
+        idle_active = (
+            any(
+                bool(metrics.get(key, 0))
+                for key in (
+                    "drafter/idle_trained",
+                    "scheduler/train_launched",
+                    "drafter/runtime_inflight",
+                )
             )
-        ) or float(metrics.get("timing_s/drafter_async_training_work", 0.0) or 0.0) > 0.0
+            or float(metrics.get("timing_s/drafter_async_training_work", 0.0) or 0.0)
+            > 0.0
+        )
         baseline = self._idle_worker_gen_per_token_baseline_ms
         if not idle_active:
             self._idle_worker_gen_slowdown_streak = 0
@@ -1163,10 +1181,7 @@ class DrafterScheduler:
         ratio = gen_ms / max(baseline, 1.0e-9)
         result["bubble/gen_slowdown_ratio"] = ratio
         threshold = 1.0 + float(config.idle_worker_gen_slowdown_threshold)
-        if (
-            config.idle_worker_dynamic_batch_cap
-            and ratio > threshold
-        ):
+        if config.idle_worker_dynamic_batch_cap and ratio > threshold:
             self._idle_worker_gen_slowdown_streak += 1
             if current_cap > 1:
                 previous = current_cap
@@ -1503,12 +1518,12 @@ class DrafterScheduler:
                 must_be_ready_at=(
                     None
                     if event.get("must_be_ready_at") is None
-                    else float(event.get("must_be_ready_at", 0.0))
+                    else float(cast(Any, event.get("must_be_ready_at", 0.0)))
                 ),
                 event_ts=(
                     None
                     if event.get("event_ts") is None
-                    else float(event.get("event_ts", 0.0))
+                    else float(cast(Any, event.get("event_ts", 0.0)))
                 ),
             )
         elif not isinstance(event.event_type, RolloutWorkerEventType):
@@ -1747,10 +1762,7 @@ class DrafterScheduler:
         boundary_confirmed = 0
         if confirm_speculative_idle:
             for state in self._idle_workers.values():
-                if (
-                    state.status == "idle"
-                    and state.memory_released
-                ):
+                if state.status == "idle" and state.memory_released:
                     if state.idle_confidence is IdleWindowConfidence.SPECULATIVE:
                         promoted += 1
                     # Runtime idle callbacks are request-local: they may arrive
@@ -1802,7 +1814,9 @@ class DrafterScheduler:
                 }
             )
             for replica_rank, window in observed:
-                metrics[f"bubble/replica_{replica_rank}_observed_idle_window_s"] = window
+                metrics[f"bubble/replica_{replica_rank}_observed_idle_window_s"] = (
+                    window
+                )
                 metrics[f"bubble/replica_{replica_rank}_historical_idle_window_s"] = (
                     self._effective_historical_idle_window_sec(
                         replica_rank=replica_rank
@@ -1882,9 +1896,7 @@ class DrafterScheduler:
                 record.get("training_group_ranks", ())
             )
             if bool(record.get("is_global_publish_leader", False)):
-                leader_worker_id = str(
-                    record.get("worker_id", record.get("rank", ""))
-                )
+                leader_worker_id = str(record.get("worker_id", record.get("rank", "")))
                 if leader_worker_id:
                     global_publish_leaders.append(leader_worker_id)
             if replica_rank is not None and training_ranks:
@@ -1900,17 +1912,14 @@ class DrafterScheduler:
                 )
             if not fallback_group:
                 fallback_group = training_ranks
-            if (
-                fallback_group
-                and fallback_group not in seen_full_collective_groups
-            ):
+            if fallback_group and fallback_group not in seen_full_collective_groups:
                 full_collective_groups.append(fallback_group)
                 seen_full_collective_groups.add(fallback_group)
             if training_ranks in self._disabled_replica_local_idle_groups:
                 continue
-            idle_collective_scope = str(
-                record.get("idle_collective_scope", "") or ""
-            ).strip().lower()
+            idle_collective_scope = (
+                str(record.get("idle_collective_scope", "") or "").strip().lower()
+            )
             if idle_collective_scope == "replica_local":
                 full_group = training_ranks
             else:
@@ -1971,9 +1980,7 @@ class DrafterScheduler:
         for group in self._metadata_idle_training_groups:
             worker_ids = _normalize_worker_id_group(group)
             if worker_ids and all(
-                (
-                    state := self._idle_workers.get(worker_id)
-                ) is not None
+                (state := self._idle_workers.get(worker_id)) is not None
                 and state.status == "idle"
                 and state.memory_released
                 for worker_id in worker_ids
@@ -1998,9 +2005,7 @@ class DrafterScheduler:
                 self._replica_last_observed_idle_window_sec.get(replica_rank, 0.0)
             )
             metrics[f"{prefix}_historical_idle_window_s"] = float(
-                self._effective_historical_idle_window_sec(
-                    replica_rank=replica_rank
-                )
+                self._effective_historical_idle_window_sec(replica_rank=replica_rank)
                 or 0.0
             )
             metrics[f"{prefix}_idle_event_delivery_lag_s"] = float(
@@ -2122,8 +2127,7 @@ class DrafterScheduler:
         if (
             self._idle_worker_suspended_until_step is not None
             and self._last_observed_global_step is not None
-            and self._last_observed_global_step
-            < self._idle_worker_suspended_until_step
+            and self._last_observed_global_step < self._idle_worker_suspended_until_step
         ):
             return AvailableTrainingResources(False, "generation_slowdown_cooldown")
         if (
@@ -2537,8 +2541,7 @@ class DrafterScheduler:
                 )
             if (
                 not self._idle_worker_writer_migration_blocked
-                and
-                self._disabled_replica_local_idle_groups
+                and self._disabled_replica_local_idle_groups
                 and not self._metadata_idle_training_groups
             ):
                 resources = AvailableTrainingResources(
@@ -2737,7 +2740,7 @@ class DrafterScheduler:
         advance_completed_cycle: bool = False,
     ) -> None:
         try:
-            interval = int(config.training_interval_steps)
+            interval = int(cast(Any, config.training_interval_steps))
         except (TypeError, ValueError):
             interval = 0
         current_step = _as_int(global_step)
@@ -2772,9 +2775,7 @@ class DrafterScheduler:
             # data. Once this cycle completes, the newest collected version
             # becomes the next cycle and receives its own target quota.
             return
-        debt_trigger = max(
-            int(config.training_quota_max_accumulated_debt), 0
-        )
+        debt_trigger = max(int(config.training_quota_max_accumulated_debt), 0)
         # ``max_accumulated_debt`` is an urgency threshold, not permission to
         # discard optimizer-step obligations.  The due check uses it to force
         # a top-up, while the ledger always retains the full accumulated debt.
@@ -2818,11 +2819,9 @@ class DrafterScheduler:
             self._training_quota_oldest_cycle_step is None
             or _as_int(global_step) >= self._training_quota_oldest_cycle_step
         )
-        age_due = (
-            interval_boundary_reached
-            and self._training_quota_age_steps(global_step)
-            >= max(int(config.training_quota_max_debt_age_steps), 0)
-        )
+        age_due = interval_boundary_reached and self._training_quota_age_steps(
+            global_step
+        ) >= max(int(config.training_quota_max_debt_age_steps), 0)
         debt_limit = max(int(config.training_quota_max_accumulated_debt), 0)
         debt_due = (
             debt_limit > 0
@@ -2843,11 +2842,11 @@ class DrafterScheduler:
             return False
         if self._training_quota_oldest_cycle_step is None:
             return True
-        return (
-            _as_int(global_step) >= self._training_quota_oldest_cycle_step
-            and self._training_quota_age_steps(global_step)
-            >= max(int(config.training_quota_max_completion_lag_steps), 0)
-        )
+        return _as_int(
+            global_step
+        ) >= self._training_quota_oldest_cycle_step and self._training_quota_age_steps(
+            global_step
+        ) >= max(int(config.training_quota_max_completion_lag_steps), 0)
 
     def _plan_training_quota_topup(
         self,
@@ -2890,9 +2889,8 @@ class DrafterScheduler:
         force_completion = self._training_quota_force_completion_due(
             context.global_step, config
         )
-        if (
-            not force_completion
-            and not self._training_quota_due(context.global_step, config)
+        if not force_completion and not self._training_quota_due(
+            context.global_step, config
         ):
             return None
         target_steps = self._training_quota_target_steps(config)
@@ -3024,12 +3022,15 @@ class DrafterScheduler:
             flush=True,
         )
         if full_collective_fallback:
-            hot_worker_ids = tuple(
-                sorted(
-                    (plan.worker_snapshots or {}).keys(),
-                    key=_natural_worker_sort_key,
+            hot_worker_ids = (
+                tuple(
+                    sorted(
+                        (plan.worker_snapshots or {}).keys(),
+                        key=_natural_worker_sort_key,
+                    )
                 )
-            ) or self._all_idle_training_worker_ids()
+                or self._all_idle_training_worker_ids()
+            )
             return replace(
                 plan,
                 reason="quota_forced_completion_ready",
@@ -3273,14 +3274,10 @@ class DrafterScheduler:
                     self._training_quota_debt_steps
                 ),
                 "bubble/training_quota_debt_age_steps": int(
-                    self._training_quota_age_steps(
-                        context.schedule_context.global_step
-                    )
+                    self._training_quota_age_steps(context.schedule_context.global_step)
                 ),
                 "bubble/training_quota_completion_lag_steps": int(
-                    self._training_quota_age_steps(
-                        context.schedule_context.global_step
-                    )
+                    self._training_quota_age_steps(context.schedule_context.global_step)
                 ),
                 "bubble/training_quota_data_version": int(
                     self._training_quota_data_version
@@ -3345,7 +3342,7 @@ class DrafterScheduler:
             runtime_state=context.runtime_state,
         )
         if execution.reason == "submitted_async":
-            metrics = {
+            metrics: dict[str, float | int] = {
                 "scheduler/train_launched": 1,
                 "scheduler/pending_training_count": 1,
             }
@@ -3440,9 +3437,7 @@ class DrafterScheduler:
             tail_reserve_sec = float(idle_tail_reserve_sec or 0.0)
             reclaim_penalty_sec = self._effective_idle_reclaim_penalty_sec()
             micro_batch_estimate = self._effective_idle_batch_estimate_sec(config)
-            optimizer_step_estimate = (
-                micro_batch_estimate * gradient_accumulation_steps
-            )
+            optimizer_step_estimate = micro_batch_estimate * gradient_accumulation_steps
             hard_train_batch_cap = max(int(config.train_batches_per_trigger), 1)
             train_batch_cap = self._effective_idle_dynamic_batch_cap(config)
             base_usable_window = max(
@@ -3480,6 +3475,7 @@ class DrafterScheduler:
             # just as Sync re-samples its DataBuffer.  Distinct samples are an
             # admission requirement, not an upper bound on plan length.
             replay_seed_available = trainable_batches > 0
+
             # Only an authoritative runtime deadline may rely on cooperative
             # reclaim after admission. Historical/bootstrap windows are
             # estimates, so their planned optimizer work must fit completely
@@ -3509,10 +3505,7 @@ class DrafterScheduler:
             if cold_writer_first_real_plan and not has_hard_runtime_deadline:
                 max_batches = 0
                 cold_writer_reason = "cold_writer_wait_for_runtime_deadline"
-            elif (
-                cold_writer_first_real_plan
-                and max_batches < cold_writer_min_steps
-            ):
+            elif cold_writer_first_real_plan and max_batches < cold_writer_min_steps:
                 max_batches = 0
                 cold_writer_reason = "cold_writer_window_too_small"
 
@@ -3588,9 +3581,7 @@ class DrafterScheduler:
                     if cold_writer_first_real_plan:
                         if not has_hard_runtime_deadline:
                             max_batches = 0
-                            cold_writer_reason = (
-                                "cold_writer_wait_for_runtime_deadline"
-                            )
+                            cold_writer_reason = "cold_writer_wait_for_runtime_deadline"
                         elif max_batches < cold_writer_min_steps:
                             max_batches = 0
                             cold_writer_reason = "cold_writer_window_too_small"
@@ -3711,9 +3702,7 @@ class DrafterScheduler:
             limiting_factor = (
                 "window"
                 if window_batches <= 0
-                else (
-                    "data" if not replay_seed_available else "config"
-                )
+                else ("data" if not replay_seed_available else "config")
             )
             logger.debug(
                 "[BubbleTime] idle_budget_limits: step=%s group=%s "
@@ -3780,7 +3769,7 @@ class DrafterScheduler:
                             config,
                             resources.worker_ids,
                         )
-                            - float(idle_tail_reserve_sec or 0.0),
+                        - float(idle_tail_reserve_sec or 0.0),
                         0.0,
                     )
                     - self._effective_idle_reclaim_penalty_sec(),
@@ -3840,9 +3829,7 @@ class DrafterScheduler:
                 else None
             ),
             "idle_tail_reserve_sec": (
-                float(idle_tail_reserve_sec or 0.0)
-                if resources is not None
-                else None
+                float(idle_tail_reserve_sec or 0.0) if resources is not None else None
             ),
             "idle_trainable_batches": (
                 (
@@ -3918,14 +3905,10 @@ class DrafterScheduler:
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
 
-        if (
-            plan.execution_strategy is DrafterExecutionStrategy.SYNC
-            or plan.reason
-            in {
-                "quota_topup_training_ready",
-                "quota_forced_completion_ready",
-            }
-        ):
+        if plan.execution_strategy is DrafterExecutionStrategy.SYNC or plan.reason in {
+            "quota_topup_training_ready",
+            "quota_forced_completion_ready",
+        }:
             return self.sync_execution_strategy.execute(
                 plan,
                 executor=self._worker_executor,
@@ -4085,15 +4068,13 @@ class DrafterScheduler:
             if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
                 group = _normalize_worker_id_group(plan.target_worker_ids)
                 if group:
-                    previous_group_successes = self._idle_worker_group_success_counts.get(
-                        group, 0
+                    previous_group_successes = (
+                        self._idle_worker_group_success_counts.get(group, 0)
                     )
                     self._idle_worker_group_success_counts[group] = (
                         previous_group_successes + 1
                     )
-                    writer_group = self._current_idle_writer_group(
-                        assign_default=False
-                    )
+                    writer_group = self._current_idle_writer_group(assign_default=False)
                     if writer_group is None:
                         self._idle_worker_writer_group = group
                         writer_group = group

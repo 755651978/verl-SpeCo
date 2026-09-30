@@ -31,6 +31,8 @@ class DrafterWorkerExecutor(Protocol):
 
     def request_reclaim(self, worker_ids: tuple[str, ...]) -> Any: ...
 
+    def resolve(self, submission: Any) -> Any: ...
+
     def get_training_data_status(
         self,
         *,
@@ -84,7 +86,10 @@ class CallbackDrafterWorkerExecutor:
         if isinstance(result, tuple) and len(result) == 2:
             return (bool(result[0]), result[1])
         if isinstance(result, dict):
-            return (bool(result.get("ready", False)), result.get("submission", submission))
+            return (
+                bool(result.get("ready", False)),
+                result.get("submission", submission),
+            )
         return (bool(result), submission)
 
     def request_reclaim(self, worker_ids: tuple[str, ...]) -> Any:

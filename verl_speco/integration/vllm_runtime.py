@@ -1148,9 +1148,7 @@ def _ensure_vllm_server_drafter_env(
         try:
             loaded = json.loads(embedded_config_json)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Invalid embedded vLLM drafter runtime config"
-            ) from exc
+            raise RuntimeError("Invalid embedded vLLM drafter runtime config") from exc
         if isinstance(loaded, dict):
             embedded_config = loaded
     env_config = _load_env_drafter_config()
@@ -2673,8 +2671,7 @@ class _SpecoVLLMHttpServerMixin:
                 self._speco_rollout_release_verified = False
             async with lease_lock:
                 remaining_requests = max(
-                    int(getattr(self, "_speco_rollout_active_requests", 1) or 1)
-                    - 1,
+                    int(getattr(self, "_speco_rollout_active_requests", 1) or 1) - 1,
                     0,
                 )
                 self._speco_rollout_active_requests = remaining_requests
@@ -2817,7 +2814,9 @@ def install_upstream_vllm_runtime_bridge() -> bool:
         "[BubbleTime] installed SPECO vLLM runtime bridge: replica_cls=%s "
         "server_cls=%s",
         getattr(SpecoVLLMReplica, "__name__", type(SpecoVLLMReplica).__name__),
-        getattr(speco_http_server_cls, "__name__", type(speco_http_server_cls).__name__),
+        getattr(
+            speco_http_server_cls, "__name__", type(speco_http_server_cls).__name__
+        ),
     )
     return True
 
