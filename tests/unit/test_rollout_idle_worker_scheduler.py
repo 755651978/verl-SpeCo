@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import replace
@@ -980,7 +981,7 @@ def test_quota_publish_releases_writer_for_next_longer_idle_group() -> None:
     assert next_group.worker_ids == ("1",)
 
 
-def test_released_writer_does_not_switch_to_stale_drafter_group() -> None:
+def test_released_writer_does_not_switch_to_stale_drafter_group(caplog) -> None:
     scheduler = _scheduler_with_statuses(("0", "1"))
     scheduler._metadata_idle_training_groups = (("0",), ("1",))
     scheduler._idle_worker_writer_group = ("0",)
@@ -1017,18 +1018,21 @@ def test_released_writer_does_not_switch_to_stale_drafter_group() -> None:
         idle_worker_deadline_guard_sec=0.0,
     )
 
-    scheduler.record_rollout_drafter_publish_completed(
-        10,
-        acknowledgements=[
-            {"published": True, "published_version": 10, "worker_rank": 0}
-        ],
-    )
-    scheduler.record_training_quota_publish_completed(global_step=10)
+    with caplog.at_level(logging.INFO):
+        scheduler.record_rollout_drafter_publish_completed(
+            10,
+            acknowledgements=[
+                {"published": True, "published_version": 10, "worker_rank": 0}
+            ],
+        )
+        scheduler.record_training_quota_publish_completed(global_step=10)
 
-    next_group = scheduler.select_idle_training_resources(config, now=now)
+        next_group = scheduler.select_idle_training_resources(config, now=now)
 
     assert next_group.available
     assert next_group.worker_ids == ("0",)
+    assert "rollout_drafter_versions_updated" in caplog.text
+    assert "idle_group_stale_drafter_version" in caplog.text
 
 
 def test_released_writer_can_switch_to_acknowledged_latest_group() -> None:

@@ -541,7 +541,7 @@ class DrafterScheduler:
         *,
         acknowledgements: Any = None,
         worker_ids: tuple[str, ...] | None = None,
-    ) -> dict[str, float | int]:
+    ) -> None:
         """Record rollout workers that acknowledged the live drafter version.
 
         Bubble writer switching is safe only after the candidate rollout group
@@ -553,7 +553,7 @@ class DrafterScheduler:
         try:
             published_version = _as_int(source_version)
         except (TypeError, ValueError):
-            return {}
+            return
         self._latest_published_drafter_version = published_version
         ack_workers: set[str] = set()
         stale_or_failed_acks = 0
@@ -583,7 +583,7 @@ class DrafterScheduler:
             ack_workers.update(self._known_rollout_training_worker_ids())
         for worker_id in ack_workers:
             self._rollout_worker_drafter_versions[worker_id] = published_version
-        logger.warning(
+        logger.info(
             "[BubbleTime] rollout_drafter_versions_updated: "
             "published_version=%s workers=%s stale_or_failed_acks=%s versions=%s",
             published_version,
@@ -591,19 +591,6 @@ class DrafterScheduler:
             stale_or_failed_acks,
             dict(sorted(self._rollout_worker_drafter_versions.items())),
         )
-        print(
-            "[BubbleTime] rollout_drafter_versions_updated: "
-            f"published_version={published_version} "
-            f"workers={tuple(sorted(ack_workers, key=_natural_worker_sort_key))} "
-            f"stale_or_failed_acks={stale_or_failed_acks} "
-            f"versions={dict(sorted(self._rollout_worker_drafter_versions.items()))}",
-            flush=True,
-        )
-        return {
-            "bubble/published_drafter_version": published_version,
-            "bubble/published_drafter_workers": len(ack_workers),
-            "bubble/publish_stale_or_failed_acks": stale_or_failed_acks,
-        }
 
     def _drafter_version_ready_for_writer_group(
         self, group: tuple[str, ...]
@@ -2234,13 +2221,6 @@ class DrafterScheduler:
                         group,
                         self._latest_published_drafter_version,
                         group_versions,
-                    )
-                    print(
-                        "[BubbleTime] idle_group_stale_drafter_version: "
-                        f"group_id=idle-group-{index} group={group} "
-                        f"latest_published={self._latest_published_drafter_version} "
-                        f"worker_versions={group_versions}",
-                        flush=True,
                     )
                     continue
             missing = [worker_id for worker_id in group if worker_id not in idle_states]
