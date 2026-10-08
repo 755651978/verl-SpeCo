@@ -2232,11 +2232,44 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             _get_nested(self.config, ("actor_rollout_ref", "actor", "strategy"), "")
             or ""
         ).lower()
-        if strategy not in {"fsdp", "fsdp2", "veomni"}:
+        if strategy not in {"fsdp", "fsdp2", "megatron", "veomni"}:
             raise ValueError(
                 "SPECO old-logprob hidden collection supports "
-                "actor.strategy=fsdp/fsdp2/veomni, "
+                "actor.strategy=fsdp/fsdp2/megatron/veomni, "
                 f"got {strategy!r}"
+            )
+        if strategy == "megatron":
+            tp_size = int(
+                _get_nested(
+                    self.config,
+                    (
+                        "actor_rollout_ref",
+                        "actor",
+                        "megatron",
+                        "tensor_model_parallel_size",
+                    ),
+                    1,
+                )
+                or 1
+            )
+            pp_size = int(
+                _get_nested(
+                    self.config,
+                    (
+                        "actor_rollout_ref",
+                        "actor",
+                        "megatron",
+                        "pipeline_model_parallel_size",
+                    ),
+                    1,
+                )
+                or 1
+            )
+            logger.warning(
+                "SPECO old-logprob hidden collection with Megatron backend: "
+                f"TP={tp_size}, PP={pp_size}. "
+                "TP>1 uses Megatron native sequence parallelism for hidden-state gathering. "
+                "PP>1 uses cross-stage dist communication for capture transfer."
             )
         capture_impl = str(
             training_cfg.get("old_logprob_hidden_capture_impl", "forward_hook")
@@ -2245,6 +2278,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if capture_impl not in {"forward_hook", "output_hidden_states"}:
             raise ValueError(
                 f"Unsupported SPECO old-logprob hidden capture impl: {capture_impl!r}"
+            )
+        if strategy == "megatron" and capture_impl != "forward_hook":
+            raise ValueError(
+                "SPECO old-logprob hidden collection with Megatron backend supports "
+                f"forward_hook capture only, got {capture_impl!r}"
             )
         return True
 
@@ -4771,6 +4809,18 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_oldlogprob_hidden_layout(),
             )
             tu.assign_non_tensor_data(batch_td, OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY, True)
+            # Pass the user's sequence_parallel setting through the batch,
+            # because MindSpeed repatch may override tf_config.sequence_parallel
+            # back to True even when the user sets it to False.
+            _actor_megatron_cfg = _get_nested(
+                self.config, ("actor_rollout_ref", "actor", "megatron"), {}
+            )
+            _user_seq_parallel = _actor_megatron_cfg.get("sequence_parallel", True)
+            tu.assign_non_tensor_data(
+                batch_td,
+                "speco_oldlogprob_sp_disabled",
+                not bool(_user_seq_parallel),
+            )
 
             self._speco_last_oldlogprob_prepare_elapsed_sec = (
                 time.perf_counter() - prepare_started
