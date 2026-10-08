@@ -24,6 +24,9 @@ required by the store-only, TP>1 setup:
   ``assert req_id in self.requests`` in the scheduler and kills the engine.
 * ``_ensure_store`` creates the accelerator context Mooncake's Ascend transport
   needs before allocating its local segment.
+* ``register_kv_caches`` and the DtoH publish path are reimplemented on the
+  device abstraction so the connector runs on non-CUDA backends (the upstream
+  versions hard-code CUDA streams/events).
 
 Observability (opt-in): when ``SPECO_HS_PROBE=1`` the connector appends a
 write-path breakdown to ``SPECO_HS_PROBE_FILE`` (default
@@ -39,8 +42,10 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+import torch
+from hs_connectors import mooncake_hidden_states_connector as _upstream_hs
 from hs_connectors.mooncake_hidden_states_connector import (
     MooncakeConnectorMetadata,
     MooncakeHiddenStatesConnector as _UpstreamMooncakeHiddenStatesConnector,
@@ -49,9 +54,6 @@ from vllm.logger import init_logger
 
 from verl.utils.device import get_torch_device
 from verl_speco.producer.hidden_states_store import ensure_accelerator_context
-
-if TYPE_CHECKING:
-    import torch
 
 logger = init_logger(__name__)
 
@@ -92,6 +94,26 @@ class SpecoMooncakeHiddenStatesConnector(_UpstreamMooncakeHiddenStatesConnector)
     def get_finished_count(self) -> int:
         return 1
 
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        # Reimplemented instead of delegating: the upstream version hard-codes a
+        # CUDA stream. The device abstraction resolves the copy stream on the
+        # active backend (e.g. NPU on Ascend).
+        self._is_tp_rank_zero = _upstream_hs.get_tensor_model_parallel_rank() == 0
+
+        from vllm.model_executor.models.extract_hidden_states import (  # noqa: PLC0415
+            CacheOnlyAttentionLayer,
+        )
+
+        layers = _upstream_hs.get_layers_from_vllm_config(
+            self._vllm_config, CacheOnlyAttentionLayer, list(kv_caches.keys())
+        )
+        cache_layers = list(layers.keys())
+        assert len(cache_layers) == 1, (
+            f"Expected 1 CacheOnlyAttentionLayer, got {len(cache_layers)}"
+        )
+        self._kv_cache = kv_caches[cache_layers[0]]
+        self._copy_stream = get_torch_device().Stream()
+
     def _ensure_store(self) -> None:
         # Mooncake's Ascend transport needs an active device context to
         # allocate its local segment.
@@ -108,16 +130,70 @@ class SpecoMooncakeHiddenStatesConnector(_UpstreamMooncakeHiddenStatesConnector)
     def _write_sample(self, pending: Any, ready_event: Any) -> None:
         probe = getattr(self, "_probe", None)
         if probe is None:
-            return super()._write_sample(pending, ready_event)
+            return self._publish_sample(pending, ready_event)
         started = time.perf_counter()
         try:
-            return super()._write_sample(pending, ready_event)
+            return self._publish_sample(pending, ready_event)
         finally:
             probe.record(
                 total_ms=(time.perf_counter() - started) * 1000.0,
                 tokens=int(pending.token_ids.shape[0]),
                 num_layers=int(getattr(self, "num_hidden_states", 0) or 0),
             )
+
+    def _publish_sample(self, pending: Any, ready_event: Any) -> None:
+        # Device-agnostic reimplementation of the upstream DtoH publish. The
+        # only backend-specific call is entering the copy stream; everything else
+        # (tensor ops, wait_event, synchronize) is shared across backends.
+        assert self._kv_cache is not None
+        assert self._copy_stream is not None
+
+        copy_stream = self._copy_stream
+        copy_stream.wait_event(ready_event)
+
+        block_ids_t = torch.tensor(pending.block_ids, dtype=torch.long)
+        num_blocks = block_ids_t.shape[0]
+        block_offsets = torch.arange(0, self._block_size, dtype=torch.long)
+        slot_mapping = (
+            block_offsets.reshape((1, self._block_size))
+            + block_ids_t.reshape((num_blocks, 1)) * self._block_size
+        ).flatten()
+
+        num_tokens = pending.token_ids.shape[0]
+
+        try:
+            with get_torch_device().stream(copy_stream):
+                slot_mapping = slot_mapping.to(self._kv_cache.device, non_blocking=True)
+                hidden_states = _upstream_hs.extract_from_kv_cache(
+                    self._kv_cache,
+                    slot_mapping,
+                    num_tokens,
+                )
+                _upstream_hs.assert_finite("hidden_states", hidden_states)
+                # Async DtoH copy into pinned host memory.
+                pinned_hs = torch.empty_like(
+                    hidden_states, device="cpu", pin_memory=True
+                )
+                pinned_hs.copy_(hidden_states, non_blocking=True)
+
+            # Wait for the DtoH copy to complete before handing data to the store.
+            copy_stream.synchronize()
+
+            self._store.put_sample(
+                pending.mooncake_key,
+                {"hidden_states": pinned_hs, "token_ids": pending.token_ids},
+            )
+        except Exception as exc:
+            try:
+                # Store error marker instead of the sample, so consumer can
+                # re-request.
+                self._store.put_error(pending.mooncake_key, str(exc))
+            except Exception:
+                logger.exception(
+                    "Failed to publish Mooncake error marker for %s",
+                    pending.req_id,
+                )
+            raise
 
     def get_finished(
         self, finished_req_ids: set[str]

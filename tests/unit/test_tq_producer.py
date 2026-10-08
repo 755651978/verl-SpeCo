@@ -810,6 +810,42 @@ def test_run_producer_renders_off_the_event_loop(
     assert all(ident != main_thread for ident in render_threads)
 
 
+def test_run_producer_misaligned_drop_survives_cleanup_failure(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """A store deletion failure on the drop path must not abort the producer."""
+
+    import verl_speco.standalone_tq_producer as producer_module
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    transport = _Transport()
+    pool = _OneMisalignedPool(tmp_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+
+    def fail_cleanup(raw):
+        raise RuntimeError("store delete failed")
+
+    monkeypatch.setattr(producer_module, "delete_temporary_result", fail_cleanup)
+    with caplog.at_level("WARNING", logger="verl_speco.standalone_tq_producer"):
+        stats = asyncio.run(
+            run_producer(
+                config,
+                transport=transport,
+                tokenizer=_Tokenizer(),
+                client_pool=pool,
+            )
+        )
+
+    assert stats.dropped_count == 1
+    assert stats.published_count == 2
+    assert any(
+        "best-effort temporary cleanup failed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_run_producer_replaces_misaligned_sample_before_eos(
     tmp_path: Path,
 ) -> None:

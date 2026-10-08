@@ -78,7 +78,7 @@ def test_mooncake_store_load_and_release_round_trip() -> None:
     assert fake.deleted == ["key-1"]
 
 
-def test_mooncake_store_release_is_best_effort() -> None:
+def test_mooncake_store_release_propagates_deletion_failure() -> None:
     store = MooncakeHiddenStatesStore(MooncakeStoreSettings())
 
     class _Broken:
@@ -86,7 +86,49 @@ def test_mooncake_store_release_is_best_effort() -> None:
             raise RuntimeError("gone")
 
     store._store = _Broken()
-    store.release("missing")  # must not raise
+    # Deletion errors must surface so callers with a retry policy can react.
+    with pytest.raises(RuntimeError, match="gone"):
+        store.release("missing")
+
+
+def test_connector_register_kv_caches_uses_device_stream(monkeypatch) -> None:
+    import verl_speco.mooncake_hidden_states_connector as connector_module
+    from verl_speco.mooncake_hidden_states_connector import (
+        SpecoMooncakeHiddenStatesConnector,
+    )
+
+    stream_sentinel = object()
+
+    class _Layer:
+        pass
+
+    layer = _Layer()
+
+    class _Device:
+        def Stream(self):
+            return stream_sentinel
+
+    connector = object.__new__(SpecoMooncakeHiddenStatesConnector)
+    connector._vllm_config = object()
+
+    monkeypatch.setattr(
+        connector_module._upstream_hs,
+        "get_tensor_model_parallel_rank",
+        lambda: 3,
+    )
+    monkeypatch.setattr(
+        connector_module._upstream_hs,
+        "get_layers_from_vllm_config",
+        lambda *args, **kwargs: {"cache": layer},
+    )
+    monkeypatch.setattr(connector_module, "get_torch_device", lambda: _Device())
+
+    kv_caches = {"cache": torch.zeros(1)}
+    connector.register_kv_caches(kv_caches)
+
+    assert connector._kv_cache is kv_caches["cache"]
+    assert connector._copy_stream is stream_sentinel
+    assert connector._is_tp_rank_zero is False
 
 
 def test_file_store_load_and_release(tmp_path) -> None:

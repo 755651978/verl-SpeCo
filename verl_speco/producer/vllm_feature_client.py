@@ -305,6 +305,8 @@ class VllmFeatureClientPool:
             state = choose_endpoint(candidates)
             state.inflight += 1
             request_started = time.monotonic()
+            response: VllmResponse | None = None
+            loaded = False
             try:
                 async with state.semaphore:
                     if generate:
@@ -329,6 +331,7 @@ class VllmFeatureClientPool:
                         response,
                         self.hidden_states_store,
                     )
+                    loaded = True
                 state.requests += 1
                 if self._should_log_success(state.requests):
                     logger.info(
@@ -382,10 +385,36 @@ class VllmFeatureClientPool:
                 )
                 await asyncio.sleep(backoff)
             finally:
+                # The server has already published the hidden states, so a
+                # reference fetched but not loaded must be released; otherwise
+                # retries (and cancellation) leak a file or leave an object in
+                # the bounded Mooncake store.
+                if response is not None and not loaded:
+                    await self._release_unconsumed(response)
                 state.inflight = max(state.inflight - 1, 0)
         raise RuntimeError(
             "unreachable: vLLM request retry loop exhausted without returning"
         )
+
+    async def _release_unconsumed(self, response: VllmResponse) -> None:
+        """Best-effort release of a fetched reference whose load failed.
+
+        Only release when the response matches the configured store; a backend
+        mismatch is a deterministic protocol error that must not trigger a
+        delete against the wrong store.
+        """
+        expected = MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+        reference = response.reference
+        if self.hidden_states_store.backend != expected or not reference:
+            return
+        try:
+            await asyncio.to_thread(self.hidden_states_store.release, reference)
+        except Exception as exc:  # noqa: BLE001 - retry cleanup is best effort
+            logger.warning(
+                "Failed to release unconsumed vLLM hidden-state reference %s: %r",
+                reference,
+                exc,
+            )
 
     def _should_log_success(self, count: int) -> bool:
         interval = self.success_log_interval

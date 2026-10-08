@@ -129,6 +129,24 @@ def _cleanup_result_sync(result: PreparedFeature) -> float:
     return time.monotonic() - cleanup_started
 
 
+async def _delete_result_best_effort(result: RawVllmFeature) -> None:
+    """Best-effort cleanup for call sites without a retry policy.
+
+    ``HiddenStatesStore.release`` propagates deletion failures so the publish
+    cleanup loop can retry them; drop/filter paths must not abort on a
+    transient store error.
+    """
+    try:
+        await asyncio.to_thread(delete_temporary_result, result)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not break the producer
+        logger.warning(
+            "Standalone TQ Producer best-effort temporary cleanup failed; "
+            "ignoring path=%s error=%r",
+            result.temporary_path,
+            exc,
+        )
+
+
 async def publish_one(
     result: PreparedFeature,
     transport: Any,
@@ -835,7 +853,7 @@ async def run_producer(
                         # The generation request may still produce a prompt-only
                         # connector file. It is not the training payload; the
                         # following full-sequence prefill produces that payload.
-                        await asyncio.to_thread(delete_temporary_result, generated)
+                        await _delete_result_best_effort(generated)
                     mark_stage(worker, "vllm_prefill", request.sample_id)
                     prefill_started = time.monotonic()
                     raw = await pool.prefill(request)
@@ -870,7 +888,7 @@ async def run_producer(
                     stats.pending_bytes = max(
                         stats.pending_bytes - int(raw.byte_size), 0
                     )
-                    await asyncio.to_thread(delete_temporary_result, raw)
+                    await _delete_result_best_effort(raw)
                     logger.warning(
                         "Standalone TQ Producer dropped misaligned sample "
                         "sequence_no=%s sample_id=%s dropped=%s consecutive=%s/%s "

@@ -753,6 +753,45 @@ def test_validate_hidden_states_store_fails_fast_when_unreachable() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {
+            "SPECO_VLLM_HIDDEN_STATES_STORE": "mooncake",
+            "SPECO_VLLM_HIDDEN_STATES_MOONCAKE_MASTER": "10.0.0.1:50051",
+        },
+        {
+            "SPECO_TQ_STORAGE_BACKEND": "MooncakeStore",
+            "SPECO_TQ_MOONCAKE_MASTER": "10.0.0.1:50051",
+        },
+    ],
+    ids=["hidden-states-store", "tq-backend"],
+)
+def test_ray_pipeline_validates_mooncake_master_before_spawning(
+    monkeypatch, environ
+) -> None:
+    import verl_speco.standalone_tq_training_launcher as launcher
+    from verl_speco import standalone_ray_runtime as ray_runtime
+
+    def _connect(address, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(launcher.socket, "create_connection", _connect)
+    commands = SimpleNamespace(vllm_endpoints=["http://ready:8000/v1"], vllm=None)
+
+    with pytest.raises(RuntimeError, match="no mooncake_master is reachable"):
+        ray_runtime.run_ray_pipeline(
+            commands,
+            ray_module=object(),
+            ray_address="127.0.0.1:6379",
+            environ=environ,
+            endpoint_ready=lambda endpoint: True,
+            popen=lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("validation must fail before spawning processes")
+            ),
+        )
+
+
 def test_pipeline_commands_select_mooncake_hidden_states_store() -> None:
     env = {
         "SPECO_VLLM_HIDDEN_STATES_STORE": "mooncake",

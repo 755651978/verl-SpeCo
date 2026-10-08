@@ -177,7 +177,11 @@ class HiddenStatesStore:
         raise NotImplementedError
 
     def release(self, reference: str) -> None:
-        """Drop a payload once it has been consumed (best effort)."""
+        """Drop a payload once it has been consumed.
+
+        Implementations may raise; callers for which cleanup is strictly
+        best-effort must guard the call themselves.
+        """
         raise NotImplementedError
 
     def close(self) -> None:
@@ -250,12 +254,10 @@ class MooncakeHiddenStatesStore(HiddenStatesStore):
     def release(self, reference: str) -> None:
         if self._store is None:
             return
-        try:
-            self._store.delete_sample(reference)
-        except Exception:  # noqa: BLE001 - cleanup must not break the producer
-            logger.warning(
-                "Failed to delete Mooncake hidden-state handle %s", reference
-            )
+        # Deletion errors deliberately propagate so callers with a retry policy
+        # (the Producer cleanup loop) can retry transient store failures. Callers
+        # for which cleanup is strictly best-effort wrap this in their own guard.
+        self._store.delete_sample(reference)
 
     def close(self) -> None:
         # hs_connectors exposes no explicit teardown; dropping the reference

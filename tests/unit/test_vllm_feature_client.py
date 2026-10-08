@@ -174,6 +174,55 @@ def test_pool_retry_fails_over_to_another_endpoint(monkeypatch) -> None:
     assert pool._states[1].requests == 1
 
 
+def test_pool_releases_reference_when_load_fails_before_retry(monkeypatch) -> None:
+    endpoint = VllmEndpoint("http://vllm:8000/v1", 1)
+    handles = iter(["hs-1", "hs-2"])
+    load_calls = {"n": 0}
+
+    async def fake_prefill(endpoint, client, prompt_token_ids, **kwargs):
+        del client, prompt_token_ids, kwargs
+        return VllmResponse(None, endpoint.base_url, handle=next(handles))
+
+    def fake_load(response, store=None):
+        del store
+        load_calls["n"] += 1
+        if load_calls["n"] == 1:
+            raise RuntimeError("transient load failure")
+        return RawVllmFeature(
+            payload={},
+            temporary_path=response.reference,
+            endpoint_url=response.endpoint_url,
+            byte_size=0,
+        )
+
+    async def no_backoff(_seconds):
+        return None
+
+    monkeypatch.setattr(client_module, "request_prefill", fake_prefill)
+    monkeypatch.setattr(client_module, "load_hidden_state_result", fake_load)
+    monkeypatch.setattr(client_module.asyncio, "sleep", no_backoff)
+
+    store = _RecordingStore()
+    pool = VllmFeatureClientPool(
+        [endpoint],
+        model="target",
+        max_inflight_requests=1,
+        request_timeout=10,
+        hidden_states_store=store,
+    )
+    pool._states = [
+        client_module._EndpointState(endpoint, object(), asyncio.Semaphore(1))
+    ]
+
+    raw = asyncio.run(
+        pool.prefill(SimpleNamespace(prompt_token_ids=[1, 2], sample_id="sample-a"))
+    )
+
+    assert raw.temporary_path == "hs-2"
+    assert store.released == ["hs-1"]
+    assert load_calls["n"] == 2
+
+
 def test_success_logging_is_rate_limited_per_endpoint_counter() -> None:
     pool = VllmFeatureClientPool(
         [VllmEndpoint("http://vllm:8000/v1", 1)],
