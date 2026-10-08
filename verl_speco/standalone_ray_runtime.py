@@ -38,6 +38,8 @@ from verl_speco.standalone_tq_training_launcher import (
     _wait_for_owner_ready,
     _wait_for_vllm_ready,
     _vllm_is_ready,
+    validate_hidden_states_store,
+    validate_tq_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -767,6 +769,11 @@ def run_ray_pipeline(
 
     base_env = dict(os.environ if environ is None else environ)
     base_env["RAY_ADDRESS"] = ray_address
+    # Mirror the subprocess path: fail fast when the selected TQ transport or
+    # handle-based store points at an unreachable Mooncake master. This is the
+    # default runtime mode.
+    validate_tq_backend(base_env)
+    validate_hidden_states_store(base_env)
     owner = None
     vllm = None
     hidden_states_temp = None

@@ -33,6 +33,10 @@ from verl_speco.integration import transferqueue_bridge as default_transport
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.producer.hidden_states_store import (
+    HiddenStatesStoreConfig,
+    build_hidden_states_store,
+)
 from verl_speco.producer.input_reader import (
     GenerationRequest,
     SampleFilteredError,
@@ -124,6 +128,24 @@ def _cleanup_result_sync(result: PreparedFeature) -> float:
     cleanup_started = time.monotonic()
     delete_temporary_result(result.raw)
     return time.monotonic() - cleanup_started
+
+
+async def _delete_result_best_effort(result: RawVllmFeature) -> None:
+    """Best-effort cleanup for call sites without a retry policy.
+
+    ``HiddenStatesStore.release`` propagates deletion failures so the publish
+    cleanup loop can retry them; drop/filter paths must not abort on a
+    transient store error.
+    """
+    try:
+        await asyncio.to_thread(delete_temporary_result, result)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not break the producer
+        logger.warning(
+            "Standalone TQ Producer best-effort temporary cleanup failed; "
+            "ignoring path=%s error=%r",
+            result.temporary_path,
+            exc,
+        )
 
 
 async def publish_one(
@@ -297,6 +319,11 @@ def validate_producer_config(config: Any) -> str:
         )
     if int(producer_cfg.get("vllm_success_log_interval", 100)) < 0:
         raise ValueError("vllm_success_log_interval must be non-negative")
+    store_cfg = producer_cfg.get("hidden_states_store")
+    if store_cfg:
+        # Raises on an unsupported backend before the pool is built, without
+        # constructing a throwaway store (the pool builds the real one).
+        HiddenStatesStoreConfig.from_mapping(store_cfg)
     return _read_on_missing_response(producer_cfg)
 
 
@@ -452,6 +479,9 @@ async def run_producer(
                 request_timeout=float(producer_cfg["request_timeout"]),
                 success_log_interval=int(
                     producer_cfg.get("vllm_success_log_interval", 100)
+                ),
+                hidden_states_store=build_hidden_states_store(
+                    producer_cfg.get("hidden_states_store")
                 ),
             )
         await pool.start()
@@ -910,7 +940,7 @@ async def run_producer(
                         # The generation request may still produce a prompt-only
                         # connector file. It is not the training payload; the
                         # following full-sequence prefill produces that payload.
-                        await asyncio.to_thread(delete_temporary_result, generated)
+                        await _delete_result_best_effort(generated)
                 mark_stage(worker, "vllm_prefill", request.sample_id)
                 prefill_started = time.monotonic()
                 try:
@@ -945,7 +975,7 @@ async def run_producer(
                     stats.pending_bytes = max(
                         stats.pending_bytes - int(raw.byte_size), 0
                     )
-                    await asyncio.to_thread(delete_temporary_result, raw)
+                    await _delete_result_best_effort(raw)
                     sample_timings.pop(int(request.sequence_no), None)
                     logger.warning(
                         "Standalone TQ Producer dropped misaligned sample "
@@ -1275,34 +1305,36 @@ async def run_producer(
         return stats
     finally:
         try:
+            if feature_executor is not None:
+                feature_executor.shutdown(wait=True)
+            if publish_executor is not None:
+                publish_executor.shutdown(wait=True)
+            if connected and completed:
+                # Keep every producer-side segment mounted until the consumer
+                # has fetched and cleared all samples. Mooncake allocates
+                # objects across a process's registered segments
+                # (allocation_strategy=random by default), so closing the
+                # hidden-state store first can unmount a segment that still
+                # holds unconsumed TQ fields; the consumer then fails with
+                # batch_get_into error -704 (object not found).
+                await _drain_pending_samples(
+                    transport,
+                    run_id,
+                    timeout=float(
+                        os.environ.get(
+                            "SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "1800"
+                        )
+                        or 0
+                    ),
+                    poll_interval=float(producer_cfg["pending_poll_interval_seconds"]),
+                )
+        finally:
             try:
                 if pool is not None:
                     await pool.close()
             finally:
-                if feature_executor is not None:
-                    feature_executor.shutdown(wait=True)
-                if publish_executor is not None:
-                    publish_executor.shutdown(wait=True)
-        finally:
-            if connected:
-                if completed:
-                    # Closing a remote store client unmounts the producer's
-                    # segment; wait until the consumer has fetched and cleared
-                    # every sample before releasing it.
-                    await _drain_pending_samples(
-                        transport,
-                        run_id,
-                        timeout=float(
-                            os.environ.get(
-                                "SPECO_TQ_PRODUCER_DRAIN_TIMEOUT_SECONDS", "1800"
-                            )
-                            or 0
-                        ),
-                        poll_interval=float(
-                            producer_cfg["pending_poll_interval_seconds"]
-                        ),
-                    )
-                transport.close_transfer_queue_client()
+                if connected:
+                    transport.close_transfer_queue_client()
 
 
 async def _wait_for_owner_ready(
