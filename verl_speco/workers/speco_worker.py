@@ -1179,11 +1179,12 @@ class SpecoWorker(Worker):
         projection_fingerprint = payload.get("projection_fingerprint")
         projection_mode = payload.get("projection_mode")
         projection_dynamic = bool(payload.get("projection_dynamic", True))
-        actual_fingerprint = _projection_fingerprint(payload)
-        if (
-            not projection_fingerprint
-            or str(projection_fingerprint) != actual_fingerprint
-        ):
+        # Full-tensor hashing is reserved for PEFT projection exports. Ordinary
+        # actor payloads omit the fingerprint and retain the non-PEFT sync path.
+        actual_fingerprint = (
+            _projection_fingerprint(payload) if projection_fingerprint else None
+        )
+        if projection_fingerprint and str(projection_fingerprint) != actual_fingerprint:
             return {
                 "accepted": False,
                 "applied": False,

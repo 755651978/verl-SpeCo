@@ -584,7 +584,7 @@ def _projection_fingerprint(payload: dict[str, Any]) -> str:
 
 
 def _finalize_projection_payload(
-    payload: Optional[dict[str, Any]], *, dynamic: bool
+    payload: Optional[dict[str, Any]], *, dynamic: bool, fingerprint: bool
 ) -> Optional[dict[str, Any]]:
     if payload is None:
         return None
@@ -593,7 +593,9 @@ def _finalize_projection_payload(
     result["projection_mode"] = (
         "transferred_effective" if dynamic else "static_verified"
     )
-    result["projection_fingerprint"] = _projection_fingerprint(result)
+    result["projection_fingerprint"] = (
+        _projection_fingerprint(result) if fingerprint else None
+    )
     return result
 
 
@@ -1073,12 +1075,14 @@ def export_actor_lm_head_weight(
                 keep_model_on_device=keep_model_on_device,
             ),
             dynamic=projection_dynamic,
+            fingerprint=uses_peft,
         )
 
     if projection_has_adapter:
         return _finalize_projection_payload(
             _export_effective_peft_projection(worker, row_indices=row_indices),
             dynamic=True,
+            fingerprint=True,
         )
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
@@ -1102,7 +1106,7 @@ def export_actor_lm_head_weight(
             return None
         if direct_payload is not None:
             return _finalize_projection_payload(
-                direct_payload, dynamic=projection_dynamic
+                direct_payload, dynamic=projection_dynamic, fingerprint=uses_peft
             )
 
     per_tensor_param, _ = worker.actor.engine.get_per_tensor_param(
@@ -1162,6 +1166,7 @@ def export_actor_lm_head_weight(
             "export_strategy": "engine_full_param",
         },
         dynamic=projection_dynamic,
+        fingerprint=uses_peft,
     )
 
 

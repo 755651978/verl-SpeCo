@@ -26,6 +26,84 @@ class _FakeObjectRef:
     pass
 
 
+def test_non_peft_projection_finalization_does_not_hash_weights(monkeypatch) -> None:
+    def unexpected_hash(payload):
+        raise AssertionError("non-PEFT projection must not hash the weight tensor")
+
+    monkeypatch.setattr(rollout_publish, "_projection_fingerprint", unexpected_hash)
+    weight = object()
+    payload = rollout_publish._finalize_projection_payload(
+        {"weight": weight}, dynamic=True, fingerprint=False
+    )
+    assert payload["weight"] is weight
+    assert payload["projection_fingerprint"] is None
+    assert payload["projection_dynamic"] is True
+
+
+def test_peft_projection_finalization_keeps_fingerprint(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        rollout_publish,
+        "_projection_fingerprint",
+        lambda payload: calls.append(payload["weight"]) or "verified",
+    )
+    weight = object()
+    payload = rollout_publish._finalize_projection_payload(
+        {"weight": weight}, dynamic=False, fingerprint=True
+    )
+    assert calls == [weight]
+    assert payload["projection_fingerprint"] == "verified"
+    assert payload["projection_mode"] == "static_verified"
+
+
+@pytest.mark.parametrize("uses_peft", [False, True])
+@pytest.mark.parametrize("strategy", ["veomni", "direct_sparse"])
+def test_projection_export_hashing_is_gated_by_peft(monkeypatch, uses_peft, strategy):
+    hashes = []
+    weight = object()
+    rows = SimpleNamespace(numel=lambda: 2)
+    worker = SimpleNamespace(_is_actor=True, actor=object(), config={})
+    monkeypatch.setattr(rollout_publish, "_torch_module", lambda: object())
+    monkeypatch.setattr(rollout_publish, "_actor_uses_peft", lambda worker: uses_peft)
+    monkeypatch.setattr(
+        rollout_publish, "_projection_has_adapter", lambda worker: False
+    )
+    monkeypatch.setattr(
+        rollout_publish, "_projection_weight_is_trainable", lambda worker: False
+    )
+    monkeypatch.setattr(
+        rollout_publish, "_validate_supported_output_projection", lambda worker: None
+    )
+    monkeypatch.setattr(
+        rollout_publish, "_is_veomni_actor_worker", lambda worker: strategy == "veomni"
+    )
+    monkeypatch.setattr(
+        rollout_publish, "_normalize_lm_head_row_indices", lambda value: rows
+    )
+    monkeypatch.setattr(
+        rollout_publish, "drafter_speculative_algorithm", lambda config: "DSPARK"
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_export_veomni_actor_lm_head_weight",
+        lambda *args, **kwargs: {"weight": weight},
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_export_actor_lm_head_rows_direct",
+        lambda *args, **kwargs: {"weight": weight},
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_projection_fingerprint",
+        lambda payload: hashes.append(payload["weight"]) or "verified",
+    )
+
+    payload = rollout_publish.export_actor_lm_head_weight(worker, row_indices=rows)
+    assert hashes == ([weight] if uses_peft else [])
+    assert payload["projection_fingerprint"] == ("verified" if uses_peft else None)
+
+
 class _FakeRay:
     ObjectRef = _FakeObjectRef
 

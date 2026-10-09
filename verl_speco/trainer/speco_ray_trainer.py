@@ -1916,6 +1916,37 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ]
         return payload_buckets, global_step_buckets, target_sync_bucket_count
 
+    def _speco_target_sync_worker_replicas(self) -> dict[str, int] | None:
+        """Resolve collected worker identities independently of broadcast buckets."""
+        worker_group = getattr(self, "drafter_wg", None)
+        if worker_group is None:
+            return None
+        mapping = self._speco_owner_route_mapping()
+        collect_info = getattr(worker_group, "_collect_info", None)
+        collect_mask = (
+            collect_info.get(_DRAFTER_TARGET_SYNC_MESH)
+            if isinstance(collect_info, dict)
+            else None
+        )
+        if collect_mask is None and hasattr(worker_group, "_query_collect_info"):
+            collect_mask = worker_group._query_collect_info(_DRAFTER_TARGET_SYNC_MESH)
+            if isinstance(collect_info, dict):
+                collect_info[_DRAFTER_TARGET_SYNC_MESH] = collect_mask
+        if mapping is None or collect_mask is None:
+            raise RuntimeError("SPECO cannot resolve target projection sync topology")
+        if len(mapping) != worker_group.world_size or len(collect_mask) != len(mapping):
+            raise RuntimeError("SPECO target projection sync topology has invalid size")
+        expected = {
+            str(rank): int(replica)
+            for rank, (replica, collect) in enumerate(
+                zip(mapping, collect_mask, strict=True)
+            )
+            if collect
+        }
+        if not expected:
+            raise RuntimeError("SPECO target projection sync has no collecting workers")
+        return expected
+
     def _speco_start_target_lm_head_weight_sync(
         self,
         training_plan: TrainingPlan | None = None,
@@ -1998,9 +2029,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if defer_device_apply:
             payload = dict(payload)
             payload["defer_device_apply"] = True
-        payload_arg, global_step_arg, target_sync_bucket_count = (
+        payload_arg, global_step_arg, _ = (
             self._speco_build_drafter_target_lm_head_sync_args(payload)
         )
+        expected_worker_replicas = self._speco_target_sync_worker_replicas()
         dispatch_started = time.perf_counter()
         pending_refs = self.speco_sync_target_lm_head_weight(
             payload_arg, global_step=global_step_arg
@@ -2021,7 +2053,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "dispatch_finished": dispatch_started + dispatch_elapsed,
             "dispatch_elapsed": dispatch_elapsed,
             "pre_dispatch_elapsed": dispatch_started - sync_started,
-            "expected_results": target_sync_bucket_count,
+            "expected_results": (
+                len(expected_worker_replicas)
+                if expected_worker_replicas is not None
+                else 1
+            ),
+            "expected_worker_replicas": expected_worker_replicas,
             "expected_global_step": int(self.global_steps),
             "expected_fingerprint": (
                 payload.get("projection_fingerprint")
@@ -2063,14 +2100,26 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             for result in results
             if result.get("replica_rank") is not None
         }
-        replicas_consistent = not replica_ranks or replica_ranks == set(
-            range(expected_results)
-        )
-        if len(results) < expected_results or not replicas_consistent or failures:
+        expected_worker_replicas = pending.get("expected_worker_replicas")
+        workers_consistent = True
+        if expected_worker_replicas is not None:
+            worker_ids = [str(result.get("worker_id")) for result in results]
+            workers_consistent = (
+                len(set(worker_ids)) == len(worker_ids)
+                and set(worker_ids) == set(expected_worker_replicas)
+                and all(
+                    result.get("replica_rank")
+                    == expected_worker_replicas.get(str(result.get("worker_id")))
+                    for result in results
+                )
+            )
+        if len(results) != expected_results or not workers_consistent or failures:
             raise RuntimeError(
                 "SPECO target projection worker acknowledgement failed: "
-                f"expected_replicas={expected_results}, actual_results={len(results)}, "
+                f"expected_workers={expected_results}, actual_results={len(results)}, "
                 f"replica_ranks={sorted(replica_ranks)}, "
+                f"expected_worker_replicas={expected_worker_replicas}, "
+                f"actual_worker_ids={[result.get('worker_id') for result in results]}, "
                 f"failures={failures}"
             )
         finished = time.perf_counter()
