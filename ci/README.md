@@ -1,14 +1,12 @@
 # CI layers
 
-The repository uses seven workflow layers:
+The repository uses five CI workflow layers:
 
 - `cpu_unit_tests.yml`: required PR checks without installing this repository or using accelerator runtimes.
-- `gpu_vllm_unit_tests.yml`: manual-only vLLM example-script runs on GPU.
-- `gpu_sglang_unit_tests.yml`: manual-only SGLang example-script runs on GPU.
 - `gpu_drafter_training_smoke.yml`: manual-only standalone drafter training smoke tests on GPU.
 - `npu_vllm_unit_tests.yml`: PR, push, and manual NPU examples plus HCCL tests.
-- `examples_e2e_manual.yml`: select any of the 21 example scripts, automatically routed to its GPU/NPU runner.
-- `npu_sglang_unit_tests.yml`: manual-only SGLang example-script runs on NPU.
+- `examples_e2e_manual.yml`: unified GPU/NPU manual entry for all 21 example scripts, automatically routed to its runner.
+- `pr_e2e_comments.yml`: PR comment requests and maintainer approval for the unified manual entry.
 
 The hardware workflows require self-hosted runner labels:
 
@@ -41,8 +39,8 @@ exit-code JSON even on failure. `pipefail` preserves example failure through
 is outside this measurement. Existing per-step metrics provide training and
 publication timings. Initialization substages are not separately instrumented.
 
-NPU SGLang (EAGLE3 and DFlash) remains manual-only until the runner runtime
-and model cache have been verified. Neither NPU workflow currently schedules runs.
+NPU SGLang remains manual-only through `examples_e2e_manual.yml`; select a
+compatible runtime image and verify the model cache. No NPU runs are scheduled.
 
 Online GPU and NPU example runs clear their result file before launch and write versioned JSON
 via `SPECO_CI_RESULT_PATH`. Training lanes require a completed run, at least one
@@ -222,11 +220,9 @@ bash ci/run_example_test.sh npu vllm dspark
 
 To test the hardware workflows on GitHub, open Actions and choose one of:
 
-- `gpu_drafter_training_smoke`
-- `gpu_vllm_unit_tests`
-- `gpu_sglang_unit_tests`
-- `npu_vllm_unit_tests`
-- `npu_sglang_unit_tests`
+- `examples_e2e_manual` (individual GPU/NPU examples)
+- `gpu_drafter_training_smoke` (standalone GPU training)
+- `npu_vllm_unit_tests` (NPU vLLM matrix and HCCL)
 
 Run the selected workflow without inputs after preparing the default paths
 above. Fill the manual inputs only when you want to override the defaults for

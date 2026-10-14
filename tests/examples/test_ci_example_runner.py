@@ -68,21 +68,21 @@ def _runner_script() -> str:
 
 def test_ci_layers_match_required_shape() -> None:
     rollout_workflows = {
-        "gpu_vllm_unit_tests.yml",
-        "gpu_sglang_unit_tests.yml",
         "npu_vllm_unit_tests.yml",
-        "npu_sglang_unit_tests.yml",
     }
     expected = rollout_workflows | {
         "cpu_unit_tests.yml",
         "gpu_drafter_training_smoke.yml",
+        "examples_e2e_manual.yml",
+        "pr_e2e_comments.yml",
     }
 
     assert expected <= {path.name for path in WORKFLOWS.glob("*.yml")}
     assert "pull_request" in _workflow("cpu_unit_tests.yml")["on"]
 
-    manual_hardware_workflows = (rollout_workflows - {"npu_vllm_unit_tests.yml"}) | {
+    manual_hardware_workflows = {
         "gpu_drafter_training_smoke.yml",
+        "examples_e2e_manual.yml",
     }
     for workflow_name in manual_hardware_workflows:
         triggers = _workflow(workflow_name)["on"]
@@ -120,15 +120,12 @@ def test_cpu_unit_workflow_is_lightweight_pr_gate() -> None:
 
 def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
     for workflow_name, accelerator, backend, expected_drafters in (
-        ("gpu_vllm_unit_tests.yml", "gpu", "vllm", {"eagle3", "dflash"}),
-        ("gpu_sglang_unit_tests.yml", "gpu", "sglang", {"eagle3", "dflash"}),
         (
             "npu_vllm_unit_tests.yml",
             "npu",
             "vllm",
             {"eagle3", "dflash", "dspark"},
         ),
-        ("npu_sglang_unit_tests.yml", "npu", "sglang", {"eagle3", "dflash"}),
     ):
         source = _workflow_source(workflow_name)
         workflow = _workflow(workflow_name)

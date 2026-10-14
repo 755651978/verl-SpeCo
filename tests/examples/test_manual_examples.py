@@ -109,17 +109,21 @@ def test_checkout_verification_rejects_stale_install(tmp_path, problem):
 
 
 def test_online_workflows_install_checkouts_and_upload_evidence():
-    for name in [
-        "gpu_vllm_unit_tests.yml",
-        "gpu_sglang_unit_tests.yml",
-        "npu_sglang_unit_tests.yml",
-    ]:
-        source = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
-        assert "uv pip install --system --no-deps -e upstream-verl -e ." in source
-        assert "python ci/verify_checkouts.py" in source
-        assert "SPECO_CI_RESULT_PATH:" in source
-        assert "if: always()" in source
-        assert ".json.log" in source and ".json.timing.json" in source
+    workflow = yaml.load(
+        (ROOT / ".github/workflows/examples_e2e_manual.yml").read_text(),
+        Loader=yaml.BaseLoader,
+    )
+    for platform in ("gpu", "npu"):
+        steps = workflow["jobs"][platform]["steps"]
+        commands = "\n".join(step.get("run", "") for step in steps)
+        assert "uv pip install --system --no-deps -e upstream-verl -e ." in commands
+        assert "python ci/verify_checkouts.py" in commands
+        assert "python ci/run_manual_example.py" in commands
+        upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
+        assert upload["if"] == "always()"
+        for evidence in ("example.log", "status.json", "result.json"):
+            assert evidence in upload["with"]["path"]
+
 
 
 @pytest.mark.parametrize("algorithm", ["eagle3", "dflash", "dspark"])

@@ -103,15 +103,11 @@ def main() -> None:
     parser.add_argument("--algorithm", default="EAGLE1", choices=["EAGLE1", "EAGLE2"])
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--device", choices=("cuda", "npu"), default="cuda")
     args = parser.parse_args()
     if args.steps < 1:
         parser.error("steps must be positive")
 
-    device = args.device
-    if device == "npu":
-        import torch_npu  # noqa: F401
-        assert torch.npu.is_available(), "NPU is required"
+    device = "cuda"
     torch.manual_seed(0)
 
     print(f"[smoke] loading target {args.target}")
