@@ -313,3 +313,17 @@ def test_ci_variable_resolution_preserves_overrides_and_multiline_values():
     assert env["SPECO_DRAFT_TENSOR_PARALLEL_SIZE"] == "1"
     assert env["SPECO_EXTRA_HYDRA_ARGS"] == variables["SPECO_EXTRA_HYDRA_ARGS"]
     assert "OTHER" not in env and "SPECO_INVALID-NAME" not in env
+
+
+@pytest.mark.parametrize("missing", ["COLLECT_DRAFTER_PATH", "DRAFT_INIT_PATH"])
+def test_manual_separate_training_rejects_missing_branch_paths(missing, tmp_path, monkeypatch):
+    settings = {
+        "MODEL_PATH": "/models/target", "TRAIN_FILE": "/data/train",
+        "TEST_FILE": "/data/test", "COLLECT_DRAFTER_PATH": "/models/collect",
+        "DRAFT_INIT_PATH": "/models/initial",
+    }
+    settings.pop(missing)
+    monkeypatch.delenv(missing, raising=False)
+    with pytest.raises(ValueError, match=missing):
+        prepare("examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh",
+                settings, "", tmp_path)

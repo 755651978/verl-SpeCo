@@ -592,3 +592,33 @@ def test_automatic_runner_reads_algorithm_variables_from_github():
     }))
     assert "drafter.rollout.spec_steps=2" in stdout
     assert "drafter.vllm.draft_tensor_parallel_size=2" in stdout
+
+
+@pytest.mark.parametrize("algorithm", ["domino", "peagle"])
+def test_manual_separate_example_passes_configured_paths_to_both_stages(algorithm, tmp_path):
+    from ci.run_manual_example import prepare
+
+    bash = _require_working_bash()
+    example = "examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh"
+    settings = {
+        "DRAFT_ALGO": algorithm, "RUN_STAGE": "both",
+        "MODEL_PATH": "/models/target", "TRAIN_FILE": "/data/train",
+        "TEST_FILE": "/data/test", "COLLECT_DRAFTER_PATH": "/models/collect",
+        "DRAFT_INIT_PATH": "/models/initial",
+    }
+    env, args, online = prepare(example, settings, "", tmp_path)
+    assert not online and not args
+    script = "python3() { printf '%s\\n' \"$@\"; }; export -f python3\n"
+    script += "".join(
+        f"export {key}={shlex.quote(env[key])}\n"
+        for key in (*settings, "CKPTS_DIR", "FEATURE_STORE_DIR", "DRAFT_CKPTS_DIR")
+    )
+    script += "bash " + shlex.quote(_bash_path(ROOT / example, bash)) + "\n"
+    result = subprocess.run([bash, "-s"], input=script.encode("utf-8"),
+                            capture_output=True, check=True)
+    arguments = result.stdout.decode("utf-8").splitlines()
+    assert "verl_speco.main" in arguments
+    assert "verl_speco.draft_train_launcher" in arguments
+    assert "actor_rollout_ref.rollout.drafter.model_path=/models/collect" in arguments
+    assert "actor_rollout_ref.rollout.drafter.model_path=/models/initial" in arguments
+    assert not any("/path/" in arg for arg in arguments)

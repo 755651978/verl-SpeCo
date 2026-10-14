@@ -97,7 +97,7 @@ def prepare(example, settings, hydra_args, output):
                 env.setdefault(key, value)
     source = (ROOT / example).read_text(encoding="utf-8")
     missing = []
-    for key in re.findall(r"^\w+=\$\{(\w+):-/path/", source, re.MULTILINE):
+    for key in re.findall(r"^[ \t]*\w+=\$\{(\w+):-/path/", source, re.MULTILINE):
         if key.endswith("CKPTS_DIR") or key in {"CKPTS_DIR", "FEATURE_STORE_DIR"}:
             env.setdefault(key, env.get("SPECO_CKPT_DIR", str(output / key.lower())))
         if not env.get(key) or env[key].startswith("/path/"):

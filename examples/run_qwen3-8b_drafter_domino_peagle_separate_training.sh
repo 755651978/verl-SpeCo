@@ -42,10 +42,10 @@ case "${DRAFT_ALGO}" in
     COLLECT_ALGO="DFLASH"
     TRAIN_ALGO="DOMINO"
     # Stage-1 drafter: any engine-servable DFlash drafter for the rollout.
-    COLLECT_DRAFTER_PATH=/path/to/vllm-compatible-dflash-drafter
+    COLLECT_DRAFTER_PATH=${COLLECT_DRAFTER_PATH:-/path/to/vllm-compatible-dflash-drafter}
     # Stage-2 drafter: an existing Domino checkpoint, or a path that does not
     # exist yet to cold-start the draft from the target config.
-    DRAFT_INIT_PATH=/path/to/domino-drafter-or-new-dir
+    DRAFT_INIT_PATH=${DRAFT_INIT_PATH:-/path/to/domino-drafter-or-new-dir}
     ALGO_TRAIN_ARGS=(
       actor_rollout_ref.rollout.drafter.training.domino_block_size=16
       actor_rollout_ref.rollout.drafter.training.domino_num_anchors=512
@@ -59,8 +59,8 @@ case "${DRAFT_ALGO}" in
   peagle)
     COLLECT_ALGO="EAGLE3"
     TRAIN_ALGO="PEAGLE"
-    COLLECT_DRAFTER_PATH=/path/to/vllm-compatible-eagle3-drafter
-    DRAFT_INIT_PATH=/path/to/peagle-drafter-or-new-dir
+    COLLECT_DRAFTER_PATH=${COLLECT_DRAFTER_PATH:-/path/to/vllm-compatible-eagle3-drafter}
+    DRAFT_INIT_PATH=${DRAFT_INIT_PATH:-/path/to/peagle-drafter-or-new-dir}
     ALGO_TRAIN_ARGS=(
       actor_rollout_ref.rollout.drafter.training.peagle_num_draft_layers=4
       actor_rollout_ref.rollout.drafter.training.peagle_num_aux_hidden_states=3
