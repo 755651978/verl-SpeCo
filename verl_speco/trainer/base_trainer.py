@@ -2172,6 +2172,7 @@ class DrafterBaseTrainer:
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
+        self.last_activation_error = None
         activation_stage = "enter"
         try:
             logger.debug(
@@ -2236,6 +2237,7 @@ class DrafterBaseTrainer:
             return True
 
         except Exception as e:
+            self.last_activation_error = {"type": type(e).__name__, "message": str(e)}
             logger.error(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] "
                 f"activate_training_model failed stage={activation_stage}: {e}"
@@ -5198,6 +5200,7 @@ class DrafterBaseTrainer:
         min_sample_step: Optional[int] = None,
         max_sample_step: Optional[int] = None,
     ) -> bool:
+        self.last_training_error = None
         try:
             with torch.enable_grad():
                 return await self._training_step_impl(
@@ -5206,6 +5209,11 @@ class DrafterBaseTrainer:
                     max_sample_step=max_sample_step,
                 )
         except Exception as e:  # noqa: BLE001
+            self.last_training_error = {
+                "type": type(e).__name__,
+                "message": str(e),
+                "step": step,
+            }
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
 
