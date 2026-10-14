@@ -193,6 +193,8 @@ def test_comment_workflow_uses_only_trusted_hosted_controller():
         Loader=yaml.BaseLoader,
     )
     assert set(workflow["on"]) == {"issue_comment"}
+    assert workflow["concurrency"]["queue"] == "max"
+    assert workflow["concurrency"]["cancel-in-progress"] == "false"
     assert workflow["on"]["issue_comment"]["types"] == ["created"]
     job = workflow["jobs"]["request"]
     assert job["runs-on"] == "ubuntu-24.04"
