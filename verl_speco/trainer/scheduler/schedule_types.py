@@ -107,6 +107,10 @@ class QueueScheduleContext:
     producer_done: bool = False
     producer_paused: bool = False
     consumer_training: bool = False
+    consumer_ready: bool = True
+    outstanding_batches: int = 0
+    max_outstanding_batches: int = 1
+    remaining_steps: int | None = None
 
 
 class RolloutWorkerEventType(str, Enum):
@@ -420,6 +424,7 @@ class DrafterCollectionContext:
     source_enabled: bool = True
     validation: bool = False
     require_training_interval: bool = False
+    drafter_frozen: bool = False
 
 
 @dataclass(frozen=True)
@@ -459,6 +464,7 @@ class CollectionPlan:
         "low_watermark_reached": 10,
         "watermark_hysteresis_paused": 11,
         "watermark_hysteresis_running": 12,
+        "drafter_frozen": 13,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -733,6 +739,10 @@ class TrainingPlan:
         "cold_writer_window_too_small": 33,
         "consumer_training": 34,
         "insufficient_ready_samples": 35,
+        "consumer_initializing": 36,
+        "outstanding_capacity_reached": 37,
+        "training_budget_reserved": 38,
+        "drafter_convergence_frozen": 39,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
