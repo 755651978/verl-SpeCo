@@ -125,12 +125,23 @@ class TrainingOutcome:
         # plan has completed all requested steps and is therefore publishable.
         publish_snapshot_required = bool(
             plan.publish_after_success
+            and not plan.publish_snapshot_deferred
             and trained
             and successful_steps >= int(plan.max_batches)
         )
         publish_snapshot_consistent = not publish_snapshot_required or (
             len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
         )
+        if (
+            plan.publish_snapshot_deferred
+            and trained
+            and successful_steps >= int(plan.max_batches)
+        ):
+            publish_snapshot_consistent = all(
+                bool(result.get("publish_snapshot_deferred", False))
+                for result in normalized_results
+                if result.get("triggered", False)
+            ) and bool(participating_results)
         result_consistent = not strict_consistency or (
             worker_ids_consistent
             and incarnations_consistent
@@ -145,13 +156,65 @@ class TrainingOutcome:
         )
         if not result_consistent:
             trained = False
+        quota_topup = plan.reason in {
+            "quota_topup_training_ready",
+            "quota_forced_completion_ready",
+        }
+        idle_training = bool(
+            plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and not quota_topup
+        )
         metrics: dict[str, float | int] = {
+            **{
+                f"bubble/{name}": int(
+                    any(
+                        result.get(name, False)
+                        for result in normalized_results
+                        if result.get("triggered", False)
+                    )
+                )
+                for name in ("reclaim_received_via_bus", "reclaim_control_error")
+            },
+            **{
+                f"timing_s/drafter_{name}": max(
+                    (
+                        (_metric_float(result.get(f"{name}_sec")) or 0.0)
+                        for result in normalized_results
+                        if result.get("triggered", False)
+                    ),
+                    default=0.0,
+                )
+                for name in (
+                    "reclaim_receive_to_stop",
+                    "reclaim_receive_to_cleanup",
+                    "idle_control_yield_elapsed",
+                )
+            },
+            "timing_s/drafter_idle_control": max(
+                (
+                    (_metric_float(result.get("idle_control_elapsed_sec")) or 0.0)
+                    for result in normalized_results
+                    if result.get("triggered", False)
+                ),
+                default=0.0,
+            ),
+            "bubble/activation_started_resident": int(
+                bool(participating_results)
+                and all(
+                    result.get("activation_started_resident", False)
+                    for result in normalized_results
+                    if result.get("triggered", False)
+                )
+            ),
             "drafter/trained": int(trained),
             "drafter/trained_any": int(trained),
-            "drafter/idle_trained": int(
-                plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
-                and trained
-            ),
+            "drafter/idle_trained": int(idle_training and trained),
+            "bubble/idle_optimizer_steps": successful_steps
+            if idle_training and trained
+            else 0,
+            "bubble/critical_path_topup_optimizer_steps": successful_steps
+            if quota_topup and trained
+            else 0,
             "drafter/train_successful_steps_max": successful_steps,
             "drafter/train_successful_valid_tokens_max": max(
                 (result.successful_valid_tokens for result in worker_results),
@@ -224,11 +287,16 @@ class TrainingOutcome:
             "timing_s/drafter_optimizer",
             "timing_s/drafter_publish_snapshot",
             "activation_elapsed_sec",
+            "target_head_prepare_elapsed_sec",
+            "model_restore_elapsed_sec",
+            "optimizer_restore_elapsed_sec",
             "preflight_elapsed_sec",
             "preflight_to_first_batch_sec",
             "preflight_to_stop_sec",
             "training_loop_elapsed_sec",
             "cleanup_elapsed_sec",
+            "cleanup_nonpark_elapsed_sec",
+            "memory_park_elapsed_sec",
             "elapsed_sec",
         ):
             values = [
@@ -239,11 +307,16 @@ class TrainingOutcome:
             if values:
                 metric_key = {
                     "activation_elapsed_sec": "timing_s/drafter_worker_activation",
+                    "target_head_prepare_elapsed_sec": "timing_s/drafter_worker_target_head_prepare",
+                    "model_restore_elapsed_sec": "timing_s/drafter_worker_model_restore",
+                    "optimizer_restore_elapsed_sec": "timing_s/drafter_worker_optimizer_restore",
                     "preflight_elapsed_sec": "timing_s/drafter_worker_preflight",
                     "preflight_to_first_batch_sec": "timing_s/drafter_worker_preflight_to_first_batch",
                     "preflight_to_stop_sec": "timing_s/drafter_worker_preflight_to_stop",
                     "training_loop_elapsed_sec": "timing_s/drafter_worker_training_loop",
                     "cleanup_elapsed_sec": "timing_s/drafter_worker_cleanup",
+                    "cleanup_nonpark_elapsed_sec": "timing_s/drafter_worker_cleanup_nonpark",
+                    "memory_park_elapsed_sec": "timing_s/drafter_worker_memory_park",
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
                 }.get(key, key)
                 metrics[metric_key] = max(values)

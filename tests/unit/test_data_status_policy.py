@@ -98,6 +98,4 @@ def test_status_policy_marks_mismatched_target_versions_unknown() -> None:
 
 
 def test_status_policy_returns_none_without_available_workers() -> None:
-    assert (
-        ConservativeTrainingDataStatusPolicy().aggregate([], global_step=4) is None
-    )
+    assert ConservativeTrainingDataStatusPolicy().aggregate([], global_step=4) is None

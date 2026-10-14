@@ -34,6 +34,7 @@ class CollectionOutcome:
     elapsed_sec: float = 0.0
     worker_results: list[CollectionWorkerResult] | None = None
     finalized: bool = False
+    committed_unfinalized: bool = False
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collection_completed": 1,
@@ -43,6 +44,7 @@ class CollectionOutcome:
         "collection_version_mismatch": 5,
         "collection_stage_failed": 6,
         "collection_id_mismatch": 7,
+        "collection_finalize_failed": 8,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -57,12 +59,29 @@ class CollectionOutcome:
             ),
             "drafter/collection_worker_results": len(worker_results),
             "drafter/collection_finalized": int(self.finalized),
+            "drafter/collection_committed_unfinalized": int(self.committed_unfinalized),
             "drafter/collection_expired_stages": sum(
                 result.expired_stages for result in worker_results
             ),
             "drafter/raw_drafter_samples": self.raw_samples,
             "timing_s/drafter_collection_rpc": self.elapsed_sec,
         }
+
+
+class CollectionFinalizeError(RuntimeError):
+    """An ambiguous post-commit failure must stop downstream training."""
+
+    def __init__(self, collection_id: str, outcome: CollectionOutcome):
+        self.collection_id = collection_id
+        self.outcome = outcome
+        super().__init__(
+            f"Drafter collection {collection_id}: collection_finalize_failed; "
+            "committed but not fully finalized. Training must stop; recover "
+            "from a consistent checkpoint before retrying."
+        )
+
+    def __reduce__(self):
+        return type(self), (self.collection_id, self.outcome)
 
 
 class DrafterCollectionStrategy(Protocol):
@@ -234,13 +253,48 @@ class SyncCollectionStrategy:
         finalized = False
         if reason == "collection_completed":
             try:
-                executor.finalize(payload)
+                final_results = executor.finalize(payload)
+                final_ids = [result.worker_id for result in final_results]
+                committed_identities = {
+                    result.worker_id: result.worker_incarnation for result in results
+                }
+                if (
+                    len(final_ids) != len(set(final_ids))
+                    or set(final_ids) != set(expected_by_owner)
+                    or not all(
+                        result.reason == "collection_finalized"
+                        and result.collection_id == plan.collection_id
+                        and result.worker_incarnation
+                        == committed_identities.get(result.worker_id)
+                        and result.source_global_step
+                        == _as_int(plan.source_global_step)
+                        for result in final_results
+                    )
+                ):
+                    raise RuntimeError(
+                        "Incomplete or inconsistent collection finalize ACK"
+                    )
                 finalized = True
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "Failed to finalize committed drafter collection %s",
                     plan.collection_id,
                 )
+                # Some owners may already have discarded their rollback
+                # journals. Rolling back only the remaining owners would split
+                # the dataset. Preserve evidence and fail closed instead.
+                outcome = CollectionOutcome(
+                    attempted=True,
+                    collected=False,
+                    reason="collection_finalize_failed",
+                    source_global_step=plan.source_global_step,
+                    raw_samples=payload.raw_samples,
+                    elapsed_sec=time.perf_counter() - started_at,
+                    worker_results=results,
+                    finalized=False,
+                    committed_unfinalized=True,
+                )
+                raise CollectionFinalizeError(plan.collection_id, outcome) from exc
         else:
             executor.rollback(payload)
         return CollectionOutcome(

@@ -16,9 +16,7 @@ def test_dflash_lm_head_rows_prefer_newer_collected_version_when_step_lags() -> 
         reason="drafter row selection needs the trainer dependency stack",
     )
     torch = pytest.importorskip("torch")
-    trainer = base_trainer.DrafterBaseTrainer.__new__(
-        base_trainer.DrafterBaseTrainer
-    )
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
     trainer.backend = SimpleNamespace(model_type="dflash")
     trainer.current_rl_step = 1
     trainer.use_data_buffer = False
@@ -48,9 +46,7 @@ def test_dflash_lm_head_rows_fall_back_to_latest_collected_version() -> None:
         reason="drafter row selection needs the trainer dependency stack",
     )
     torch = pytest.importorskip("torch")
-    trainer = base_trainer.DrafterBaseTrainer.__new__(
-        base_trainer.DrafterBaseTrainer
-    )
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
     trainer.backend = SimpleNamespace(model_type="dflash")
     trainer.current_rl_step = 1
     trainer.use_data_buffer = False
@@ -90,9 +86,7 @@ def test_single_micro_batch_bubble_reservation_is_replayed_until_finalize() -> N
         def __len__(self) -> int:
             return 2
 
-    trainer = base_trainer.DrafterBaseTrainer.__new__(
-        base_trainer.DrafterBaseTrainer
-    )
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
     trainer.rank = 0
     trainer.data_buffer = _Buffer()
     trainer._active_training_reservation_id = "quota-plan"
@@ -114,9 +108,7 @@ def test_single_micro_batch_bubble_reservation_is_replayed_until_finalize() -> N
     consumed = trainer.finalize_training_data_reservation("quota-plan")
 
     assert consumed == 2
-    assert trainer.data_buffer.consume_calls == [
-        ("quota-plan", [first, second])
-    ]
+    assert trainer.data_buffer.consume_calls == [("quota-plan", [first, second])]
 
 
 def test_quota_cycle_reuses_full_snapshot_across_bubble_plans() -> None:
@@ -126,9 +118,7 @@ def test_quota_cycle_reuses_full_snapshot_across_bubble_plans() -> None:
     )
     data_buffer_module = pytest.importorskip("verl_speco.trainer.data_buffer")
 
-    trainer = base_trainer.DrafterBaseTrainer.__new__(
-        base_trainer.DrafterBaseTrainer
-    )
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
     trainer.rank = 0
     trainer.batch_size = 4
     trainer.data_buffer = data_buffer_module.DataBuffer(max_size=32)

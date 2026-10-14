@@ -75,11 +75,272 @@ class _FakeTrainer:
         self.cleanup_calls += 1
         self.keep_hot = keep_hot
 
-    async def release_training_memory_after_activation(self):
+    async def release_training_memory_after_activation(self, *, strict=False):
         self.release_after_activation_calls += 1
+        self.release_strict = strict
 
     def pop_model_state_dict_for_publish(self, global_step: int):
         return global_step == 4, {"weight": global_step}
+
+
+def test_park_training_worker_preserves_optimizer_and_replay_progress() -> None:
+    worker = _worker(data_version=4)
+    worker.trainer.model = object()
+    worker.trainer._training_device_resident = True
+    worker.trainer.optimizer_steps_total = 9
+    worker.trainer.reserved_plan_id = "quota-snapshot"
+
+    result = asyncio.run(worker.park_drafter_training_model())
+
+    assert result["parked"]
+    assert worker.trainer.release_after_activation_calls == 1
+    assert worker.trainer.release_strict
+    assert worker.trainer.optimizer_steps_total == 9
+    assert worker.trainer.reserved_plan_id == "quota-snapshot"
+    assert worker.trainer.cleanup_calls == 0
+
+
+def test_park_training_worker_skips_already_parked_model() -> None:
+    worker = _worker(data_version=4)
+    worker.trainer.model = object()
+    worker.trainer._training_device_resident = False
+
+    result = asyncio.run(worker.park_drafter_training_model())
+
+    assert not result["parked"]
+    assert worker.trainer.release_after_activation_calls == 0
+
+
+def test_parking_preserves_optimizer_replay_and_training_counters(monkeypatch) -> None:
+    import verl_speco.trainer.base_trainer as base_trainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.model = object()
+    trainer.optimizer = SimpleNamespace(zero_grad=lambda **kwargs: None)
+    trainer.optimizer_steps_total = 9
+    trainer.training_steps = 9
+    trainer._last_ckpt_step = 7
+    trainer._training_active = True
+    trainer._training_device_resident = True
+    trainer.data_buffer = ["quota-snapshot"]
+    trainer._active_training_reservation_id = "quota"
+    operations = []
+    monkeypatch.setattr(base_trainer, "device_name", "cpu")
+    monkeypatch.setattr(
+        base_trainer,
+        "offload_fsdp_model_to_cpu",
+        lambda model: operations.append("model"),
+    )
+    trainer._offload_optimizer_state_to_cpu = lambda: operations.append("optimizer")
+    trainer._move_target_lm_head = lambda device: operations.append("head")
+    trainer._park_idle_drafter_hccl = lambda: None
+
+    asyncio.run(trainer.release_training_memory_after_activation())
+
+    assert operations == ["model", "optimizer", "head"]
+    assert not trainer._training_device_resident
+    assert trainer.optimizer_steps_total == trainer.training_steps == 9
+    assert trainer._last_ckpt_step == 7
+    assert trainer.data_buffer == ["quota-snapshot"]
+    assert trainer._active_training_reservation_id == "quota"
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_parking_failure_continues_cleanup_and_retains_residency(
+    monkeypatch, strict
+) -> None:
+    import verl_speco.trainer.base_trainer as base_trainer
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.model = object()
+    trainer.optimizer = SimpleNamespace(zero_grad=lambda **kwargs: None)
+    trainer._training_device_resident = True
+    operations = []
+    trainer._offload_optimizer_state_to_cpu = lambda: operations.append("optimizer")
+    trainer._move_target_lm_head = lambda device: operations.append("head")
+    trainer._park_idle_drafter_hccl = lambda: operations.append("hccl")
+    monkeypatch.setattr(base_trainer, "device_name", "cpu")
+
+    def fail_offload(model):
+        raise RuntimeError("device transfer failed")
+
+    monkeypatch.setattr(base_trainer, "offload_fsdp_model_to_cpu", fail_offload)
+    if strict:
+        with pytest.raises(RuntimeError, match="offload_model"):
+            asyncio.run(trainer.release_training_memory_after_activation(strict=True))
+    else:
+        assert asyncio.run(trainer.release_training_memory_after_activation()) is False
+    assert operations == ["optimizer", "head", "hccl"]
+    assert trainer._training_device_resident
+
+
+def test_cpu_writer_handoff_preserves_adam_scheduler_and_next_update() -> None:
+    import torch
+
+    def trainer(seed):
+        torch.manual_seed(seed)
+        obj = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+        obj.model = torch.nn.Linear(3, 2)
+        obj.optimizer = torch.optim.AdamW(obj.model.parameters(), lr=0.01)
+        obj.lr_scheduler = torch.optim.lr_scheduler.StepLR(obj.optimizer, 1, 0.9)
+        obj._training_active = obj._training_device_resident = False
+        obj._active_training_reservation_id = None
+        obj._target_lm_head_snapshots = {}
+        obj.data_buffer = DataBuffer()
+        obj.collected_data = []
+        obj.buffer_version = 1
+        obj.optimizer_steps_total = obj.training_steps = 0
+        obj._mark_buffer_changed = lambda: None
+        return obj
+
+    source, target = trainer(1), trainer(2)
+
+    def step(obj):
+        obj.optimizer.zero_grad(set_to_none=True)
+        obj.model(torch.ones(2, 3)).square().mean().backward()
+        obj.optimizer.step()
+        obj.lr_scheduler.step()
+        obj.optimizer_steps_total += 1
+        obj.training_steps += 1
+
+    step(source)
+    target.load_writer_state(source.local_writer_state(export=True))
+    assert target.optimizer_steps_total == 1
+    assert target.lr_scheduler.state_dict() == source.lr_scheduler.state_dict()
+    step(source)
+    step(target)
+    for left, right in zip(
+        source.model.parameters(), target.model.parameters(), strict=True
+    ):
+        assert torch.equal(left, right)
+
+
+def test_cpu_writer_checkpoint_roundtrip_preserves_rng_next_loss_and_optimizer():
+    import io
+    import torch
+
+    def trainer(seed):
+        torch.manual_seed(seed)
+        obj = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+        obj.model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.Dropout(0.2))
+        obj.optimizer = torch.optim.AdamW(obj.model.parameters(), lr=0.01)
+        obj.lr_scheduler = torch.optim.lr_scheduler.StepLR(obj.optimizer, 1, 0.9)
+        obj._training_active = obj._training_device_resident = False
+        obj._active_training_reservation_id = None
+        obj._target_lm_head_snapshots = {}
+        obj.data_buffer = DataBuffer()
+        obj.collected_data = []
+        obj.buffer_version = 1
+        obj.optimizer_steps_total = obj.training_steps = 0
+        obj._last_ckpt_step = 5
+        obj._mark_buffer_changed = lambda: None
+        return obj
+
+    def step(obj):
+        obj.optimizer.zero_grad(set_to_none=True)
+        loss = obj.model(torch.randn(2, 3)).square().mean()
+        loss.backward()
+        obj.optimizer.step()
+        obj.lr_scheduler.step()
+        obj.optimizer_steps_total += 1
+        obj.training_steps += 1
+        return loss.detach()
+
+    source, target = trainer(1), trainer(2)
+    step(source)
+    state = source.local_writer_state(export=True)
+    state["rng"] = torch.get_rng_state()
+    checkpoint = io.BytesIO()
+    torch.save(state, checkpoint)
+    checkpoint.seek(0)
+    restored = torch.load(checkpoint, weights_only=False)
+    target.load_writer_state(restored)
+    assert target._last_ckpt_step == source._last_ckpt_step
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(
+            source.model.parameters(), target.model.parameters(), strict=True
+        )
+    )
+    torch.set_rng_state(restored["rng"])
+    source_loss = step(source)
+    torch.set_rng_state(restored["rng"])
+    target_loss = step(target)
+    assert torch.equal(source_loss, target_loss)
+    assert target.optimizer_steps_total == source.optimizer_steps_total == 2
+    assert target.lr_scheduler.state_dict() == source.lr_scheduler.state_dict()
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(
+            source.model.parameters(), target.model.parameters(), strict=True
+        )
+    )
+    for a, b in zip(
+        source.optimizer.state.values(), target.optimizer.state.values(), strict=True
+    ):
+        assert all(torch.equal(a[key], b[key]) for key in a)
+
+
+def test_fsdp1_optimizer_checkpoint_conversion_uses_writer_group(monkeypatch) -> None:
+    from contextlib import nullcontext
+    import verl_speco.trainer.base_trainer as module
+
+    group = object()
+    seen = []
+
+    class FakeFSDP:
+        @staticmethod
+        def state_dict_type(*args):
+            return nullcontext()
+
+        @staticmethod
+        def optim_state_dict(model, optimizer, *, group):
+            seen.append(group)
+            return {"state": {}}
+
+        @staticmethod
+        def optim_state_dict_to_load(model, optimizer, state, *, group):
+            seen.append(group)
+            return state
+
+    monkeypatch.setattr(module, "FSDP", FakeFSDP)
+    optimizer = SimpleNamespace(load_state_dict=lambda state: None)
+    adapter = module._DrafterOptimizerState(FakeFSDP(), optimizer, group)
+    adapter._is_ddp = lambda: False
+    state = adapter.state_dict()
+    adapter.load_state_dict(state)
+    assert seen == [group, group]
+
+
+def test_sync_optimizer_checkpoint_retains_dcp_conversion(monkeypatch) -> None:
+    import torch.distributed.checkpoint.state_dict as state_dict_api
+    import verl_speco.trainer.base_trainer as module
+
+    class FakeFSDP:
+        @staticmethod
+        def optim_state_dict(*args, **kwargs):
+            pytest.fail("Sync must retain its original DCP API")
+
+        @staticmethod
+        def optim_state_dict_to_load(*args, **kwargs):
+            pytest.fail("Sync must retain its original DCP API")
+
+    monkeypatch.setattr(module, "FSDP", FakeFSDP)
+    calls = []
+    monkeypatch.setattr(
+        state_dict_api,
+        "get_optimizer_state_dict",
+        lambda model, optimizer, **kwargs: calls.append("save") or {},
+    )
+    monkeypatch.setattr(
+        state_dict_api,
+        "set_optimizer_state_dict",
+        lambda model, optimizer, state, **kwargs: calls.append("load"),
+    )
+    adapter = module._DrafterOptimizerState(FakeFSDP(), object())
+    adapter._is_ddp = lambda: False
+    adapter.load_state_dict(adapter.state_dict())
+    assert calls == ["save", "load"]
 
 
 def _worker(*, data_version: int) -> SpecoWorker:
@@ -106,9 +367,7 @@ def _worker(*, data_version: int) -> SpecoWorker:
             "rollout": {
                 "drafter": {
                     "training": {
-                        "scheduler": {
-                            "execution": {"strategy": "rollout_idle_worker"}
-                        }
+                        "scheduler": {"execution": {"strategy": "rollout_idle_worker"}}
                     }
                 }
             }
@@ -289,7 +548,10 @@ def test_full_collective_hot_bootstrap_retains_only_selected_worker() -> None:
     )
 
 
-def test_cleanup_keep_hot_does_not_offload_training_state(monkeypatch) -> None:
+@pytest.mark.parametrize("trim_cache", [False, True])
+def test_cleanup_keep_hot_does_not_offload_training_state(
+    monkeypatch, trim_cache
+) -> None:
     class _Optimizer:
         def __init__(self) -> None:
             self.zeroed = False
@@ -312,6 +574,13 @@ def test_cleanup_keep_hot_does_not_offload_training_state(monkeypatch) -> None:
     trainer._last_ckpt_step = 3
     trainer.training_steps = 7
     trainer._mark_buffer_changed = lambda: None
+    cache_calls = []
+    trainer.device_module = SimpleNamespace(
+        empty_cache=lambda: cache_calls.append(True)
+    )
+    monkeypatch.setattr("verl_speco.trainer.base_trainer.device_name", "cuda")
+    monkeypatch.setenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", str(trim_cache).lower())
+    monkeypatch.delenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", raising=False)
 
     monkeypatch.setattr(
         "verl_speco.trainer.base_trainer.offload_fsdp_model_to_cpu",
@@ -327,6 +596,140 @@ def test_cleanup_keep_hot_does_not_offload_training_state(monkeypatch) -> None:
     assert not trainer._training_active
     assert trainer._last_ckpt_step == 3
     assert trainer.training_steps == 7
+    assert len(cache_calls) == int(trim_cache)
+
+
+def test_memory_diagnostics_counts_shared_storage_once(monkeypatch, caplog) -> None:
+    import torch
+
+    monkeypatch.setenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "true")
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    trainer.runtime_device = torch.device("cpu")
+    trainer.model = torch.nn.Linear(2, 2, bias=False)
+    trainer._target_lm_head_module = lambda: trainer.model
+    trainer.optimizer = SimpleNamespace(state={0: {"shared": trainer.model.weight}})
+    trainer.collected_data = [{"view": trainer.model.weight.detach().view(-1)}]
+    trainer.device_module = SimpleNamespace(
+        memory_allocated=lambda: 32,
+        memory_reserved=lambda: 64,
+        max_memory_allocated=lambda: 128,
+    )
+    trainer._log_training_memory("test")
+    assert "'target_head': 16" in caplog.text
+    assert "'model': 0" in caplog.text
+    assert "'optimizer': 0" in caplog.text
+    assert "'replay': 0" in caplog.text
+    assert "cache_bytes=32" in caplog.text
+    assert "unattributed_allocated_bytes=16" in caplog.text
+
+
+def test_memory_diagnostics_failure_does_not_interrupt_training(
+    monkeypatch, caplog
+) -> None:
+    monkeypatch.setenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "true")
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer._log_training_memory("test")
+    assert "Drafter memory diagnostics failed" in caplog.text
+
+
+def test_memory_diagnostics_locates_internal_and_replay_storage(
+    monkeypatch, caplog
+) -> None:
+    import torch
+
+    monkeypatch.setenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "true")
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    trainer.runtime_device = torch.device("cpu")
+    trainer.model = torch.nn.Linear(2, 2, bias=False)
+    trainer.model.weight._full_param_padded = torch.ones(3)
+    trainer.model._handle = SimpleNamespace(flat_param=trainer.model.weight)
+    trainer._target_lm_head_module = lambda: trainer.model
+    trainer.optimizer = SimpleNamespace(state={})
+    trainer._training_replay_sessions = {2: {"items": [torch.ones(2)]}}
+    trainer._scratch = torch.ones(1)
+    trainer.device_module = SimpleNamespace(
+        memory_allocated=lambda: 40,
+        memory_reserved=lambda: 64,
+        max_memory_allocated=lambda: 128,
+    )
+    trainer._log_training_memory("parked")
+    assert "revision=3" in caplog.text
+    assert "'replay': 8" in caplog.text
+    assert "'model_internal': 12" in caplog.text
+    assert "'trainer_runtime': 4" in caplog.text
+    assert "flat_param._full_param_padded" in caplog.text
+    assert "unattributed_allocated_bytes=0" in caplog.text
+
+
+def test_cache_trim_releases_only_unused_cache(monkeypatch, caplog) -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    model = object()
+    optimizer = object()
+    trainer.model = model
+    trainer.optimizer = optimizer
+    trainer.optimizer_steps_total = 19
+    state = {"reserved": 256}
+    trainer.device_module = SimpleNamespace(
+        memory_reserved=lambda: state["reserved"],
+        memory_allocated=lambda: 128,
+        empty_cache=lambda: state.update(reserved=128),
+    )
+    monkeypatch.setattr("verl_speco.trainer.base_trainer.device_name", "cuda")
+    trainer._trim_keep_hot_cache()
+    assert trainer.model is model and trainer.optimizer is optimizer
+    assert trainer.optimizer_steps_total == 19
+    assert "freed_reserved_bytes=128" in caplog.text
+    assert "allocated_before_bytes=128 allocated_after_bytes=128" in caplog.text
+
+
+@pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+def test_bubble_fsdp1_publish_filters_before_host_copy(monkeypatch, dtype) -> None:
+    import torch
+    from contextlib import nullcontext
+
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 0
+    trainer.backend = SimpleNamespace(trains_draft_lm_head=False)
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={"publish_dtype": dtype},
+            )
+        )
+    )
+    trainer.model = torch.nn.Module()
+    trainer.model.embed_tokens = torch.nn.Embedding(4, 3)
+    trainer.model.layer = torch.nn.Linear(3, 3)
+    trainer.model.alias = trainer.model.layer
+    trainer.model.register_buffer("scale", torch.ones(3))
+    trainer.model.register_buffer("temporary", torch.ones(7), persistent=False)
+    trainer._is_checkpoint_leader = lambda: True
+    trainer._is_frozen_publish_param = lambda name: name.startswith("embed_tokens.")
+    monkeypatch.setattr(
+        "verl_speco.trainer.base_trainer.FSDP.summon_full_params",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    expected = {
+        name
+        for name in trainer.model.state_dict()
+        if not name.startswith("embed_tokens.")
+    }
+    result = trainer._get_bubble_fsdp1_publish_state()
+    assert set(result) == expected
+    assert all(value.device.type == "cpu" for value in result.values())
+    assert all(
+        value.dtype == (torch.bfloat16 if dtype == "bf16" else torch.float32)
+        for value in result.values()
+    )
+    original = result["layer.weight"].clone()
+    with torch.no_grad():
+        trainer.model.layer.weight.add_(1)
+    assert torch.equal(original, result["layer.weight"])
+    trainer._is_checkpoint_leader = lambda: False
+    assert trainer._get_bubble_fsdp1_publish_state() == {}
 
 
 def test_bubble_publish_uses_replica_local_group_leader(monkeypatch) -> None:
@@ -352,6 +755,31 @@ def test_sync_publish_still_uses_global_leader(monkeypatch) -> None:
     monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
 
     assert worker.maybe_publish() is None
+
+
+def test_deferred_publish_stages_once_and_rejects_changed_optimizer(
+    monkeypatch,
+) -> None:
+    worker = _worker(data_version=4)
+    worker.last_global_step = worker.last_trained_step = 4
+    worker.is_drafter_group_leader = True
+    worker._last_trained_execution_strategy = "rollout_idle_worker"
+    worker._last_trained_target_worker_ids = ("0",)
+    worker._deferred_publish_snapshot_step = 4
+    worker._deferred_publish_optimizer_step = 20
+    worker.trainer.optimizer_steps_total = 21
+    with pytest.raises(RuntimeError, match="changed before snapshot"):
+        worker.maybe_publish()
+    worker.trainer.optimizer_steps_total = 20
+    calls = []
+    worker.trainer.prepare_model_state_dict_for_publish = lambda step: calls.append(
+        step
+    )
+    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
+    result = worker.maybe_publish()
+    assert calls == [4]
+    assert worker._deferred_publish_snapshot_step is None
+    assert result is not None
 
 
 def test_replica_local_idle_trainer_config_enables_use_orig_params() -> None:
@@ -381,9 +809,7 @@ def test_replica_local_idle_trainer_config_enables_use_orig_params() -> None:
     trainer_config = worker._replica_local_idle_trainer_config()
 
     assert trainer_config.actor.fsdp_config.use_orig_params is True
-    assert (
-        trainer_config.rollout.drafter.training.fsdp_config.use_orig_params is True
-    )
+    assert trainer_config.rollout.drafter.training.fsdp_config.use_orig_params is True
     assert worker.config.actor.fsdp_config.use_orig_params is False
     assert worker.config.rollout.drafter.training.fsdp_config.use_orig_params is False
 

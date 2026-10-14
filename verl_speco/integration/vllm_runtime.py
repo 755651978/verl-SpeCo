@@ -1191,7 +1191,16 @@ def _rollout_idle_worker_config(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
     scheduler_cfg = training_cfg.get("scheduler") or {}
     idle_cfg = scheduler_cfg.get("idle_worker") or {}
     execution_cfg = scheduler_cfg.get("execution") or {}
-    strategy = str(execution_cfg.get("strategy", "sync") or "sync").strip().lower()
+    strategy = (
+        str(
+            execution_cfg.get(
+                "strategy", training_cfg.get("execution_strategy", "sync")
+            )
+            or "sync"
+        )
+        .strip()
+        .lower()
+    )
     return dict(idle_cfg) if strategy == "rollout_idle_worker" else {}
 
 
@@ -3296,9 +3305,11 @@ class _SpecoVLLMHttpServerMixin:
                     )
             self._speco_rollout_active_requests = active_requests + 1
         request_completed = False
+        request_completed_ts = None
         try:
             output = await super().generate(*args, **kwargs)
             request_completed = True
+            request_completed_ts = time.time()
         finally:
             if not request_completed:
                 self._speco_rollout_release_verified = False
@@ -3332,6 +3343,7 @@ class _SpecoVLLMHttpServerMixin:
                                 ),
                                 "replica_rank": replica_rank,
                                 "memory_released": release_verified,
+                                "request_completed_ts": request_completed_ts,
                                 "release_source": (
                                     "runtime_request_finalized"
                                     if release_verified

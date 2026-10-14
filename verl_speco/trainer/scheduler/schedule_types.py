@@ -159,6 +159,7 @@ class AvailableTrainingResources:
     # boundary; bootstrap/historical windows are estimates protected by the
     # rollout-training lease and cooperative reclaim.
     idle_window_source: str = ""
+    idle_window_measured_at: float | None = None
 
 
 class DrafterCollectionSource(str, Enum):
@@ -200,6 +201,11 @@ class DrafterScheduleConfig:
     # reported that the complete rollout worker group is idle.
     idle_worker_require_runtime_idle_events: bool = False
     idle_worker_drain_before_next_rollout: bool = True
+    idle_worker_keep_hot_between_plans: bool = False
+    idle_worker_writer_migration_enable: bool = False
+    idle_worker_writer_migration_history_steps: int = 4
+    idle_worker_writer_migration_min_idle_gain_sec: float = 1.0
+    idle_worker_writer_migration_cost_margin: float = 2.0
     idle_worker_full_collective_fallback: bool = False
     # Retain a small amount of ready data, then stop creating newer target-head
     # versions until the buffer has been consumed by Bubble training.
@@ -233,7 +239,7 @@ class DrafterScheduleConfig:
     # interval receives the full quota. ``adaptive`` keeps the exact same
     # quota size and data-version semantics, but opens a new quota only when
     # speculative-decoding quality drops or the maximum refresh age expires.
-    training_quota_trigger_mode: str = "interval"
+    training_quota_trigger_mode: str = "adaptive"
     training_quota_acceptance_drop_ratio: float = 0.03
     training_quota_loss_increase_ratio: float = 0.10
     training_quota_min_refresh_interval_steps: int = 2
@@ -241,7 +247,7 @@ class DrafterScheduleConfig:
     # Critical-path completion is useful as a compatibility fallback, but it
     # defeats Bubble Time's resource-isolation contract. Production Bubble
     # configurations should leave this disabled.
-    training_quota_allow_critical_path_fallback: bool = True
+    training_quota_allow_critical_path_fallback: bool = False
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -315,6 +321,21 @@ class DrafterScheduleConfig:
             idle_worker_drain_before_next_rollout=bool(
                 idle_get("drain_before_next_rollout", True)
             ),
+            idle_worker_keep_hot_between_plans=bool(
+                idle_get("keep_hot_between_plans", False)
+            ),
+            idle_worker_writer_migration_enable=bool(
+                idle_get("writer_migration_enable", False)
+            ),
+            idle_worker_writer_migration_history_steps=max(
+                int(idle_get("writer_migration_history_steps", 4)), 3
+            ),
+            idle_worker_writer_migration_min_idle_gain_sec=max(
+                float(idle_get("writer_migration_min_idle_gain_sec", 1.0)), 0.0
+            ),
+            idle_worker_writer_migration_cost_margin=max(
+                float(idle_get("writer_migration_cost_margin", 2.0)), 1.0
+            ),
             idle_worker_full_collective_fallback=bool(
                 idle_get("full_collective_fallback", False)
             ),
@@ -373,7 +394,7 @@ class DrafterScheduleConfig:
                 int(training_quota_get("max_sync_topup_steps", 2) or 0), 0
             ),
             training_quota_trigger_mode=str(
-                training_quota_get("trigger_mode", "interval") or "interval"
+                training_quota_get("trigger_mode", "adaptive") or "adaptive"
             )
             .strip()
             .lower(),
@@ -392,7 +413,7 @@ class DrafterScheduleConfig:
                 int(training_quota_get("max_refresh_interval_steps", 10) or 0), 0
             ),
             training_quota_allow_critical_path_fallback=bool(
-                training_quota_get("allow_critical_path_fallback", True)
+                training_quota_get("allow_critical_path_fallback", False)
             ),
         )
 
@@ -573,6 +594,7 @@ class DrafterScheduleContext:
     oldlogprob_collection_requested: bool
     data_status: TrainingDataStatus | None = None
     pending_training_count: int = 0
+    allow_cached_training: bool = False
 
 
 @dataclass(frozen=True)
@@ -598,6 +620,8 @@ class TrainingDataStatus:
     worker_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
     trainable_valid_tokens: int = 0
+    min_sample_step: int | None = None
+    max_sample_step: int | None = None
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingDataStatus":
@@ -624,6 +648,8 @@ class TrainingDataStatus:
             worker_incarnation=str(value.get("worker_incarnation", "")),
             worker_id=str(value.get("worker_id", value.get("rank", ""))),
             trainable_valid_tokens=_as_int(value.get("trainable_valid_tokens", 0)),
+            min_sample_step=_optional_int(value.get("min_sample_step")),
+            max_sample_step=_optional_int(value.get("max_sample_step")),
         )
 
     def metrics(self) -> dict[str, int | float]:
@@ -687,6 +713,8 @@ class TrainingPlan:
     idle_window_batches: int | None = None
     idle_batch_estimate_sec: float | None = None
     idle_startup_reserve_sec: float | None = None
+    idle_first_step_extra_sec: float = 0.0
+    idle_continuation: bool = False
     idle_tail_reserve_sec: float | None = None
     idle_reclaim_penalty_sec: float | None = None
     idle_trainable_batches: int | None = None
@@ -694,6 +722,9 @@ class TrainingPlan:
     idle_confidence: IdleWindowConfidence = IdleWindowConfidence.SPECULATIVE
     gradient_accumulation_steps: int = 1
     planned_optimizer_steps: int = 0
+    idle_park_after_training: bool = False
+    publish_snapshot_deferred: bool = False
+    idle_snapshot_estimate_sec: float = 0.0
     planned_valid_tokens: int = 0
     retain_replay_session: bool = False
     # A zero-progress full-collective fallback can seed exactly one
@@ -743,6 +774,8 @@ class TrainingPlan:
         "outstanding_capacity_reached": 37,
         "training_budget_reserved": 38,
         "drafter_convergence_frozen": 39,
+        "final_tail_window_too_small": 40,
+        "cold_writer_wait_for_optimizer_bootstrap": 41,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -750,6 +783,7 @@ class TrainingPlan:
 
         return {
             "launch": self.launch,
+            "reason": self.reason,
             "execution_strategy": self.execution_strategy.value,
             "source_global_step": self.source_global_step,
             "max_batches": self.max_batches,
@@ -769,9 +803,14 @@ class TrainingPlan:
             "training_group_id": self.training_group_id,
             "idle_batch_estimate_sec": self.idle_batch_estimate_sec,
             "idle_startup_reserve_sec": self.idle_startup_reserve_sec,
+            "idle_first_step_extra_sec": self.idle_first_step_extra_sec,
+            "idle_continuation": self.idle_continuation,
             "idle_tail_reserve_sec": self.idle_tail_reserve_sec,
             "idle_reclaim_penalty_sec": self.idle_reclaim_penalty_sec,
             "idle_window_source": self.idle_window_source,
+            "idle_park_after_training": self.idle_park_after_training,
+            "publish_snapshot_deferred": self.publish_snapshot_deferred,
+            "idle_snapshot_estimate_sec": self.idle_snapshot_estimate_sec,
             "idle_confidence": self.idle_confidence.value,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "planned_optimizer_steps": self.planned_optimizer_steps,

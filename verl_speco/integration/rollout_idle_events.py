@@ -9,6 +9,8 @@ import asyncio
 import logging
 import os
 import time
+import threading
+import uuid
 from typing import Any, cast
 
 logger = logging.getLogger(__file__)
@@ -38,6 +40,28 @@ def _event_bus_actor_class(ray):
             self._training_owners: dict[str, tuple[str, float]] = {}
             self._pending_rollout_groups: set[tuple[str, ...]] = set()
             self._replica_groups: dict[int, tuple[str, ...]] = {}
+            self._training_reclaims: dict[str, float] = {}
+            self._rollout_requests: dict[str, tuple[tuple[str, ...], bool]] = {}
+
+        def request_training_reclaim(self, worker_ids, sent_ts=None):
+            plans = {
+                self._training_owners[worker_id][0]
+                for worker_id in self._worker_group(worker_ids)
+                if worker_id in self._training_owners
+            }
+            for plan_id in plans:
+                self._training_reclaims.setdefault(
+                    plan_id, float(sent_ts or time.time())
+                )
+            return {"requested": bool(plans), "plan_ids": sorted(plans)}
+
+        def training_reclaim_status(self, plan_id, worker_id):
+            owner = self._training_owners.get(str(worker_id))
+            return {
+                "active": owner is not None and owner[0] == str(plan_id),
+                "requested": str(plan_id) in self._training_reclaims,
+                "sent_ts": self._training_reclaims.get(str(plan_id)),
+            }
 
         @staticmethod
         def _worker_group(worker_ids: Any) -> tuple[str, ...]:
@@ -48,6 +72,7 @@ def _event_bus_actor_class(ray):
         def _append_event(self, event: dict[str, Any]) -> None:
             event = dict(event)
             event.setdefault("event_ts", time.time())
+            event.setdefault("bus_received_ts", time.time())
             self._events.append(event)
 
         def _worker_group_for_event(
@@ -72,6 +97,10 @@ def _event_bus_actor_class(ray):
             ]
             for worker_id in expired:
                 self._training_owners.pop(worker_id, None)
+            live_plans = {owner[0] for owner in self._training_owners.values()}
+            for plan_id in tuple(self._training_reclaims):
+                if plan_id not in live_plans:
+                    self._training_reclaims.pop(plan_id, None)
 
         def emit(self, event: dict[str, Any]) -> int:
             self._append_event(event)
@@ -99,6 +128,9 @@ def _event_bus_actor_class(ray):
             """Atomically acquire one rollout replica's colocated resources."""
 
             group = self._worker_group_for_event(worker_ids, event)
+            request_id = str(event.get("lease_request_id", ""))
+            if request_id and self._rollout_requests.get(request_id) == (group, True):
+                return {"acquired": True, "blocking_plan_ids": []}
             now = time.time()
             self._expire_training_owners(now)
             blocking_plans = sorted(
@@ -109,6 +141,9 @@ def _event_bus_actor_class(ray):
                 }
             )
             if blocking_plans:
+                if request_id:
+                    self._rollout_requests[request_id] = (group, False)
+                self.request_training_reclaim(group, now)
                 # One busy notification is sufficient to make the trainer
                 # cooperatively reclaim the in-flight Bubble batch.
                 if group not in self._pending_rollout_groups:
@@ -136,8 +171,50 @@ def _event_bus_actor_class(ray):
                 started["event_type"] = "GENERATION_STARTED"
                 started["event_ts"] = now
                 self._append_event(started)
-            self._pending_rollout_groups.discard(group)
+            if request_id:
+                self._rollout_requests[request_id] = (group, True)
+            if not any(
+                workers == group and not owned
+                for workers, owned in self._rollout_requests.values()
+            ):
+                self._pending_rollout_groups.discard(group)
             return {"acquired": True, "blocking_plan_ids": []}
+
+        def cancel_rollout_wait(self, request_id: str) -> dict[str, Any]:
+            """Cancel one waiter, including an acquire completed during cancellation."""
+            state = self._rollout_requests.pop(str(request_id), None)
+            if state is None:
+                return {"cancelled": False}
+            group, acquired = state
+            if acquired:
+                for worker_id in group:
+                    remaining = max(self._rollout_owners.get(worker_id, 0) - 1, 0)
+                    if remaining:
+                        self._rollout_owners[worker_id] = remaining
+                    else:
+                        self._rollout_owners.pop(worker_id, None)
+            waiting = any(
+                workers == group and not owned
+                for workers, owned in self._rollout_requests.values()
+            )
+            if not waiting:
+                self._pending_rollout_groups.discard(group)
+            if not waiting and not any(
+                self._rollout_owners.get(worker, 0) for worker in group
+            ):
+                for replica_rank, workers in self._replica_groups.items():
+                    if workers == group:
+                        self._append_event(
+                            {
+                                "event_type": "WORKER_IDLE",
+                                "worker_id": group[0],
+                                "replica_rank": replica_rank,
+                                "memory_released": True,
+                                "idle_confidence": "confirmed",
+                                "release_source": "rollout_wait_cancelled",
+                            }
+                        )
+            return {"cancelled": True, "acquired": acquired}
 
         def release_rollout(
             self,
@@ -146,7 +223,19 @@ def _event_bus_actor_class(ray):
         ) -> dict[str, Any]:
             """Release serving ownership and publish an authoritative idle event."""
 
+            event = dict(event)
+            event.setdefault("bus_received_ts", time.time())
             group = self._worker_group_for_event(worker_ids, event)
+            completed_request = next(
+                (
+                    request
+                    for request, (workers, owned) in self._rollout_requests.items()
+                    if workers == group and owned
+                ),
+                None,
+            )
+            if completed_request is not None:
+                self._rollout_requests.pop(completed_request)
             for worker_id in group:
                 remaining = max(self._rollout_owners.get(worker_id, 0) - 1, 0)
                 if remaining:
@@ -163,6 +252,7 @@ def _event_bus_actor_class(ray):
                         "event_type": "WORKER_IDLE",
                         "idle_confidence": "confirmed",
                         "event_ts": time.time(),
+                        "lease_released_ts": time.time(),
                     }
                 )
                 self._append_event(released)
@@ -183,6 +273,7 @@ def _event_bus_actor_class(ray):
                 worker_id
                 for worker_id in group
                 if self._rollout_owners.get(worker_id, 0) > 0
+                or any(worker_id in pending for pending in self._pending_rollout_groups)
             ]
             training_busy = [
                 worker_id
@@ -217,6 +308,10 @@ def _event_bus_actor_class(ray):
                 if owner is not None and owner[0] == str(plan_id):
                     self._training_owners.pop(worker_id, None)
                     released.append(worker_id)
+            if not any(
+                owner[0] == str(plan_id) for owner in self._training_owners.values()
+            ):
+                self._training_reclaims.pop(str(plan_id), None)
             return {"released": bool(released), "worker_ids": released}
 
         def drain(self) -> list[dict[str, Any]]:
@@ -248,6 +343,70 @@ def ensure_rollout_idle_event_bus(name: str):
         return None
 
 
+def request_rollout_training_reclaim(name, worker_ids, sent_ts=None) -> bool:
+    """Signal the independent lease actor, never the busy training actor."""
+    ray, actor = _event_bus(name)
+    if actor is None:
+        return False
+    try:
+        result = ray.get(
+            actor.request_training_reclaim.remote(list(worker_ids), sent_ts),
+            timeout=1.0,
+        )
+        return bool(result.get("requested", False))
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Bubble reclaim control unavailable; using worker RPC fallback"
+        )
+        return False
+
+
+class TrainingReclaimWatcher:
+    """CPU-only control polling; the callback must never touch model tensors."""
+
+    def __init__(self, name, plan_id, worker_id, receive):
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(name, plan_id, worker_id, receive),
+            name=f"bubble-reclaim-{worker_id}",
+            daemon=True,
+        )
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def close(self):
+        # Do not put a polling-period/thread join on the GPU critical path.
+        # Worker callbacks validate plan identity before changing stop flags.
+        self._stop.set()
+
+    def _run(self, name, plan_id, worker_id, receive):
+        ray = _ray_module()
+        try:
+            actor = ray.get_actor(name)
+            while not self._stop.is_set():
+                status = ray.get(
+                    actor.training_reclaim_status.remote(plan_id, worker_id),
+                    timeout=1.0,
+                )
+                if self._stop.is_set() or not status.get("active", False):
+                    return
+                if status.get("requested", False):
+                    receive(plan_id, status.get("sent_ts"), "lease_bus")
+                    return
+                if self._stop.wait(0.02):
+                    return
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Bubble reclaim watcher failed: plan=%s worker=%s", plan_id, worker_id
+            )
+            if not self._stop.is_set():
+                # Fail closed: complete the current atomic step, then stop.
+                receive(plan_id, None, "control_error")
+
+
 def emit_rollout_idle_event(name: str | None, event: dict[str, Any]) -> bool:
     if not name:
         return False
@@ -256,7 +415,9 @@ def emit_rollout_idle_event(name: str | None, event: dict[str, Any]) -> bool:
         return False
     try:
         actor = ray.get_actor(name)
-        actor.emit.remote(dict(event))
+        payload = dict(event)
+        payload.setdefault("event_emit_ts", time.time())
+        actor.emit.remote(payload)
         return True
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to emit SPECO rollout idle event to %s: %s", name, exc)
@@ -299,24 +460,52 @@ async def acquire_rollout_resource_lease(
     if not callable(remote):
         return False, 0.0
     started = time.monotonic()
-    while True:
-        result = await _await_ray_result(
-            ray,
-            remote(list(worker_ids), dict(event)),
-        )
-        if isinstance(result, dict) and bool(result.get("acquired", False)):
-            return True, time.monotonic() - started
-        if time.monotonic() - started >= max(float(timeout_sec), 1.0):
-            raise TimeoutError(
-                "Timed out waiting for SPECO Bubble training to release rollout "
-                f"workers={worker_ids}"
+    deadline = started + max(float(timeout_sec), 1.0)
+    request_id = uuid.uuid4().hex
+    payload = {**event, "lease_request_id": request_id}
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(
+                    "Timed out waiting for SPECO Bubble training to release rollout "
+                    f"workers={worker_ids}"
+                )
+            result = await asyncio.wait_for(
+                _await_ray_result(ray, remote(list(worker_ids), dict(payload))),
+                timeout=remaining,
             )
-        retry_after = (
-            float(result.get("retry_after_sec", 0.01))
-            if isinstance(result, dict)
-            else 0.01
-        )
-        await asyncio.sleep(max(retry_after, 0.001))
+            if isinstance(result, dict) and bool(result.get("acquired", False)):
+                return True, time.monotonic() - started
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "Timed out waiting for SPECO Bubble training to release rollout "
+                    f"workers={worker_ids}"
+                )
+            retry_after = (
+                float(result.get("retry_after_sec", 0.01))
+                if isinstance(result, dict)
+                else 0.01
+            )
+            await asyncio.sleep(
+                min(max(retry_after, 0.001), deadline - time.monotonic())
+            )
+    except BaseException:
+        # A cancelled waiter must not retain generation priority forever.
+        # If acquire completed just as cancellation arrived, cancel also
+        # releases that request's grant, never another request's ownership.
+        cancel = getattr(getattr(actor, "cancel_rollout_wait", None), "remote", None)
+        if callable(cancel):
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(_await_ray_result(ray, cancel(request_id))),
+                    timeout=1.0,
+                )
+            except BaseException:  # noqa: BLE001
+                logger.exception(
+                    "Unable to cancel Bubble rollout lease request %s", request_id
+                )
+        raise
 
 
 async def release_rollout_resource_lease(
@@ -332,7 +521,9 @@ async def release_rollout_resource_lease(
     remote = getattr(release, "remote", None)
     if not callable(remote):
         return False
-    result = await _await_ray_result(ray, remote(list(worker_ids), dict(event)))
+    payload = dict(event)
+    payload.setdefault("event_emit_ts", time.time())
+    result = await _await_ray_result(ray, remote(list(worker_ids), payload))
     return bool(isinstance(result, dict) and result.get("released", False))
 
 

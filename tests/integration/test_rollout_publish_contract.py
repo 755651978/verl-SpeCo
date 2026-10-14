@@ -26,6 +26,68 @@ class _FakeObjectRef:
     pass
 
 
+@pytest.mark.parametrize("overlay", ["class_metadata", "config"])
+def test_head_export_capability_supports_legacy_worker_overlay(monkeypatch, overlay):
+    import json
+
+    class Worker(SimpleNamespace):
+        pass
+
+    drafter = {
+        "training": {"scheduler": {"execution": {"strategy": "rollout_idle_worker"}}}
+    }
+    Worker._speco_sglang_drafter_config_env = json.dumps(drafter)
+    config = {"actor": {"strategy": "fsdp2"}, "model": {}, "rollout": {}}
+    if overlay == "config":
+        config["rollout"]["drafter"] = drafter
+    worker = Worker(config=config, _is_actor=True, actor=object(), rank=0)
+    tensor = object()
+    monkeypatch.setattr(
+        rollout_publish, "_actor_module_candidates", lambda worker: [object()]
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_select_lm_head_named_tensor",
+        lambda module: ("model.lm_head.weight", tensor),
+    )
+    capability = (
+        rollout_publish.DraftWeightPublishMixin.get_actor_lm_head_export_capability(
+            worker
+        )
+    )
+    assert capability["supported"] and capability["reason"] == "head_only_ready"
+    assert rollout_publish._head_only_export_candidate(worker)[1] is tensor
+
+
+@pytest.mark.parametrize("failure", ["sync", "missing_head", "lora"])
+def test_head_export_capability_rejects_unsafe_layouts(monkeypatch, failure):
+    config = {
+        "actor": {"strategy": "fsdp2"},
+        "model": {},
+        "rollout": {
+            "drafter": {
+                "training": {
+                    "scheduler": {"execution": {"strategy": "rollout_idle_worker"}}
+                }
+            }
+        },
+    }
+    if failure == "sync":
+        config["rollout"]["drafter"]["training"]["scheduler"]["execution"][
+            "strategy"
+        ] = "sync"
+    if failure == "lora":
+        config["model"]["lora_rank"] = 8
+    worker = SimpleNamespace(config=config, _is_actor=True, actor=object(), rank=0)
+    monkeypatch.setattr(rollout_publish, "_actor_module_candidates", lambda worker: [])
+    capability = (
+        rollout_publish.DraftWeightPublishMixin.get_actor_lm_head_export_capability(
+            worker
+        )
+    )
+    assert not capability["supported"]
+
+
 class _FakeRay:
     ObjectRef = _FakeObjectRef
 
@@ -213,9 +275,7 @@ def test_legacy_async_publish_still_updates_rollout_directly() -> None:
     worker.config = {"rollout": {"drafter": {"enable": True}}}
     worker.rollout = _Rollout()
 
-    ack = asyncio.run(
-        worker.update_draft_weights_async({"weight": 1}, global_steps=4)
-    )
+    ack = asyncio.run(worker.update_draft_weights_async({"weight": 1}, global_steps=4))
 
     assert ack["published"] is True
     assert worker.rollout.updates == [({"weight": 1}, 4)]
@@ -355,6 +415,91 @@ def test_veomni_lm_head_export_avoids_full_engine_state_dict(
     assert payload["export_strategy"] == expected_strategy
     assert payload["actor_backend"] == "veomni"
     assert tuple(payload["weight"].shape) == (expected_rows, 3)
+
+
+def test_bubble_fsdp2_full_head_export_preserves_all_rows_without_actor_enumeration() -> (
+    None
+):
+    torch = pytest.importorskip("torch")
+    module = torch.nn.Module()
+    module.lm_head = torch.nn.Linear(3, 6, bias=False)
+
+    def fail_enumeration(**kwargs):
+        raise AssertionError("full actor enumeration must not run")
+
+    worker = SimpleNamespace(
+        _is_actor=True,
+        rank=0,
+        config={
+            "actor": {"strategy": "fsdp2"},
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "scheduler": {"execution": {"strategy": "rollout_idle_worker"}}
+                    }
+                }
+            },
+        },
+        actor=SimpleNamespace(
+            engine=SimpleNamespace(module=module, get_per_tensor_param=fail_enumeration)
+        ),
+    )
+    payload = rollout_publish.export_actor_lm_head_weight(worker)
+    assert payload["export_strategy"] == "direct_full"
+    assert payload["row_indices"] is None
+    assert torch.equal(
+        payload["weight"], module.lm_head.weight.detach().to(torch.bfloat16)
+    )
+
+
+@pytest.mark.parametrize("device_name", ["cuda", "npu"])
+def test_bubble_cpu_head_export_uses_verl_device_abstraction(monkeypatch, device_name):
+    import sys
+    from types import ModuleType
+
+    device_module = ModuleType("verl.utils.device")
+    device_module.get_device_name = lambda: device_name
+    monkeypatch.setitem(sys.modules, "verl.utils.device", device_module)
+    moved = []
+
+    class Head:
+        shape = (6, 3)
+
+        def to_local(self):
+            return SimpleNamespace(device=SimpleNamespace(type="cpu"))
+
+        def to(self, *, device, **kwargs):
+            moved.append(device)
+            return self
+
+        def detach(self):
+            return self
+
+        def full_tensor(self):
+            return self
+
+        def contiguous(self):
+            return self
+
+    head = Head()
+    monkeypatch.setattr(
+        rollout_publish,
+        "_torch_module",
+        lambda: SimpleNamespace(device=lambda name: name, bfloat16="bf16"),
+    )
+    monkeypatch.setattr(
+        rollout_publish, "_is_veomni_actor_worker", lambda worker: False
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_head_only_export_candidate",
+        lambda worker, rows: ("lm_head.weight", head, "head_only_ready"),
+    )
+    payload = rollout_publish.export_actor_lm_head_weight(
+        SimpleNamespace(_is_actor=True, actor=object(), rank=0)
+    )
+    assert moved == [device_name, "cpu"]
+    assert payload["export_strategy"] == "direct_full"
 
 
 def test_dflash_lm_head_sparse_export_avoids_full_engine_state_dict() -> None:

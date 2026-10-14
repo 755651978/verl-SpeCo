@@ -268,7 +268,18 @@ class DrafterScheduler:
         self._global_publish_leader_worker_id: str | None = None
         self._replica_idle_worker_groups: dict[int, tuple[str, ...]] = {}
         self._idle_worker_batch_estimate_sec: float | None = None
+        self._idle_optimizer_steps_total = 0
+        self._critical_path_topup_optimizer_steps_total = 0
         self._idle_worker_batch_samples_sec: deque[float] = deque(maxlen=32)
+        self._idle_worker_first_step_samples_sec: deque[float] = deque(maxlen=32)
+        self._idle_first_step_by_mode: dict[
+            tuple[tuple[str, ...], str], deque[float]
+        ] = {}
+        self._idle_worker_head_prepare_samples: dict[tuple[str, ...], deque[float]] = {}
+        self._idle_worker_hot_head_prepare_samples: dict[
+            tuple[str, ...], deque[float]
+        ] = {}
+        self._idle_worker_last_target_version: dict[tuple[str, ...], int] = {}
         self._idle_worker_reclaim_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_startup_samples_sec: deque[float] = deque(maxlen=32)
         # Intermediate plans only release their plan-local reservation and keep
@@ -278,9 +289,19 @@ class DrafterScheduler:
         self._idle_worker_partial_tail_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_final_tail_samples_sec: deque[float] = deque(maxlen=32)
         self._idle_worker_hot_prewarmed_groups: set[tuple[str, ...]] = set()
+        self._idle_worker_bootstrapped = False
+        # Loading/publishing a model does not initialize optimizer state.
+        self._idle_optimizer_initialized_groups: set[tuple[str, ...]] = set()
+        self._idle_worker_restore_samples: dict[tuple[str, ...], deque[float]] = {}
+        self._idle_worker_park_samples_sec: deque[float] = deque(maxlen=32)
+        self._training_quota_last_registered_data_version: int | None = None
         self._idle_worker_writer_group: tuple[str, ...] | None = None
         self._idle_worker_writer_state_version: int | None = None
         self._idle_worker_writer_migration_blocked: bool = False
+        self._writer_boundary_migration_allowed = False
+        self._writer_idle_history: deque[dict[tuple[str, ...], float]] = deque(
+            maxlen=64
+        )
         self._latest_published_drafter_version: int | None = None
         self._rollout_worker_drafter_versions: dict[str, int] = {}
         self._idle_worker_group_success_counts: dict[tuple[str, ...], int] = {}
@@ -289,6 +310,8 @@ class DrafterScheduler:
         # lets the replica that finishes last (and therefore has an almost
         # zero tail) suppress useful Bubble windows on every earlier replica.
         self._replica_idle_window_samples_sec: dict[int, deque[float]] = {}
+        self._replica_idle_windows_by_source: dict[int, dict[str, deque[float]]] = {}
+        self._replica_idle_timeline: dict[int, dict[str, float | None]] = {}
         self._replica_idle_event_delivery_lag_sec: dict[int, float] = {}
         self._replica_last_observed_idle_window_sec: dict[int, float] = {}
         self._replica_idle_window_close_source: dict[int, str] = {}
@@ -296,6 +319,9 @@ class DrafterScheduler:
         self._idle_worker_reclaim_penalty_sec: float = 0.0
         self._idle_worker_reclaim_penalty_last_step: int | None = None
         self._idle_worker_dynamic_batch_cap: int | None = None
+        self._idle_group_batch_caps: dict[tuple[str, ...], int] = {}
+        self._idle_worker_last_feedback_step: int | None = None
+        self._runtime_replica_local_topology = False
         self._idle_worker_gen_per_token_baseline_ms: float | None = None
         self._idle_worker_gen_per_token_samples: deque[float] = deque(maxlen=16)
         self._idle_worker_gen_slowdown_streak: int = 0
@@ -357,25 +383,83 @@ class DrafterScheduler:
         else:
             estimate = self._effective_idle_batch_estimate_sec(config)
             configured_guard = max(_BOOTSTRAP_IDLE_DEADLINE_GUARD_SEC, estimate * 0.1)
-        reclaim_guard = _conservative_percentile(self._idle_worker_reclaim_samples_sec)
-        return max(configured_guard, reclaim_guard)
+        # Reclaim drain includes in-flight training and sometimes publication.
+        # Offload belongs to the tail budget, not an additional deadline guard.
+        return configured_guard
+
+    def _effective_idle_first_step_extra_sec(
+        self, config, worker_ids=(), *, continuation=False
+    ) -> float:
+        group = _normalize_worker_id_group(worker_ids)
+        mode = (
+            "continuation"
+            if continuation and group in self._idle_worker_hot_prewarmed_groups
+            else ("hot" if group in self._idle_worker_hot_prewarmed_groups else "cold")
+        )
+        history = self._idle_first_step_by_mode.get((group, mode))
+        if history is None:
+            # A new restart mode cannot inherit another group's cold outlier.
+            # Continuation uses the hot restart estimate until measured itself.
+            history = (
+                self._idle_first_step_by_mode.get((group, "hot"))
+                if mode == "continuation"
+                else None
+            )
+        budget_history: Iterable[float] = (
+            history
+            if history is not None
+            else (
+                ()
+                if self._idle_first_step_by_mode
+                else self._idle_worker_first_step_samples_sec
+            )
+        )
+        return max(
+            _conservative_percentile(budget_history)
+            - self._effective_idle_batch_estimate_sec(config),
+            0.0,
+        ) * self._idle_gradient_accumulation_steps(
+            config, _normalize_worker_id_group(worker_ids)
+        )
 
     def _effective_idle_startup_reserve_sec(
         self,
         config: DrafterScheduleConfig,
         worker_ids: tuple[str, ...] | None = None,
+        *,
+        continuation: bool = False,
     ) -> float:
         """Reserve activation and preflight work before the first batch."""
 
         group = _normalize_worker_id_group(worker_ids)
+        first_extra = self._effective_idle_first_step_extra_sec(
+            config, group, continuation=continuation
+        )
         if group and group in self._idle_worker_hot_prewarmed_groups:
-            return 0.0
+            head_prepare = 0.0
+            target = self._training_quota_data_version
+            if (
+                target is not None
+                and self._idle_worker_last_target_version.get(group) != target
+            ):
+                head_history: Iterable[float] = (
+                    self._idle_worker_hot_head_prepare_samples.get(group)
+                    or self._idle_worker_head_prepare_samples.get(group)
+                    or ()
+                )
+                head_prepare = _conservative_percentile(head_history)
+            return head_prepare + first_extra
+        restore = _conservative_percentile(
+            self._idle_worker_restore_samples.get(group, ())
+        )
+        if restore > 0.0:
+            return restore + first_extra
         historical = _conservative_percentile(self._idle_worker_startup_samples_sec)
         if historical > 0.0:
-            return historical
+            return historical + first_extra
         if self._idle_batch_estimate_is_bootstrap(config):
-            return _BOOTSTRAP_IDLE_STARTUP_RESERVE_SEC
-        return 0.0
+            return _BOOTSTRAP_IDLE_STARTUP_RESERVE_SEC + first_extra
+        return first_extra
 
     def prewarm_idle_training_workers(self) -> list[Any]:
         if self._worker_executor is None:
@@ -680,11 +764,20 @@ class DrafterScheduler:
             else self._idle_worker_partial_tail_samples_sec
         )
         historical = _conservative_percentile(samples)
+        park = (
+            0.0
+            if config.idle_worker_keep_hot_between_plans
+            else _conservative_percentile(self._idle_worker_park_samples_sec)
+        )
         if historical > 0.0:
-            return historical
+            return historical + park
         if final and self._idle_batch_estimate_is_bootstrap(config):
-            return _BOOTSTRAP_IDLE_TAIL_RESERVE_SEC
-        return 0.0
+            return _BOOTSTRAP_IDLE_TAIL_RESERVE_SEC + park
+        return park
+
+    def record_memory_park_elapsed(self, elapsed_sec: float) -> None:
+        if elapsed_sec > 0.0:
+            self._idle_worker_park_samples_sec.append(float(elapsed_sec))
 
     def record_reclaim_elapsed(self, elapsed_sec: float) -> None:
         elapsed_sec = max(float(elapsed_sec), 0.0)
@@ -703,6 +796,7 @@ class DrafterScheduler:
         outcome: TrainingOutcome,
         *,
         final: bool = False,
+        worker_ids: tuple[str, ...] = (),
     ) -> None:
         """Learn conservative admission overhead from useful training plans.
 
@@ -729,15 +823,57 @@ class DrafterScheduler:
             float(outcome.metrics.get("timing_s/drafter_worker_preflight", 0.0) or 0.0),
             0.0,
         )
-        tail_sec = max(
-            float(outcome.metrics.get("timing_s/drafter_worker_cleanup", 0.0) or 0.0),
+        park_sec = max(
+            float(
+                outcome.metrics.get("timing_s/drafter_worker_memory_park", 0.0) or 0.0
+            ),
             0.0,
-        ) + max(
+        )
+        self.record_memory_park_elapsed(park_sec)
+        group = _normalize_worker_id_group(worker_ids)
+        head_prepare = float(
+            outcome.metrics.get("timing_s/drafter_worker_target_head_prepare", 0.0)
+            or 0.0
+        )
+        if group and head_prepare > 0.0:
+            self._idle_worker_head_prepare_samples.setdefault(
+                group, deque(maxlen=32)
+            ).append(head_prepare)
+            if outcome.metrics.get("bubble/activation_started_resident", 0):
+                self._idle_worker_hot_head_prepare_samples.setdefault(
+                    group, deque(maxlen=32)
+                ).append(head_prepare)
+        # Aggregate each rank's non-park cleanup directly. Subtracting the
+        # maximum park from the maximum cleanup can mix different ranks.
+        cleanup_sec = max(
+            float(
+                outcome.metrics.get(
+                    "timing_s/drafter_worker_cleanup_nonpark",
+                    max(
+                        float(
+                            outcome.metrics.get("timing_s/drafter_worker_cleanup", 0.0)
+                            or 0.0
+                        )
+                        - park_sec,
+                        0.0,
+                    ),
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+        snapshot_sec = max(
             float(outcome.metrics.get("timing_s/drafter_publish_snapshot", 0.0) or 0.0),
             0.0,
         )
+        tail_sec = cleanup_sec + (snapshot_sec if final else 0.0)
         if setup_sec > 0.0:
             self._idle_worker_startup_samples_sec.append(setup_sec)
+            group = _normalize_worker_id_group(worker_ids)
+            if group:
+                self._idle_worker_restore_samples.setdefault(
+                    group, deque(maxlen=32)
+                ).append(setup_sec)
         tail_samples = (
             self._idle_worker_final_tail_samples_sec
             if final
@@ -747,14 +883,21 @@ class DrafterScheduler:
             tail_samples.append(tail_sec)
         if setup_sec <= 0.0 and tail_sec <= 0.0:
             return
-        logger.debug(
+        logger.warning(
             "[BubbleTime] idle_overhead_updated: reason=%s setup_s=%.3f "
-            "tail_s=%.3f tail_kind=%s setup_reserve_s=%.3f "
+            "tail_s=%.3f tail_kind=%s activation_s=%.3f park_s=%.3f "
+            "snapshot_s=%.3f nonpark_cleanup_s=%.3f setup_reserve_s=%.3f "
             "partial_tail_reserve_s=%.3f final_tail_reserve_s=%.3f",
             outcome.reason,
             setup_sec,
             tail_sec,
             "final" if final else "partial",
+            float(
+                outcome.metrics.get("timing_s/drafter_worker_activation", 0.0) or 0.0
+            ),
+            park_sec,
+            snapshot_sec,
+            cleanup_sec,
             _conservative_percentile(self._idle_worker_startup_samples_sec),
             _conservative_percentile(self._idle_worker_partial_tail_samples_sec),
             _conservative_percentile(self._idle_worker_final_tail_samples_sec),
@@ -954,6 +1097,7 @@ class DrafterScheduler:
         *,
         min_batches: int = 1,
         worker_ids: tuple[str, ...] | None = None,
+        continuation: bool = False,
     ) -> float:
         """Minimum window that can start and finish a useful idle batch."""
 
@@ -966,7 +1110,9 @@ class DrafterScheduler:
         return max(
             self._effective_idle_min_window_sec(config),
             self._effective_idle_deadline_guard_sec(config)
-            + self._effective_idle_startup_reserve_sec(config, worker_ids)
+            + self._effective_idle_startup_reserve_sec(
+                config, worker_ids, continuation=continuation
+            )
             + self._effective_idle_tail_reserve_sec(config)
             + optimizer_step_estimate_sec * max(int(min_batches), 1),
         )
@@ -974,6 +1120,7 @@ class DrafterScheduler:
     def _effective_idle_dynamic_batch_cap(
         self,
         config: DrafterScheduleConfig,
+        worker_ids: tuple[str, ...] | None = None,
     ) -> int:
         hard_cap = max(int(config.train_batches_per_trigger), 1)
         if not config.idle_worker_dynamic_batch_cap:
@@ -983,7 +1130,19 @@ class DrafterScheduler:
             self._idle_worker_dynamic_batch_cap = (
                 hard_cap if initial_cap is None else max(int(initial_cap), 1)
             )
-        return max(min(int(self._idle_worker_dynamic_batch_cap), hard_cap), 1)
+        group = (
+            _normalize_worker_id_group(worker_ids)
+            if worker_ids is not None
+            else self._current_idle_writer_group(assign_default=False)
+        )
+        cap = self._idle_group_batch_caps.get(group) if group else None
+        if cap is None:
+            cap = (
+                self._idle_worker_dynamic_batch_cap
+                if not self._idle_group_batch_caps or not group
+                else (config.idle_worker_initial_dynamic_batches or hard_cap)
+            )
+        return max(min(int(cap), hard_cap), 1)
 
     @staticmethod
     def _idle_stop_reason(
@@ -1010,8 +1169,23 @@ class DrafterScheduler:
     ) -> None:
         if plan.execution_strategy is not DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
             return
+        if plan.reason in {
+            "quota_topup_training_ready",
+            "quota_forced_completion_ready",
+        }:
+            return
+        group = _normalize_worker_id_group(plan.target_worker_ids)
         previous = max(
-            int(self._idle_worker_dynamic_batch_cap or plan.max_batches or 1),
+            int(
+                self._idle_group_batch_caps.get(
+                    group,
+                    self._idle_worker_dynamic_batch_cap
+                    if not self._idle_group_batch_caps
+                    else None,
+                )
+                or plan.max_batches
+                or 1
+            ),
             1,
         )
         next_cap = previous
@@ -1048,12 +1222,18 @@ class DrafterScheduler:
             return
         elif not outcome.trained or outcome.successful_steps <= 0:
             return
-        elif stop_reason in {"reclaim_requested", "deadline_reached"}:
+        elif stop_reason == "reclaim_requested":
+            # An early rollout return invalidates this opportunity, not the
+            # writer's capacity in the next window. Deadline/budget and the
+            # generation-slowdown guard still bound subsequent work.
+            return
+        elif stop_reason == "deadline_reached":
             next_cap = max(1, min(previous, max(outcome.successful_steps, 1)))
         elif stop_reason == "max_batches_reached" or outcome.successful_steps >= max(
             int(plan.max_batches), 1
         ):
-            next_cap = max(previous, max(int(plan.max_batches), 1) * 2)
+            next_cap = max(previous * 2, max(int(plan.max_batches), 1) * 2)
+        self._idle_group_batch_caps[group] = max(int(next_cap), 1)
         self._idle_worker_dynamic_batch_cap = max(int(next_cap), 1)
         if self._idle_worker_dynamic_batch_cap != previous:
             print(
@@ -1086,7 +1266,10 @@ class DrafterScheduler:
             )
         try:
             if observed_step is not None:
-                self._last_observed_global_step = _as_int(observed_step)
+                self._last_observed_global_step = max(
+                    _as_int(observed_step),
+                    self._last_observed_global_step or 0,
+                )
         except (TypeError, ValueError):
             pass
 
@@ -1148,6 +1331,21 @@ class DrafterScheduler:
         result.update(self._quality_gate_metrics(config))
         if gen_ms is None or gen_ms <= 0:
             return result
+        try:
+            feedback_step = (
+                _as_int(observed_step) if observed_step is not None else None
+            )
+        except (TypeError, ValueError):
+            feedback_step = None
+        if feedback_step is not None:
+            if (
+                self._idle_worker_last_feedback_step is not None
+                and feedback_step <= self._idle_worker_last_feedback_step
+            ):
+                # Training and deferred publication may merge the same step's
+                # metrics more than once. One rollout is one slowdown sample.
+                return result
+            self._idle_worker_last_feedback_step = feedback_step
         idle_active = (
             any(
                 bool(metrics.get(key, 0))
@@ -1188,6 +1386,11 @@ class DrafterScheduler:
                 self._idle_worker_dynamic_batch_cap = max(
                     1, int(math.ceil(current_cap / 2))
                 )
+                group = self._current_idle_writer_group(assign_default=False)
+                if group:
+                    self._idle_group_batch_caps[group] = (
+                        self._idle_worker_dynamic_batch_cap
+                    )
                 result["bubble/gen_slowdown_cap_reduced"] = 1
                 result["bubble/idle_dynamic_batch_cap"] = (
                     self._idle_worker_dynamic_batch_cap
@@ -1291,12 +1494,21 @@ class DrafterScheduler:
     ) -> int:
         """Match the sync path's effective data-parallel batch in Bubble mode."""
 
-        group_size = max(len(_normalize_worker_id_group(worker_ids)), 1)
+        group = _normalize_worker_id_group(
+            worker_ids
+        ) or self._current_idle_writer_group(assign_default=False)
+        if not group:
+            return max(int(config.gradient_accumulation_steps), 1)
+        group_size = len(group)
         sync_size = max(
             (len(group) for group in self._metadata_full_collective_idle_groups),
             default=group_size,
         )
-        replica_ratio = max(int(math.ceil(sync_size / group_size)), 1)
+        if sync_size % group_size:
+            raise ValueError(
+                "Bubble writer group cannot match the Sync effective batch: non-divisible group sizes"
+            )
+        replica_ratio = max(sync_size // group_size, 1)
         return max(int(config.gradient_accumulation_steps), 1) * replica_ratio
 
     def bind_worker_executor(self, worker_executor: DrafterWorkerExecutor) -> None:
@@ -1514,13 +1726,24 @@ class DrafterScheduler:
     ):
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
+        probe_started = time.perf_counter()
         statuses = self._worker_executor.get_training_data_status(
             sample_last_n_steps=config.sample_last_n_steps,
             require_full_batch=config.require_full_batch,
             worker_ids=worker_ids,
             target_version=target_version,
         )
-        return self.data_status_policy.aggregate(statuses, global_step=global_step)
+        status = self.data_status_policy.aggregate(statuses, global_step=global_step)
+        if config.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+            logger.warning(
+                "[BubbleTime] training_data_probe: step=%s workers=%s "
+                "target_version=%s elapsed_s=%.4f",
+                global_step,
+                worker_ids,
+                target_version,
+                time.perf_counter() - probe_started,
+            )
+        return status
 
     def on_worker_event(
         self,
@@ -1529,6 +1752,25 @@ class DrafterScheduler:
         """Record rollout replica state for Bubble Time idle-worker planning."""
 
         if isinstance(event, dict):
+            if str(event.get("event_type", "")).lower() == "worker_idle":
+                replica = _as_int(event.get("replica_rank", 0))
+                timeline = {
+                    key: (_as_float(event[key]) if event.get(key) is not None else None)
+                    for key in (
+                        "request_completed_ts",
+                        "event_emit_ts",
+                        "lease_released_ts",
+                        "bus_received_ts",
+                    )
+                }
+                timeline["driver_received_ts"] = time.time()
+                self._replica_idle_timeline[replica] = timeline
+                logger.warning(
+                    "[BubbleTime] idle_event_timeline: replica=%s release_source=%s timestamps=%s",
+                    replica,
+                    event.get("release_source"),
+                    timeline,
+                )
             event = RolloutWorkerEvent(
                 event_type=_rollout_worker_event_type(event.get("event_type", "")),
                 worker_id=str(event.get("worker_id", "")),
@@ -1648,6 +1890,7 @@ class DrafterScheduler:
             outcome.metrics.get("bubble/train_reclaimed_before_first_batch", 0)
         )
         if outcome.trained and outcome.successful_steps > 0:
+            self._writer_boundary_migration_allowed = False
             if self._idle_worker_prebatch_reclaim_streak:
                 print(
                     "[BubbleTime] idle_reclaim_penalty_reset: "
@@ -1744,8 +1987,27 @@ class DrafterScheduler:
             int(replica_rank), deque(maxlen=32)
         )
         samples.append(observed_window)
+        source_samples = self._replica_idle_windows_by_source.setdefault(
+            int(replica_rank), {}
+        ).setdefault(source, deque(maxlen=32))
+        source_samples.append(observed_window)
         self._replica_last_observed_idle_window_sec[int(replica_rank)] = observed_window
         self._replica_idle_window_close_source[int(replica_rank)] = str(source)
+        logger.warning(
+            "[BubbleTime] idle_window_timeline: replica=%s usable_idle_start_ts=%.6f "
+            "window_closed_ts=%.6f observed_window_s=%.4f close_source=%s by_source_p75=%s",
+            replica_rank,
+            idle_started_at,
+            event_ts,
+            observed_window,
+            source,
+            {
+                kind: _conservative_percentile(values, quantile=0.75)
+                for kind, values in self._replica_idle_windows_by_source[
+                    int(replica_rank)
+                ].items()
+            },
+        )
         logger.warning(
             "[BubbleTime] observed replica idle window: replica_rank=%s "
             "window_s=%.3f conservative_window_s=%.3f samples=%s "
@@ -1782,6 +2044,17 @@ class DrafterScheduler:
             is not None
         ]
         promoted = 0
+        observed_by_replica = dict(observed)
+        history_row = {}
+        groups = self._metadata_idle_training_groups or tuple(
+            self._replica_idle_worker_groups.values()
+        )
+        for raw_group in groups:
+            group = _normalize_worker_id_group(raw_group)
+            replicas = self._replica_ranks_for_worker_group(group)
+            if replicas and all(rank in observed_by_replica for rank in replicas):
+                history_row[group] = min(observed_by_replica[rank] for rank in replicas)
+        self._writer_idle_history.append(history_row)
         boundary_confirmed = 0
         if confirm_speculative_idle:
             for state in self._idle_workers.values():
@@ -1855,6 +2128,78 @@ class DrafterScheduler:
         metrics.update(self.idle_worker_metrics())
         return metrics
 
+    def writer_switch_decision(self, config, *, cost_sec=0.0):
+        """Compare paired, completed rollout observations, never a single event."""
+        source = self.idle_writer_group()
+        rows = list(self._writer_idle_history)[
+            -config.idle_worker_writer_migration_history_steps :
+        ]
+        metrics = {
+            "bubble/writer_switch_enabled": int(
+                config.idle_worker_writer_migration_enable
+            ),
+            "bubble/writer_switch_history_samples": len(rows),
+            "bubble/writer_switch_estimated_cost_s": float(cost_sec),
+            "bubble/writer_switch_eligible": 0,
+        }
+        if not source or len(rows) < config.idle_worker_writer_migration_history_steps:
+            return None, metrics
+        candidates = []
+        for raw_group in self._metadata_idle_training_groups:
+            target = _normalize_worker_id_group(raw_group)
+            if (
+                target == source
+                or len(target) != len(source)
+                or target in self._disabled_replica_local_idle_groups
+            ):
+                continue
+            if not all(source in row and target in row for row in rows):
+                continue
+            gains = [row[target] - row[source] for row in rows]
+            mean_gain = sum(gains) / len(gains)
+            wins = sum(
+                gain >= config.idle_worker_writer_migration_min_idle_gain_sec
+                for gain in gains
+            )
+            candidates.append((mean_gain, wins, target, gains))
+        if not candidates:
+            return None, metrics
+        gain, wins, target, gains = max(candidates, key=lambda item: (item[0], item[1]))
+        source_mean = sum(row[source] for row in rows) / len(rows)
+        metrics.update(
+            {
+                "bubble/writer_switch_current_idle_mean_s": source_mean,
+                "bubble/writer_switch_candidate_idle_mean_s": source_mean + gain,
+                "bubble/writer_switch_missed_idle_s": sum(
+                    max(value, 0.0) for value in gains
+                ),
+                "bubble/writer_switch_persistent_wins": wins,
+                # Amortize over a bounded next-history-sized horizon, not forever.
+                "bubble/writer_switch_estimated_gain_s": max(gain, 0.0) * len(rows),
+            }
+        )
+        ready, versions = self._drafter_version_ready_for_writer_group(target)
+        ready = ready and all(
+            value == self._latest_published_drafter_version
+            for value in versions.values()
+        )
+        metrics["bubble/writer_switch_candidate_ack_ready"] = int(ready)
+        metrics["bubble/writer_switch_boundary_ready"] = int(
+            self._writer_boundary_migration_allowed
+        )
+        eligible = (
+            config.idle_worker_writer_migration_enable
+            and self._writer_boundary_migration_allowed
+            and self._latest_published_drafter_version is not None
+            and ready
+            and wins >= math.ceil(len(rows) * 0.75)
+            and gain >= config.idle_worker_writer_migration_min_idle_gain_sec
+            and gain * len(rows)
+            > cost_sec * config.idle_worker_writer_migration_cost_margin
+        )
+        metrics["bubble/writer_switch_eligible"] = int(eligible)
+        return (target if eligible else None), metrics
+
     def _record_worker_event_state(
         self,
         event: RolloutWorkerEvent,
@@ -1905,6 +2250,16 @@ class DrafterScheduler:
         """
 
         records = _flatten_metadata_records(metadata)
+        self._runtime_replica_local_topology = (
+            self._runtime_replica_local_topology
+            or any(
+                bool(record.get("in_drafter_train_group", False))
+                and bool(record.get("full_collective_ranks"))
+                and len(record["full_collective_ranks"])
+                < len(record.get("sync_collective_ranks", ()))
+                for record in records
+            )
+        )
         replica_group_members: dict[int, set[str]] = {}
         full_groups: list[tuple[str, ...]] = []
         full_collective_groups: list[tuple[str, ...]] = []
@@ -1998,6 +2353,13 @@ class DrafterScheduler:
             "bubble/registered_replica_groups": len(replica_groups),
         }
 
+    def training_work_metrics(self) -> dict[str, int]:
+        """Monotonic counters avoid per-plan metric overwrite within a step."""
+        return {
+            "bubble/idle_optimizer_steps_total": self._idle_optimizer_steps_total,
+            "bubble/critical_path_topup_optimizer_steps_total": self._critical_path_topup_optimizer_steps_total,
+        }
+
     def idle_worker_metrics(self) -> dict[str, float | int]:
         complete_groups = 0
         for group in self._metadata_idle_training_groups:
@@ -2010,6 +2372,7 @@ class DrafterScheduler:
             ):
                 complete_groups += 1
         metrics: dict[str, float | int] = {
+            **self.training_work_metrics(),
             "bubble/idle_workers": sum(
                 int(state.status == "idle") for state in self._idle_workers.values()
             ),
@@ -2024,6 +2387,27 @@ class DrafterScheduler:
         replica_ranks.update(self._replica_last_observed_idle_window_sec)
         for replica_rank in sorted(replica_ranks):
             prefix = f"bubble/replica_{replica_rank}"
+            histories = self._replica_idle_windows_by_source.get(replica_rank, {})
+            for source, label in (
+                ("generation_started", "generation_start_closed"),
+                ("generation_completed", "generation_end_closed"),
+            ):
+                history = histories.get(source, ())
+                metrics[f"{prefix}_{label}_p75_s"] = _conservative_percentile(
+                    history, quantile=0.75
+                )
+                metrics[f"{prefix}_{label}_samples"] = len(history)
+            timeline = self._replica_idle_timeline.get(replica_rank, {})
+            received = timeline.get("driver_received_ts")
+            emitted = timeline.get("event_emit_ts")
+            completed = timeline.get("request_completed_ts")
+            released = timeline.get("lease_released_ts")
+            if received is not None and emitted is not None:
+                metrics[f"{prefix}_emit_to_driver_s"] = max(received - emitted, 0.0)
+            if completed is not None and released is not None:
+                metrics[f"{prefix}_request_to_lease_release_s"] = max(
+                    released - completed, 0.0
+                )
             metrics[f"{prefix}_observed_idle_window_s"] = float(
                 self._replica_last_observed_idle_window_sec.get(replica_rank, 0.0)
             )
@@ -2086,13 +2470,30 @@ class DrafterScheduler:
 
         if self._idle_worker_writer_migration_blocked:
             return ()
+        if (
+            config.idle_worker_full_collective_fallback
+            and self._runtime_replica_local_topology
+        ):
+            raise ValueError(
+                "full_collective_fallback cannot combine independent replica-local "
+                "optimizers; it requires an actual full-collective training topology"
+            )
         if config.idle_worker_training_groups:
-            return tuple(
-                group
+            requested = tuple(
+                _normalize_worker_id_group(group)
                 for group in config.idle_worker_training_groups
                 if _normalize_worker_id_group(group)
                 not in self._disabled_replica_local_idle_groups
             )
+            if self._metadata_idle_training_groups:
+                legal = set(self._metadata_idle_training_groups)
+                invalid = [group for group in requested if group not in legal]
+                if invalid:
+                    raise ValueError(
+                        "idle_worker.training_groups must match complete runtime "
+                        f"training collectives: invalid={invalid}, legal={sorted(legal)}"
+                    )
+            return requested
         if self._metadata_idle_training_groups:
             return tuple(
                 group
@@ -2145,6 +2546,7 @@ class DrafterScheduler:
         config: DrafterScheduleConfig,
         *,
         now: float | None = None,
+        continuation: bool = False,
     ) -> AvailableTrainingResources:
         now = time.time() if now is None else now
         if (
@@ -2325,10 +2727,12 @@ class DrafterScheduler:
                 minimum_window = self._minimum_idle_training_window_sec(
                     config,
                     worker_ids=group,
+                    continuation=continuation,
                 )
             min_idle_window_sec = self._minimum_idle_training_window_sec(
                 config,
                 worker_ids=group,
+                continuation=continuation,
             )
             if minimum_window < min_idle_window_sec:
                 window_too_small_seen = True
@@ -2368,7 +2772,13 @@ class DrafterScheduler:
                     f"replica_ranks={self._replica_ranks_for_worker_group(group)} "
                     f"window_s={minimum_window:.3f} "
                     f"historical_window_s={historical_window} "
-                    f"event_age_s={event_ages} source={source}",
+                    f"event_age_s={event_ages} source={source} "
+                    f"min_required_s={min_idle_window_sec:.3f} "
+                    f"budget_deficit_s={max(min_idle_window_sec - minimum_window, 0.0):.3f} "
+                    f"startup_reserve_s={self._effective_idle_startup_reserve_sec(config, group):.3f} "
+                    f"tail_reserve_s={self._effective_idle_tail_reserve_sec(config):.3f} "
+                    f"final_tail_reserve_s={self._effective_idle_tail_reserve_sec(config, final=True):.3f} "
+                    f"writer_group={writer_group}",
                     flush=True,
                 )
                 small_window = AvailableTrainingResources(
@@ -2472,18 +2882,21 @@ class DrafterScheduler:
                 minimum_idle_window_sec=chosen_window,
                 idle_confidence=chosen_confidence,
                 idle_window_source=chosen_source,
+                idle_window_measured_at=(
+                    now if chosen_source != "bootstrap_minimum" else None
+                ),
             )
         reason = (
             "incomplete_training_group"
             if incomplete_seen
             else "speculative_idle_unconfirmed"
             if speculative_unconfirmed_seen
+            else "window_too_small"
+            if window_too_small_seen
             else "writer_state_migration_required"
             if writer_state_migration_seen
             else "stale_drafter_version"
             if stale_drafter_version_seen
-            else "window_too_small"
-            if window_too_small_seen
             else "idle_group_not_prewarmed"
             if not_prewarmed_seen
             else "no_idle_worker"
@@ -2506,6 +2919,8 @@ class DrafterScheduler:
         self,
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
+        *,
+        idle_continuation_plan: TrainingPlan | None = None,
     ) -> TrainingPlan:
         """Build a plan while avoiding worker RPCs for cheap skip conditions."""
 
@@ -2514,6 +2929,7 @@ class DrafterScheduler:
             return self.prepare_idle_worker_training_plan(
                 context,
                 config,
+                continuation_plan=idle_continuation_plan,
             )
         if (
             context.training_mode == "collect_only"
@@ -2540,6 +2956,8 @@ class DrafterScheduler:
         self,
         context: DrafterScheduleContext,
         config: DrafterScheduleConfig,
+        *,
+        continuation_plan: TrainingPlan | None = None,
     ) -> TrainingPlan:
         self._decay_idle_reclaim_penalty(context.global_step)
         if (
@@ -2555,7 +2973,41 @@ class DrafterScheduler:
                     reason="training_quota_publish_pending",
                 ),
             )
-        resources = self.select_idle_training_resources(config)
+        resources = self.select_idle_training_resources(
+            config, continuation=continuation_plan is not None
+        )
+        if continuation_plan is not None and resources.available:
+            # A completed small plan does not buy a new historical window.
+            # Stay on the same writer/data snapshot and retain the original
+            # absolute deadline, including time spent resolving its outcome.
+            deadline = continuation_plan.deadline_ts
+            if deadline is None or tuple(resources.worker_ids) != tuple(
+                continuation_plan.target_worker_ids
+            ):
+                resources = replace(
+                    resources, available=False, reason="window_too_small"
+                )
+            else:
+                now = time.time()
+                remaining = max(float(deadline) - now, 0.0)
+                # The previous deadline already excluded guard/cleanup. Add
+                # those back only to the resource budget representation; the
+                # new planner subtracts them again, never extending the bound.
+                reserved_tail = self._effective_idle_deadline_guard_sec(
+                    config
+                ) + self._effective_idle_tail_reserve_sec(config)
+                resources = replace(
+                    resources,
+                    minimum_idle_window_sec=min(
+                        resources.minimum_idle_window_sec,
+                        remaining + reserved_tail,
+                    ),
+                    idle_window_measured_at=now,
+                )
+                if remaining <= 0:
+                    resources = replace(
+                        resources, available=False, reason="window_too_small"
+                    )
         if not resources.available:
             if self._idle_worker_writer_migration_blocked:
                 resources = AvailableTrainingResources(
@@ -2621,6 +3073,7 @@ class DrafterScheduler:
             config,
             resources=resources,
             require_interval=False,
+            idle_continuation=continuation_plan is not None,
         )
         if plan.launch and self._idle_worker_writer_state_version is None:
             # Idle observations before collection must not pin all future
@@ -2762,6 +3215,11 @@ class DrafterScheduler:
         config: DrafterScheduleConfig,
         advance_completed_cycle: bool = False,
     ) -> None:
+        # Boundary inspections may rediscover a retained replay buffer. They
+        # must not turn that same snapshot into another optimizer-step quota.
+        previous_version = self._training_quota_last_registered_data_version
+        if previous_version is not None and data_version <= previous_version:
+            return
         try:
             interval = int(cast(Any, config.training_interval_steps))
         except (TypeError, ValueError):
@@ -2791,6 +3249,7 @@ class DrafterScheduler:
         if target_steps <= 0:
             self._training_quota_last_cycle_step = cycle_step
             self._training_quota_collection_step = None
+            self._writer_boundary_migration_allowed = True
             return
         previous_debt = self._training_quota_debt_steps
         if previous_debt > 0:
@@ -2803,6 +3262,7 @@ class DrafterScheduler:
         # discard optimizer-step obligations.  The due check uses it to force
         # a top-up, while the ledger always retains the full accumulated debt.
         self._training_quota_debt_steps = previous_debt + target_steps
+        self._training_quota_last_registered_data_version = data_version
         self._quality_loss_increase_ratio = float(
             config.training_quota_loss_increase_ratio
         )
@@ -2909,7 +3369,8 @@ class DrafterScheduler:
             )
             if self._training_quota_debt_steps <= 0:
                 return None
-        force_completion = self._training_quota_force_completion_due(
+        bootstrap_due = self.needs_idle_optimizer_bootstrap(config)
+        force_completion = bootstrap_due or self._training_quota_force_completion_due(
             context.global_step, config
         )
         if not force_completion and not self._training_quota_due(
@@ -2921,7 +3382,17 @@ class DrafterScheduler:
             target_steps - int(self._training_quota_debt_steps),
             0,
         )
-        full_collective_fallback = force_completion and completed_bubble_steps == 0
+        sync_workers = self._all_idle_training_worker_ids()
+        replica_local_topology = self._runtime_replica_local_topology or any(
+            len(group) < len(sync_workers)
+            for group in self._metadata_idle_training_groups
+        )
+        full_collective_fallback = (
+            force_completion
+            and completed_bubble_steps == 0
+            and self._idle_worker_writer_state_version is None
+            and not replica_local_topology
+        )
         # Soft top-ups before any genuine Bubble progress only add critical-path
         # activation/snapshot overhead and leave a split 2+2+16 schedule. Keep
         # the full quota available for rollout idle windows until the hard
@@ -2953,11 +3424,37 @@ class DrafterScheduler:
         # Before the first real Bubble optimizer step, assigning the first hot
         # group here pins target-head prefetch and all later idle admission to
         # metadata order rather than the replica that actually becomes idle.
-        writer_group = writer_group or self._current_idle_writer_group(
-            assign_default=True
-        )
+        writer_group = writer_group or self._best_idle_bootstrap_group()
         if not writer_group or self._idle_worker_writer_migration_blocked:
             return None
+        if (
+            not force_completion
+            and config.idle_worker_keep_hot_between_plans
+            and writer_group in self._idle_worker_hot_prewarmed_groups
+        ):
+            historical_window = self._effective_historical_idle_window_sec(
+                worker_ids=writer_group
+            )
+            if (
+                historical_window is not None
+                and historical_window
+                >= self._minimum_idle_training_window_sec(
+                    config,
+                    worker_ids=writer_group,
+                )
+            ):
+                # Keep the exact quota/snapshot available to later idle leases.
+                # The existing hard freshness deadline still forces completion
+                # even if future windows do not materialize.
+                logger.warning(
+                    "[BubbleTime] quota_soft_topup_deferred: step=%s writer=%s debt=%s "
+                    "historical_window_s=%.3f reason=hot_writer_idle_before_hard_deadline",
+                    context.global_step,
+                    writer_group,
+                    self._training_quota_debt_steps,
+                    historical_window,
+                )
+                return None
         writer_data_status = self.inspect_training_data(
             global_step=context.global_step,
             config=config,
@@ -2996,6 +3493,11 @@ class DrafterScheduler:
                 execution_strategy=DrafterExecutionStrategy.SYNC,
                 training_interval_steps=1,
                 train_batches_per_trigger=topup_steps,
+                gradient_accumulation_steps=(
+                    config.gradient_accumulation_steps
+                    if full_collective_fallback
+                    else self._idle_gradient_accumulation_steps(config, writer_group)
+                ),
                 min_trainable_batches=min(
                     max(int(config.min_trainable_batches), 1), topup_steps
                 ),
@@ -3032,6 +3534,14 @@ class DrafterScheduler:
             )
         if not plan.launch:
             return None
+        if bootstrap_due:
+            logger.warning(
+                "[BubbleTime] quota_optimizer_bootstrap_planned: step=%s writer=%s quota_steps=%s historical_window_s=%s",
+                context.global_step,
+                writer_group,
+                topup_steps,
+                self._effective_historical_idle_window_sec(worker_ids=writer_group),
+            )
         print(
             "[BubbleTime] training_quota_topup_planned: "
             f"step={context.global_step} workers="
@@ -3077,10 +3587,34 @@ class DrafterScheduler:
             execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
             target_worker_ids=writer_group,
             training_group_id="quota-topup",
+            gradient_accumulation_steps=self._idle_gradient_accumulation_steps(
+                config, writer_group
+            ),
             deadline_ts=None,
             publish_after_success=force_completion,
             retain_replay_session=not force_completion,
         )
+
+    def needs_idle_optimizer_bootstrap(self, config: DrafterScheduleConfig) -> bool:
+        """Model prewarm alone must not delay the first real optimizer quota."""
+        return bool(
+            self._training_quota_debt_steps > 0
+            and self._training_quota_debt_steps
+            >= self._training_quota_target_steps(config)
+            and self._training_quota_data_version is not None
+            and self._idle_worker_writer_state_version is None
+            and not self._idle_optimizer_initialized_groups
+        )
+
+    def record_hot_target_head_prepared(
+        self, worker_ids: tuple[str, ...], target_version: int, elapsed_sec: float
+    ) -> None:
+        group = _normalize_worker_id_group(worker_ids)
+        self._idle_worker_last_target_version[group] = int(target_version)
+        if elapsed_sec > 0:
+            self._idle_worker_hot_head_prepare_samples.setdefault(
+                group, deque(maxlen=32)
+            ).append(float(elapsed_sec))
 
     def _skip_idle_worker_plan(
         self,
@@ -3178,6 +3712,26 @@ class DrafterScheduler:
             raise RuntimeError(
                 f"SPECO drafter trainer activation failed: {failures[:3]}"
             )
+        for result in active:
+            group = _normalize_worker_id_group(result.get("training_group_ranks", ()))
+            restore = float(result.get("restore_elapsed_sec", 0.0) or 0.0)
+            if group and restore > 0.0:
+                self._idle_worker_restore_samples.setdefault(
+                    group, deque(maxlen=32)
+                ).append(restore)
+            park = float(result.get("park_elapsed_sec", 0.0) or 0.0)
+            self.record_memory_park_elapsed(park)
+            snapshot = float(result.get("snapshot_elapsed_sec", 0.0) or 0.0)
+            if snapshot > 0.0:
+                self._idle_worker_final_tail_samples_sec.append(snapshot)
+            if group:
+                logger.warning(
+                    "[BubbleTime] CPU restore calibrated: group=%s restore_s=%.4f park_s=%.4f snapshot_s=%.4f",
+                    group,
+                    restore,
+                    park,
+                    snapshot,
+                )
         return results
 
     def wait_pending_publish(self) -> int:
@@ -3268,6 +3822,11 @@ class DrafterScheduler:
         plan = self.prepare_training_plan(
             context.schedule_context,
             context.config,
+            **(
+                {"idle_continuation_plan": context.idle_continuation_plan}
+                if context.idle_continuation_plan is not None
+                else {}
+            ),
         )
         force_completion_due = False
         if (
@@ -3430,6 +3989,7 @@ class DrafterScheduler:
         resources: AvailableTrainingResources | None = None,
         *,
         require_interval: bool = True,
+        idle_continuation: bool = False,
     ) -> TrainingPlan:
         interval_matched = self.training_interval_matched(context.global_step, config)
         execution_strategy = (
@@ -3438,7 +3998,14 @@ class DrafterScheduler:
             else DrafterExecutionStrategy.SYNC
         )
         trigger = self.trigger_policy.should_train(
-            context,
+            replace(
+                context,
+                allow_cached_training=(
+                    context.allow_cached_training
+                    or resources is not None
+                    or (not require_interval and config.training_quota_enable)
+                ),
+            ),
             config,
             interval_matched=interval_matched if require_interval else True,
         )
@@ -3455,7 +4022,23 @@ class DrafterScheduler:
             if context.data_status is not None
             else 0
         )
+        idle_publish_deferred = False
+        publish_snapshot_deferred = False
+        final_tail_blocked = False
         if resources is not None and budget.max_batches > 0:
+            budget_started_ts = time.time()
+            measured_at = getattr(resources, "idle_window_measured_at", None)
+            if measured_at is not None:
+                # Inspection RPCs spend the selected window too. Never restart
+                # its clock after data readiness has been checked.
+                resources = replace(
+                    resources,
+                    minimum_idle_window_sec=max(
+                        resources.minimum_idle_window_sec
+                        - max(budget_started_ts - measured_at, 0.0),
+                        0.0,
+                    ),
+                )
             sync_budget_batches = budget.max_batches
             gradient_accumulation_steps = self._idle_gradient_accumulation_steps(
                 config, resources.worker_ids
@@ -3464,13 +4047,16 @@ class DrafterScheduler:
             startup_reserve_sec = self._effective_idle_startup_reserve_sec(
                 config,
                 resources.worker_ids,
+                continuation=idle_continuation,
             )
             tail_reserve_sec = float(idle_tail_reserve_sec or 0.0)
             reclaim_penalty_sec = self._effective_idle_reclaim_penalty_sec()
             micro_batch_estimate = self._effective_idle_batch_estimate_sec(config)
             optimizer_step_estimate = micro_batch_estimate * gradient_accumulation_steps
             hard_train_batch_cap = max(int(config.train_batches_per_trigger), 1)
-            train_batch_cap = self._effective_idle_dynamic_batch_cap(config)
+            train_batch_cap = self._effective_idle_dynamic_batch_cap(
+                config, resources.worker_ids
+            )
             base_usable_window = max(
                 resources.minimum_idle_window_sec
                 - deadline_guard_sec
@@ -3527,13 +4113,22 @@ class DrafterScheduler:
             cold_writer_first_real_plan = bool(
                 replay_seed_available
                 and max_batches > 0
-                and self._idle_worker_writer_state_version is None
                 and config.training_quota_enable
                 and self._training_quota_debt_steps > 0
-                and resources.worker_ids not in self._idle_worker_hot_prewarmed_groups
+                and resources.worker_ids not in self._idle_optimizer_initialized_groups
+                and self._idle_worker_writer_state_version is None
                 and not self._idle_worker_writer_migration_blocked
             )
-            if cold_writer_first_real_plan and not has_hard_runtime_deadline:
+            if (
+                cold_writer_first_real_plan
+                and config.training_quota_allow_critical_path_fallback
+            ):
+                # An unmeasured first optimizer update can take tens of seconds.
+                # Bootstrap through the existing bounded-freshness top-up, not
+                # a model-only prewarm falsely treated as a hot optimizer.
+                max_batches = 0
+                cold_writer_reason = "cold_writer_wait_for_optimizer_bootstrap"
+            elif cold_writer_first_real_plan and not has_hard_runtime_deadline:
                 max_batches = 0
                 cold_writer_reason = "cold_writer_wait_for_runtime_deadline"
             elif cold_writer_first_real_plan and max_batches < cold_writer_min_steps:
@@ -3586,6 +4181,9 @@ class DrafterScheduler:
                     if replay_seed_available
                     else 0
                 )
+                # Completing and exporting must fit the final budget even
+                # when a hard deadline permits opportunistic partial work.
+                final_max_batches = min(final_max_batches, final_window_batches)
                 final_projected_debt = max(
                     self._training_quota_debt_steps - int(final_max_batches),
                     0,
@@ -3622,8 +4220,33 @@ class DrafterScheduler:
                         - final_tail_reserve_sec,
                         0.0,
                     )
+                else:
+                    final_tail_blocked = True
+                    idle_publish_deferred = True
+                    if (
+                        config.training_quota_enable
+                        and config.idle_worker_keep_hot_between_plans
+                        and window_batches >= self._training_quota_debt_steps
+                        and max_batches >= self._training_quota_debt_steps
+                    ):
+                        # Complete optimizer work in this real idle window.
+                        # The canonical writer is frozen until publish ACK,
+                        # so its immutable snapshot can be exported later at
+                        # the existing safe publish point, not on this lease.
+                        max_batches = self._training_quota_debt_steps
+                        publish_snapshot_deferred = True
+                        idle_publish_deferred = False
+                        final_tail_blocked = False
+                    elif config.training_quota_enable:
+                        # Keep useful partial work, but never cross the quota
+                        # completion boundary without budgeting its snapshot.
+                        max_batches = min(
+                            max_batches, max(self._training_quota_debt_steps - 1, 0)
+                        )
             if max_batches > 0:
                 idle_budget_reason = "idle_worker_budget_ready"
+            elif final_tail_blocked:
+                idle_budget_reason = "final_tail_window_too_small"
             elif cold_writer_reason is not None:
                 idle_budget_reason = cold_writer_reason
             elif window_batches <= 0:
@@ -3638,8 +4261,8 @@ class DrafterScheduler:
                 max_batches=max_batches,
                 min_batches=budget.min_batches,
                 deadline_ts=(
-                    time.time() + worker_deadline_window
-                    if has_hard_runtime_deadline
+                    budget_started_ts + worker_deadline_window
+                    if has_hard_runtime_deadline or max_batches > 0
                     else None
                 ),
                 require_full_batch=budget.require_full_batch,
@@ -3710,6 +4333,7 @@ class DrafterScheduler:
                 f"reclaim_penalty_s={reclaim_penalty_sec:.3f} "
                 f"guard_s={deadline_guard_sec:.3f} "
                 f"startup_reserve_s={startup_reserve_sec:.3f} "
+                f"first_step_extra_s={self._effective_idle_first_step_extra_sec(config, resources.worker_ids, continuation=idle_continuation):.3f} "
                 f"tail_reserve_s={tail_reserve_sec:.3f} "
                 f"worker_deadline_window_s={worker_deadline_window:.3f} "
                 f"micro_batch_estimate_s={micro_batch_estimate:.3f} "
@@ -3786,6 +4410,12 @@ class DrafterScheduler:
             "worker_snapshots": (
                 context.data_status.worker_snapshots if context.data_status else None
             ),
+            "min_sample_step": context.data_status.min_sample_step
+            if context.data_status
+            else None,
+            "max_sample_step": context.data_status.max_sample_step
+            if context.data_status
+            else None,
             "target_worker_ids": resources.worker_ids if resources else (),
             "training_group_id": resources.training_group_id if resources else "",
             "idle_window_sec": (
@@ -3799,6 +4429,7 @@ class DrafterScheduler:
                         - self._effective_idle_startup_reserve_sec(
                             config,
                             resources.worker_ids,
+                            continuation=idle_continuation,
                         )
                         - float(idle_tail_reserve_sec or 0.0),
                         0.0,
@@ -3819,6 +4450,14 @@ class DrafterScheduler:
                 if resources is not None
                 else ""
             ),
+            "idle_first_step_extra_sec": (
+                self._effective_idle_first_step_extra_sec(
+                    config, resources.worker_ids, continuation=idle_continuation
+                )
+                if resources is not None
+                else 0.0
+            ),
+            "idle_continuation": idle_continuation,
             "idle_window_batches": (
                 int(
                     math.floor(
@@ -3829,6 +4468,7 @@ class DrafterScheduler:
                                 - self._effective_idle_startup_reserve_sec(
                                     config,
                                     resources.worker_ids,
+                                    continuation=idle_continuation,
                                 )
                                 - float(idle_tail_reserve_sec or 0.0),
                                 0.0,
@@ -3855,6 +4495,7 @@ class DrafterScheduler:
                 self._effective_idle_startup_reserve_sec(
                     config,
                     resources.worker_ids,
+                    continuation=idle_continuation,
                 )
                 if resources is not None
                 else None
@@ -3878,6 +4519,19 @@ class DrafterScheduler:
             "gradient_accumulation_steps": gradient_accumulation_steps,
             "planned_optimizer_steps": planned_optimizer_steps,
             "planned_valid_tokens": planned_valid_tokens,
+            "idle_park_after_training": bool(
+                resources is not None
+                and getattr(resources, "idle_window_source", "runtime_deadline")
+                == "runtime_deadline"
+                and budget.deadline_ts is not None
+                and not config.idle_worker_keep_hot_between_plans
+            ),
+            "publish_snapshot_deferred": publish_snapshot_deferred,
+            "idle_snapshot_estimate_sec": (
+                self._effective_idle_tail_reserve_sec(config, final=True)
+                if publish_snapshot_deferred
+                else 0.0
+            ),
         }
         if not trigger.should_train:
             return TrainingPlan(
@@ -3918,6 +4572,7 @@ class DrafterScheduler:
             # traffic before the boundary top-up publishes the completed cycle.
             publish_after_success=(
                 not quota_cycle_incomplete
+                and not idle_publish_deferred
                 and (
                     self._publish_interval_matched(context.global_step, config)
                     or (
@@ -4010,10 +4665,41 @@ class DrafterScheduler:
         plan: TrainingPlan,
         outcome: TrainingOutcome,
     ) -> None:
+        if (
+            plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and outcome.reason == "worker_result_inconsistent"
+            and outcome.successful_steps > 0
+        ):
+            # Some shards may already have advanced model/optimizer state.
+            # A retryable zero-step result can continue with divergent shards.
+            raise RuntimeError(
+                f"Inconsistent Bubble training state: plan_id={plan.plan_id}; restart from a consistent checkpoint"
+            )
         is_quota_topup = plan.reason in {
             "quota_topup_training_ready",
             "quota_forced_completion_ready",
         }
+        if outcome.trained:
+            if (
+                is_quota_topup
+                or plan.execution_strategy
+                is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            ):
+                self._writer_boundary_migration_allowed = False
+            if is_quota_topup:
+                self._critical_path_topup_optimizer_steps_total += int(
+                    outcome.successful_steps
+                )
+            elif (
+                plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            ):
+                self._idle_optimizer_steps_total += int(outcome.successful_steps)
+        outcome.metrics.update(
+            {
+                "bubble/idle_optimizer_steps_total": self._idle_optimizer_steps_total,
+                "bubble/critical_path_topup_optimizer_steps_total": self._critical_path_topup_optimizer_steps_total,
+            }
+        )
         if is_quota_topup and (
             not outcome.trained
             or int(outcome.successful_steps) != int(plan.max_batches)
@@ -4026,16 +4712,19 @@ class DrafterScheduler:
                 f"reason={outcome.reason} plan_id={plan.plan_id}"
             )
         if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
-            if not is_quota_topup:
-                completed_final_plan = bool(
-                    plan.publish_after_success
-                    and outcome.trained
-                    and int(outcome.successful_steps) >= int(plan.max_batches)
-                )
-                self.record_idle_training_outcome(
-                    outcome,
-                    final=completed_final_plan,
-                )
+            # Writer-local topups restore exactly the same model/optimizer as
+            # idle plans. Learn their measured overhead too; never use a Sync
+            # full-collective plan to calibrate a replica-local writer.
+            completed_final_plan = bool(
+                plan.publish_after_success
+                and outcome.trained
+                and int(outcome.successful_steps) >= int(plan.max_batches)
+            )
+            self.record_idle_training_outcome(
+                outcome,
+                final=completed_final_plan,
+                worker_ids=plan.target_worker_ids,
+            )
             self._record_replica_local_unavailable(plan, outcome)
             if not is_quota_topup:
                 self._record_prebatch_reclaim_penalty(plan, outcome)
@@ -4076,6 +4765,7 @@ class DrafterScheduler:
             if not bootstrap_groups and bootstrap_worker_ids:
                 bootstrap_groups = (bootstrap_worker_ids,)
             if bootstrap_groups:
+                self._idle_optimizer_initialized_groups.update(bootstrap_groups)
                 # Every worker just completed the same full-collective quota.
                 # Keep the participating replica-local trainers resident, but
                 # do not elect a private writer yet.  The next real Bubble
@@ -4099,6 +4789,7 @@ class DrafterScheduler:
             if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
                 group = _normalize_worker_id_group(plan.target_worker_ids)
                 if group:
+                    self._idle_optimizer_initialized_groups.add(group)
                     previous_group_successes = (
                         self._idle_worker_group_success_counts.get(group, 0)
                     )
@@ -4111,7 +4802,19 @@ class DrafterScheduler:
                         writer_group = group
                     is_writer = group == writer_group
                     if is_writer:
-                        self._idle_worker_hot_prewarmed_groups.add(group)
+                        target_version = (
+                            plan.required_target_version
+                            if plan.required_target_version is not None
+                            else plan.data_version
+                        )
+                        if target_version is not None:
+                            self._idle_worker_last_target_version[group] = int(
+                                target_version
+                            )
+                        if outcome.metrics.get("bubble/training_residency_retained", 1):
+                            self._idle_worker_hot_prewarmed_groups.add(group)
+                        else:
+                            self._idle_worker_hot_prewarmed_groups.discard(group)
                         self._idle_worker_writer_state_version = _as_int(
                             plan.source_global_step
                         )
@@ -4153,11 +4856,105 @@ class DrafterScheduler:
                 int(plan.gradient_accumulation_steps), 1
             )
             if (
-                micro_batch_sec > 0
+                (
+                    micro_batch_sec > 0
+                    or any(
+                        isinstance(result, dict)
+                        and result.get("optimizer_step_samples_sec")
+                        for result in outcome.raw_results
+                    )
+                )
                 and plan.execution_strategy
                 is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
             ):
-                self._idle_worker_batch_samples_sec.append(micro_batch_sec)
+                measured_steps = []
+                first_steps = []
+                for result in outcome.raw_results:
+                    if (
+                        not isinstance(result, dict)
+                        or int(result.get("successful_steps", 0) or 0) <= 0
+                    ):
+                        continue
+                    worker_id = result.get("worker_id")
+                    if (
+                        plan.target_worker_ids
+                        and worker_id is not None
+                        and str(worker_id) not in plan.target_worker_ids
+                    ):
+                        continue
+                    samples = result.get("optimizer_step_samples_sec")
+                    if isinstance(samples, list):
+                        warmup = int(result.get("optimizer_warmup_steps", 0) or 0)
+                        if (
+                            samples
+                            and warmup == 0
+                            and plan.reason
+                            not in {
+                                "quota_topup_training_ready",
+                                "quota_forced_completion_ready",
+                            }
+                        ):
+                            # A serialized top-up may have a different first
+                            # step (e.g. after actor work). It can calibrate
+                            # steady throughput, not hot idle restart overhead.
+                            first_steps.append(
+                                float(samples[0])
+                                / max(plan.gradient_accumulation_steps, 1)
+                            )
+                        measured_steps.append(
+                            [
+                                float(value)
+                                for value in samples[max(warmup, 1) :]
+                                if float(value) > 0
+                            ]
+                        )
+                if first_steps:
+                    self._idle_worker_first_step_samples_sec.append(max(first_steps))
+                    group = _normalize_worker_id_group(plan.target_worker_ids)
+                    resident = all(
+                        bool(
+                            result.get(
+                                "activation_started_resident",
+                                group in self._idle_worker_hot_prewarmed_groups,
+                            )
+                        )
+                        for result in outcome.raw_results
+                        if isinstance(result, dict)
+                        and int(result.get("successful_steps", 0) or 0) > 0
+                        and (
+                            not group
+                            or str(result.get("worker_id", result.get("rank", "")))
+                            in group
+                        )
+                    )
+                    mode = (
+                        "continuation"
+                        if plan.idle_continuation and resident
+                        else ("hot" if resident else "cold")
+                    )
+                    self._idle_first_step_by_mode.setdefault(
+                        (group, mode), deque(maxlen=4)
+                    ).append(max(first_steps))
+                if measured_steps:
+                    shared_count = min(len(samples) for samples in measured_steps)
+                    if shared_count == 0:
+                        # A single cold optimizer step is not a steady-state
+                        # throughput measurement; keep the prior admission estimate.
+                        return
+                    normalized = [
+                        max(samples[index] for samples in measured_steps)
+                        / max(plan.gradient_accumulation_steps, 1)
+                        for index in range(shared_count)
+                    ]
+                    # Use a short rolling history so an initialization outlier
+                    # cannot suppress every future idle window.
+                    self._idle_worker_batch_samples_sec = deque(
+                        [*self._idle_worker_batch_samples_sec, *normalized][-8:],
+                        maxlen=32,
+                    )
+                    micro_batch_sec = _conservative_percentile(normalized, quantile=0.5)
+                else:
+                    self._idle_worker_batch_samples_sec.append(micro_batch_sec)
                 if self._idle_worker_batch_estimate_sec is None:
                     self._idle_worker_batch_estimate_sec = micro_batch_sec
                 else:
@@ -4237,6 +5034,7 @@ class DrafterScheduler:
         """Release collection backpressure only after publication succeeds."""
 
         if self._training_quota_debt_steps <= 0:
+            self._writer_boundary_migration_allowed = True
             had_active_quota = self._training_quota_collection_step is not None
             completed_step = global_step
             if completed_step is None:
@@ -4248,24 +5046,18 @@ class DrafterScheduler:
             released_writer_group = self._idle_worker_writer_group
             released_writer_version = self._idle_worker_writer_state_version
             if released_writer_group is not None or released_writer_version is not None:
-                # A quota must be trained by one writer because its model and
-                # optimizer state are private to that replica-local group.  Once
-                # the completed quota has been published, however, the next
-                # quota can safely elect the group with the longest observed
-                # rollout-idle window instead of being pinned to the previous
-                # writer forever.
-                self._idle_worker_writer_group = None
-                self._idle_worker_writer_state_version = None
-                self._idle_worker_writer_migration_blocked = False
+                # Publishing inference weights does not copy Adam moments or
+                # scheduler state. Preserve the authoritative training owner
+                # across quotas until a complete state migration is implemented.
                 logger.warning(
-                    "[BubbleTime] idle_writer_released_after_quota_publish: "
+                    "[BubbleTime] idle_writer_retained_after_quota_publish: "
                     "group=%s state_version=%s completed_step=%s",
                     released_writer_group,
                     released_writer_version,
                     completed_step,
                 )
                 print(
-                    "[BubbleTime] idle_writer_released_after_quota_publish: "
+                    "[BubbleTime] idle_writer_retained_after_quota_publish: "
                     f"group={released_writer_group} "
                     f"state_version={released_writer_version} "
                     f"completed_step={completed_step}",

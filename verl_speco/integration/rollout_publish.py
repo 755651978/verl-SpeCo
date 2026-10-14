@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import time
 from typing import Any, Optional, cast
@@ -778,10 +779,57 @@ def _export_veomni_actor_lm_head_weight(
                 empty_cache()
 
 
+def _worker_bubble_enabled(worker: Any) -> bool:
+    strategy = _get_nested(
+        getattr(worker, "config", None),
+        ("rollout", "drafter", "training", "scheduler", "execution", "strategy"),
+        None,
+    )
+    if strategy is None:
+        # verl 0.8 can strip the rollout overlay; TaskRunner preserves it on
+        # the wrapped class, as it already does for the runtime adapters.
+        raw = getattr(type(worker), "_speco_sglang_drafter_config_env", None)
+        if raw:
+            try:
+                strategy = _get_nested(
+                    json.loads(raw),
+                    ("training", "scheduler", "execution", "strategy"),
+                    None,
+                )
+            except (TypeError, ValueError):
+                strategy = None
+    return strategy == "rollout_idle_worker"
+
+
+def _head_only_export_candidate(worker: Any, row_indices: Any = None):
+    config = getattr(worker, "config", None)
+    if (
+        not getattr(worker, "_is_actor", False)
+        or getattr(worker, "actor", None) is None
+    ):
+        return None, None, "not_actor"
+    if not _worker_bubble_enabled(worker):
+        return None, None, "bubble_overlay_unavailable"
+    if actor_training_backend_name(config) != "fsdp2":
+        return None, None, "actor_not_fsdp2"
+    if row_indices is not None:
+        return None, None, "row_restricted_export"
+    if _get_nested(config, ("model", "lora_rank"), 0) or _get_nested(
+        config, ("model", "lora_adapter_path"), None
+    ):
+        return None, None, "lora_export"
+    for module in _actor_module_candidates(worker):
+        name, tensor = _select_lm_head_named_tensor(module)
+        if tensor is not None and name is not None and name.endswith("lm_head.weight"):
+            return name, tensor, "head_only_ready"
+    return None, None, "lm_head_not_found"
+
+
 def export_actor_lm_head_weight(
     worker: Any,
     row_indices: Any = None,
     keep_model_on_device: bool = False,
+    require_head_only: bool = False,
 ) -> Optional[dict]:
     """Export actor lm_head or tied embedding rows from an actor-rollout worker."""
 
@@ -801,6 +849,49 @@ def export_actor_lm_head_weight(
         )
 
     normalized_row_indices = _normalize_lm_head_row_indices(row_indices)
+    name, tensor, head_only_reason = _head_only_export_candidate(
+        worker, normalized_row_indices
+    )
+    if tensor is not None:
+        # FSDP2 exposes each parameter as a DTensor. Export only the projection
+        # instead of enumerating/materializing the entire actor checkpoint.
+        # All mesh ranks execute full_tensor; only rank zero retains the payload.
+        if tensor is not None:
+            local = (
+                tensor.to_local()
+                if callable(getattr(tensor, "to_local", None))
+                else tensor
+            )
+            if callable(getattr(tensor, "full_tensor", None)):
+                if local.device.type == "cpu":
+                    from verl.utils.device import get_device_name
+
+                    device = torch.device(get_device_name())
+                    tensor = tensor.to(device=device)
+                weight = tensor.detach().full_tensor()
+            else:
+                weight = tensor.detach()
+            if getattr(worker, "rank", None) != 0:
+                return None
+            weight = weight.to(device="cpu", dtype=torch.bfloat16).contiguous()
+            logger.info(
+                "[actor lm_head export] direct_full name=%s shape=%s",
+                name,
+                tuple(weight.shape),
+            )
+            return {
+                "name": name,
+                "weight": weight,
+                "row_indices": None,
+                "source_vocab_size": int(weight.shape[0]),
+                "selected_rows": 0,
+                "export_strategy": "direct_full",
+            }
+    if require_head_only:
+        raise RuntimeError(
+            "Async Bubble export requires the FSDP2 head-only path; refusing full actor reload: "
+            + head_only_reason
+        )
     # Block drafters that train against the target's own lm_head rows.
     is_dflash = drafter_speculative_algorithm(getattr(worker, "config", None)) in {
         "DFLASH",
@@ -917,6 +1008,32 @@ class DraftWeightPublishMixin:
             self,
             row_indices=row_indices,
             keep_model_on_device=keep_model_on_device,
+        )
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
+    def get_actor_lm_head_export_capability(self):
+        name, tensor, reason = _head_only_export_candidate(self)
+        return {
+            "rank": getattr(self, "rank", None),
+            "supported": tensor is not None,
+            "participating": bool(getattr(self, "_is_actor", False)),
+            "reason": reason,
+            "name": name,
+        }
+
+    @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
+    def get_actor_lm_head_weight_async(
+        self,
+        row_indices: Any = None,
+        keep_model_on_device: bool = False,
+    ):
+        # Export itself remains serialized on the actor. The caller must fence
+        # completion before mutating actor weights; only the RPC return is async.
+        return export_actor_lm_head_weight(
+            self,
+            row_indices=row_indices,
+            keep_model_on_device=keep_model_on_device,
+            require_head_only=True,
         )
 
     @staticmethod

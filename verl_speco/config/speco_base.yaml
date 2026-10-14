@@ -496,6 +496,16 @@ actor_rollout_ref:
           idle_worker:
             require_memory_released: true
             drain_before_next_rollout: true
+            # Reuse device tensors within a rollout. By default park them on
+            # CPU before PPO and rollout wake-up; enable only with enough memory
+            # for both the main workload and the resident drafter trainer.
+            keep_hot_between_plans: false
+            # Experimental: enable only after validating an equal-topology
+            # subgroup state handoff and its end-to-end cost on the target host.
+            writer_migration_enable: false
+            writer_migration_history_steps: 4
+            writer_migration_min_idle_gain_sec: 1.0
+            writer_migration_cost_margin: 2.0
             # Last-resort Bubble fallback. If every replica-local group is
             # disabled (for example OOM during activation), allow the scheduler
             # to require the full drafter collective to be idle. Disabled by

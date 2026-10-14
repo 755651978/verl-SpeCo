@@ -34,6 +34,27 @@ def _training_plan(*, launch: bool = True) -> TrainingPlan:
     )
 
 
+def test_bubble_production_defaults_match_yaml_and_allow_explicit_strict_mode():
+    direct = DrafterScheduleConfig()
+    absent = DrafterScheduleConfig.from_mapping({})
+    empty = DrafterScheduleConfig.from_mapping({"scheduler": {"training_quota": {}}})
+    for config in (direct, absent, empty):
+        assert config.training_quota_trigger_mode == "adaptive"
+        assert config.training_quota_allow_critical_path_fallback is False
+    strict = DrafterScheduleConfig.from_mapping(
+        {
+            "scheduler": {
+                "training_quota": {
+                    "trigger_mode": "interval",
+                    "allow_critical_path_fallback": True,
+                }
+            }
+        }
+    )
+    assert strict.training_quota_trigger_mode == "interval"
+    assert strict.training_quota_allow_critical_path_fallback is True
+
+
 def test_before_actor_update_plans_then_prepares() -> None:
     scheduler = DrafterScheduler()
     plan = _training_plan()

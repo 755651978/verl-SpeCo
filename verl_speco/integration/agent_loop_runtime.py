@@ -116,7 +116,9 @@ def _ensure_extra_field_defaults(result: Any) -> Any:
 
     for key in _DEFAULT_EXTRA_KEYS:
         if key not in non_tensor_batch:
-            values = np.empty(batch_len, dtype=object)
+            values: np.ndarray[Any, np.dtype[np.object_]] = np.empty(
+                batch_len, dtype=object
+            )
             values[:] = [None for _ in range(batch_len)]
             non_tensor_batch[key] = values
     return result
@@ -133,7 +135,6 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
     skip_collection = bool(_CURRENT_SKIP_DRAFTER_COLLECTION.get())
     if validate or skip_collection:
         patched["_verl_skip_drafter_collection"] = True
-        patched["_verl_skip_rollout_idle_event"] = validate
     return patched
 
 
@@ -151,7 +152,6 @@ def _sampling_params_with_speco_step(
         patched["_verl_global_steps"] = global_steps
     if validate or skip_drafter_collection:
         patched["_verl_skip_drafter_collection"] = True
-        patched["_verl_skip_rollout_idle_event"] = bool(validate)
     return patched
 
 

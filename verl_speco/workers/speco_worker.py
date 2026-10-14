@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import time
+import threading
 import uuid
 from collections import deque
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
+from verl_speco.integration.rollout_idle_events import TrainingReclaimWatcher
 from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import DictConfig, open_dict
 
@@ -355,6 +357,33 @@ class SpecoWorker(Worker):
     drafter model periodically according to global RL steps.
     """
 
+    def _reclaim_control_lock(self):
+        lock = getattr(self, "_drafter_reclaim_control_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._drafter_reclaim_control_lock = lock
+        return lock
+
+    def _receive_drafter_reclaim(self, plan_id=None, sent_ts=None, source="worker_rpc"):
+        with self._reclaim_control_lock():
+            active = getattr(self, "_active_drafter_training_plan_id", None)
+            if plan_id is not None and active != plan_id:
+                return False
+            self._drafter_reclaim_requested = True
+            self._drafter_reclaim_source = source
+            if getattr(self, "_drafter_reclaim_received_perf", None) is None:
+                self._drafter_reclaim_received_perf = time.perf_counter()
+                self._drafter_reclaim_received_ts = time.time()
+        logger.warning(
+            "[BubbleTime] reclaim_received: rank=%s plan_id=%s source=%s sent_ts=%s received_ts=%.6f",
+            self.rank,
+            plan_id or active,
+            source,
+            sent_ts,
+            time.time(),
+        )
+        return True
+
     def __init__(
         self,
         config: DictConfig,
@@ -591,6 +620,22 @@ class SpecoWorker(Worker):
         if not self.in_drafter_train_group:
             return
 
+        if any(
+            name in os.environ
+            for name in (
+                "VERL_DRAFTER_MEMORY_DIAGNOSTICS",
+                "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
+            )
+        ):
+            # Worker logging defaults to WARN. An explicitly requested
+            # diagnostic must remain visible under that default.
+            logger.warning(
+                "[DrafterMemory] worker_environment: rank=%s diagnostics=%s trim_cache=%s",
+                self.rank,
+                os.getenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "false"),
+                os.getenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", "false"),
+            )
+
         from verl_speco.backends.factory import build_trainer_backend
         from verl_speco.trainer.base_trainer import DrafterBaseTrainer
 
@@ -629,6 +674,13 @@ class SpecoWorker(Worker):
                 data_parallel_process_group=None,
                 backend=trainer_backend,
             )
+            if os.getenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                self.trainer._log_training_memory("replica_local_initialized")
             return
 
         trainer_backend = build_trainer_backend(self.config, self.config.model)
@@ -1396,6 +1448,27 @@ class SpecoWorker(Worker):
             release_ts = time.time()
             await self.trainer.release_training_memory_after_activation()
             result["release_elapsed_sec"] = time.time() - release_ts
+            if result["activated"] and self._use_replica_local_idle_training():
+                # Measure restoring an existing CPU model separately from the
+                # one-time checkpoint build. This never advances the optimizer.
+                restore_ts = time.perf_counter()
+                restored = bool(await self.trainer.activate_training_model())
+                result["restore_elapsed_sec"] = time.perf_counter() - restore_ts
+                if restored:
+                    snapshot_started = time.perf_counter()
+                    # Calibrate final staging without advancing training or
+                    # retaining a publishable version. Initial checkpoint I/O
+                    # and later optimizer warmup are separate measurements.
+                    snapshot = self.trainer.get_model_state_dict()
+                    result["snapshot_elapsed_sec"] = (
+                        time.perf_counter() - snapshot_started
+                    )
+                    del snapshot
+                park_ts = time.perf_counter()
+                await self.trainer.release_training_memory_after_activation(strict=True)
+                result["park_elapsed_sec"] = time.perf_counter() - park_ts
+                result["training_group_ranks"] = list(self.training_group_ranks)
+                result["activated"] = restored
             result["elapsed_sec"] = time.time() - start_ts
             result["reason"] = (
                 "activated" if result["activated"] else "activation_failed"
@@ -1814,8 +1887,15 @@ class SpecoWorker(Worker):
         self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
         self._prepared_training_data_version = actual_data_version
         self._prepared_training_target_version = current_target_version
-        self._drafter_reclaim_requested = False
+        with self._reclaim_control_lock():
+            self._drafter_reclaim_requested = False
+            self._drafter_reclaim_received_perf = None
+            self._drafter_reclaim_received_ts = None
+            self._drafter_reclaim_source = None
         activation_started_ts = time.time()
+        self._prepared_activation_started_resident = bool(
+            getattr(self.trainer, "_training_device_resident", False)
+        )
         activation_error: BaseException | None = None
         with _preserve_process_rng_state(self.device_name):
             try:
@@ -1825,6 +1905,15 @@ class SpecoWorker(Worker):
                 activated = False
         result["activated"] = activated
         result["activation_elapsed_sec"] = time.time() - activation_started_ts
+        stages = getattr(self.trainer, "_last_activation_stage_timings", {})
+        self._prepared_activation_stage_timings = dict(stages)
+        logger.warning(
+            "[BubbleTime] training_activation_breakdown: rank=%s plan=%s target_version=%s stages_sec=%s",
+            self.rank,
+            training_plan.get("plan_id"),
+            current_target_version,
+            stages,
+        )
         if not activated:
             self.trainer.release_training_data_reservation(
                 str(training_plan.get("plan_id", ""))
@@ -1890,7 +1979,8 @@ class SpecoWorker(Worker):
             # The scheduler has already moved ``deadline_ts`` earlier by the
             # tail reserve, so only one optimizer batch must fit at this point.
             required_remaining_sec = max(
-                float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
+                float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0)
+                + float(training_plan.get("idle_first_step_extra_sec", 0.0) or 0.0),
                 0.0,
             )
             deadline_tolerance_sec = min(
@@ -1986,12 +2076,114 @@ class SpecoWorker(Worker):
         }
         return str(self.rank) in bootstrap_workers
 
+    def _bubble_group_control_value(self, value: int) -> int:
+        """Agree only within the trainer's explicit SP/DP groups, never WORLD."""
+        if not dist.is_initialized():
+            return value
+        groups = [
+            self.trainer._get_sp_group(),
+            self.trainer._get_dp_group(),
+        ]
+        seen = set()
+        control = None
+        for group in groups:
+            if group is None or id(group) in seen:
+                continue
+            seen.add(id(group))
+            if dist.get_world_size(group) <= 1:
+                continue
+            if control is None:
+                control = torch.tensor(
+                    [value], device=self.trainer.runtime_device, dtype=torch.int32
+                )
+            dist.all_reduce(control, op=dist.ReduceOp.MAX, group=group)
+        return int(control.item()) if control is not None else value
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_hot_drafter_target_head(self, worker_ids, target_version):
+        """Apply a cached frozen head only; never load model/optimizer here."""
+        result = {
+            "worker_id": str(self.rank),
+            "prepared": False,
+            "target_version": int(target_version),
+            "elapsed_sec": 0.0,
+        }
+        if str(self.rank) not in {str(worker) for worker in worker_ids}:
+            return result
+        trainer = getattr(self, "trainer", None)
+        if (
+            not self.enable_drafter
+            or trainer is None
+            or not getattr(trainer, "_training_device_resident", False)
+            or trainer.optimizer_steps_total <= 0
+            or getattr(self, "_prepared_training_plan_id", None) is not None
+            or getattr(self, "_deferred_publish_snapshot_step", None) is not None
+        ):
+            return result
+        if not trainer.select_target_lm_head_version(int(target_version)):
+            return result
+        head = trainer._target_lm_head_module()
+        if head is None or head.weight.device.type == "cpu":
+            return result
+        started = time.perf_counter()
+        trainer._apply_pending_target_lm_head_weight()
+        # A device-copy enqueue is not proof of an applied head. This fence is
+        # scoped to the writer at the safe point, not the rollout idle window.
+        if hasattr(trainer.device_module, "synchronize"):
+            trainer.device_module.synchronize()
+        result["prepared"] = trainer._applied_target_lm_head_weight_step == int(
+            target_version
+        )
+        result["elapsed_sec"] = time.perf_counter() - started
+        logger.warning(
+            "[BubbleTime] hot_target_head_prepared: rank=%s target_version=%s prepared=%s elapsed_s=%.4f",
+            self.rank,
+            target_version,
+            result["prepared"],
+            result["elapsed_sec"],
+        )
+        return result
+
+    def _bubble_optimizer_stop_reason(self, deadline_ts, next_step_sec: float) -> str:
+        now = time.time()
+        code = 0
+        if deadline_ts is not None:
+            if now >= float(deadline_ts):
+                code = 1
+            elif now + next_step_sec > float(deadline_ts):
+                code = 2
+        if self._drafter_reclaim_requested:
+            code = 3
+        return {
+            0: "",
+            1: "deadline_reached",
+            2: "next_batch_budget_too_small",
+            3: "reclaim_requested",
+        }[self._bubble_group_control_value(code)]
+
+    def _bubble_can_stage_snapshot(self, training_plan) -> bool:
+        deadline = training_plan.get("deadline_ts")
+        estimate = float(training_plan.get("idle_snapshot_estimate_sec", 0.0) or 0.0)
+        allowed = bool(
+            deadline is not None
+            and estimate > 0.0
+            and not self._drafter_reclaim_requested
+            and time.time() + estimate < float(deadline)
+        )
+        return self._bubble_group_control_value(int(not allowed)) == 0
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def train_drafter(self, training_plan=None):
         result = {
             "trained": False,
             "triggered": False,
             "successful_steps": 0,
+            "optimizer_step_samples_sec": [],
+            "idle_control_elapsed_sec": 0.0,
+            "idle_control_yield_elapsed_sec": 0.0,
+            "optimizer_warmup_steps": int(self.trainer.optimizer_steps_total == 0)
+            if getattr(self, "trainer", None) is not None
+            else 0,
             "attempted_steps": 0,
             "successful_valid_tokens": 0,
             "elapsed_sec": 0.0,
@@ -2044,6 +2236,8 @@ class SpecoWorker(Worker):
         prepared_activation_elapsed_sec = self._prepared_training_activation_elapsed_sec
         prepared_preflight_elapsed_sec = self._prepared_training_preflight_elapsed_sec
         prepared_ready_ts = self._prepared_training_ready_ts
+        with self._reclaim_control_lock():
+            self._active_drafter_training_plan_id = plan_id
         self._prepared_training_plan_id = None
         self._prepared_training_data_version = None
         self._prepared_training_target_version = None
@@ -2058,7 +2252,40 @@ class SpecoWorker(Worker):
             float(training_plan.get("idle_batch_estimate_sec", 0.0) or 0.0),
             0.0,
         )
+        first_step_extra_sec = max(
+            float(training_plan.get("idle_first_step_extra_sec", 0.0) or 0.0), 0.0
+        )
+        coordinated_idle = bool(
+            execution_strategy == "rollout_idle_worker"
+            and training_plan.get("reason")
+            not in {"quota_topup_training_ready", "quota_forced_completion_ready"}
+        )
         prepare_publish = bool(training_plan.get("publish_after_success", False))
+        reclaim_watcher = None
+        if coordinated_idle and training_plan.get("reclaim_bus_name"):
+            reclaim_watcher = TrainingReclaimWatcher(
+                training_plan["reclaim_bus_name"],
+                plan_id,
+                str(self.rank),
+                self._receive_drafter_reclaim,
+            ).start()
+        stages = getattr(self, "_prepared_activation_stage_timings", {})
+        result["activation_started_resident"] = int(
+            getattr(self, "_prepared_activation_started_resident", False)
+        )
+        result["target_head_prepare_elapsed_sec"] = sum(
+            float(stages.get(key, 0.0))
+            for key in ("host_head_apply", "head_move", "head_apply")
+        )
+        result["model_restore_elapsed_sec"] = float(stages.get("model_restore", 0.0))
+        result["optimizer_restore_elapsed_sec"] = float(
+            stages.get("optimizer_restore", 0.0)
+        )
+        defer_snapshot = bool(
+            execution_strategy == "rollout_idle_worker"
+            and training_plan.get("publish_snapshot_deferred", False)
+        )
+        snapshot_staged_in_idle = False
         snapshot = (training_plan.get("worker_snapshots") or {})[str(self.rank)]
         buffer_size_before = int(snapshot.get("trainable_samples", 0))
         result.update(
@@ -2085,15 +2312,52 @@ class SpecoWorker(Worker):
 
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
+            migrated_rng = getattr(self, "_migrated_training_rng", None)
+            if migrated_rng is not None:
+                random.setstate(migrated_rng["python"])
+                np.random.set_state(migrated_rng["numpy"])
+                torch.set_rng_state(migrated_rng["cpu"])
+                if migrated_rng["device"] is not None:
+                    get_torch_device().set_rng_state(migrated_rng["device"])
             start_ts = time.time()
+            if getattr(self, "_deferred_publish_snapshot_step", None) is not None:
+                raise RuntimeError(
+                    "Cannot train a new plan before deferred snapshot staging"
+                )
             self.trainer.clear_pending_publish_state_dict()
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
                 for batch_index in range(max_batches):
                     deadline_ts = training_plan.get("deadline_ts")
+                    shared_stop_reason = ""
+                    if coordinated_idle:
+                        # Let queued reclaim RPCs run, then agree before any
+                        # rank enters the next optimizer step's collectives.
+                        # sleep(0) only requeues this ready task: repeated
+                        # blocking device work can starve incoming I/O timers.
+                        # A short timer yield gives the loop an I/O turn without
+                        # moving training onto another thread/device context.
+                        yield_started = time.perf_counter()
+                        await asyncio.sleep(0.001)
+                        result["idle_control_yield_elapsed_sec"] += (
+                            time.perf_counter() - yield_started
+                        )
+                        control_started = time.perf_counter()
+                        shared_stop_reason = self._bubble_optimizer_stop_reason(
+                            deadline_ts,
+                            idle_batch_estimate_sec
+                            + (first_step_extra_sec if batch_index == 0 else 0.0),
+                        )
+                        result["idle_control_elapsed_sec"] += (
+                            time.perf_counter() - control_started
+                        )
                     now_ts = time.time()
-                    if deadline_ts is not None and now_ts >= float(deadline_ts):
+                    if shared_stop_reason == "deadline_reached" or (
+                        not coordinated_idle
+                        and deadline_ts is not None
+                        and now_ts >= float(deadline_ts)
+                    ):
                         result["reason"] = "deadline_reached"
                         result["stop_reason"] = "deadline_reached"
                         if prepared_ready_ts is not None:
@@ -2129,10 +2393,14 @@ class SpecoWorker(Worker):
                             flush=True,
                         )
                         break
-                    if (
-                        deadline_ts is not None
+                    if shared_stop_reason == "next_batch_budget_too_small" or (
+                        not coordinated_idle
+                        and deadline_ts is not None
                         and idle_batch_estimate_sec > 0.0
-                        and now_ts + idle_batch_estimate_sec > float(deadline_ts)
+                        and now_ts
+                        + idle_batch_estimate_sec
+                        + (first_step_extra_sec if batch_index == 0 else 0.0)
+                        > float(deadline_ts)
                     ):
                         result["reason"] = "next_batch_budget_too_small"
                         result["stop_reason"] = "deadline_reached"
@@ -2181,7 +2449,9 @@ class SpecoWorker(Worker):
                             flush=True,
                         )
                         break
-                    if self._drafter_reclaim_requested:
+                    if shared_stop_reason == "reclaim_requested" or (
+                        not coordinated_idle and self._drafter_reclaim_requested
+                    ):
                         result["reason"] = "reclaim_requested"
                         result["stop_reason"] = "reclaim_requested"
                         if prepared_ready_ts is not None:
@@ -2271,15 +2541,23 @@ class SpecoWorker(Worker):
                         return True
 
                     try:
+                        optimizer_step_started = time.perf_counter()
                         step_ok = await self.trainer.training_accumulation_step(
                             self.last_global_step,
                             gradient_accumulation_steps,
-                            can_start_micro_batch=can_start_micro_batch,
+                            # A Bubble step is atomic: never let one rank abort
+                            # accumulation while peers enter forward/backward.
+                            can_start_micro_batch=(
+                                None if coordinated_idle else can_start_micro_batch
+                            ),
                         )
                     except Exception as error:  # noqa: BLE001
                         step_error = error
                         step_ok = False
                     if step_ok:
+                        result["optimizer_step_samples_sec"].append(
+                            time.perf_counter() - optimizer_step_started
+                        )
                         result["successful_steps"] += 1
                         result["successful_valid_tokens"] += int(
                             getattr(self.trainer, "_last_optimizer_valid_tokens", 0)
@@ -2348,13 +2626,56 @@ class SpecoWorker(Worker):
                 ):
                     result["stop_reason"] = "max_batches_reached"
                 result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
+                if coordinated_idle:
+                    received_perf = getattr(
+                        self, "_drafter_reclaim_received_perf", None
+                    )
+                    result["reclaim_receive_to_stop_sec"] = (
+                        max(time.perf_counter() - received_perf, 0.0)
+                        if received_perf is not None
+                        else 0.0
+                    )
+                    logger.warning(
+                        "[BubbleTime] training_stop_boundary: plan_id=%s rank=%s "
+                        "stop_ts=%.6f reclaim_received_ts=%s successful_steps=%s reason=%s",
+                        plan_id,
+                        self.rank,
+                        time.time(),
+                        getattr(self, "_drafter_reclaim_received_ts", None),
+                        result["successful_steps"],
+                        result.get("stop_reason", ""),
+                    )
+                samples = result["optimizer_step_samples_sec"]
+                logger.warning(
+                    "[BubbleTime] optimizer_plan_timing: rank=%s plan=%s accumulation=%s first_step_s=%s steady_steps_s=%s warmup_steps=%s",
+                    self.rank,
+                    plan_id,
+                    gradient_accumulation_steps,
+                    samples[0] if samples else None,
+                    samples[1:],
+                    result["optimizer_warmup_steps"],
+                )
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
                     publish_quota_completed = bool(
                         result["successful_steps"] >= max_batches
                         and not result.get("error")
                     )
-                    if prepare_publish and publish_quota_completed:
+                    if (
+                        prepare_publish
+                        and publish_quota_completed
+                        and defer_snapshot
+                        and coordinated_idle
+                    ):
+                        await asyncio.sleep(0)
+                        snapshot_staged_in_idle = self._bubble_can_stage_snapshot(
+                            training_plan
+                        )
+                    if (
+                        prepare_publish
+                        and publish_quota_completed
+                        and (not defer_snapshot or snapshot_staged_in_idle)
+                    ):
                         snapshot_ts = time.time()
                         cached = self.trainer.prepare_model_state_dict_for_publish(
                             self.last_global_step
@@ -2363,6 +2684,13 @@ class SpecoWorker(Worker):
                         result["publish_snapshot_elapsed_sec"] = (
                             time.time() - snapshot_ts
                         )
+                        if snapshot_staged_in_idle:
+                            logger.warning(
+                                "[BubbleTime] publish_snapshot_staged_in_idle: rank=%s plan=%s elapsed_s=%.4f",
+                                self.rank,
+                                plan_id,
+                                result["publish_snapshot_elapsed_sec"],
+                            )
                         if hasattr(self.trainer, "record_training_timing"):
                             self.trainer.record_training_timing(
                                 "timing_s/drafter_publish_snapshot",
@@ -2377,6 +2705,8 @@ class SpecoWorker(Worker):
                     self.trainer.clear_pending_publish_state_dict()
                 result.update(self.trainer.get_training_metrics())
             finally:
+                if reclaim_watcher is not None:
+                    reclaim_watcher.close()
                 cleanup_ts = time.time()
                 finalize_reservation = getattr(
                     self.trainer, "finalize_training_data_reservation", None
@@ -2417,10 +2747,28 @@ class SpecoWorker(Worker):
                     execution_strategy=execution_strategy,
                     successful_steps=int(result.get("successful_steps", 0) or 0),
                 )
+                park_before_deadline = bool(
+                    execution_strategy == "rollout_idle_worker"
+                    and training_plan.get("idle_park_after_training", False)
+                    and training_plan.get("deadline_ts") is not None
+                )
+                cleanup_started = time.perf_counter()
                 await self.trainer.cleanup_training(
                     clear_data=False,
-                    keep_hot=keep_hot,
+                    keep_hot=keep_hot or park_before_deadline,
                 )
+                result["cleanup_nonpark_elapsed_sec"] = (
+                    time.perf_counter() - cleanup_started
+                )
+                if park_before_deadline:
+                    park_started = time.perf_counter()
+                    await self.trainer.release_training_memory_after_activation(
+                        strict=True
+                    )
+                    result["memory_park_elapsed_sec"] = (
+                        time.perf_counter() - park_started
+                    )
+                    keep_hot = False
                 result["training_residency_retained"] = int(keep_hot)
                 if keep_hot and execution_strategy == "sync":
                     print(
@@ -2431,6 +2779,26 @@ class SpecoWorker(Worker):
                         flush=True,
                     )
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
+                if coordinated_idle:
+                    received_perf = getattr(
+                        self, "_drafter_reclaim_received_perf", None
+                    )
+                    result["reclaim_receive_to_cleanup_sec"] = (
+                        max(time.perf_counter() - received_perf, 0.0)
+                        if received_perf is not None
+                        else 0.0
+                    )
+                    logger.warning(
+                        "[BubbleTime] training_cleanup_boundary: plan_id=%s rank=%s "
+                        "cleanup_done_ts=%.6f cleanup_s=%.4f keep_hot=%s",
+                        plan_id,
+                        self.rank,
+                        time.time(),
+                        result["cleanup_elapsed_sec"],
+                        keep_hot,
+                    )
+                with self._reclaim_control_lock():
+                    self._active_drafter_training_plan_id = None
 
             result["trained"] = result["successful_steps"] > 0
             if not result["trained"] and not result.get("stop_reason"):
@@ -2441,11 +2809,26 @@ class SpecoWorker(Worker):
                 else result["reason"] or "no_trainable_batch"
             )
             if result["trained"]:
+                if execution_strategy == "rollout_idle_worker":
+                    self._migrated_training_rng = self._capture_training_rng_state()
                 self.last_trained_step = self.last_global_step
                 self._last_trained_execution_strategy = execution_strategy
                 self._last_trained_target_worker_ids = tuple(
                     sorted(target_worker_ids, key=str)
                 )
+                if (
+                    prepare_publish
+                    and defer_snapshot
+                    and result["successful_steps"] >= max_batches
+                    and not result.get("error")
+                ):
+                    if not snapshot_staged_in_idle:
+                        self._deferred_publish_snapshot_step = self.last_global_step
+                        self._deferred_publish_optimizer_step = int(
+                            self.trainer.optimizer_steps_total
+                        )
+                    result["publish_snapshot_deferred"] = True
+                    result["publish_snapshot_staged_in_idle"] = snapshot_staged_in_idle
             data_status_after = self.trainer.get_training_data_status(
                 sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
@@ -2453,27 +2836,129 @@ class SpecoWorker(Worker):
             result["buffer_size_after"] = int(data_status_after["trainable_samples"])
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
+            result["reclaim_received_via_bus"] = int(
+                getattr(self, "_drafter_reclaim_source", None) == "lease_bus"
+            )
+            result["reclaim_control_error"] = int(
+                getattr(self, "_drafter_reclaim_source", None) == "control_error"
+            )
             return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def request_drafter_training_reclaim(self, worker_ids=None):
+    def request_drafter_training_reclaim(
+        self, worker_ids=None, *, sent_ts=None, plan_id=None
+    ):
         target_worker_ids = {str(worker_id) for worker_id in (worker_ids or ())}
         if target_worker_ids and str(self.rank) not in target_worker_ids:
             return {"rank": self.rank, "worker_id": str(self.rank), "requested": False}
-        self._drafter_reclaim_requested = True
+        if not self._receive_drafter_reclaim(plan_id=plan_id, sent_ts=sent_ts):
+            return {"rank": self.rank, "worker_id": str(self.rank), "requested": False}
+        received_ts = time.time()
+        # Duplicate requests must not reset the first receive-to-stop timer.
+        if getattr(self, "_drafter_reclaim_received_perf", None) is None:
+            self._drafter_reclaim_received_perf = time.perf_counter()
+            self._drafter_reclaim_received_ts = received_ts
         logger.warning(
-            "[BubbleTime] reclaim_requested: worker_id=%s rank=%s target_workers=%s",
+            "[BubbleTime] reclaim_requested: worker_id=%s rank=%s target_workers=%s "
+            "plan_id=%s sent_ts=%s received_ts=%.6f",
             self.rank,
             self.rank,
             tuple(sorted(target_worker_ids)),
-        )
-        print(
-            "[BubbleTime] reclaim_requested: "
-            f"worker_id={self.rank} rank={self.rank} "
-            f"target_workers={tuple(sorted(target_worker_ids))}",
-            flush=True,
+            getattr(self, "_active_drafter_training_plan_id", None)
+            or getattr(self, "_prepared_training_plan_id", None),
+            sent_ts,
+            received_ts,
         )
         return {"rank": self.rank, "worker_id": str(self.rank), "requested": True}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def park_drafter_training_model(self, worker_ids=None):
+        """Park resident training tensors without resetting the quota or optimizer."""
+        if worker_ids is not None and str(self.rank) not in worker_ids:
+            return {"parked": False, "rank": self.rank, "elapsed_sec": 0.0}
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+        ):
+            return {"parked": False, "rank": self.rank, "elapsed_sec": 0.0}
+        model = getattr(self.trainer, "model", None)
+        if model is None or not getattr(
+            self.trainer, "_training_device_resident", True
+        ):
+            return {"parked": False, "rank": self.rank, "elapsed_sec": 0.0}
+        started = time.perf_counter()
+        await self.trainer.release_training_memory_after_activation(strict=True)
+        elapsed = time.perf_counter() - started
+        stage_timings = getattr(self.trainer, "_last_memory_park_stage_timings", {})
+        logger.warning(
+            "[BubbleTime] training_memory_parked: rank=%s elapsed_s=%.4f optimizer_steps=%s stages_sec=%s",
+            self.rank,
+            elapsed,
+            self.trainer.optimizer_steps_total,
+            stage_timings,
+        )
+        return {
+            "parked": True,
+            "rank": self.rank,
+            "elapsed_sec": elapsed,
+            "stage_timings_sec": stage_timings,
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_drafter_writer_state(self, worker_ids, export=False):
+        if str(self.rank) not in worker_ids or self.trainer is None:
+            return None
+        state = self.trainer.local_writer_state(export=export)
+        if state is None:
+            return {"rank": self.rank, "available": False}
+        if export:
+            rng = getattr(self, "_migrated_training_rng", None)
+            if rng is None:
+                raise RuntimeError(
+                    "No canonical training RNG available for writer migration"
+                )
+            state["rng"] = deepcopy(rng)
+            state["worker_progress"] = {
+                "last_trained_step": self.last_trained_step,
+                "last_trained_step_version": self.last_trained_step_version,
+                "execution_strategy": self._last_trained_execution_strategy,
+            }
+        return {"rank": self.rank, "available": True, "state": state}
+
+    def _capture_training_rng_state(self):
+        return {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cpu": torch.get_rng_state(),
+            "device": get_torch_device().get_rng_state()
+            if self.device_name != "cpu"
+            else None,
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def import_drafter_writer_state(self, worker_ids, states, validate_only=False):
+        if str(self.rank) not in worker_ids or self.trainer is None:
+            return None
+        state = states[worker_ids.index(str(self.rank))]
+        if isinstance(state, ray.ObjectRef):
+            state = ray.get(state)
+        if "rng" not in state or "worker_progress" not in state:
+            raise RuntimeError("Incomplete writer RNG/progress state")
+        self.trainer.validate_writer_state(state)
+        if not validate_only:
+            self.trainer.load_writer_state(state)
+            self._migrated_training_rng = deepcopy(state["rng"])
+            progress = state["worker_progress"]
+            self.last_trained_step = progress["last_trained_step"]
+            self.last_trained_step_version = progress["last_trained_step_version"]
+            self._last_trained_execution_strategy = progress["execution_strategy"]
+            self._last_trained_target_worker_ids = tuple(worker_ids)
+        return {
+            "rank": self.rank,
+            "validated": True,
+            "optimizer_steps": state["optimizer_steps"],
+        }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def maybe_publish(self):
@@ -2487,6 +2972,28 @@ class SpecoWorker(Worker):
             return None
         if self.last_trained_step != self.last_global_step:
             return None
+        if (
+            getattr(self, "_deferred_publish_snapshot_step", None)
+            == self.last_global_step
+        ):
+            # Invoked on all writer ranks by ONE_TO_ALL at the safe point.
+            # No optimizer step or new quota may run before publication ACK.
+            started = time.perf_counter()
+            if (
+                self.trainer.optimizer_steps_total
+                != self._deferred_publish_optimizer_step
+            ):
+                raise RuntimeError(
+                    "Deferred publish writer changed before snapshot staging"
+                )
+            self.trainer.prepare_model_state_dict_for_publish(self.last_global_step)
+            self._deferred_publish_snapshot_step = None
+            logger.warning(
+                "[BubbleTime] deferred_snapshot_staged: rank=%s step=%s elapsed_s=%.4f",
+                self.rank,
+                self.last_global_step,
+                time.perf_counter() - started,
+            )
         has_snapshot, weights = self.trainer.pop_model_state_dict_for_publish(
             self.last_global_step
         )

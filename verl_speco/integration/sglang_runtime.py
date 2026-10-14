@@ -178,7 +178,16 @@ def _rollout_idle_worker_config(drafter_cfg: dict[str, Any]) -> dict[str, Any]:
     scheduler_cfg = training_cfg.get("scheduler") or {}
     idle_cfg = scheduler_cfg.get("idle_worker") or {}
     execution_cfg = scheduler_cfg.get("execution") or {}
-    strategy = str(execution_cfg.get("strategy", "sync") or "sync").strip().lower()
+    strategy = (
+        str(
+            execution_cfg.get(
+                "strategy", training_cfg.get("execution_strategy", "sync")
+            )
+            or "sync"
+        )
+        .strip()
+        .lower()
+    )
     if strategy != "rollout_idle_worker":
         return {}
     return dict(idle_cfg)
@@ -1829,6 +1838,7 @@ class _SpecoSGLangHttpServerMixin:
                     )
             self._speco_rollout_active_requests = active_requests + 1
         request_completed = False
+        request_completed_ts = None
         try:
             output = await self._speco_generate_request(
                 prompt_ids,
@@ -1838,6 +1848,7 @@ class _SpecoSGLangHttpServerMixin:
                 video_data=video_data,
             )
             request_completed = True
+            request_completed_ts = time.time()
             return output
         finally:
             if not request_completed:
@@ -1875,6 +1886,7 @@ class _SpecoSGLangHttpServerMixin:
                                 ),
                                 "replica_rank": replica_rank,
                                 "memory_released": release_verified,
+                                "request_completed_ts": request_completed_ts,
                                 "release_source": (
                                     "runtime_request_finalized"
                                     if release_verified

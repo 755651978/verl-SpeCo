@@ -151,6 +151,7 @@ def test_bubble_collection_is_single_flight_until_quota_completes() -> None:
         execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
         training_quota_enable=True,
         training_quota_target_steps=20,
+        training_quota_trigger_mode="interval",
     )
     first = scheduler.plan_collection(
         DrafterCollectionContext(
@@ -427,12 +428,12 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
         (
             _context(samples=0, oldlogprob_requested=True),
             DrafterScheduleConfig(training_interval_steps=5, use_data_buffer=True),
-            "no_trainable_batch",
+            "no_current_step_oldlogprob_samples",
         ),
         (
             _context(samples=0),
             DrafterScheduleConfig(training_interval_steps=5),
-            "no_trainable_batch",
+            "no_current_step_samples",
         ),
     ],
 )

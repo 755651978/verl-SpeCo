@@ -56,7 +56,11 @@ from .lifecycle import (
     BeforeActorUpdateContext,
     SchedulerEventOutcome,
 )
-from .collection_strategy import CollectionOutcome, DrafterCollectionStrategy
+from .collection_strategy import (
+    CollectionFinalizeError,
+    CollectionOutcome,
+    DrafterCollectionStrategy,
+)
 from .collection_adapter import DrafterCollectionAdapter
 from .training_outcome import TrainingOutcome
 from .standalone_executor import (
@@ -80,6 +84,7 @@ __all__ = [
     "CollectionPayload",
     "CollectionWorkerResult",
     "CollectionOutcome",
+    "CollectionFinalizeError",
     "ConservativeTrainingDataStatusPolicy",
     "CallbackDrafterWorkerExecutor",
     "CallbackDrafterCollectionExecutor",

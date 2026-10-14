@@ -21,6 +21,7 @@ import random
 import fnmatch
 import shutil
 from collections import deque
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Any, Callable, cast
 from omegaconf import open_dict
@@ -179,9 +180,10 @@ def resolve_drafter_strategy(config) -> str:
 class _DrafterOptimizerState:
     """DCP Stateful adapter for FSDP1/FSDP2 optimizer state dicts."""
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, process_group=None):
         self.model = model
         self.optimizer = optimizer
+        self.process_group = process_group
 
     def _is_ddp(self) -> bool:
         return is_ddp_wrapped(self.model)
@@ -198,6 +200,22 @@ class _DrafterOptimizerState:
             # optimizer API is only defined for FSDP-wrapped models, so save
             # the plain state dict to stay checkpointable on every torch build.
             return self.optimizer.state_dict()
+        if isinstance(self.model, FSDP) and self.process_group is not None:
+            from torch.distributed.fsdp import (
+                StateDictType,
+                ShardedStateDictConfig,
+                ShardedOptimStateDictConfig,
+            )
+
+            with FSDP.state_dict_type(
+                self.model,
+                StateDictType.SHARDED_STATE_DICT,
+                ShardedStateDictConfig(offload_to_cpu=True),
+                ShardedOptimStateDictConfig(offload_to_cpu=True),
+            ):
+                return FSDP.optim_state_dict(
+                    self.model, self.optimizer, group=self.process_group
+                )
         from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
         return get_optimizer_state_dict(
@@ -207,6 +225,24 @@ class _DrafterOptimizerState:
     def load_state_dict(self, state_dict):
         if self._is_ddp():
             self.optimizer.load_state_dict(state_dict)
+            return
+        if isinstance(self.model, FSDP) and self.process_group is not None:
+            from torch.distributed.fsdp import (
+                StateDictType,
+                ShardedStateDictConfig,
+                ShardedOptimStateDictConfig,
+            )
+
+            with FSDP.state_dict_type(
+                self.model,
+                StateDictType.SHARDED_STATE_DICT,
+                ShardedStateDictConfig(offload_to_cpu=True),
+                ShardedOptimStateDictConfig(offload_to_cpu=True),
+            ):
+                local_state = FSDP.optim_state_dict_to_load(
+                    self.model, self.optimizer, state_dict, group=self.process_group
+                )
+                self.optimizer.load_state_dict(local_state)
             return
         from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
@@ -545,7 +581,15 @@ class DrafterBaseTrainer:
         scheduler_cfg = training_cfg.get("scheduler", {}) or {}
         execution_cfg = scheduler_cfg.get("execution", {}) or {}
         self._bubble_time_enabled = (
-            str(execution_cfg.get("strategy", "sync")) == "rollout_idle_worker"
+            str(
+                execution_cfg.get(
+                    "strategy", training_cfg.get("execution_strategy", "sync")
+                )
+                or "sync"
+            )
+            .strip()
+            .lower()
+            == "rollout_idle_worker"
         )
         # Bubble Time intentionally trains step N data during the step N+1
         # rollout.  Keep that data across RL-step boundaries automatically.
@@ -567,6 +611,9 @@ class DrafterBaseTrainer:
         self.is_offload_param = bool(training_cfg.get("is_offload_param", False))
         self.is_offload_optimizer = bool(
             training_cfg.get("is_offload_optimizer", False)
+        )
+        self.skip_heavy_cleanup_after_drafter_training = bool(
+            training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
         )
         self.park_hccl_after_drafter_training = bool(
             training_cfg.get("park_hccl_after_drafter_training", False)
@@ -1585,6 +1632,39 @@ class DrafterBaseTrainer:
 
     def _get_trainable_state_dict(self) -> dict[str, torch.Tensor]:
         """Get floating state dict entries excluding weights shared with the target model."""
+        if (
+            isinstance(self.model, FSDP)
+            and self._use_replica_local_bubble_group()
+            and getattr(self.backend, "model_type", None) == "dspark"
+        ):
+            return self._get_bubble_fsdp1_publish_state()
+        if (
+            getattr(self, "_bubble_time_enabled", False)
+            and self.training_device_mesh is not None
+            and not isinstance(self.model, FSDP)
+            and not self._is_ddp_wrapped()
+        ):
+            # FSDP2 allows gathering individual DTensors. Frozen embeddings
+            # need no hot update, so avoid gathering them merely to discard them.
+            result = {}
+            for name, tensor in self.model.state_dict().items():
+                if (
+                    not torch.is_floating_point(tensor)
+                    or self._is_frozen_publish_param(name)
+                    or (
+                        "lm_head.weight" in name
+                        and not getattr(self.backend, "trains_draft_lm_head", False)
+                    )
+                ):
+                    continue
+                full_tensor = (
+                    tensor.detach().full_tensor()
+                    if callable(getattr(tensor, "full_tensor", None))
+                    else tensor.detach()
+                )
+                if self.rank == 0:
+                    result[name] = full_tensor.cpu().contiguous()
+            return result
         full_state_dict = self._get_full_model_state_dict()
         if not full_state_dict:
             return {}
@@ -1608,6 +1688,85 @@ class DrafterBaseTrainer:
             trainable_state_dict[name] = param
 
         return trainable_state_dict
+
+    def _get_bubble_fsdp1_publish_state(self) -> dict[str, torch.Tensor]:
+        """Copy only publishable weights while subgroup full params are exposed.
+
+        FSDP1 still gathers its flat parameters, including frozen entries in
+        the same flat buffer. Avoid copying those frozen entries to CPU merely
+        to discard them, and cast before transfer rather than on the host.
+        Checkpoint and Sync export retain their original state-dict paths.
+        """
+        config = self.config.rollout.drafter.training
+        dtype = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }.get(config.get("publish_dtype"))
+        patterns = config.get("publish_param_name_patterns")
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        result = {}
+        copied_bytes = 0
+        skipped_bytes = 0
+        leader = self._is_checkpoint_leader()
+
+        def copy_entry(name, tensor):
+            nonlocal copied_bytes, skipped_bytes
+            name = name.replace("_fsdp_wrapped_module.", "")
+            skip = (
+                not torch.is_floating_point(tensor)
+                or self._is_frozen_publish_param(name)
+                or (
+                    "lm_head.weight" in name
+                    and not getattr(self.backend, "trains_draft_lm_head", False)
+                )
+                or (
+                    patterns
+                    and not any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
+                )
+            )
+            if skip:
+                skipped_bytes += tensor.numel() * tensor.element_size()
+            elif leader:
+                value = tensor.detach()
+                if dtype is not None:
+                    value = value.to(dtype=dtype)
+                value = value.to(device="cpu", copy=True).contiguous()
+                result[name] = value
+                copied_bytes += value.numel() * value.element_size()
+
+        started = time.perf_counter()
+        with FSDP.summon_full_params(
+            self.model,
+            recurse=True,
+            writeback=False,
+            rank0_only=False,
+            offload_to_cpu=False,
+        ):
+            for name, tensor in self.model.named_parameters(remove_duplicate=False):
+                copy_entry(name, tensor)
+            for prefix, module in self.model.named_modules(remove_duplicate=False):
+                for name, tensor in module._buffers.items():
+                    if (
+                        tensor is not None
+                        and name not in module._non_persistent_buffers_set
+                    ):
+                        copy_entry(f"{prefix}.{name}" if prefix else name, tensor)
+        logger.warning(
+            "[BubbleTime] publish_trainable_only_export: rank=%s leader=%s "
+            "copied_bytes=%s skipped_bytes=%s entries=%s elapsed_s=%.4f",
+            self.rank,
+            leader,
+            copied_bytes,
+            skipped_bytes,
+            len(result),
+            time.perf_counter() - started,
+        )
+        return result
 
     def _get_full_export_state_dict(self) -> dict[str, torch.Tensor]:
         """Get a complete CPU state dict for offline drafter export.
@@ -1828,7 +1987,15 @@ class DrafterBaseTrainer:
             import torch.distributed.checkpoint as dcp
 
             dcp.save(
-                {"optimizer": _DrafterOptimizerState(self.model, self.optimizer)},
+                {
+                    "optimizer": _DrafterOptimizerState(
+                        self.model,
+                        self.optimizer,
+                        self._checkpoint_process_group()
+                        if self._use_replica_local_bubble_group()
+                        else None,
+                    )
+                },
                 checkpoint_id=temporary_path,
                 process_group=self._checkpoint_process_group(),
             )
@@ -1902,7 +2069,15 @@ class DrafterBaseTrainer:
             import torch.distributed.checkpoint as dcp
 
             dcp.load(
-                {"optimizer": _DrafterOptimizerState(self.model, self.optimizer)},
+                {
+                    "optimizer": _DrafterOptimizerState(
+                        self.model,
+                        self.optimizer,
+                        self._checkpoint_process_group()
+                        if self._use_replica_local_bubble_group()
+                        else None,
+                    )
+                },
                 checkpoint_id=optimizer_path,
                 process_group=self._checkpoint_process_group(),
             )
@@ -2252,13 +2427,27 @@ class DrafterBaseTrainer:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
         activation_stage = "enter"
+        self._last_activation_stage_timings: dict[str, float] = {}
+
+        def timed(stage, operation):
+            started = time.perf_counter()
+            try:
+                return operation()
+            finally:
+                self._last_activation_stage_timings[stage] = (
+                    time.perf_counter() - started
+                )
+
         try:
+            # Activation can fail after moving only part of the state. A later
+            # boundary must still attempt to park those tensors.
+            self._training_device_resident = True
             logger.debug(
                 f"[Trainer rank {getattr(self, 'rank', -1)}] activate_training_model enter "
             )
 
             if self._training_active and self.model is not None:
-                self._apply_pending_target_lm_head_weight()
+                timed("head_apply", self._apply_pending_target_lm_head_weight)
                 logger.debug(
                     f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model reused active model "
                     f"elapsed={time.time() - start_ts:.2f}s"
@@ -2269,14 +2458,14 @@ class DrafterBaseTrainer:
             # Apply them before loading drafter model/optimizer state to keep
             # accelerator memory peaks low during activation.
             activation_stage = "apply_pending_target_head_on_host"
-            self._apply_pending_target_lm_head_weight()
+            timed("host_head_apply", self._apply_pending_target_lm_head_weight)
 
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
                 activation_stage = "build_draft_model"
-                self._build_draft_model()
+                timed("model_build", self._build_draft_model)
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -2287,7 +2476,7 @@ class DrafterBaseTrainer:
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 activation_stage = "load_draft_model"
-                load_fsdp_model_to_gpu(self.model)
+                timed("model_restore", lambda: load_fsdp_model_to_gpu(self.model))
                 logger.debug("Loaded drafter model to GPU for training")
 
             if self.optimizer is not None and (
@@ -2297,17 +2486,24 @@ class DrafterBaseTrainer:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
                 activation_stage = "load_draft_optimizer"
-                load_fsdp_optimizer(optimizer=self.optimizer, device_id=current_dev_id)
+                timed(
+                    "optimizer_restore",
+                    lambda: load_fsdp_optimizer(
+                        optimizer=self.optimizer, device_id=current_dev_id
+                    ),
+                )
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             activation_stage = "load_target_lm_head"
-            self._move_target_lm_head(self.runtime_device)
+            timed("head_move", lambda: self._move_target_lm_head(self.runtime_device))
             activation_stage = "apply_pending_target_head_on_device"
-            self._apply_pending_target_lm_head_weight()
+            timed("head_apply", self._apply_pending_target_lm_head_weight)
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
             self._training_active = True
+            self._training_device_resident = True
+            self._log_training_memory("activated")
             logger.debug(
                 f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model success "
                 f"elapsed={time.time() - start_ts:.2f}s"
@@ -2356,7 +2552,7 @@ class DrafterBaseTrainer:
         # A newly received payload may replace an earlier snapshot with the
         # same logical step. Force one apply before that version can train.
         self._applied_target_lm_head_weight_step = None
-        if global_step is not None:
+        if global_step is not None and getattr(self, "_bubble_time_enabled", False):
             version = int(global_step)
             self._target_lm_head_snapshots[version] = {
                 "weight": self._pending_target_lm_head_weight,
@@ -3988,6 +4184,8 @@ class DrafterBaseTrainer:
         available_data: list[dict[str, Any]],
         batch_size: int,
         rng: random.Random,
+        *,
+        sample_index: int | None = None,
     ) -> list[dict[str, Any]]:
         if len(available_data) <= batch_size:
             return list(available_data)
@@ -4006,7 +4204,14 @@ class DrafterBaseTrainer:
             # optimizer steps; e.g. ratio=.1 and batch=4 produces exactly eight
             # hard draws over twenty updates instead of rounding every batch to
             # zero. Either ratio being zero takes the baseline path above.
-            optimizer_step = max(int(getattr(self, "optimizer_steps_total", 0)), 0)
+            optimizer_step = max(
+                int(
+                    getattr(self, "optimizer_steps_total", 0)
+                    if sample_index is None
+                    else sample_index
+                ),
+                0,
+            )
             previous_target = int(optimizer_step * batch_size * hard_ratio + 0.5)
             next_target = int((optimizer_step + 1) * batch_size * hard_ratio + 0.5)
             hard_count = min(batch_size, max(0, next_target - previous_target))
@@ -4054,6 +4259,24 @@ class DrafterBaseTrainer:
             selected.extend(rng.sample(remaining, min(random_count, len(remaining))))
 
         return selected
+
+    def _sample_replay_items(self, available_data, batch_size):
+        """Use the normal objective's sampler on the immutable quota snapshot."""
+        cursor = int(getattr(self, "_active_training_replay_cursor", 0))
+        version = int(self._active_training_target_version)
+        rng = random.Random((version << 16) + cursor)
+        items = self._sample_training_items(
+            available_data,
+            batch_size,
+            rng,
+            sample_index=(
+                int(self.optimizer_steps_total)
+                * int(getattr(self, "_sampling_accumulation_steps", 1))
+                + int(getattr(self, "_sampling_micro_index", 0))
+            ),
+        )
+        self._active_training_replay_cursor = cursor + len(items)
+        return items
 
     def _pack_block_drafter_chunks(
         self,
@@ -4277,15 +4500,9 @@ class DrafterBaseTrainer:
             ]
             if not available_data:
                 return None
-            # Shuffle by rotation rather than permanently taking the first
-            # entries.  The reservation remains immutable for this plan, so a
-            # later optimizer step can replay it without changing its target
-            # LM-head version or colliding with another plan.
-            cursor = int(getattr(self, "_active_training_replay_cursor", 0))
-            start = cursor % len(available_data)
-            ordered_data = available_data[start:] + available_data[:start]
-            items = ordered_data[:effective_batch_size]
-            self._active_training_replay_cursor = cursor + len(items)
+            # Preserve hard-sample policy and deterministic cursor across short
+            # plans without letting later appends change the reserved dataset.
+            items = self._sample_replay_items(available_data, effective_batch_size)
 
         # last-hidden supervision can only be reconstructed with the exact target
         # head version that produced those hidden states, so older buffered Eagle3
@@ -5521,6 +5738,8 @@ class DrafterBaseTrainer:
             "buffer_version": self.buffer_version,
             "data_version": max(sample_steps) if sample_steps else None,
             "trainable_valid_tokens": trainable_valid_tokens,
+            "min_sample_step": min(sample_steps) if sample_steps else None,
+            "max_sample_step": max(sample_steps) if sample_steps else None,
         }
 
     def _mark_buffer_changed(self) -> None:
@@ -5605,6 +5824,8 @@ class DrafterBaseTrainer:
             return False
 
     async def training_step(self, step: int) -> bool:
+        self._sampling_accumulation_steps = 1
+        self._sampling_micro_index = 0
         try:
             with torch.enable_grad():
                 return await self._training_step_impl(step)
@@ -5621,13 +5842,16 @@ class DrafterBaseTrainer:
         """Execute one Bubble optimizer step from reserved micro-batches."""
 
         accumulation_steps = max(int(accumulation_steps), 1)
+        self._sampling_accumulation_steps = accumulation_steps
+        self._sampling_micro_index = 0
         if accumulation_steps == 1:
             return await self.training_step(step)
         batches: list[dict[str, torch.Tensor]] = []
         batch_items: list[list[dict[str, Any]]] = []
         self._active_accumulation_item_ids: set[int] = set()
         try:
-            for _ in range(accumulation_steps):
+            for micro_index in range(accumulation_steps):
+                self._sampling_micro_index = micro_index
                 batch = self.prepare_training_batch()
                 if not self._sync_batch_readiness(batch is not None) or batch is None:
                     self._last_prepared_training_items = []
@@ -5759,6 +5983,15 @@ class DrafterBaseTrainer:
             reduce_world_size *= self.training_device_mesh.size()
         return metrics[0], metrics[1], metrics[2], reduce_world_size
 
+    def _clip_training_grad_norm(self):
+        if getattr(self, "_bubble_time_enabled", False) and isinstance(
+            self.model, FSDP
+        ):
+            # Original-parameter FSDP1 gradients are local shards. All writer
+            # ranks must clip against the same full-model norm, not each shard.
+            return self.model.clip_grad_norm_(max_norm=1.0)
+        return torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
     async def _training_step_on_batch(
         self,
         batch: dict[str, torch.Tensor],
@@ -5878,9 +6111,7 @@ class DrafterBaseTrainer:
             for parameter in self.model.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(accumulation_denom)
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), max_norm=1.0
-        )
+        grad_norm = self._clip_training_grad_norm()
         if not torch.isfinite(grad_norm):
             logger.error(
                 f"Step {self.training_steps + 1}: non-finite drafter grad norm, "
@@ -5999,8 +6230,10 @@ class DrafterBaseTrainer:
 
     def prepare_model_state_dict_for_publish(self, global_step: Optional[int]) -> bool:
         """Snapshot trainable drafter weights before cleanup/offload for fast publish."""
-        self.clear_pending_publish_state_dict()
         step = int(global_step) if global_step is not None else None
+        if self._pending_publish_ready and self._pending_publish_step == step:
+            return bool(self._pending_publish_state_dict)
+        self.clear_pending_publish_state_dict()
         state_dict = self.get_model_state_dict()
         self._pending_publish_state_dict = state_dict
         self._pending_publish_step = step
@@ -6029,6 +6262,184 @@ class DrafterBaseTrainer:
         self.clear_pending_publish_state_dict()
         return True, state_dict
 
+    def _log_training_memory(self, stage: str) -> None:
+        """Opt-in local storage accounting; never gather FSDP shards."""
+        if not _env_flag_enabled("VERL_DRAFTER_MEMORY_DIAGNOSTICS"):
+            return
+        try:
+            self._log_training_memory_impl(stage)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("Drafter memory diagnostics failed: %s", error)
+
+    def _log_training_memory_impl(self, stage: str) -> None:
+        seen = set()
+
+        def storage_bytes(value, depth=0):
+            if depth > 8:
+                return 0
+            if torch.is_tensor(value):
+                local = getattr(value, "_local_tensor", value)
+                if local.device.type != self.runtime_device.type:
+                    return 0
+                storage = local.untyped_storage()
+                key = (str(local.device), storage.data_ptr(), storage.nbytes())
+                if key in seen:
+                    return 0
+                seen.add(key)
+                return storage.nbytes()
+            if isinstance(value, dict):
+                return sum(storage_bytes(item, depth + 1) for item in value.values())
+            if isinstance(value, (list, tuple, deque)):
+                return sum(storage_bytes(item, depth + 1) for item in value)
+            return 0
+
+        model = getattr(self, "model", None)
+        head = self._target_lm_head_module()
+        optimizer = getattr(self, "optimizer", None)
+        # Shared storage is counted once, under the first matching category.
+        parts = {
+            "target_head": storage_bytes(list(head.parameters()) if head else []),
+            "model": storage_bytes(list(model.parameters()) if model else []),
+            "buffers": storage_bytes(list(model.buffers()) if model else []),
+            "gradients": storage_bytes(
+                [param.grad for param in model.parameters()] if model else []
+            ),
+            "optimizer": storage_bytes(optimizer.state if optimizer else {}),
+            "replay": storage_bytes(
+                [
+                    getattr(self, "collected_data", []),
+                    getattr(getattr(self, "data_buffer", None), "buffer", []),
+                    getattr(self, "_training_replay_sessions", {}),
+                    getattr(self, "_last_prepared_training_items", []),
+                    getattr(self, "_active_training_replay_used_items", {}),
+                ]
+            ),
+            "publish": storage_bytes(
+                getattr(self, "_pending_publish_state_dict", None)
+            ),
+        }
+        # Inspect local, already materialized storage only. Never summon full
+        # parameters, walk autograd graphs or free private FSDP tensors here.
+        extra_storage = {}
+
+        def account_attributes(owner, prefix):
+            if owner is None or not hasattr(owner, "__dict__"):
+                return 0
+            total = 0
+            for name, value in vars(owner).items():
+                size = storage_bytes(value)
+                if size:
+                    extra_storage[f"{prefix}.{name}"] = size
+                    total += size
+            return total
+
+        fsdp_bytes = 0
+        if model is not None:
+            for name, module in model.named_modules():
+                prefix = f"model.{name or '<root>'}"
+                fsdp_bytes += account_attributes(module, prefix)
+                handles = list(getattr(module, "_handles", ()) or ())
+                handle = getattr(module, "_handle", None)
+                if handle is not None:
+                    handles.append(handle)
+                for index, handle in enumerate(handles):
+                    fsdp_bytes += account_attributes(handle, f"{prefix}.handle{index}")
+                    fsdp_bytes += account_attributes(
+                        getattr(handle, "flat_param", None),
+                        f"{prefix}.handle{index}.flat_param",
+                    )
+        parts["model_internal"] = fsdp_bytes
+        parts["trainer_runtime"] = account_attributes(self, "trainer")
+        parts["backend_runtime"] = account_attributes(
+            getattr(self, "backend", None), "backend"
+        )
+        allocated = int(self.device_module.memory_allocated())
+        reserved = int(self.device_module.memory_reserved())
+        logger.warning(
+            "[DrafterMemory] revision=3 source=%s rank=%s stage=%s device=%s bytes=%s "
+            "allocated_bytes=%s reserved_bytes=%s cache_bytes=%s "
+            "unattributed_allocated_bytes=%s peak_allocated_bytes=%s",
+            __file__,
+            self.rank,
+            stage,
+            self.runtime_device,
+            parts,
+            allocated,
+            reserved,
+            max(0, reserved - allocated),
+            max(0, allocated - sum(parts.values())),
+            int(self.device_module.max_memory_allocated()),
+        )
+        if extra_storage:
+            logger.warning(
+                "[DrafterMemory] extra_storage: rank=%s stage=%s largest_storage_bytes=%s",
+                self.rank,
+                stage,
+                sorted(extra_storage.items(), key=lambda item: item[1], reverse=True)[
+                    :20
+                ],
+            )
+        if (
+            self.runtime_device.type == "cuda"
+            and stage in {"parked", "keep_hot_after_cache_trim"}
+            and allocated - sum(parts.values()) >= 64 * 1024 * 1024
+            and callable(getattr(self.device_module, "memory_snapshot", None))
+        ):
+            # Public allocator metadata, not a tensor/autograd graph walk.
+            # Addresses and sizes distinguish live blocks from pending frees;
+            # they do not identify an owner when allocation stacks are absent.
+            known_addresses = {entry[1] for entry in seen}
+            unexplained = []
+            for segment in self.device_module.memory_snapshot():
+                if segment.get("device") != self.runtime_device.index:
+                    continue
+                address = int(segment.get("address", 0))
+                for block in segment.get("blocks", []):
+                    block_address = int(block.get("address", address))
+                    if (
+                        str(block.get("state", "")).startswith("active")
+                        and block_address not in known_addresses
+                    ):
+                        unexplained.append(
+                            {
+                                "address": block_address,
+                                "size": block.get("size", 0),
+                                "requested_size": block.get("requested_size", 0),
+                                "state": block.get("state"),
+                            }
+                        )
+                    address += int(block.get("size", 0))
+            logger.warning(
+                "[DrafterMemory] unattributed_allocator_blocks: rank=%s stage=%s largest=%s",
+                self.rank,
+                stage,
+                sorted(unexplained, key=lambda item: int(item["size"]), reverse=True)[
+                    :12
+                ],
+            )
+
+    def _trim_keep_hot_cache(self) -> None:
+        """Release only unused allocator blocks, preserving all live state."""
+        self._last_keep_hot_cache_trim_elapsed_sec = 0.0
+        if device_name == "cpu" or not hasattr(self.device_module, "empty_cache"):
+            return
+        reserved = getattr(self.device_module, "memory_reserved", lambda: 0)
+        allocated = getattr(self.device_module, "memory_allocated", lambda: 0)
+        reserved_before = int(reserved())
+        allocated_before = int(allocated())
+        started = time.perf_counter()
+        self.device_module.empty_cache()
+        self._last_keep_hot_cache_trim_elapsed_sec = time.perf_counter() - started
+        logger.warning(
+            "[DrafterMemory] keep_hot_cache_trim: rank=%s elapsed_s=%.4f "
+            "freed_reserved_bytes=%s allocated_before_bytes=%s allocated_after_bytes=%s",
+            self.rank,
+            self._last_keep_hot_cache_trim_elapsed_sec,
+            max(0, reserved_before - int(reserved())),
+            allocated_before,
+            int(allocated()),
+        )
+
     async def cleanup_training(
         self,
         clear_data: bool = True,
@@ -6037,6 +6448,7 @@ class DrafterBaseTrainer:
     ):
         # First set training as inactive to prevent further steps
         self._training_active = False
+        self._last_keep_hot_cache_trim_elapsed_sec = 0.0
 
         # Wait for any pending async checkpoint save to complete
         if self._pending_checkpoint_future is not None:
@@ -6086,6 +6498,39 @@ class DrafterBaseTrainer:
                 self._full_checkpoint_executor = None
             self._training_initialized = True
             self._training_active = False
+            self._log_training_memory("keep_hot_before_cache_trim")
+            # Optional: return unused allocator blocks, not live optimizer/model
+            # tensors. Keep disabled by default because cache reuse can be faster.
+            if _env_flag_enabled("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE"):
+                self._trim_keep_hot_cache()
+                self._log_training_memory("keep_hot_after_cache_trim")
+            return
+
+        if getattr(self, "_bubble_time_enabled", False):
+            # Do not report a cold Bubble plan complete while training tensors
+            # are still resident: releasing its lease would let serving reuse
+            # the same device before the main-stage parking guard can run.
+            await self.release_training_memory_after_activation(strict=True)
+            if clear_data:
+                self.collected_data.clear()
+                self.data_buffer.clear()
+                self._mark_buffer_changed()
+            if self._full_checkpoint_executor is not None:
+                self._full_checkpoint_executor.shutdown(wait=False)
+                self._full_checkpoint_executor = None
+            return
+
+        if getattr(self, "skip_heavy_cleanup_after_drafter_training", False):
+            # Preserve main's explicitly configured Sync cleanup behavior.
+            if clear_data:
+                self.collected_data.clear()
+                self.data_buffer.clear()
+                self._mark_buffer_changed()
+            self._training_initialized = False
+            self._training_active = False
+            self._last_ckpt_step = -1
+            self.training_steps = 0
+            logger.debug("[Rank %s] Skipped heavy drafter cleanup", self.rank)
             return
 
         if self.model is not None:
@@ -6125,55 +6570,225 @@ class DrafterBaseTrainer:
         self._last_ckpt_step = -1
         self.training_steps = 0
 
-    async def release_training_memory_after_activation(self):
-        """Release runtime-device memory after a pre-fit activation warmup."""
+    async def release_training_memory_after_activation(self, *, strict: bool = False):
+        """Park training tensors on CPU, preserving optimizer and replay progress.
+
+        Warmup retains best-effort cleanup. Bubble main-workload boundaries use
+        strict mode so partial offload cannot be reported as successful parking.
+        """
 
         self._training_active = False
-
+        operations = []
         if self.optimizer is not None:
-            try:
-                self.optimizer.zero_grad(set_to_none=True)
-            except Exception as e:  # noqa: BLE001
-                logger.debug(
-                    f"Failed to clear drafter gradients after activation warmup: {e}"
-                )
-
-        if self.model is not None:
-            try:
-                offload_fsdp_model_to_cpu(self.model)
-                logger.debug("Offloaded drafter model to CPU after activation warmup")
-            except Exception as e:  # noqa: BLE001
-                logger.debug(
-                    f"Failed to offload drafter model after activation warmup: {e}"
-                )
-
-        if self.optimizer is not None:
-            try:
-                self._offload_optimizer_state_to_cpu()
-                logger.debug(
-                    "Offloaded drafter optimizer state to CPU after activation warmup"
-                )
-            except Exception as e:  # noqa: BLE001
-                if self._use_blocking_npu_optimizer_offload():
-                    raise RuntimeError(
-                        "NPU VeOmni drafter optimizer blocking offload failed "
-                        "after activation warmup"
-                    ) from e
-                logger.debug(
-                    f"Failed to offload drafter optimizer after activation warmup: {e}"
-                )
-
-        try:
-            self._move_target_lm_head("cpu")
-        except Exception as e:  # noqa: BLE001
-            logger.debug(
-                f"Failed to offload drafter target head after activation warmup: {e}"
+            operations.append(
+                ("clear_gradients", lambda: self.optimizer.zero_grad(set_to_none=True))
             )
-
+        if self.model is not None:
+            operations.append(
+                ("offload_model", lambda: offload_fsdp_model_to_cpu(self.model))
+            )
+        if self.optimizer is not None:
+            operations.append(
+                ("offload_optimizer", lambda: self._offload_optimizer_state_to_cpu())
+            )
+        operations.append(
+            ("offload_target_head", lambda: self._move_target_lm_head("cpu"))
+        )
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
             if hasattr(self.device_module, "synchronize"):
-                self.device_module.synchronize()
-            self.device_module.empty_cache()
+                operations.append(
+                    ("device_synchronize", self.device_module.synchronize)
+                )
+            operations.append(("empty_cache", self.device_module.empty_cache))
+        operations.append(("park_hccl", self._park_idle_drafter_hccl))
 
-        self._park_idle_drafter_hccl()
+        failures = []
+        fatal_failure = False
+        stage_timings = {}
+        for stage, operation in operations:
+            operation_started = time.perf_counter()
+            try:
+                operation()
+            except Exception as error:  # noqa: BLE001
+                failures.append((stage, error))
+                # Preserve the existing fatal NPU optimizer and device/stream
+                # errors even for best-effort warmup cleanup.
+                fatal_failure |= stage in {
+                    "device_synchronize",
+                    "empty_cache",
+                    "park_hccl",
+                } or (
+                    stage == "offload_optimizer"
+                    and self._use_blocking_npu_optimizer_offload()
+                )
+                logger.warning(
+                    "Drafter parking failed: stage=%s strict=%s error=%s",
+                    stage,
+                    strict,
+                    error,
+                )
+            finally:
+                stage_timings[stage] = time.perf_counter() - operation_started
+        self._last_memory_park_stage_timings = stage_timings
+        if getattr(self, "_bubble_time_enabled", False) or _env_flag_enabled(
+            "VERL_DRAFTER_MEMORY_DIAGNOSTICS"
+        ):
+            logger.warning(
+                "[BubbleTime] memory_park_breakdown: rank=%s stages_sec=%s failures=%s",
+                self.rank,
+                stage_timings,
+                [stage for stage, _ in failures],
+            )
         self._training_initialized = False
+        self._training_device_resident = bool(failures)
+        self._log_training_memory("parked" if not failures else "park_failed")
+        if failures and (strict or fatal_failure):
+            raise RuntimeError(
+                "Failed to park drafter training state: "
+                + ", ".join(stage for stage, _ in failures)
+            ) from failures[0][1]
+        return not failures
+
+    def local_writer_state(self, *, export: bool = False):
+        """Portable CPU shards for an equal-topology quota-boundary handoff."""
+        if (
+            self._training_active
+            or (export and self._training_device_resident)
+            or self._active_training_reservation_id
+        ):
+            return None
+        parameters = dict(self.model.named_parameters())
+        if any(
+            (export and p.device.type != "cpu")
+            or callable(getattr(p, "to_local", None))
+            for p in parameters.values()
+        ):
+            return None
+        parameter_names = {id(p): name for name, p in parameters.items()}
+        groups = [
+            [parameter_names[id(p)] for p in group["params"]]
+            for group in self.optimizer.param_groups
+        ]
+        optimizer = self.optimizer.state_dict()
+        buffers = {
+            f"{prefix}.{name}".lstrip("."): buffer
+            for prefix, module in self.model.named_modules()
+            for name, buffer in module._buffers.items()
+            if buffer is not None and name not in module._non_persistent_buffers_set
+        }
+        snapshots = self._target_lm_head_snapshots
+        replay = {
+            "buffer": self.data_buffer,
+            "collected": self.collected_data,
+            "sessions": getattr(self, "_training_replay_sessions", {}),
+        }
+
+        def tensor_bytes(value):
+            if torch.is_tensor(value):
+                if export and value.device.type != "cpu":
+                    raise RuntimeError("Writer migration requires CPU training state")
+                return value.numel() * value.element_size()
+            if isinstance(value, dict):
+                return sum(tensor_bytes(v) for v in value.values())
+            if isinstance(value, (list, tuple, deque)):
+                return sum(tensor_bytes(v) for v in value)
+            return 0
+
+        size = (
+            tensor_bytes(parameters)
+            + tensor_bytes(buffers)
+            + tensor_bytes(optimizer)
+            + tensor_bytes(snapshots)
+            + tensor_bytes(self.data_buffer.get_all_data())
+        )
+        if not export:
+            return {
+                "bytes": size,
+                "optimizer_steps": self.optimizer_steps_total,
+                "device_resident": self._training_device_resident,
+            }
+        return {
+            "parameters": {name: p.detach().clone() for name, p in parameters.items()},
+            "buffers": {
+                name: buffer.detach().cpu().clone() for name, buffer in buffers.items()
+            },
+            "optimizer": deepcopy(optimizer),
+            "optimizer_names": groups,
+            "optimizer_type": type(self.optimizer).__qualname__,
+            "scheduler_type": type(self.lr_scheduler).__qualname__,
+            "lr_scheduler": deepcopy(self.lr_scheduler.state_dict())
+            if self.lr_scheduler
+            else None,
+            "optimizer_steps": self.optimizer_steps_total,
+            "training_steps": self.training_steps,
+            "last_checkpoint_step": getattr(self, "_last_ckpt_step", -1),
+            "replay": deepcopy(replay),
+            "heads": deepcopy(snapshots),
+            "buffer_version": self.buffer_version,
+            "bytes": size,
+        }
+
+    def validate_writer_state(self, state) -> None:
+        if (
+            self._training_active
+            or self._training_device_resident
+            or self._active_training_reservation_id
+        ):
+            raise RuntimeError(
+                "Destination writer must be parked with no active reservation"
+            )
+        parameters = dict(self.model.named_parameters())
+        if parameters.keys() != state["parameters"].keys():
+            raise RuntimeError("Writer parameter names differ")
+        for name, p in parameters.items():
+            source = state["parameters"][name]
+            if (
+                p.device.type != "cpu"
+                or p.shape != source.shape
+                or p.dtype != source.dtype
+            ):
+                raise RuntimeError(f"Writer shard layout differs: {name}")
+        names = {id(p): name for name, p in parameters.items()}
+        if [
+            [names[id(p)] for p in group["params"]]
+            for group in self.optimizer.param_groups
+        ] != state["optimizer_names"]:
+            raise RuntimeError("Writer optimizer parameter ordering differs")
+        if (
+            type(self.optimizer).__qualname__ != state["optimizer_type"]
+            or type(self.lr_scheduler).__qualname__ != state["scheduler_type"]
+        ):
+            raise RuntimeError("Writer optimizer or scheduler types differ")
+        buffers = dict(self.model.named_buffers())
+        for name, source in state["buffers"].items():
+            if (
+                name not in buffers
+                or buffers[name].shape != source.shape
+                or buffers[name].dtype != source.dtype
+            ):
+                raise RuntimeError(f"Writer buffer layout differs: {name}")
+
+    def load_writer_state(self, state) -> None:
+        self.validate_writer_state(state)
+        with torch.no_grad():
+            for name, p in self.model.named_parameters():
+                p.copy_(state["parameters"][name])
+            buffers = dict(self.model.named_buffers())
+            for name, source in state["buffers"].items():
+                buffers[name].copy_(source)
+        self.optimizer.load_state_dict(deepcopy(state["optimizer"]))
+        if self.lr_scheduler is not None and state["lr_scheduler"] is not None:
+            self.lr_scheduler.load_state_dict(state["lr_scheduler"])
+        self.optimizer_steps_total = int(state["optimizer_steps"])
+        self.training_steps = int(state["training_steps"])
+        self._last_ckpt_step = int(state.get("last_checkpoint_step", -1))
+        # Detach long-lived replay tensors from the migration ObjectRef; a
+        # small hidden-state view must not pin the entire optimizer payload.
+        replay = deepcopy(state["replay"])
+        self.data_buffer = replay["buffer"]
+        self.collected_data = replay["collected"]
+        self._training_replay_sessions = replay["sessions"]
+        self._target_lm_head_snapshots = deepcopy(state["heads"])
+        self._applied_target_lm_head_weight_step = None
+        self.buffer_version = int(state["buffer_version"])
+        self._mark_buffer_changed()

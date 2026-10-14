@@ -48,6 +48,10 @@ class ConservativeTrainingDataStatusPolicy:
             }
             if s.trainable_valid_tokens:
                 snapshot["trainable_valid_tokens"] = s.trainable_valid_tokens
+            if s.min_sample_step is not None:
+                snapshot["min_sample_step"] = s.min_sample_step
+            if s.max_sample_step is not None:
+                snapshot["max_sample_step"] = s.max_sample_step
             worker_snapshots[s.worker_id] = snapshot
         return TrainingDataStatus(
             current_step=_as_int(global_step),
@@ -76,4 +80,12 @@ class ConservativeTrainingDataStatusPolicy:
             buffer_version=min(s.buffer_version for s in statuses),
             worker_snapshots=worker_snapshots,
             trainable_valid_tokens=min(s.trainable_valid_tokens for s in statuses),
+            min_sample_step=min(
+                (s.min_sample_step for s in statuses if s.min_sample_step is not None),
+                default=None,
+            ),
+            max_sample_step=max(
+                (s.max_sample_step for s in statuses if s.max_sample_step is not None),
+                default=None,
+            ),
         )
