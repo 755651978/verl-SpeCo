@@ -525,19 +525,17 @@ def test_megatron_example_uses_shared_manual_workflow() -> None:
     assert "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh" in options
 
 
-def test_npu_smoke_split_and_trigger_scope() -> None:
+def test_npu_examples_run_without_smoke_dependency() -> None:
     workflow = _workflow("npu_vllm_unit_tests.yml")
-    assert workflow["jobs"]["example"]["needs"] == "hccl-smoke"
-    hccl = str(workflow["jobs"]["hccl-smoke"])
-    assert "npu_hccl_smoke.py" in hccl
-    assert "eagle1_gpu_smoke.py" not in hccl
-    assert "upstream-verl" not in hccl
+    assert set(workflow["jobs"]) == {"example"}
+    assert "needs" not in workflow["jobs"]["example"]
+    entries = workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
+    assert {entry["drafter"] for entry in entries} == {"eagle3", "dflash", "dspark"}
     for event in ("pull_request", "push"):
         paths = workflow["on"][event]["paths"]
         assert "ci/**" not in paths
         assert "ci/run_example_test.sh" in paths
         assert "ci/check_result.py" in paths
-        assert "ci/npu_hccl_smoke.py" in paths
 
 
 

@@ -4,7 +4,7 @@ The repository uses five CI workflow layers:
 
 - `cpu_unit_tests.yml`: required PR checks without installing this repository or using accelerator runtimes.
 - `gpu_drafter_training_smoke.yml`: manual-only standalone drafter training smoke tests on GPU.
-- `npu_vllm_unit_tests.yml`: PR, push, and manual NPU examples plus HCCL tests.
+- `npu_vllm_unit_tests.yml`: PR, push, and manual NPU EAGLE3, DFlash and DSpark examples.
 - `examples_e2e_manual.yml`: unified GPU/NPU manual entry for all 21 example scripts, automatically routed to its runner.
 - `pr_e2e_comments.yml`: PR comment requests and maintainer approval for the unified manual entry.
 
@@ -23,15 +23,14 @@ NPU vLLM pull requests and pushes to `main` run three example lanes:
 - FSDP2 + DFlash
 - FSDP2 + DSpark
 
-Examples wait for the lightweight two-card HCCL smoke. It needs neither a
-model cache nor upstream verl, and checks synchronized gradients, parameter
-updates, and model/AdamW checkpoint resume with a small linear model.
+The three example jobs start without a prerequisite smoke job. They run one at
+a time (`max-parallel: 1`); a failure does not cancel the other examples.
 NPU standalone EAGLE1/EAGLE2 training has no dedicated workflow for now.
 Megatron + EAGLE3 runs through `examples_e2e_manual.yml` by selecting
 `examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh`;
 provide compatible 4B model paths in `environment_json`.
 
-NPU trigger paths list the example runner, result checker, and HCCL script
+NPU trigger paths list the example runner, result checker, and shared profile
 explicitly; changes only to CPU CI requirements do not trigger NPU tests.
 Online GPU and NPU examples upload result JSON, combined stdout/stderr logs, and elapsed-time/
 exit-code JSON even on failure. `pipefail` preserves example failure through
@@ -222,7 +221,7 @@ To test the hardware workflows on GitHub, open Actions and choose one of:
 
 - `examples_e2e_manual` (individual GPU/NPU examples)
 - `gpu_drafter_training_smoke` (standalone GPU training)
-- `npu_vllm_unit_tests` (NPU vLLM matrix and HCCL)
+- `npu_vllm_unit_tests` (NPU vLLM example matrix)
 
 Run the selected workflow without inputs after preparing the default paths
 above. Fill the manual inputs only when you want to override the defaults for
