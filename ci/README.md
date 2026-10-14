@@ -1,15 +1,13 @@
 # CI layers
 
-The repository uses nine workflow layers:
+The repository uses seven workflow layers:
 
 - `cpu_unit_tests.yml`: required PR checks without installing this repository or using accelerator runtimes.
 - `gpu_vllm_unit_tests.yml`: manual-only vLLM example-script runs on GPU.
 - `gpu_sglang_unit_tests.yml`: manual-only SGLang example-script runs on GPU.
 - `gpu_drafter_training_smoke.yml`: manual-only standalone drafter training smoke tests on GPU.
-- `npu_vllm_unit_tests.yml`: PR, push, and manual NPU examples plus standalone/HCCL tests.
+- `npu_vllm_unit_tests.yml`: PR, push, and manual NPU examples plus HCCL tests.
 - `examples_e2e_manual.yml`: select any of the 21 example scripts, automatically routed to its GPU/NPU runner.
-- `npu_standalone_training_manual.yml`: manual-only EAGLE1/EAGLE2 standalone training; requires a cached target model path.
-- `npu_megatron_example_manual.yml`: manual-only Megatron + EAGLE3 example with the same strict training/result checks.
 - `npu_sglang_unit_tests.yml`: manual-only SGLang example-script runs on NPU.
 
 The hardware workflows require self-hosted runner labels:
@@ -30,8 +28,10 @@ NPU vLLM pull requests and pushes to `main` run three example lanes:
 Examples wait for the lightweight two-card HCCL smoke. It needs neither a
 model cache nor upstream verl, and checks synchronized gradients, parameter
 updates, and model/AdamW checkpoint resume with a small linear model.
-EAGLE1/EAGLE2 standalone training is manual-only in its own workflow, so PR
-examples no longer wait for its repeated target-model loads.
+NPU standalone EAGLE1/EAGLE2 training has no dedicated workflow for now.
+Megatron + EAGLE3 runs through `examples_e2e_manual.yml` by selecting
+`examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh`;
+provide compatible 4B model paths in `environment_json`.
 
 NPU trigger paths list the example runner, result checker, and HCCL script
 explicitly; changes only to CPU CI requirements do not trigger NPU tests.
@@ -348,3 +348,17 @@ Explicit environment overrides win over repository/environment variables, then
 the shared defaults apply. Explicit manual Hydra overrides are appended last.
 Algorithm-specific scripts, device topology and runtime selection are preserved.
 Separate-training profiles and checkpoint tests remain unchanged.
+
+
+The standard NPU vLLM EAGLE3, DFlash and DSpark manual/comment cases reuse
+`ci/run_example_test.sh`, just like automatic PR runs. Their defaults are eight
+NPUs, rollout TP=1 and actor/ref SP=1, with the same algorithm-specific overrides,
+communication setup and strict result checks. GitHub SPECO variables supply
+configuration; `environment_json` overrides variables and explicit `hydra_args`
+are applied last. Other examples retain their own backend-specific settings;
+4B, DFlash2 and separate-training cases still require compatible assets.
+
+Automatic and manual runners share SPECO variable resolution: nonempty process
+values take priority over GitHub variables, and explicit manual environment
+settings take priority over both. Result validation uses the final Hydra training
+switch, including overrides supplied through `hydra_args`.

@@ -22,10 +22,42 @@ import re
 import subprocess
 import time
 
-from verl_speco.integration.ci_result import validate_result
-
-
 ROOT = Path(__file__).resolve().parents[1]
+AUTOMATIC_NPU_CASES = {
+    f"examples/run_qwen3-8b_drafter_{algorithm}_vllm_npu.sh": algorithm
+    for algorithm in ("eagle3", "dflash", "dspark")
+}
+
+
+
+def configured_environment(environment):
+    """Merge trusted GitHub CI variables; explicit process values take priority."""
+    env = dict(environment)
+    variables = json.loads(env.get("SPECO_CI_VARIABLES_JSON", "{}"))
+    for key, value in variables.items():
+        if re.fullmatch(r"SPECO_[A-Z0-9_]+", key) and isinstance(value, str) and value:
+            if not env.get(key):
+                env[key] = value
+    return env
+
+
+def command_for(example, env, args):
+    if example not in AUTOMATIC_NPU_CASES:
+        return ["bash", example, *args]
+    for source, target in {
+        "MODEL_PATH": "SPECO_TARGET_MODEL",
+        "DRAFTER_PATH": "SPECO_" + AUTOMATIC_NPU_CASES[example].upper() + "_DRAFT_MODEL",
+        "TRAIN_FILE": "SPECO_TRAIN_FILE",
+        "TEST_FILE": "SPECO_TEST_FILE",
+        "CKPTS_DIR": "SPECO_CKPT_DIR",
+    }.items():
+        if env.get(source):
+            env[target] = env[source]
+    env.setdefault("SPECO_ACCELERATOR_COUNT", "8")
+    env.setdefault("SPECO_TENSOR_PARALLEL_SIZE", "1")
+    env.setdefault("SPECO_SEQUENCE_PARALLEL_SIZE", "1")
+    env["SPECO_EXTRA_HYDRA_ARGS"] = "\n".join(args)
+    return ["bash", "ci/run_example_test.sh", "npu", "vllm", AUTOMATIC_NPU_CASES[example]]
 
 
 def prepare(example, settings, hydra_args, output):
@@ -41,7 +73,8 @@ def prepare(example, settings, hydra_args, output):
         raise ValueError(
             "environment_json must contain environment variable names and string values"
         )
-    env = {**os.environ, **settings}
+    env = configured_environment(os.environ)
+    env.update(settings)
     env.setdefault("TRAIN_LOGGERS", '["console"]')
     online = "separate_training" not in example
     if online:
@@ -59,14 +92,14 @@ def prepare(example, settings, hydra_args, output):
             )
             defaults["DRAFTER_PATH"] = algorithm + "_DRAFT_MODEL"
         for key, default_key in defaults.items():
-            value = env.get("SPECO_DEFAULT_" + default_key)
+            value = env.get("SPECO_" + default_key) or env.get("SPECO_DEFAULT_" + default_key)
             if value:
                 env.setdefault(key, value)
     source = (ROOT / example).read_text(encoding="utf-8")
     missing = []
     for key in re.findall(r"^\w+=\$\{(\w+):-/path/", source, re.MULTILINE):
         if key.endswith("CKPTS_DIR") or key in {"CKPTS_DIR", "FEATURE_STORE_DIR"}:
-            env.setdefault(key, str(output / key.lower()))
+            env.setdefault(key, env.get("SPECO_CKPT_DIR", str(output / key.lower())))
         if not env.get(key) or env[key].startswith("/path/"):
             missing.append(key)
     if missing:
@@ -85,7 +118,11 @@ def prepare(example, settings, hydra_args, output):
             env[key] = value
             defaults.append(spec["key"] + "=" + value)
         # Explicit Hydra arguments are last and retain priority.
-        args = defaults + args
+        if example in AUTOMATIC_NPU_CASES:
+            extra = env.get("SPECO_EXTRA_HYDRA_ARGS", "")
+            args = defaults + [line.strip() for line in extra.splitlines() if line.strip()] + args
+        else:
+            args = defaults + args
         if manifest[example] == "npu" and "eagle3" in example:
             env.setdefault("SPECO_EAGLE3_DISABLE_TORCH_COMPILE", "true")
     online = "separate_training" not in example
@@ -111,7 +148,7 @@ def main():
         result_path.unlink(missing_ok=True)
         with (output / "example.log").open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
-                ["bash", example, *args],
+                command_for(example, env, args),
                 cwd=ROOT,
                 env=env,
                 stdout=subprocess.PIPE,
@@ -128,11 +165,17 @@ def main():
         if code:
             raise RuntimeError(f"Example exited with code {code}")
         if online:
-            training = True
             key = "actor_rollout_ref.rollout.drafter.enable_drafter_training="
-            for arg in args:
+            check_args = (
+                env.get("SPECO_EXTRA_HYDRA_ARGS", "").splitlines()
+                if example in AUTOMATIC_NPU_CASES else args
+            )
+            training = env.get("SPECO_ENABLE_TRAINING", "true").lower() == "true"
+            for arg in check_args:
                 if arg.startswith(key):
                     training = arg[len(key) :].lower() == "true"
+            from verl_speco.integration.ci_result import validate_result
+
             validate_result(
                 json.loads(result_path.read_text(encoding="utf-8")), training=training
             )

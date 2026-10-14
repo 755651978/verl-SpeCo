@@ -252,3 +252,60 @@ def test_separate_training_does_not_receive_online_profile(tmp_path):
         "examples/run_qwen3-8b_drafter_separate_training.sh", settings, "", tmp_path
     )
     assert not online and args == []
+
+
+@pytest.mark.parametrize("algorithm", ["eagle3", "dflash", "dspark"])
+def test_standard_npu_manual_reuses_automatic_runner(algorithm, tmp_path, monkeypatch):
+    from ci.run_manual_example import command_for
+
+    monkeypatch.setenv("SPECO_CI_VARIABLES_JSON", json.dumps({
+        "SPECO_ACCELERATOR_COUNT": "4",
+        "SPECO_TENSOR_PARALLEL_SIZE": "2",
+        "SPECO_SEQUENCE_PARALLEL_SIZE": "1",
+        "SPECO_TOTAL_TRAINING_STEPS": "6",
+        "SPECO_TARGET_MODEL": "/models/from-environment",
+    }))
+    example = f"examples/run_qwen3-8b_drafter_{algorithm}_vllm_npu.sh"
+    env, args, online = prepare(example, {
+        "DRAFTER_PATH": "/models/draft", "TRAIN_FILE": "/data/train",
+        "TEST_FILE": "/data/test", "SPECO_TENSOR_PARALLEL_SIZE": "1",
+    }, "trainer.total_training_steps=9", tmp_path)
+    assert online
+    assert command_for(example, env, args) == [
+        "bash", "ci/run_example_test.sh", "npu", "vllm", algorithm,
+    ]
+    assert env["SPECO_TARGET_MODEL"] == "/models/from-environment"
+    assert env["SPECO_ACCELERATOR_COUNT"] == "4"
+    assert env["SPECO_TENSOR_PARALLEL_SIZE"] == "1"
+    assert env["SPECO_EXTRA_HYDRA_ARGS"].splitlines()[-1] == "trainer.total_training_steps=9"
+    assert "trainer.total_training_steps=6" in env["SPECO_EXTRA_HYDRA_ARGS"]
+
+
+def test_standard_npu_manual_default_parallelism(tmp_path):
+    from ci.run_manual_example import command_for
+
+    env = {"MODEL_PATH": "/m", "DRAFTER_PATH": "/d", "CKPTS_DIR": str(tmp_path)}
+    command_for("examples/run_qwen3-8b_drafter_eagle3_vllm_npu.sh", env, [])
+    assert env["SPECO_ACCELERATOR_COUNT"] == "8"
+    assert env["SPECO_TENSOR_PARALLEL_SIZE"] == "1"
+    assert env["SPECO_SEQUENCE_PARALLEL_SIZE"] == "1"
+
+
+def test_ci_variable_resolution_preserves_overrides_and_multiline_values():
+    from ci.run_manual_example import configured_environment
+
+    variables = {
+        "SPECO_DSPARK_SPEC_STEPS": "2",
+        "SPECO_DRAFT_TENSOR_PARALLEL_SIZE": "2",
+        "SPECO_EXTRA_HYDRA_ARGS": "trainer.total_epochs=2\ntrainer.total_training_steps=3",
+        "SPECO_INVALID-NAME": "bad",
+        "OTHER": "ignored",
+    }
+    env = configured_environment({
+        "SPECO_CI_VARIABLES_JSON": json.dumps(variables),
+        "SPECO_DRAFT_TENSOR_PARALLEL_SIZE": "1",
+    })
+    assert env["SPECO_DSPARK_SPEC_STEPS"] == "2"
+    assert env["SPECO_DRAFT_TENSOR_PARALLEL_SIZE"] == "1"
+    assert env["SPECO_EXTRA_HYDRA_ARGS"] == variables["SPECO_EXTRA_HYDRA_ARGS"]
+    assert "OTHER" not in env and "SPECO_INVALID-NAME" not in env

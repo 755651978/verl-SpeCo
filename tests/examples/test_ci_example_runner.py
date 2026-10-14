@@ -385,6 +385,7 @@ def _dry_run(
     backend: str = "vllm",
     accelerator_count: str = "1",
     extra_hydra_args: str | None = None,
+    ci_variables: str | None = None,
 ) -> str:
     """Dump the Hydra overrides the runner would pass, without launching a job."""
     bash = _require_working_bash()
@@ -401,6 +402,8 @@ def _dry_run(
     }
     if extra_hydra_args is not None:
         env["SPECO_EXTRA_HYDRA_ARGS"] = extra_hydra_args
+    if ci_variables is not None:
+        env["SPECO_CI_VARIABLES_JSON"] = ci_variables
     script = "".join(
         f"export {name}={shlex.quote(value)}\n" for name, value in env.items()
     )
@@ -518,12 +521,11 @@ def test_separate_training_example_takes_its_device_count_from_the_env() -> None
     assert "draft_train_gpus_per_node=${DRAFT_TRAIN_GPUS_PER_NODE:-8}" in example
 
 
-def test_megatron_example_is_manual_only() -> None:
-    workflow = _workflow("npu_megatron_example_manual.yml")
+def test_megatron_example_uses_shared_manual_workflow() -> None:
+    workflow = _workflow("examples_e2e_manual.yml")
     assert set(workflow["on"]) == {"workflow_dispatch"}
-    entries = workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
-    assert [entry["drafter"] for entry in entries] == ["megatron-eagle3"]
-    assert "needs" not in workflow["jobs"]["example"]
+    options = workflow["on"]["workflow_dispatch"]["inputs"]["example"]["options"]
+    assert "examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm_npu.sh" in options
 
 
 def test_npu_smoke_split_and_trigger_scope() -> None:
@@ -539,10 +541,7 @@ def test_npu_smoke_split_and_trigger_scope() -> None:
         assert "ci/run_example_test.sh" in paths
         assert "ci/check_result.py" in paths
         assert "ci/npu_hccl_smoke.py" in paths
-    standalone = _workflow("npu_standalone_training_manual.yml")
-    assert set(standalone["on"]) == {"workflow_dispatch"}
-    source = _workflow_source("npu_standalone_training_manual.yml")
-    assert "--algorithm EAGLE1" in source and "--algorithm EAGLE2" in source
+
 
 
 @pytest.mark.parametrize("platform", ["gpu", "npu"])
@@ -571,3 +570,30 @@ def test_online_log_capture_preserves_failure_and_timing(platform: str) -> None:
         timing = json.loads(Path(str(result) + ".timing.json").read_text())
         assert timing["exit_code"] == 7
         assert timing["elapsed_seconds"] >= 0
+
+
+@pytest.mark.parametrize("initial,overrides,expected", [
+    ("true", ["False"], "false"),
+    ("false", ["True"], "true"),
+    ("true", ["False", "True", "False"], "false"),
+])
+def test_result_check_uses_final_hydra_training_mode(initial, overrides, expected):
+    bash = _require_working_bash()
+    mode_logic = _runner_script().split("# Match the mode actually passed to Hydra")[1]
+    mode_logic = mode_logic[mode_logic.index("for override"):].split('if [[ "${SPECO_DRY_RUN')[0]
+    arguments = ["actor_rollout_ref.rollout.drafter.enable_drafter_training=" + value for value in overrides]
+    script = "enable_training=" + initial + "\noverrides=(" + " ".join(map(shlex.quote, arguments)) + ")\n"
+    script += mode_logic + '\nprintf "%s" "$enable_training"\n'
+    result = subprocess.run([bash, "-s"], input=script.encode("utf-8"), capture_output=True, check=True)
+    assert result.stdout.decode("utf-8") == expected
+
+
+def test_automatic_runner_reads_algorithm_variables_from_github():
+    import json
+
+    stdout = _dry_run("dspark", platform="npu", ci_variables=json.dumps({
+        "SPECO_DSPARK_SPEC_STEPS": "2",
+        "SPECO_DRAFT_TENSOR_PARALLEL_SIZE": "2",
+    }))
+    assert "drafter.rollout.spec_steps=2" in stdout
+    assert "drafter.vllm.draft_tensor_parallel_size=2" in stdout
