@@ -31,7 +31,8 @@ function fixture() {
     context.payload.comment = {id: 300, body: '/ci approve 100', user: {id: 2, login: 'maintainer', type: 'User'}};
   };
   return {run, approve, context, pr, comments, dispatched, original,
-    setPermission: value => {permission = value;}};
+    setPermission: value => {permission = value;},
+    failPermission: status => {github.rest.repos.getCollaboratorPermissionLevel = async () => {throw Object.assign(new Error("lookup failed"), {status});};}};
 }
 
 test('commands are exact and cannot contain extra shell text', () => {
@@ -73,4 +74,31 @@ test('unknown cases and non-PR comments never dispatch', async () => {
   await f.run(); assert.match(f.comments.at(-1).body, /unknown case/);
   delete f.context.payload.issue.pull_request;
   await f.run(); assert.equal(f.dispatched.length, 0);
+});
+
+
+test('author requests do not require collaborator lookup even if it would return 404', async () => {
+  const f = fixture(); f.failPermission(404); await f.run();
+  assert.match(f.comments.at(-1).body, /\/ci approve 100/);
+  assert.equal(f.dispatched.length, 0);
+});
+
+test('permission lookup errors deny approval and outsider requests with a reply', async () => {
+  for (const status of [404, 403, 500]) {
+    for (const action of ['run', 'approve']) {
+      const f = fixture(); await f.run();
+      if (action === 'approve') f.approve();
+      else f.context.payload.comment = {id: 400, body: '/ci run eagle3', user: {id: 3, login: 'outsider', type: 'User'}};
+      f.failPermission(status); await f.run();
+      assert.equal(f.dispatched.length, 0);
+      assert.match(f.comments.at(-1).body, /could not verify maintainer permission/);
+    }
+  }
+});
+
+test('PR authors cannot approve their own request without maintainer permission', async () => {
+  const f = fixture(); await f.run();
+  f.context.payload.comment = {id: 400, body: '/ci approve 100', user: f.pr.user};
+  await f.run(); assert.equal(f.dispatched.length, 0);
+  assert.match(f.comments.at(-1).body, /approval requires/);
 });

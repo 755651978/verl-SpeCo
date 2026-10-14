@@ -25,10 +25,18 @@ async function handle({github, context, cases, settings = {}}) {
   const reply = body => github.rest.issues.createComment({...scope, body});
   const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: scope.issue_number});
   if (pr.state !== 'open' || !pr.head.repo) return reply('CI: PR must be open with an available head repository.');
-  const {data: permission} = await github.rest.repos.getCollaboratorPermissionLevel({
-    ...context.repo, username: event.comment.user.login,
-  });
-  const maintainer = ['admin', 'maintain', 'write'].includes(permission.permission);
+  const authorRequest = command.action === 'run' && event.comment.user.id === pr.user.id;
+  let maintainer = false;
+  if (!authorRequest) {
+    try {
+      const {data: permission} = await github.rest.repos.getCollaboratorPermissionLevel({
+        ...context.repo, username: event.comment.user.login,
+      });
+      maintainer = ['admin', 'maintain', 'write'].includes(permission.permission);
+    } catch (error) {
+      return reply('CI: could not verify maintainer permission; no test was started. Please retry or ask a maintainer.');
+    }
+  }
   if (command.action === 'run') {
     if (event.comment.user.id !== pr.user.id && !maintainer) return reply('CI: only the PR author or a maintainer may request tests.');
     const example = cases[command.argument];

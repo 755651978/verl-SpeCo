@@ -10,6 +10,7 @@ permissions:
 concurrency:
   group: pr-e2e-requests-${{ github.event.issue.number }}
   cancel-in-progress: false
+  queue: max
 jobs:
   request:
     if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/ci ')
