@@ -6268,6 +6268,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 training_plan.source_global_step,
             )
             raise
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_workers(outcome.raw_results)
+            self._speco_ci_result.record_metrics(outcome.metrics)
         return outcome.trained, dict(outcome.metrics)
 
     def _speco_poll_pending_drafter_training(
@@ -6279,6 +6282,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             runtime_state=runtime_state
         )
         if outcome is not None and training_plan is not None:
+            if getattr(self, "_speco_ci_result", None) is not None:
+                self._speco_ci_result.record_workers(outcome.raw_results)
+                self._speco_ci_result.record_metrics(outcome.metrics)
             self._speco_release_rollout_training_lease(training_plan)
             self._speco_last_known_trainable_batches = None
             logger.info(
@@ -6302,6 +6308,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             runtime_state=runtime_state
         )
         if outcome is not None and training_plan is not None:
+            if getattr(self, "_speco_ci_result", None) is not None:
+                self._speco_ci_result.record_workers(outcome.raw_results)
+                self._speco_ci_result.record_metrics(outcome.metrics)
             self._speco_release_rollout_training_lease(training_plan)
             self._speco_last_known_trainable_batches = None
             logger.warning(
@@ -6326,11 +6335,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # tensors back on CPU, so every group can later restore its model
             # without reading checkpoints inside a short idle lease.
             scheduler = self._speco_get_drafter_scheduler()
-            scheduler.activate_training_workers()
+            results = scheduler.activate_training_workers()
+            if getattr(self, "_speco_ci_result", None) is not None:
+                self._speco_ci_result.record_workers(results)
             scheduler._idle_worker_bootstrapped = True
             logger.info("[BubbleTime] CPU bootstrap completed before fit")
             return
-        self._speco_get_drafter_scheduler().activate_training_workers()
+        results = self._speco_get_drafter_scheduler().activate_training_workers()
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_workers(results)
 
     def _speco_validate_bubble_publish_acks(
         self, acknowledgements, source_version, *, staged=False
@@ -6735,7 +6748,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 f"attempted={publish_outcome.attempted}",
                 flush=True,
             )
-        return dict(event.metrics or {})
+        metrics = dict(event.metrics or {})
+        if getattr(self, "_speco_ci_result", None) is not None:
+            self._speco_ci_result.record_metrics(metrics)
+        return metrics
 
     def _speco_update_output_metrics(self, output: Any, metrics: dict[str, Any]):
         if not metrics:
@@ -6857,6 +6873,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         ):
             data = dict(data)
             data.update(latest_rollout_metrics)
+        if (
+            getattr(self, "_speco_ci_result", None) is not None
+            and isinstance(data, dict)
+            and "training/global_step" in data
+        ):
+            self._speco_ci_result.record_metrics(
+                {"training/global_step": data["training/global_step"]}
+            )
         data = _speco_move_drafter_timing_next_to_update_actor(data)
         if isinstance(data, dict):
             data.update(self._speco_freeze_metrics())
@@ -8058,6 +8082,25 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return drafter_enabled and training_enabled
 
     def fit(self):
+        result_path = os.getenv("SPECO_CI_RESULT_PATH")
+        if not result_path:
+            return self._speco_fit_impl()
+        from verl_speco.integration.ci_result import CIResult
+
+        self._speco_ci_result = CIResult(self.is_drafter_training_enabled(self.config))
+        try:
+            result = self._speco_fit_impl()
+            self._speco_ci_result.data["completed"] = True
+            return result
+        except BaseException as error:
+            self._speco_ci_result.data["errors"].append(
+                {"type": type(error).__name__, "message": str(error)}
+            )
+            raise
+        finally:
+            self._speco_ci_result.write(result_path)
+
+    def _speco_fit_impl(self):
         try:
             if self.is_drafter_training_enabled(self.config):
                 self._speco_activate_drafter_training_model_before_fit()

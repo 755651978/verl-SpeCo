@@ -631,6 +631,10 @@ def test_bubble_preparation_failure_participates_in_readiness(local_error):
     worker._sync_batch_readiness = lambda flag: flags.append(flag) or False
     assert worker._prepare_training_batch_for_step() is None
     assert flags == [not local_error]
+    if local_error:
+        assert worker.last_training_error["type"] == "MemoryError"
+    else:
+        assert getattr(worker, "last_training_error", None) is None
 
 
 def _status_trainer(
@@ -836,6 +840,7 @@ def test_streamed_accumulation_discards_partial_gradients_on_peer_failure():
     )
     worker = cls()
     worker._bubble_time_enabled = True
+    worker.last_training_error = {"type": "StaleError", "message": "prior plan"}
     worker._last_prepared_training_items = [{"id": 1}]
     worker.prepare_training_batch = lambda: object()
     ready_calls = []
@@ -857,6 +862,57 @@ def test_streamed_accumulation_discards_partial_gradients_on_peer_failure():
     assert len(ready_calls) == 2
     assert gradients == []
     assert worker._active_accumulation_item_ids == set()
+    assert worker.last_training_error is None
+
+
+@pytest.mark.parametrize("mode", ["poll", "wait"])
+def test_bubble_async_completion_preserves_main_ci_evidence(mode):
+    from verl_speco.integration.ci_result import CIResult
+
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {
+            "_speco_poll_pending_drafter_training",
+            "_speco_wait_pending_drafter_training",
+        },
+    )
+    driver = cls()
+    plan = SimpleNamespace(
+        source_global_step=4,
+        plan_id="quota-4",
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+    )
+    outcome = SimpleNamespace(
+        trained=True,
+        successful_steps=2,
+        elapsed_sec=0.5,
+        reason="trained",
+        raw_results=[{"errors": [{"type": "TestError", "message": "test evidence"}]}],
+        metrics={"drafter/trained": 1, "drafter/train_successful_steps_max": 2},
+    )
+    results = [outcome, None]
+
+    def complete(**kwargs):
+        return results.pop(0)
+
+    driver._speco_get_drafter_scheduler = lambda: SimpleNamespace(
+        poll_pending_training=complete, wait_pending_training=complete
+    )
+    driver._speco_get_drafter_runtime_state = lambda: SimpleNamespace(active_plan=plan)
+    driver._speco_ci_result = CIResult(training=True)
+    released = []
+    driver._speco_release_rollout_training_lease = lambda p: released.append(p.plan_id)
+    method = (
+        driver._speco_poll_pending_drafter_training
+        if mode == "poll"
+        else driver._speco_wait_pending_drafter_training
+    )
+    assert method() == (plan, outcome)
+    assert method() == (plan, None)
+    assert released == ["quota-4"]
+    assert driver._speco_ci_result.data["optimizer_steps"] == 2
+    assert driver._speco_ci_result.data["errors"] == outcome.raw_results[0]["errors"]
 
 
 def _freeze_publish_driver(*, bubble=True, asynchronous=True, failure=None):

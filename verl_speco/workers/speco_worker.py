@@ -1444,6 +1444,15 @@ class SpecoWorker(Worker):
             start_ts = time.time()
             activation_ts = time.time()
             result["activated"] = bool(await self.trainer.activate_training_model())
+            if not result["activated"]:
+                result["errors"] = [
+                    getattr(
+                        self.trainer,
+                        "last_activation_error",
+                        None,
+                    )
+                    or {"type": "ActivationError", "message": "activation_failed"}
+                ]
             result["activation_elapsed_sec"] = time.time() - activation_ts
             release_ts = time.time()
             await self.trainer.release_training_memory_after_activation()
@@ -1924,6 +1933,10 @@ class SpecoWorker(Worker):
                 str(training_plan.get("plan_id", ""))
             )
             result["reason"] = "activation_failed"
+            result["errors"] = [
+                getattr(self.trainer, "last_activation_error", None)
+                or {"type": "ActivationError", "message": "activation_failed"}
+            ]
             if (
                 execution_strategy == "rollout_idle_worker"
                 and self._use_replica_local_idle_training()
@@ -2191,6 +2204,7 @@ class SpecoWorker(Worker):
             else 0,
             "attempted_steps": 0,
             "successful_valid_tokens": 0,
+            "errors": [],
             "elapsed_sec": 0.0,
             "reason": "",
             "worker_id": str(self.rank),
@@ -2547,24 +2561,38 @@ class SpecoWorker(Worker):
 
                     try:
                         optimizer_step_started = time.perf_counter()
-                        step_ok = await self.trainer.training_accumulation_step(
-                            self.last_global_step,
-                            gradient_accumulation_steps,
-                            # A Bubble step is atomic: never let one rank abort
-                            # accumulation while peers enter forward/backward.
-                            can_start_micro_batch=(
-                                None if coordinated_idle else can_start_micro_batch
-                            ),
-                            **{
-                                key: training_plan[key]
-                                for key in ("min_sample_step", "max_sample_step")
-                                if execution_strategy == "sync"
-                                and training_plan.get(key) is not None
-                            },
-                        )
+                        if execution_strategy == "sync":
+                            step_ok = await self.trainer.training_step(
+                                self.last_global_step,
+                                min_sample_step=training_plan.get("min_sample_step"),
+                                max_sample_step=training_plan.get("max_sample_step"),
+                            )
+                        else:
+                            step_ok = await self.trainer.training_accumulation_step(
+                                self.last_global_step,
+                                gradient_accumulation_steps,
+                                # Bubble optimizer steps stop as a whole group.
+                                can_start_micro_batch=(
+                                    None if coordinated_idle else can_start_micro_batch
+                                ),
+                            )
                     except Exception as error:  # noqa: BLE001
                         step_error = error
                         step_ok = False
+                    training_error = getattr(self.trainer, "last_training_error", None)
+                    if training_error is not None:
+                        result["errors"].append(dict(training_error))
+                    elif step_error is not None:
+                        result["errors"].append(
+                            {
+                                "type": type(step_error).__name__,
+                                "message": str(step_error),
+                            }
+                        )
+                    if not step_ok and execution_strategy == "sync":
+                        # Main's Sync path attempts the remaining batches and
+                        # retains prior errors for the CI contract checker.
+                        continue
                     if step_ok:
                         result["optimizer_step_samples_sec"].append(
                             time.perf_counter() - optimizer_step_started
@@ -2669,7 +2697,10 @@ class SpecoWorker(Worker):
                 result.update(self.trainer.get_training_metrics())
                 if result["successful_steps"] > 0:
                     publish_quota_completed = bool(
-                        result["successful_steps"] >= max_batches
+                        (
+                            execution_strategy == "sync"
+                            or result["successful_steps"] >= max_batches
+                        )
                         and not result.get("error")
                     )
                     if (

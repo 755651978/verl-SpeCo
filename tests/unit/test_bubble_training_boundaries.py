@@ -671,12 +671,23 @@ def test_completed_quota_stages_or_defers_snapshot_without_new_training(
 def test_sync_does_not_enter_idle_control(worker_class):
     worker, plan, callbacks = _prepared_worker(worker_class)
     plan["execution_strategy"] = "sync"
+    plan.update(min_sample_step=8, max_sample_step=10)
+
+    async def sync_step(step, **bounds):
+        callbacks.append(bounds)
+        worker.trainer.optimizer_steps_total += 1
+        return True
+
+    worker.trainer.training_step = sync_step
+    worker.trainer.training_accumulation_step = lambda *args, **kwargs: pytest.fail(
+        "Sync must use its original training_step entry point"
+    )
     worker._bubble_group_control_value = lambda code: pytest.fail(
         "Sync control changed"
     )
     result = asyncio.run(worker.train_drafter(plan))
     assert result["successful_steps"] == 3
-    assert all(callable(callback) for callback in callbacks)
+    assert callbacks == [{"min_sample_step": 8, "max_sample_step": 10}] * 3
 
 
 @pytest.mark.parametrize(
