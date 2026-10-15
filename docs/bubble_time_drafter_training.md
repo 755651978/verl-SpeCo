@@ -172,6 +172,14 @@ this path. Adaptive collection retains its existing writer-local
 minimum and budget policy. This aligns collection, not bitwise optimizer updates
 or end-to-end quality; those still need device validation.
 
+For the first nonempty interval-mode old-logprob collection, the scheduler
+selects the bootstrap writer before dispatch and sends the complete selected
+pool directly to that group. It does not first distribute the pool and then
+gather it again. Empty or skipped collection does not elect a writer. Selecting
+this data destination does not mark the optimizer initialized or the writer hot;
+the existing first-quota bootstrap and real-idle admission checks still apply.
+Until that bootstrap finishes, another group cannot take over its data snapshot.
+
 Initial writer election uses recent, recency-weighted observations with a
 confidence discount for sparse history instead of selecting an old p75 spike.
 This changes only the initial election score, not training admission deadlines

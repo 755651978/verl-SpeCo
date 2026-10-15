@@ -296,6 +296,7 @@ class DrafterScheduler:
         self._idle_worker_park_samples_sec: deque[float] = deque(maxlen=32)
         self._training_quota_last_registered_data_version: int | None = None
         self._idle_worker_writer_group: tuple[str, ...] | None = None
+        self._idle_worker_bootstrap_collection_group: tuple[str, ...] | None = None
         self._idle_worker_writer_state_version: int | None = None
         self._idle_worker_writer_migration_blocked: bool = False
         self._writer_boundary_migration_allowed = False
@@ -585,6 +586,33 @@ class DrafterScheduler:
         """Return the current Bubble writer group without exposing mutable state."""
 
         return self._current_idle_writer_group(assign_default=False)
+
+    def prepare_collection_writer_group(self) -> tuple[str, ...] | None:
+        """Pin the initial data destination, not initialized optimizer state.
+
+        Call only after a nonempty old-logprob sample set has been selected.
+        Routing the complete pool once avoids discarding other replicas' data
+        when the first quota is bootstrapped on a single writer group.
+        """
+
+        writer_group = self._current_idle_writer_group(assign_default=False)
+        if writer_group is not None:
+            return writer_group
+        if (
+            self._idle_worker_writer_migration_blocked
+            or self._idle_worker_writer_state_version is not None
+        ):
+            return None
+        writer_group = self._best_idle_bootstrap_group()
+        if writer_group:
+            self._idle_worker_writer_group = writer_group
+            self._idle_worker_bootstrap_collection_group = writer_group
+            logger.warning(
+                "[BubbleTime] collection_writer_selected: group=%s "
+                "reason=first_nonempty_sync_aligned_collection",
+                writer_group,
+            )
+        return writer_group
 
     def idle_checkpoint_group(self) -> tuple[str, ...] | None:
         """Return one complete group that owns the checkpoint operation."""
@@ -2665,6 +2693,23 @@ class DrafterScheduler:
         )
         for index, group in enumerate(groups):
             group = _normalize_worker_id_group(group)
+            if (
+                not writer_has_private_state
+                and writer_group is not None
+                and self._idle_worker_bootstrap_collection_group == writer_group
+                and group != writer_group
+            ):
+                # Before the first optimizer step, ownership is already fixed
+                # by collection routing. Other replicas have no copy of this
+                # quota's complete pool and cannot safely replace its writer.
+                incomplete_seen = True
+                logger.info(
+                    "[BubbleTime] idle_group_not_collection_writer group=%s "
+                    "writer_group=%s reason=bootstrap_data_owned_by_writer",
+                    group,
+                    writer_group,
+                )
+                continue
             if writer_has_private_state and group != writer_group:
                 not_prewarmed_seen = True
                 writer_state_migration_seen = True

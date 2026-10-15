@@ -4901,6 +4901,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         selected_indices = collect_mask.nonzero(as_tuple=False).flatten().tolist()
         if sync_aligned_collection:
+            if selected_indices:
+                # Pin only after selection succeeds: empty/skipped collection
+                # must not choose a writer. Keep Sync's global sample set but
+                # deliver it directly to the first quota's actual optimizer
+                # owner instead of stranding one bucket on every candidate.
+                collection_owners = self._speco_bubble_collection_owner_ranks(
+                    bootstrap=True
+                )
+                if collection_owners:
+                    routed_owner_ranks = (
+                        tuple(
+                            owner
+                            for owner in collection_owners
+                            if 0 <= owner < owner_count
+                        )
+                        or routed_owner_ranks
+                    )
             if routed_owner_ranks != tuple(range(owner_count)):
                 routing = torch.tensor(routed_owner_ranks, dtype=owner_rank.dtype)
                 owner_rank[collect_mask] = routing[
@@ -5577,7 +5594,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         dispatch_bucket_count = max(mapping_ranks) + 1
         return max(dispatch_bucket_count - 1, 1)
 
-    def _speco_bubble_collection_owner_ranks(self) -> tuple[int, ...] | None:
+    def _speco_bubble_collection_owner_ranks(
+        self, *, bootstrap: bool = False
+    ) -> tuple[int, ...] | None:
         """Route every Bubble sample to the logical single-writer group.
 
         The owner-route dispatch already transports each bucket once and fans it
@@ -5588,13 +5607,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         if not self._speco_rollout_idle_worker_enabled():
             return None
-        writer_group = self._speco_get_drafter_scheduler().target_lm_head_sync_worker_ids(
+        scheduler = self._speco_get_drafter_scheduler()
+        mapping = self._speco_owner_route_mapping()
+        if not mapping:
+            return None
+        writer_group = (
+            scheduler.prepare_collection_writer_group() if bootstrap else None
+        )
+        writer_group = writer_group or scheduler.target_lm_head_sync_worker_ids(
             full_collective_fallback=bool(
                 self._speco_drafter_schedule_config().idle_worker_full_collective_fallback
             )
         )
-        mapping = self._speco_owner_route_mapping()
-        if not writer_group or not mapping:
+        if not writer_group:
             return None
         owner_ranks: list[int] = []
         for worker_id in writer_group:

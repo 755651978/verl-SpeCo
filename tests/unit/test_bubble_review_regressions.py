@@ -1925,7 +1925,9 @@ def _collection_alignment_driver(
     driver._speco_oldlogprob_window_mode = lambda cfg: "random"
     driver._speco_oldlogprob_window_train_rows = lambda cfg: 512
     driver._speco_owner_bucket_count = lambda: owners
-    driver._speco_bubble_collection_owner_ranks = lambda: routed if bubble else ()
+    driver._speco_bubble_collection_owner_ranks = (
+        lambda **kwargs: routed if bubble else ()
+    )
     driver._speco_rollout_idle_worker_enabled = lambda: bubble
     driver._speco_drafter_schedule_config = lambda: DrafterScheduleConfig(
         training_quota_enable=True,
@@ -2000,6 +2002,116 @@ def test_interval_collection_matches_sync_before_routing(
         assert sum(actual["owner_token_counts"]) == actual["selected_count"] * 513
         if len(routed) == owners:
             assert torch.equal(actual["owner_rank"], expected["owner_rank"])
+
+
+def _bind_collection_writer(driver, *, owners, tp):
+    from collections import deque
+
+    scheduler = DrafterScheduler()
+    groups = tuple(
+        tuple(str(owner * tp + rank) for rank in range(tp)) for owner in range(owners)
+    )
+    scheduler._metadata_idle_training_groups = groups
+    scheduler._replica_idle_worker_groups = dict(enumerate(groups))
+    scheduler._replica_idle_windows_by_source = {
+        owner: {"generation_completed": deque([float(owner + 1)] * 3)}
+        for owner in range(owners)
+    }
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_bubble_collection_owner_ranks"},
+    )
+    driver._speco_get_drafter_scheduler = lambda: scheduler
+    driver._speco_owner_route_mapping = lambda: [
+        owner for owner in range(owners) for _ in range(tp)
+    ]
+    driver._speco_bubble_collection_owner_ranks = (
+        cls._speco_bubble_collection_owner_ranks.__get__(driver)
+    )
+    return scheduler, groups
+
+
+@pytest.mark.parametrize("owners,tp", [(2, 1), (2, 2), (3, 2), (4, 4)])
+@pytest.mark.parametrize("hard_ratio", [0.0, 0.375])
+def test_first_quota_writer_replay_contains_entire_sync_sample_set(
+    owners, tp, hard_ratio
+):
+    import torch
+    from verl_speco.trainer.data_buffer import DataBuffer
+    from verl_speco.trainer.scheduler.collection_adapter import _build_payload
+    from verl_speco.trainer.scheduler import DrafterCollectionSource
+
+    common = dict(owners=owners, hard_ratio=hard_ratio)
+    sync, batch = _collection_alignment_driver(bubble=False, routed=(), **common)
+    expected = sync._speco_build_oldlogprob_collect_plan(batch)
+    driver, _ = _collection_alignment_driver(bubble=True, routed=(), **common)
+    scheduler, groups = _bind_collection_writer(driver, owners=owners, tp=tp)
+    # Queries/prewarm alone still cover all candidates and do not pin ownership.
+    assert driver._speco_bubble_collection_owner_ranks() == tuple(range(owners))
+    assert scheduler.idle_writer_group() is None
+    actual = driver._speco_build_oldlogprob_collect_plan(batch)
+    indices = actual["collect_mask"].nonzero(as_tuple=False).flatten().tolist()
+    payload = _build_payload(
+        source=DrafterCollectionSource.OLD_LOGPROB,
+        samples=[{"id": i, "target_version": 5} for i in indices],
+        owners=actual["owner_rank"][actual["collect_mask"]].tolist(),
+        owner_count=owners,
+        dispatch_bucket_count=owners + 1,
+        raw_samples=len(indices),
+        collection_id="first-quota",
+    )
+    assert scheduler.idle_writer_group() == groups[-1]
+    assert scheduler._idle_worker_writer_state_version is None
+    assert not scheduler._idle_optimizer_initialized_groups
+    assert not scheduler._idle_worker_hot_prewarmed_groups
+    assert torch.equal(actual["collect_mask"], expected["collect_mask"])
+    assert torch.equal(actual["hidden_positions"], expected["hidden_positions"])
+    # Exercise the actual reservation path, not just the global collect counter.
+    worker = _head_lifecycle_worker()
+    worker.data_buffer = DataBuffer(max_size=256)
+    worker.data_buffer.update_rl_step(5)
+    for sample in payload.buckets[-2]:
+        worker.data_buffer.add_batch(sample)
+    reservation = worker.reserve_training_data(
+        plan_id="first", target_version=5, max_batches=1, retain_replay_session=True
+    )
+    expected_ids = set(
+        expected["collect_mask"].nonzero(as_tuple=False).flatten().tolist()
+    )
+    assert reservation["reserved_samples"] == len(expected_ids)
+    assert {
+        sample["id"] for sample in worker._training_replay_sessions[5]["items"]
+    } == expected_ids
+    assert all(not bucket for bucket in payload.buckets[:-2])
+    assert not payload.buckets[-1]  # Nonparticipating ranks receive no samples.
+    assert scheduler.target_lm_head_sync_worker_ids() == groups[-1]
+    scheduler._training_quota_debt_steps = 20
+    scheduler._training_quota_data_version = 5
+    assert scheduler.needs_idle_optimizer_bootstrap(
+        driver._speco_drafter_schedule_config()
+    )
+    # A later idle inversion must not silently move an existing optimizer owner.
+    scheduler._idle_worker_writer_state_version = 5
+    scheduler._replica_idle_windows_by_source[0]["generation_completed"].append(999.0)
+    assert scheduler.prepare_collection_writer_group() == groups[-1]
+
+
+def test_empty_interval_collection_does_not_pin_bootstrap_writer():
+    driver, batch = _collection_alignment_driver(bubble=True, owners=2, routed=())
+    scheduler, _ = _bind_collection_writer(driver, owners=2, tp=2)
+    batch.batch["response_mask"].zero_()
+    driver._speco_build_oldlogprob_collect_plan(batch)
+    assert scheduler.idle_writer_group() is None
+
+
+def test_adaptive_collection_does_not_elect_bootstrap_writer():
+    driver, batch = _collection_alignment_driver(
+        bubble=True, owners=2, routed=(), mode="adaptive"
+    )
+    scheduler, _ = _bind_collection_writer(driver, owners=2, tp=2)
+    driver._speco_build_oldlogprob_collect_plan(batch)
+    assert scheduler.idle_writer_group() is None
 
 
 def test_adaptive_collection_retains_existing_writer_minimum():

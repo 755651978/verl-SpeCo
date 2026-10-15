@@ -950,7 +950,63 @@ def test_initial_writer_prefers_completed_rollout_history_over_request_gaps():
     assert scheduler._best_idle_bootstrap_group() == ("1",)
 
 
-def test_first_optimizer_quota_starts_at_ready_safe_point_on_longer_group() -> None:
+def test_collection_writer_pins_data_without_initializing_optimizer():
+    scheduler = _scheduler_with_statuses(("0", "1", "2", "3"))
+    scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
+    scheduler._replica_idle_worker_groups = {0: ("0", "1"), 1: ("2", "3")}
+    scheduler._replica_idle_window_samples_sec = {
+        0: deque([0.4, 0.4, 0.4]),
+        1: deque([3.0, 3.0, 3.0]),
+    }
+    assert scheduler.prepare_collection_writer_group() == ("2", "3")
+    assert scheduler._idle_worker_writer_state_version is None
+    assert not scheduler._idle_optimizer_initialized_groups
+    assert not scheduler._idle_worker_hot_prewarmed_groups
+    now = time.time()
+    # If bootstrap is waiting for its head, an idle group with no copy of the
+    # collected pool must not steal ownership before the first optimizer step.
+    for worker_id in ("0", "1"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=0,
+                memory_released=True,
+                must_be_ready_at=now + 20.0,
+            )
+        )
+    resources = scheduler.select_idle_training_resources(_auto_idle_config(2), now=now)
+    assert not resources.available
+    assert scheduler.idle_writer_group() == ("2", "3")
+    for worker_id in ("2", "3"):
+        scheduler.on_worker_event(
+            RolloutWorkerEvent(
+                RolloutWorkerEventType.WORKER_IDLE,
+                worker_id=worker_id,
+                replica_rank=1,
+                memory_released=True,
+                must_be_ready_at=now + 10.0,
+            )
+        )
+    resources = scheduler.select_idle_training_resources(_auto_idle_config(2), now=now)
+    assert resources.available
+    assert resources.worker_ids == ("2", "3")
+
+
+def test_collection_writer_does_not_bypass_blocked_migration():
+    scheduler = DrafterScheduler()
+    scheduler._metadata_idle_training_groups = (("0",), ("1",))
+    scheduler._idle_worker_writer_group = ("0",)
+    scheduler._idle_worker_writer_migration_blocked = True
+    assert scheduler.prepare_collection_writer_group() is None
+    assert scheduler._idle_worker_writer_group == ("0",)
+    assert scheduler._idle_worker_bootstrap_collection_group is None
+
+
+@pytest.mark.parametrize("route_before_bootstrap", [False, True])
+def test_first_optimizer_quota_starts_at_ready_safe_point_on_longer_group(
+    route_before_bootstrap,
+) -> None:
     scheduler = _scheduler_with_statuses(("0", "1", "2", "3"))
     scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
     scheduler._replica_idle_worker_groups = {0: ("0", "1"), 1: ("2", "3")}
@@ -964,6 +1020,8 @@ def test_first_optimizer_quota_starts_at_ready_safe_point_on_longer_group() -> N
         training_quota_target_steps=20,
         training_quota_max_completion_lag_steps=3,
     )
+    if route_before_bootstrap:
+        assert scheduler.prepare_collection_writer_group() == ("2", "3")
     scheduler._register_training_quota_cycle(
         data_status=replace(_status("0"), data_version=2), global_step=2, config=config
     )
@@ -975,7 +1033,9 @@ def test_first_optimizer_quota_starts_at_ready_safe_point_on_longer_group() -> N
     assert plan.target_worker_ids == ("2", "3")
     assert plan.max_batches == 20 and plan.publish_after_success
     assert plan.reason == "quota_forced_completion_ready"
-    assert scheduler.idle_writer_group() is None  # Planning is not a state mutation.
+    assert scheduler.idle_writer_group() == (
+        ("2", "3") if route_before_bootstrap else None
+    )  # Planning is not a state mutation.
     scheduler._record_training_outcome(
         plan,
         TrainingOutcome(
