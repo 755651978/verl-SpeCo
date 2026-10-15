@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -527,7 +528,7 @@ def test_aborted_bubble_preflight_cleans_up_training_residency() -> None:
 
 def test_full_collective_hot_bootstrap_retains_only_selected_worker() -> None:
     selected = _worker(data_version=4)
-    selected.rank = 1
+    selected._rank = 1
     other = _worker(data_version=4)
     plan = {"hot_bootstrap_worker_ids": ("1",)}
 
@@ -739,7 +740,8 @@ def test_bubble_publish_uses_replica_local_group_leader(monkeypatch) -> None:
     worker.is_drafter_group_leader = True
     worker._last_trained_execution_strategy = "rollout_idle_worker"
     worker._last_trained_target_worker_ids = ("2", "3")
-    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
+    # ray.put serializes a snapshot before the producer clears its host payload.
+    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", copy.deepcopy)
 
     result = worker.maybe_publish()
 
@@ -752,7 +754,7 @@ def test_sync_publish_still_uses_global_leader(monkeypatch) -> None:
     worker.is_global_publish_leader = False
     worker.is_drafter_group_leader = True
     worker._last_trained_execution_strategy = "sync"
-    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
+    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", copy.deepcopy)
 
     assert worker.maybe_publish() is None
 
@@ -775,7 +777,7 @@ def test_deferred_publish_stages_once_and_rejects_changed_optimizer(
     worker.trainer.prepare_model_state_dict_for_publish = lambda step: calls.append(
         step
     )
-    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", lambda value: value)
+    monkeypatch.setattr("verl_speco.workers.speco_worker.ray.put", copy.deepcopy)
     result = worker.maybe_publish()
     assert calls == [4]
     assert worker._deferred_publish_snapshot_step is None
@@ -784,7 +786,7 @@ def test_deferred_publish_stages_once_and_rejects_changed_optimizer(
 
 def test_replica_local_idle_trainer_config_enables_use_orig_params() -> None:
     worker = SpecoWorker.__new__(SpecoWorker)
-    worker.rank = 2
+    worker._rank = 2
     worker.config = OmegaConf.create(
         {
             "actor": {

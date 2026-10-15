@@ -179,3 +179,78 @@ def test_collect_only_finalize_publishes_staged_feature_samples() -> None:
     assert writer.written == ["sample-a"]
     assert writer.flushed == [(4, 1)]
     assert "collection-4" not in worker._collection_commit_journals
+
+    worker.finalize_rollout_features([{"collection_id": "collection-4"}])
+    assert writer.written == ["sample-a"]
+    assert writer.flushed == [(4, 1)]
+
+
+@pytest.mark.parametrize("finalize", [False, True])
+def test_collect_only_commit_defers_writes_until_finalize(finalize) -> None:
+    from omegaconf import OmegaConf
+
+    worker, writer = _collect_only_worker()
+    worker.enable_drafter = True
+    worker.in_drafter_train_group = True
+    worker.config = OmegaConf.create(
+        {
+            "rollout": {
+                "drafter": {
+                    "speculative_algorithm": "EAGLE3",
+                    "training": {
+                        "mode": "collect_only",
+                        "feature_store": {"flush_interval_steps": 1},
+                    },
+                }
+            }
+        }
+    )
+    worker._staged_rollout_features["collection-4"] = {
+        "samples": [
+            {
+                "input_ids": torch.arange(4).unsqueeze(0),
+                "prompts": torch.tensor([[0, 1]]),
+                "responses": torch.tensor([[2, 3]]),
+                "hidden_states": torch.zeros(1, 4, 8),
+            }
+        ]
+    }
+    requests = [{"collection_id": "collection-4"}]
+
+    result = asyncio.run(worker.commit_rollout_features(requests))
+
+    assert result["accepted_samples"] == 1
+    assert writer.written == []
+    assert writer.flushed == []
+    assert (
+        len(worker._collection_commit_journals["collection-4"]["feature_store_samples"])
+        == 1
+    )
+
+    if finalize:
+        worker.finalize_rollout_features(requests)
+        assert len(writer.written) == 1
+        assert writer.flushed == [(4, 1)]
+    else:
+        worker.rollback_rollout_features(requests)
+        assert writer.written == []
+        assert writer.flushed == []
+    assert "collection-4" not in worker._collection_commit_journals
+
+
+def test_collect_only_failed_finalize_preserves_journal(monkeypatch) -> None:
+    worker, writer = _collect_only_worker()
+    worker._collection_commit_journals["collection-4"] = {
+        "feature_store_samples": ["sample-a"]
+    }
+
+    def fail_write(_samples):
+        raise OSError("feature store unavailable")
+
+    monkeypatch.setattr(writer, "write_many", fail_write)
+
+    with pytest.raises(OSError, match="feature store unavailable"):
+        worker.finalize_rollout_features([{"collection_id": "collection-4"}])
+
+    assert "collection-4" in worker._collection_commit_journals
+    assert writer.flushed == []

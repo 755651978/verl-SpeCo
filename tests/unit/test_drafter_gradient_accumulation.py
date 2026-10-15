@@ -90,6 +90,7 @@ def test_single_micro_batch_bubble_reservation_is_replayed_until_finalize() -> N
     trainer.rank = 0
     trainer.data_buffer = _Buffer()
     trainer._active_training_reservation_id = "quota-plan"
+    trainer._active_training_target_version = 4
     trainer._active_training_replay_cursor = 0
     trainer._active_training_replay_used_items = {}
     trainer._last_prepared_training_items = []
@@ -297,6 +298,9 @@ def test_accumulation_uses_combined_valid_token_mean(monkeypatch) -> None:
     trainer.lr_scheduler = None
     trainer.use_ulysses_sp = False
     trainer.training_steps = 0
+    trainer._bubble_time_enabled = False
+    trainer.rollout_dp_rank = 0
+    trainer._get_sp_local_rank = lambda: 0
     trainer.optimizer_steps_total = 0
     trainer._current_pad_size = 0
     trainer._current_accumulation_valid_tokens = 0
@@ -306,6 +310,10 @@ def test_accumulation_uses_combined_valid_token_mean(monkeypatch) -> None:
     trainer.record_training_timing = lambda *_args, **_kwargs: None
     trainer._record_dflash_training_metrics = lambda *_args, **_kwargs: None
     trainer._get_sp_group = lambda: None
+    # Isolate token normalization from the production max-norm=1 clipping.
+    trainer._clip_training_grad_norm = lambda: torch.nn.utils.clip_grad_norm_(
+        trainer.model.parameters(), max_norm=float("inf")
+    )
     trainer._reduce_loss_metrics = MethodType(
         lambda _self, l_v, l_p, l_n: (l_v, l_p, l_n, 1), trainer
     )
