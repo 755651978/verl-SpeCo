@@ -776,6 +776,7 @@ class TrainingPlan:
         "drafter_convergence_frozen": 39,
         "final_tail_window_too_small": 40,
         "cold_writer_wait_for_optimizer_bootstrap": 41,
+        "training_quota_complete": 42,
     }
 
     def to_worker_payload(self) -> dict[str, object]:

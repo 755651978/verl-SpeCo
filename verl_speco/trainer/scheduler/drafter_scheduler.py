@@ -3048,6 +3048,12 @@ class DrafterScheduler:
         continuation_plan: TrainingPlan | None = None,
     ) -> TrainingPlan:
         self._decay_idle_reclaim_penalty(context.global_step)
+        if self._quota_settled_without_new_collection(context, config):
+            return self._skip_idle_worker_plan(
+                context,
+                config,
+                AvailableTrainingResources(False, "training_quota_complete"),
+            )
         if (
             config.training_quota_enable
             and self._training_quota_collection_step is not None
@@ -3194,6 +3200,25 @@ class DrafterScheduler:
         if configured is None:
             configured = config.train_batches_per_trigger
         return max(int(configured), 0)
+
+    def _quota_settled_without_new_collection(
+        self, context: DrafterScheduleContext, config: DrafterScheduleConfig
+    ) -> bool:
+        """Skip empty polling only after a known quota has fully published.
+
+        Durable collection immediately registers the next quota. Preserve the
+        legacy boundary-discovery path before that first registration, and for
+        callers supplying fresh collection counts or an explicit data status.
+        """
+        return bool(
+            config.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            and config.training_quota_enable
+            and self._training_quota_last_registered_data_version is not None
+            and self._training_quota_collection_step is None
+            and self._training_quota_debt_steps <= 0
+            and context.collected_samples_this_step <= 0
+            and context.data_status is None
+        )
 
     def training_quota_blocks_collection(
         self,
@@ -3445,6 +3470,7 @@ class DrafterScheduler:
             not config.training_quota_enable
             or context.pending_training_count > 0
             or not config.training_quota_allow_critical_path_fallback
+            or self._quota_settled_without_new_collection(context, config)
         ):
             return None
         writer_group = self._current_idle_writer_group(assign_default=False)

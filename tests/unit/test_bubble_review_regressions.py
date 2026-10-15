@@ -107,6 +107,101 @@ def test_merged_dspark_publish_filters_only_untrained_confidence_head(
     assert worker._is_frozen_publish_param("draft_model.confidence_head.proj.weight")
 
 
+@pytest.mark.parametrize("bubble", [False, True])
+@pytest.mark.parametrize("collected_step", [None, 4, 5])
+def test_schedule_context_does_not_reuse_previous_bubble_collection(
+    bubble, collected_step
+):
+    from verl_speco.trainer.scheduler import DrafterRuntimeStatus
+
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_drafter_schedule_context"},
+        DrafterScheduleContext=DrafterScheduleContext,
+        DrafterRuntimeStatus=DrafterRuntimeStatus,
+    )
+    driver = cls()
+    driver.global_steps = 5
+    driver._speco_last_collected_step = collected_step
+    driver._speco_last_collected_samples = 32
+    driver._speco_rollout_idle_worker_enabled = lambda: bubble
+    driver._speco_drafter_training_mode = lambda: "online"
+    driver._speco_oldlogprob_collection_requested = lambda: False
+    driver._speco_get_drafter_runtime_state = lambda: SimpleNamespace(status=None)
+    context = driver._speco_drafter_schedule_context()
+    assert context.collected_samples_this_step == (
+        32 if not bubble or collected_step == 5 else 0
+    )
+
+
+@pytest.mark.parametrize("mesh", [None, (0, 0, 1, 1)])
+@pytest.mark.parametrize("blocking_finish", [False, True])
+def test_delayed_head_dispatch_keeps_captured_version(mesh, blocking_finish):
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {
+            "_speco_build_drafter_target_lm_head_sync_args",
+            "_speco_dispatch_target_lm_head_payload",
+            "_speco_advance_target_lm_head_prefetch",
+            "_speco_finish_target_lm_head_weight_sync",
+            "_speco_validate_target_lm_head_acks",
+            "_speco_mark_target_lm_head_version_ready",
+        },
+        time=time,
+        cast=cast,
+        Any=Any,
+        _DRAFTER_TARGET_SYNC_MESH="test-target-sync",
+        _SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT=2,
+    )
+    driver = cls()
+    driver.global_steps = 9  # Fetch was submitted for version 4.
+    driver.drafter_wg = (
+        None
+        if mesh is None
+        else SimpleNamespace(_dispatch_info={"test-target-sync": mesh})
+    )
+    driver._speco_rollout_idle_worker_enabled = lambda: True
+    driver._speco_get_drafter_scheduler = DrafterScheduler
+    driver._ray_get_if_needed = lambda value: value
+    driver._speco_ray_refs_ready = lambda value: True
+    driver._first_non_null = lambda values: next(v for v in values if v is not None)
+    driver._speco_ready_target_lm_head_versions = set()
+    driver._speco_ready_target_lm_head_workers = {}
+    dispatched_versions = []
+
+    def dispatch(payload, *, global_step):
+        dispatched_versions.append(global_step)
+        assert global_step == (4 if mesh is None else [4, 4])
+        return [_head_ack(worker) for worker in ("0", "1")]
+
+    driver.speco_sync_target_lm_head_weight = dispatch
+    driver._pending_target_lm_head_sync = {
+        "stage": "fetch",
+        "fetch_refs": [{"weight": "captured-at-4"}],
+        "target_version": 4,
+        "global_step": 4,
+        "sync_started": time.perf_counter(),
+        "fetch_started": time.perf_counter(),
+        "selected_rows": 0,
+        "source_vocab_size": 2,
+        "target_worker_ids": ("0", "1"),
+    }
+    if blocking_finish:
+        result = driver._speco_finish_target_lm_head_weight_sync(
+            driver._pending_target_lm_head_sync
+        )
+    else:
+        driver._speco_advance_target_lm_head_prefetch()
+        assert driver._pending_target_lm_head_sync["global_step"] == 4
+        result = driver._speco_advance_target_lm_head_prefetch()
+        assert driver._speco_ready_target_lm_head_versions == {4}
+    assert result["drafter/target_lm_head_synced"] == 1
+    assert len(dispatched_versions) == 1
+    assert driver.global_steps == 9
+
+
 def _draw_micro_batch(obj, pool):
     items = obj._sample_replay_items(pool, 2)
     if obj._sampling_micro_index == 1:

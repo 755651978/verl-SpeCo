@@ -187,6 +187,16 @@ or the ownership of an already-trained writer. Completed training reports
 `bubble/training_quota_debt_before` and `bubble/training_quota_debt_after`;
 `bubble/training_quota_debt_steps` in its result is the post-training value.
 
+After a registered quota completes and publishes, scheduling reports
+`reason=training_quota_complete` while there is no new collection. It skips idle
+window probing and worker data-inspection RPCs rather than rediscovering the
+consumed snapshot on every idle event. A new durable collection immediately
+registers fresh debt and re-enables training; unfinished quotas and initial
+data discovery retain their existing paths. Collection counts in Bubble's
+scheduling context refer only to the current PPO step, not the preceding step.
+Delayed target-head dispatch keeps the version captured when export started,
+even if the driver's global step has advanced before dispatch completes.
+
 `allow_critical_path_fallback=true` lets the scheduler top up unfinished quota
 on the critical path when idle windows are not enough. This is useful for
 quality-alignment and stability testing. For pure production throughput tests,

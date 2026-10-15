@@ -3849,12 +3849,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return str(training_cfg.get("mode", "online") or "online").strip().lower()
 
     def _speco_drafter_schedule_context(self) -> DrafterScheduleContext:
+        collected = int(getattr(self, "_speco_last_collected_samples", 0) or 0)
+        if self._speco_rollout_idle_worker_enabled() and getattr(
+            self, "_speco_last_collected_step", None
+        ) != int(self.global_steps):
+            # The next rollout starts before its old-logprob hook resets these
+            # counters. A previous step's samples are not a fresh collection.
+            collected = 0
         return DrafterScheduleContext(
             global_step=self.global_steps,
             training_mode=self._speco_drafter_training_mode(),
-            collected_samples_this_step=int(
-                getattr(self, "_speco_last_collected_samples", 0) or 0
-            ),
+            collected_samples_this_step=collected,
             oldlogprob_collection_requested=(
                 self._speco_oldlogprob_collection_requested()
             ),
@@ -5710,10 +5715,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_build_drafter_target_lm_head_sync_args(
         self,
         payload: dict[str, torch.Tensor],
+        *,
+        global_step: int | None = None,
     ) -> tuple[Any, Any, int]:
+        source_step = self.global_steps if global_step is None else global_step
         worker_group = self.drafter_wg
         if worker_group is None:
-            return payload, self.global_steps, 1
+            return payload, source_step, 1
 
         target_sync_mapping = None
         dispatch_info = getattr(worker_group, "_dispatch_info", None)
@@ -5728,15 +5736,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if isinstance(dispatch_info, dict):
                 dispatch_info[_DRAFTER_TARGET_SYNC_MESH] = target_sync_mapping
         if not target_sync_mapping:
-            return payload, self.global_steps, 1
+            return payload, source_step, 1
 
         target_sync_bucket_count = (
             max(int(dp_rank) for dp_rank in target_sync_mapping) + 1
         )
         payload_buckets = [payload for _ in range(target_sync_bucket_count)]
-        global_step_buckets = [
-            self.global_steps for _ in range(target_sync_bucket_count)
-        ]
+        global_step_buckets = [source_step for _ in range(target_sync_bucket_count)]
         return payload_buckets, global_step_buckets, target_sync_bucket_count
 
     def _speco_start_target_lm_head_weight_sync(
@@ -6148,6 +6154,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 selected_rows=int(pending["selected_rows"]),
                 source_vocab_size=int(pending["source_vocab_size"]),
                 target_worker_ids=pending.get("target_worker_ids"),
+                target_version=int(target_version),
             )
             assert dispatch_pending is not None
             dispatch_pending["target_version"] = target_version
@@ -6378,6 +6385,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         selected_rows: int,
         source_vocab_size: int,
         target_worker_ids: tuple[str, ...] | None = None,
+        target_version: int | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Stage a captured actor head on drafter workers without waiting."""
 
@@ -6402,9 +6410,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 payload["target_worker_ids"] = tuple(
                     str(worker_id) for worker_id in target_worker_ids
                 )
-        payload_arg, global_step_arg, _ = (
-            self._speco_build_drafter_target_lm_head_sync_args(payload)
-        )
+        if target_version is None:
+            payload_arg, global_step_arg, _ = (
+                self._speco_build_drafter_target_lm_head_sync_args(payload)
+            )
+        else:
+            payload_arg, global_step_arg, _ = (
+                self._speco_build_drafter_target_lm_head_sync_args(
+                    payload, global_step=target_version
+                )
+            )
         dispatch_started = time.perf_counter()
         pending_refs = self.speco_sync_target_lm_head_weight(
             payload_arg, global_step=global_step_arg
@@ -6423,7 +6438,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         }
         pending = {
             "refs": pending_refs,
-            "global_step": self.global_steps,
+            "global_step": self.global_steps
+            if target_version is None
+            else target_version,
             "dispatch_finished": dispatch_started + dispatch_elapsed,
             "dispatch_elapsed": dispatch_elapsed,
             "pre_dispatch_elapsed": dispatch_started - sync_started,
@@ -6466,6 +6483,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 selected_rows=int(pending["selected_rows"]),
                 source_vocab_size=int(pending["source_vocab_size"]),
                 target_worker_ids=pending.get("target_worker_ids"),
+                target_version=pending.get(
+                    "target_version", pending.get("global_step")
+                ),
             )
             metrics["timing_s/drafter_target_lm_head_fetch_async_work"] = fetch_elapsed
             metrics["timing_s/drafter_target_lm_head_fetch_critical_path"] = (

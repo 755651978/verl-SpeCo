@@ -2655,6 +2655,64 @@ def test_retained_snapshot_cannot_register_another_quota() -> None:
     assert scheduler._training_quota_debt_steps == 20
 
 
+def test_settled_quota_skips_idle_and_topup_inspection_until_next_collection():
+    scheduler = DrafterScheduler()
+    config = replace(
+        _idle_config(),
+        training_quota_enable=True,
+        training_quota_target_steps=20,
+        training_quota_allow_critical_path_fallback=True,
+    )
+    scheduler._training_quota_last_registered_data_version = 5
+    context = replace(_context(), global_step=6, collected_samples_this_step=0)
+    scheduler.inspect_training_data = lambda **kw: pytest.fail(
+        "Empty quota must not issue worker RPCs"
+    )
+    scheduler.select_idle_training_resources = lambda *a, **kw: pytest.fail(
+        "Empty quota must not probe windows"
+    )
+    outcome = scheduler.on_before_actor_update(
+        BeforeActorUpdateContext(schedule_context=context, config=config)
+    )
+    assert not outcome.training_plan.launch
+    assert outcome.training_plan.reason == "training_quota_complete"
+    assert outcome.metrics["drafter/schedule_reason"] == 42
+    # A durable new collection lifts the fast path immediately, even before
+    # its head arrives or any new optimizer step has run.
+    scheduler.record_collection_outcome(
+        SimpleNamespace(source_global_step=10),
+        SimpleNamespace(collected=True, worker_results=[]),
+        config,
+    )
+    assert scheduler._training_quota_debt_steps == 20
+    assert not scheduler._quota_settled_without_new_collection(context, config)
+
+
+@pytest.mark.parametrize(
+    "case", ["initial", "debt", "publish", "new_samples", "status", "sync", "no_quota"]
+)
+def test_empty_quota_fast_path_preserves_discovery_and_pending_work(case):
+    scheduler = DrafterScheduler()
+    scheduler._training_quota_last_registered_data_version = 5
+    context = replace(_context(), collected_samples_this_step=0)
+    config = replace(_idle_config(), training_quota_enable=True)
+    if case == "initial":
+        scheduler._training_quota_last_registered_data_version = None
+    elif case == "debt":
+        scheduler._training_quota_debt_steps = 1
+    elif case == "publish":
+        scheduler._training_quota_collection_step = 5
+    elif case == "new_samples":
+        context = replace(context, collected_samples_this_step=32)
+    elif case == "status":
+        context = replace(context, data_status=_status("0"))
+    elif case == "sync":
+        config = replace(config, execution_strategy=DrafterExecutionStrategy.SYNC)
+    else:
+        config = replace(config, training_quota_enable=False)
+    assert not scheduler._quota_settled_without_new_collection(context, config)
+
+
 def test_private_writer_topup_never_rejoins_stale_replica_groups() -> None:
     scheduler = _scheduler_with_statuses(("0", "1", "2", "3"))
     scheduler._metadata_idle_training_groups = (("0", "1"), ("2", "3"))
