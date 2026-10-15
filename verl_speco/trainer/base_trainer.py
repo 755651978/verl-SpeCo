@@ -1032,11 +1032,24 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/l1_loss"] = (
                 sums.get(f"{prefix}/l1_loss_sum", 0.0) / l1_tokens
             )
+        confidence_tokens = sums.get(f"{prefix}/confidence_weighted_token_count", 0.0)
+        if confidence_tokens > 0:
+            metrics[f"{prefix}/confidence_loss"] = (
+                sums.get(f"{prefix}/confidence_loss_sum", 0.0) / confidence_tokens
+            )
+            metrics[f"{prefix}/confidence_accept_rate"] = (
+                sums.get(f"{prefix}/confidence_accept_rate_sum", 0.0)
+                / confidence_tokens
+            )
+            metrics[f"{prefix}/confidence_pred_mean"] = (
+                sums.get(f"{prefix}/confidence_pred_mean_sum", 0.0) / confidence_tokens
+            )
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/l1_weighted_token_count",
+            f"{prefix}/confidence_weighted_token_count",
             f"{prefix}/quality_token_count",
             f"{prefix}/accepted_length_sum",
             f"{prefix}/scored_block_count",
@@ -1125,6 +1138,11 @@ class DrafterBaseTrainer:
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
+            # DSpark confidence head.
+            "confidence_loss_sum": f"{prefix}/confidence_loss_sum",
+            "confidence_weighted_token_count": f"{prefix}/confidence_weighted_token_count",
+            "confidence_accept_rate_sum": f"{prefix}/confidence_accept_rate_sum",
+            "confidence_pred_mean_sum": f"{prefix}/confidence_pred_mean_sum",
             # DFlash2 candidate selector.
             "selector_loss": f"{prefix}/selector_loss",
             "selector_loss_sum": f"{prefix}/selector_loss_sum",
@@ -1481,17 +1499,6 @@ class DrafterBaseTrainer:
         """Return whether a drafter state entry should be excluded from hot publish."""
 
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
-            return True
-        if (
-            getattr(self.backend, "model_type", None) == "dspark"
-            and "confidence_head." in name
-            and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "").lower()
-            in {"1", "true", "yes"}
-        ):
-            # The supported MRV2 runtime has no confidence-head contract, and
-            # the current trainer rejects positive confidence loss. A head
-            # inherited from an older checkpoint is frozen and must not enter
-            # the native fixed-K online update payload.
             return True
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
