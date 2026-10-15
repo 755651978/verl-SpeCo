@@ -681,6 +681,7 @@ class DrafterBaseTrainer:
         self._applied_target_lm_head_weight_step: int | None = None
         self._target_lm_head_snapshots: dict[int, dict[str, Any]] = {}
         self._target_lm_head_snapshot_limit = 2
+        self._protected_target_lm_head_versions: set[int] = set()
         self._active_training_reservation_id: str | None = None
         self._active_training_target_version: int | None = None
         self._last_prepared_training_items: list[dict[str, Any]] = []
@@ -2527,6 +2528,7 @@ class DrafterBaseTrainer:
         row_indices: Optional[torch.Tensor] = None,
         source_vocab_size: Optional[int] = None,
         defer_device_apply: bool = False,
+        protected_target_versions: tuple[int, ...] | None = None,
     ) -> dict[str, Any]:
         """Update the frozen target lm_head used by last-hidden drafter training."""
         if weight is None or not torch.is_tensor(weight):
@@ -2556,17 +2558,33 @@ class DrafterBaseTrainer:
         self._applied_target_lm_head_weight_step = None
         if global_step is not None and getattr(self, "_bubble_time_enabled", False):
             version = int(global_step)
+            if protected_target_versions is not None:
+                self._protected_target_lm_head_versions = {
+                    int(item) for item in protected_target_versions
+                }
             self._target_lm_head_snapshots[version] = {
                 "weight": self._pending_target_lm_head_weight,
                 "row_indices": self._pending_target_lm_head_row_indices,
                 "source_vocab_size": self._pending_target_lm_head_source_vocab_size,
                 "chunked_apply": self._pending_target_lm_head_chunked_apply,
             }
+            protected_versions = set(
+                getattr(self, "_protected_target_lm_head_versions", ())
+            )
+            protected_versions.update(getattr(self, "_training_replay_sessions", {}))
+            active_version = getattr(self, "_active_training_target_version", None)
+            if active_version is not None:
+                protected_versions.add(active_version)
+            protected_versions.add(version)
+            candidates = sorted(
+                set(self._target_lm_head_snapshots) - protected_versions
+            )
             while (
                 len(self._target_lm_head_snapshots)
                 > self._target_lm_head_snapshot_limit
+                and candidates
             ):
-                oldest_version = min(self._target_lm_head_snapshots)
+                oldest_version = candidates.pop(0)
                 self._target_lm_head_snapshots.pop(oldest_version, None)
         selected_rows = (
             int(self._pending_target_lm_head_row_indices.numel())
@@ -5620,6 +5638,9 @@ class DrafterBaseTrainer:
         consumed = self.data_buffer.consume(str(plan_id), used_items)
         if target_version is not None:
             sessions.pop(target_version, None)
+            getattr(self, "_protected_target_lm_head_versions", set[int]()).discard(
+                target_version
+            )
         self._active_training_replay_used_items = {}
         self._active_training_replay_cursor = 0
         if consumed:
@@ -6014,8 +6035,13 @@ class DrafterBaseTrainer:
                     self._sampling_micro_index = micro_index
                     # Only this micro-batch resides on device. Replay sampling
                     # has its own deterministic RNG/cursor, independent of forward.
+                    prepare_started = time.perf_counter()
                     batch = self._prepare_training_batch_for_step(
                         min_sample_step=min_sample_step, max_sample_step=max_sample_step
+                    )
+                    self.record_training_timing(
+                        "timing_s/drafter_prepare_batch",
+                        time.perf_counter() - prepare_started,
                     )
                     if batch is None:
                         self.optimizer.zero_grad(set_to_none=True)
@@ -6828,7 +6854,9 @@ class DrafterBaseTrainer:
     def local_writer_state(self, *, export: bool = False):
         """Portable CPU shards for an equal-topology quota-boundary handoff."""
         if (
-            self._training_active
+            self.model is None
+            or self.optimizer is None
+            or self._training_active
             or (export and self._training_device_resident)
             or self._active_training_reservation_id
         ):

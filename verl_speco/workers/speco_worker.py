@@ -1398,39 +1398,64 @@ class SpecoWorker(Worker):
     def sync_target_lm_head_weight(
         self, payload: Optional[dict], global_step: Optional[int] = None
     ):
+        def acknowledge(result):
+            # The Bubble driver validates every target rank's CPU snapshot.
+            # Keep the legacy Sync response unchanged.
+            if payload and payload.get("require_target_head_ack", False):
+                return {
+                    **result,
+                    "worker_id": str(self.rank),
+                    "global_step": global_step,
+                }
+            return result
+
         if not self.enable_drafter:
-            return {"accepted": False, "applied": False, "reason": "disabled"}
+            return acknowledge(
+                {"accepted": False, "applied": False, "reason": "disabled"}
+            )
         if not self.in_drafter_train_group or self.trainer is None:
-            return {
-                "accepted": False,
-                "applied": False,
-                "reason": "not_in_training_group",
-            }
+            return acknowledge(
+                {
+                    "accepted": False,
+                    "applied": False,
+                    "reason": "not_in_training_group",
+                }
+            )
         if not payload:
-            return {"accepted": False, "applied": False, "reason": "missing_payload"}
+            return acknowledge(
+                {"accepted": False, "applied": False, "reason": "missing_payload"}
+            )
         target_worker_ids = payload.get("target_worker_ids")
         if target_worker_ids:
             target_worker_id_set = {str(worker_id) for worker_id in target_worker_ids}
             if str(self.rank) not in target_worker_id_set:
-                return {
-                    "accepted": False,
-                    "applied": False,
-                    "reason": "not_target_worker",
-                    "worker_id": str(self.rank),
-                    "target_worker_ids": tuple(sorted(target_worker_id_set)),
-                }
+                return acknowledge(
+                    {
+                        "accepted": False,
+                        "applied": False,
+                        "reason": "not_target_worker",
+                        "worker_id": str(self.rank),
+                        "target_worker_ids": tuple(sorted(target_worker_id_set)),
+                    }
+                )
 
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
         source_vocab_size = payload.get("source_vocab_size")
         defer_device_apply = bool(payload.get("defer_device_apply", False))
         name = payload.get("name")
+        head_kwargs: dict[str, Any] = {}
+        if getattr(self.trainer, "_bubble_time_enabled", False):
+            protected_versions = payload.get("protected_target_versions")
+            if protected_versions is not None:
+                head_kwargs["protected_target_versions"] = tuple(protected_versions)
         result = self.trainer.sync_target_lm_head_weight(
             weight,
             global_step=global_step,
             row_indices=row_indices,
             source_vocab_size=source_vocab_size,
             defer_device_apply=defer_device_apply,
+            **head_kwargs,
         )
         if self.is_drafter_group_leader:
             logger.debug(
@@ -1440,7 +1465,7 @@ class SpecoWorker(Worker):
                 global_step,
                 result,
             )
-        return result
+        return acknowledge(result)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_drafter_target_lm_head_row_indices(self):
@@ -1811,8 +1836,12 @@ class SpecoWorker(Worker):
             result["reason"] = "buffer_version_changed"
             return result
         required_target_version = training_plan.get("required_target_version")
+        # Sync validates the freshly staged head below without a historical
+        # cache. Bubble (including synchronous top-up) must select its pinned
+        # quota head instead of substituting the latest actor head.
         if (
-            required_target_version is not None
+            getattr(self.trainer, "_bubble_time_enabled", False)
+            and required_target_version is not None
             and not self.trainer.select_target_lm_head_version(
                 int(required_target_version)
             )
@@ -1859,7 +1888,8 @@ class SpecoWorker(Worker):
             require_full_batch=bool(training_plan.get("require_full_batch", False)),
             target_version=(
                 int(required_target_version)
-                if required_target_version is not None
+                if getattr(self.trainer, "_bubble_time_enabled", False)
+                and required_target_version is not None
                 else None
             ),
             **{
@@ -2593,6 +2623,12 @@ class SpecoWorker(Worker):
                             return False
                         return True
 
+                    first_step_timings = (
+                        dict(getattr(self.trainer, "_training_metric_sums", {}))
+                        if execution_strategy == "rollout_idle_worker"
+                        and batch_index == 0
+                        else None
+                    )
                     try:
                         optimizer_step_started = time.perf_counter()
                         if execution_strategy == "sync":
@@ -2613,6 +2649,31 @@ class SpecoWorker(Worker):
                     except Exception as error:  # noqa: BLE001
                         step_error = error
                         step_ok = False
+                    first_step_elapsed = None
+                    if first_step_timings is not None:
+                        first_step_elapsed = (
+                            time.perf_counter() - optimizer_step_started
+                        )
+                        stage_times = {
+                            key: max(
+                                float(value) - first_step_timings.get(key, 0.0), 0.0
+                            )
+                            for key, value in getattr(
+                                self.trainer, "_training_metric_sums", {}
+                            ).items()
+                            if key.startswith("timing_s/drafter_")
+                        }
+                        result["first_optimizer_step_stage_sec"] = stage_times
+                        logger.warning(
+                            "[BubbleTime] optimizer_first_step_breakdown: plan_id=%s "
+                            "rank=%s success=%s elapsed_s=%.4f stages_sec=%s "
+                            "timing_mode=host_wall_no_device_sync",
+                            plan_id,
+                            self.rank,
+                            step_ok,
+                            first_step_elapsed,
+                            stage_times,
+                        )
                     training_error = getattr(self.trainer, "last_training_error", None)
                     if training_error is not None:
                         result["errors"].append(dict(training_error))
@@ -2629,7 +2690,9 @@ class SpecoWorker(Worker):
                         continue
                     if step_ok:
                         result["optimizer_step_samples_sec"].append(
-                            time.perf_counter() - optimizer_step_started
+                            first_step_elapsed
+                            if first_step_elapsed is not None
+                            else time.perf_counter() - optimizer_step_started
                         )
                         result["successful_steps"] += 1
                         result["successful_valid_tokens"] += int(

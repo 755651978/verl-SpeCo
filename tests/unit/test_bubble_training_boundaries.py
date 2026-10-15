@@ -15,7 +15,10 @@ import pytest
 
 @pytest.fixture
 def continuation_driver_class():
-    from verl_speco.trainer.scheduler import CollectionFinalizeError
+    from verl_speco.trainer.scheduler import (
+        CollectionFinalizeError,
+        DrafterRuntimeStatus,
+    )
 
     return _load_methods(
         "verl_speco/trainer/speco_ray_trainer.py",
@@ -38,6 +41,7 @@ def continuation_driver_class():
             "logger": logging.getLogger(__name__),
             "threading": __import__("threading"),
             "CollectionFinalizeError": CollectionFinalizeError,
+            "DrafterRuntimeStatus": DrafterRuntimeStatus,
         },
     )
 
@@ -470,6 +474,57 @@ def test_reclaim_runs_between_atomic_optimizer_steps(worker_class):
     assert result["stop_reason"] == "reclaim_requested"
     assert result["replay_session_retained"] == 1
     assert callbacks == [None]
+
+
+def test_first_idle_optimizer_breakdown_uses_per_plan_deltas(worker_class, caplog):
+    worker, plan, callbacks = _prepared_worker(worker_class)
+    worker.trainer._training_metric_sums = {"timing_s/drafter_forward_loss": 100.0}
+    original = worker.trainer.training_accumulation_step
+
+    async def train(*args, **kwargs):
+        worker.trainer._training_metric_sums["timing_s/drafter_forward_loss"] += 0.25
+        worker.trainer._training_metric_sums["timing_s/drafter_prepare_batch"] = (
+            worker.trainer._training_metric_sums.get(
+                "timing_s/drafter_prepare_batch", 0
+            )
+            + 0.1
+        )
+        return await original(*args, **kwargs)
+
+    worker.trainer.training_accumulation_step = train
+    result = asyncio.run(worker.train_drafter(plan))
+    assert result["successful_steps"] == 3
+    assert result["first_optimizer_step_stage_sec"] == {
+        "timing_s/drafter_forward_loss": 0.25,
+        "timing_s/drafter_prepare_batch": 0.1,
+    }
+    assert caplog.text.count("optimizer_first_step_breakdown:") == 1
+    assert "timing_mode=host_wall_no_device_sync" in caplog.text
+
+
+def test_all_rollout_groups_finished_skips_launch_before_head_or_data_rpc(
+    continuation_driver_class,
+):
+    import threading
+    from verl_speco.trainer.scheduler import DrafterRuntimeState
+
+    driver = continuation_driver_class()
+    driver._speco_rollout_idle_worker_enabled = lambda: True
+    driver._speco_drafter_schedule_config = lambda: SimpleNamespace(
+        idle_worker_max_pending_publish=1
+    )
+    driver._pending_drafter_publish_refs = None
+    driver._speco_get_drafter_runtime_state = lambda: DrafterRuntimeState()
+    driver._speco_bubble_training_lock = lambda: threading.RLock()
+    driver._speco_get_drafter_scheduler = lambda: SimpleNamespace(
+        rollout_generation_tail_complete=lambda: True
+    )
+    driver._speco_poll_target_lm_head_prefetch = lambda: pytest.fail(
+        "No head/data/migration RPC should run after the final serving release"
+    )
+    assert driver._speco_try_launch_rollout_idle_training() == {
+        "bubble/rollout_tail_launch_suppressed": 1
+    }
 
 
 def test_idle_yield_services_timer_delivered_reclaim_before_next_step(worker_class):

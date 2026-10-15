@@ -41,7 +41,19 @@ def _event_bus_actor_class(ray):
             self._pending_rollout_groups: set[tuple[str, ...]] = set()
             self._replica_groups: dict[int, tuple[str, ...]] = {}
             self._training_reclaims: dict[str, float] = {}
+            self._overlap_required_plans: set[str] = set()
             self._rollout_requests: dict[str, tuple[tuple[str, ...], bool]] = {}
+
+        def _reclaim_finished_overlap(self) -> None:
+            if any(count > 0 for count in self._rollout_owners.values()):
+                return
+            self.request_training_reclaim(
+                tuple(
+                    worker
+                    for worker, (plan, _) in self._training_owners.items()
+                    if plan in self._overlap_required_plans
+                )
+            )
 
         def request_training_reclaim(self, worker_ids, sent_ts=None):
             plans = {
@@ -98,6 +110,7 @@ def _event_bus_actor_class(ray):
             for worker_id in expired:
                 self._training_owners.pop(worker_id, None)
             live_plans = {owner[0] for owner in self._training_owners.values()}
+            self._overlap_required_plans.intersection_update(live_plans)
             for plan_id in tuple(self._training_reclaims):
                 if plan_id not in live_plans:
                     self._training_reclaims.pop(plan_id, None)
@@ -214,6 +227,7 @@ def _event_bus_actor_class(ray):
                                 "release_source": "rollout_wait_cancelled",
                             }
                         )
+            self._reclaim_finished_overlap()
             return {"cancelled": True, "acquired": acquired}
 
         def release_rollout(
@@ -256,6 +270,7 @@ def _event_bus_actor_class(ray):
                     }
                 )
                 self._append_event(released)
+            self._reclaim_finished_overlap()
             return {"released": True, "idle": idle}
 
         def reserve_training(
@@ -263,12 +278,20 @@ def _event_bus_actor_class(ray):
             worker_ids: list[str] | tuple[str, ...],
             plan_id: str,
             expires_at: float,
+            require_active_rollout: bool = False,
         ) -> dict[str, Any]:
             """Atomically reserve idle rollout resources for one Bubble plan."""
 
             group = self._worker_group(worker_ids)
             now = time.time()
             self._expire_training_owners(now)
+            if require_active_rollout and not any(
+                count > 0 for count in self._rollout_owners.values()
+            ):
+                # A released group is not proof that any generation remains
+                # to overlap. Reject the final-tail race in this same atomic
+                # lease operation, before any model activation or optimizer work.
+                return {"acquired": False, "reason": "no_active_rollout"}
             rollout_busy = [
                 worker_id
                 for worker_id in group
@@ -294,6 +317,8 @@ def _event_bus_actor_class(ray):
             expiry = max(requested_expiry, now + 1.0) if requested_expiry > 0.0 else 0.0
             for worker_id in group:
                 self._training_owners[worker_id] = (str(plan_id), expiry)
+            if require_active_rollout:
+                self._overlap_required_plans.add(str(plan_id))
             return {"acquired": True, "worker_ids": list(group)}
 
         def release_training(
@@ -312,6 +337,7 @@ def _event_bus_actor_class(ray):
                 owner[0] == str(plan_id) for owner in self._training_owners.values()
             ):
                 self._training_reclaims.pop(str(plan_id), None)
+                self._overlap_required_plans.discard(str(plan_id))
             return {"released": bool(released), "worker_ids": released}
 
         def drain(self) -> list[dict[str, Any]]:
@@ -533,6 +559,7 @@ def reserve_rollout_training_resources(
     worker_ids: tuple[str, ...],
     plan_id: str,
     expires_at: float,
+    require_active_rollout: bool = False,
 ) -> bool:
     ray, actor = _event_bus(name)
     if actor is None:
@@ -542,7 +569,18 @@ def reserve_rollout_training_resources(
     if not callable(remote):
         return False
     try:
-        result = ray.get(remote(list(worker_ids), str(plan_id), float(expires_at)))
+        args = (list(worker_ids), str(plan_id), float(expires_at))
+        result = ray.get(
+            remote(*args, require_active_rollout=True)
+            if require_active_rollout
+            else remote(*args)
+        )
+        if isinstance(result, dict) and result.get("reason") == "no_active_rollout":
+            logger.warning(
+                "[BubbleTime] training_lease_rejected: reason=no_active_rollout plan_id=%s workers=%s",
+                plan_id,
+                worker_ids,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to reserve rollout resources for Bubble training: %s", exc)
         return False

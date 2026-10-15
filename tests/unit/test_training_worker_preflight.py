@@ -34,6 +34,7 @@ class _FakeTrainer:
     def __init__(self, *, data_version: int) -> None:
         self.buffer_version = 3
         self._target_lm_head_weight_step = 4
+        self._bubble_time_enabled = True
         self.optimizer_steps_total = 0
         self.data_version = data_version
         self.activation_calls = 0
@@ -449,6 +450,46 @@ def test_worker_preflight_records_actual_versions_for_training_result() -> None:
     assert worker._prepared_training_plan_id == "plan-4"
     assert worker._prepared_training_data_version == 4
     assert worker._prepared_training_target_version == 4
+
+
+def test_sync_preflight_uses_staged_head_without_bubble_history() -> None:
+    worker = _worker(data_version=4)
+    worker.trainer._bubble_time_enabled = False
+
+    def reject_history_lookup(version):
+        pytest.fail("Sync must not select from Bubble's historical head cache")
+
+    worker.trainer.select_target_lm_head_version = reject_history_lookup
+    result = asyncio.run(worker.preflight_drafter_training(_plan()))
+
+    assert result["ready"]
+    assert result["target_version"] == 4
+    assert worker.trainer.requested_target_version is None
+    assert worker.trainer.activation_calls == 1
+
+
+def test_sync_preflight_still_rejects_wrong_staged_head() -> None:
+    worker = _worker(data_version=4)
+    worker.trainer._bubble_time_enabled = False
+    worker.trainer._target_lm_head_weight_step = 3
+
+    result = asyncio.run(worker.preflight_drafter_training(_plan()))
+
+    assert not result["ready"]
+    assert result["reason"] == "target_version_mismatch"
+    assert worker.trainer.activation_calls == 0
+
+
+def test_bubble_sync_topup_still_requires_pinned_history() -> None:
+    worker = _worker(data_version=4)
+    worker.trainer._bubble_time_enabled = True
+    worker.trainer.select_target_lm_head_version = lambda version: False
+
+    result = asyncio.run(worker.preflight_drafter_training(_plan()))
+
+    assert not result["ready"]
+    assert result["reason"] == "target_version_unavailable"
+    assert worker.trainer.activation_calls == 0
 
 
 def test_bubble_preflight_allows_newer_buffer_append_and_pins_target_version() -> None:

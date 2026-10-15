@@ -660,6 +660,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_known_trainable_batches: int | None = None
         self._speco_last_raw_drafter_samples = 0
         self._speco_last_collected_samples = 0
+        self._speco_last_collected_step: int | None = None
         self._speco_last_oldlogprob_candidate_samples = 0
         self._speco_last_oldlogprob_planned_samples = 0
         self._speco_last_oldlogprob_collected_samples = 0
@@ -2460,6 +2461,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_rollout_idle_worker_enabled()
             and not getattr(self, "_speco_drafter_frozen", False)
             and int(getattr(self, "_speco_last_collected_samples", 0) or 0) > 0
+            and getattr(self, "_speco_last_collected_step", None)
+            == int(self.global_steps)
         )
 
     def _speco_rollout_idle_event_bus_name(self) -> str | None:
@@ -2714,6 +2717,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_direct_sample_ids.update(sample_ids)
             self._speco_direct_collected_samples += outcome.collected_samples
             self._speco_last_collected_samples = self._speco_direct_collected_samples
+            self._speco_last_collected_step = int(self.global_steps)
             logger.warning(
                 "[BubbleTime] direct_sample_batch_committed: count=%s replicas=%s "
                 "source_step=%s collected=%s",
@@ -2767,6 +2771,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             worker_ids=tuple(str(worker_id) for worker_id in plan.target_worker_ids),
             plan_id=plan.plan_id,
             expires_at=expires_at,
+            require_active_rollout=True,
         )
         if acquired:
             self._speco_rollout_training_lease = (
@@ -2948,6 +2953,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     getattr(active_plan, "target_worker_ids", ()),
                 )
                 return {"scheduler/pending_training_count": 1}
+            if self._speco_get_drafter_scheduler().rollout_generation_tail_complete():
+                # Do not spend data-inspection/migration RPCs or activate a
+                # writer after every runtime replica has released serving.
+                # The lease bus repeats this check atomically to close races.
+                return {"bubble/rollout_tail_launch_suppressed": 1}
             head_metrics = self._speco_poll_target_lm_head_prefetch()
             head_metrics.update(self._speco_migrate_idle_writer_if_useful(config))
             event = self._speco_on_before_actor_update(
@@ -3528,36 +3538,72 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         source = scheduler.idle_writer_group()
         if (
             not source
+            or scheduler._idle_worker_writer_state_version is None
             or not scheduler._writer_boundary_migration_allowed
             or scheduler._training_quota_debt_steps <= 0
         ):
             return {}
         required_version = scheduler._training_quota_data_version
-        if required_version is None or not self._speco_target_lm_head_ready_for_workers(
-            required_version, source
+        if required_version is None or (
+            not config.use_logits
+            and not self._speco_target_lm_head_ready_for_workers(
+                required_version, source
+            )
         ):
             return {}
         target, metrics = scheduler.writer_switch_decision(config)
         if target is None:
             return metrics
+        attempt = (
+            tuple(source),
+            tuple(target),
+            scheduler._latest_published_drafter_version,
+            required_version,
+        )
+        if getattr(self, "_speco_writer_migration_failed_attempt", None) == attempt:
+            return {**metrics, "bubble/writer_migration_retry_suppressed": 1}
         group = self._require_speco_worker_group()
+        participants = tuple(dict.fromkeys(source + target))
         metadata = self._ray_get_if_needed(
-            group.export_drafter_writer_state(list(source))
+            group.export_drafter_writer_state(list(participants))
         )
         metadata = [item for item in metadata if isinstance(item, dict)]
-        if len(metadata) != len(source) or not all(
-            item.get("available") for item in metadata
+        if (
+            len(metadata) != len(participants)
+            or {str(item.get("rank")) for item in metadata} != set(participants)
+            or not all(item.get("available") for item in metadata)
         ):
-            return {}
-        transfer_bytes = sum(item["state"]["bytes"] for item in metadata)
+            self._speco_writer_migration_failed_attempt = attempt
+            return {**metrics, "bubble/writer_migration_state_unavailable": 1}
+        source_metadata = [item for item in metadata if str(item["rank"]) in source]
+        transfer_bytes = sum(item["state"]["bytes"] for item in source_metadata)
+        resident_source = any(
+            item["state"].get("device_resident", False) for item in source_metadata
+        )
+        park_estimate = (
+            max(max(scheduler._idle_worker_park_samples_sec, default=0.0), 0.5)
+            if any(item["state"].get("device_resident", False) for item in metadata)
+            else 0.0
+        )
         migration_estimate = max(
             getattr(self, "_speco_writer_migration_sec", 0.0),
-            transfer_bytes / (2 * 1024**3),
+            transfer_bytes / (2 * 1024**3) + park_estimate,
             0.5,
         )
+        # A hot destination must be parked before loading CPU shards. Its next
+        # activation is cold even when keep-hot is enabled for ordinary plans.
+        target_was_hot = target in scheduler._idle_worker_hot_prewarmed_groups
+        try:
+            scheduler._idle_worker_hot_prewarmed_groups.discard(target)
+            target_startup = scheduler._effective_idle_startup_reserve_sec(
+                config, target
+            )
+        finally:
+            if target_was_hot:
+                scheduler._idle_worker_hot_prewarmed_groups.add(target)
         total_switch_cost = (
             migration_estimate
-            + scheduler._effective_idle_startup_reserve_sec(config, target)
+            + target_startup
             + scheduler._effective_idle_tail_reserve_sec(config)
         )
         target, decision_metrics = scheduler.writer_switch_decision(
@@ -3579,11 +3625,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         finally:
             scheduler._idle_worker_writer_state_version = version
             scheduler._metadata_idle_training_groups = groups
-        if resources.minimum_idle_window_sec <= needed:
+        if not resources.available or resources.minimum_idle_window_sec <= needed:
             return {**metrics, "bubble/writer_migration_window_too_small": 1}
-        resident_source = any(
-            item["state"].get("device_resident", False) for item in metadata
-        )
         if resident_source:
             # Never offload a hot source while its colocated rollout is busy.
             try:
@@ -3602,14 +3645,29 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         migration_plan_id = f"writer-migration-{time.time_ns()}"
         bus = self._speco_rollout_idle_event_bus_name()
         if not reserve_rollout_training_resources(
-            bus, worker_ids=migration_workers, plan_id=migration_plan_id, expires_at=0.0
+            bus,
+            worker_ids=migration_workers,
+            plan_id=migration_plan_id,
+            expires_at=0.0,
+            require_active_rollout=True,
         ):
             return {**metrics, "bubble/writer_migration_lease_raced": 1}
+        started = time.perf_counter()
+        result: dict[str, Any] = {}
         try:
-            return self._speco_execute_writer_state_transfer(
+            result = self._speco_execute_writer_state_transfer(
                 group, source, target, metrics
             )
+            if not result.get("bubble/writer_state_migrated"):
+                # Do not repeatedly park/export GiB-scale state on every event
+                # poll after a deterministic failure. A new quota/version may
+                # retry; the canonical source writer remains authoritative.
+                self._speco_writer_migration_failed_attempt = attempt
+            return result
         finally:
+            elapsed = time.perf_counter() - started
+            self._speco_writer_migration_sec = elapsed
+            result["timing_s/drafter_writer_migration"] = elapsed
             release_rollout_training_resources(
                 bus, worker_ids=migration_workers, plan_id=migration_plan_id
             )
@@ -3617,8 +3675,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_execute_writer_state_transfer(self, group, source, target, metrics):
         scheduler = self._speco_get_drafter_scheduler()
         started = time.perf_counter()
-        self._ray_get_if_needed(group.park_drafter_training_model(list(source)))
+        # Both sides are protected by the caller's resource lease (a parked
+        # source needs no device lease). Park the destination BEFORE exporting
+        # source shards so a previously prewarmed target can validate/import.
+        parked = self._ray_get_if_needed(
+            group.park_drafter_training_model(list(dict.fromkeys(source + target)))
+        )
         scheduler._idle_worker_hot_prewarmed_groups.discard(tuple(source))
+        scheduler._idle_worker_hot_prewarmed_groups.discard(tuple(target))
+        scheduler.record_memory_park_elapsed(
+            max(
+                (
+                    float(item.get("elapsed_sec", 0.0) or 0.0)
+                    for item in (parked or [])
+                    if isinstance(item, dict) and item.get("parked")
+                ),
+                default=0.0,
+            )
+        )
         exported = self._ray_get_if_needed(
             group.export_drafter_writer_state(list(source), True)
         )
@@ -3626,10 +3700,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             [item for item in exported if isinstance(item, dict)],
             key=lambda item: int(item["rank"]),
         )
-        if len(exported) != len(source) or not all(
-            item.get("available") for item in exported
+        if (
+            len(exported) != len(source)
+            or {str(item.get("rank")) for item in exported} != set(source)
+            or not all(item.get("available") for item in exported)
         ):
-            return {}
+            return {**metrics, "bubble/writer_migration_state_unavailable": 1}
         states = [item["state"] for item in exported]
         transfer_bytes = sum(state["bytes"] for state in states)
         if any(
@@ -3656,12 +3732,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 target,
                 error,
             )
-            return {"bubble/writer_migration_layout_rejected": 1}
+            return {**metrics, "bubble/writer_migration_layout_rejected": 1}
         validation = [item for item in validation if isinstance(item, dict)]
-        if len(validation) != len(target) or not all(
-            item.get("validated") for item in validation
+        if (
+            len(validation) != len(target)
+            or {str(item.get("rank")) for item in validation} != set(target)
+            or not all(item.get("validated") for item in validation)
         ):
-            raise RuntimeError("Writer migration validation failed")
+            return {**metrics, "bubble/writer_migration_layout_rejected": 1}
         try:
             applied = self._ray_get_if_needed(
                 group.import_drafter_writer_state(list(target), state_refs)
@@ -3670,9 +3748,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_idle_completion_error = error
             raise
         applied = [item for item in applied if isinstance(item, dict)]
-        if len(applied) != len(target) or any(
-            item.get("optimizer_steps") != states[0]["optimizer_steps"]
-            for item in applied
+        if (
+            len(applied) != len(target)
+            or {str(item.get("rank")) for item in applied} != set(target)
+            or any(
+                not item.get("validated")
+                or item.get("optimizer_steps") != states[0]["optimizer_steps"]
+                for item in applied
+            )
         ):
             acknowledgement_error = RuntimeError(
                 "Writer migration acknowledgement failed"
@@ -3886,10 +3969,77 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_prepare_drafter_training_rpc(
         self, training_plan: TrainingPlan
     ) -> dict[str, Any]:
+        if self._speco_rollout_idle_worker_enabled() and training_plan.reason in {
+            "quota_topup_training_ready",
+            "quota_forced_completion_ready",
+        }:
+            # Full-collective execution does not turn a Bubble quota into a
+            # fresh Sync cycle. Preserve both its frozen head and any genuine
+            # pending prefetch; the post-actor gate checks readiness separately.
+            return {"drafter/target_lm_head_synced": 0}
         self._speco_set_drafter_global_step()
         metrics, pending = self._speco_start_target_lm_head_weight_sync(training_plan)
         self._pending_target_lm_head_sync = pending
         return metrics
+
+    def _speco_gate_bubble_quota_topup(
+        self, plan: TrainingPlan
+    ) -> tuple[TrainingPlan, dict[str, Any]]:
+        """Require the pinned head on every top-up rank, without re-exporting."""
+        if (
+            not self._speco_rollout_idle_worker_enabled()
+            or not plan.launch
+            or plan.reason
+            not in {
+                "quota_topup_training_ready",
+                "quota_forced_completion_ready",
+            }
+        ):
+            return plan, {}
+        required_version = plan.required_target_version
+        required_workers = tuple(
+            plan.target_worker_ids or (plan.worker_snapshots or {}).keys()
+        )
+        pending = self._pending_target_lm_head_sync
+        head_ready = required_version is None or (
+            bool(required_workers)
+            and self._speco_target_lm_head_ready_for_workers(
+                required_version, required_workers
+            )
+        )
+        if pending is None and head_ready:
+            return plan, {}
+        reason = (
+            "target_lm_head_prefetch_pending"
+            if pending is not None
+            else "target_lm_head_not_ready"
+        )
+        logger.warning(
+            "[BubbleTime] training_quota_topup_deferred: reason=%s plan_id=%s "
+            "required_target_version=%s required_workers=%s pending_target_version=%s",
+            reason,
+            plan.plan_id,
+            required_version,
+            required_workers,
+            pending.get("target_version", pending.get("global_step"))
+            if pending is not None
+            else None,
+        )
+        deferred = replace(
+            plan,
+            launch=False,
+            reason="quota_topup_lm_head_prefetch_pending",
+            max_batches=0,
+            publish_after_success=False,
+        )
+        return deferred, {
+            **deferred.metrics(),
+            "scheduler/train_requested": 0,
+            "scheduler/planned_batches": 0,
+            "bubble/training_quota_topup_batches": 0,
+            "bubble/training_quota_topup_deferred": 1,
+            "bubble/target_lm_head_not_ready": int(not head_ready),
+        }
 
     def _speco_execute_collection(
         self,
@@ -4463,10 +4613,25 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         if not eligible_owner_ranks:
             eligible_owner_ranks = tuple(range(owner_count))
+        routed_owner_ranks = eligible_owner_ranks
+        bubble_collection = self._speco_rollout_idle_worker_enabled()
+        schedule_config = (
+            self._speco_drafter_schedule_config() if bubble_collection else None
+        )
+        sync_aligned_collection = bool(
+            schedule_config is not None
+            and schedule_config.training_quota_enable
+            and schedule_config.training_quota_trigger_mode == "interval"
+        )
+        if sync_aligned_collection:
+            # Select the same immutable sample set as Sync using its logical
+            # owners and budgets. Routing to one writer happens only AFTER
+            # selection; it must not change sample count, hardness or windows.
+            eligible_owner_ranks = tuple(range(owner_count))
         max_per_owner = collection_plan.max_samples_per_replica
         max_per_owner = max_per_owner if max_per_owner is not None else batch_size
         max_per_owner = max(max_per_owner, 0)
-        if self._speco_rollout_idle_worker_enabled():
+        if bubble_collection and not sync_aligned_collection:
             # Single-writer Bubble routing concentrates samples that Sync
             # would have kept on multiple owners.  Do not let the legacy
             # per-owner default silently reduce its plan-local dataset.
@@ -4486,7 +4651,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         max_tokens_per_owner = collection_plan.max_tokens_per_replica
         if max_tokens_per_owner is not None:
             max_tokens_per_owner = max(max_tokens_per_owner, 0)
-            if self._speco_rollout_idle_worker_enabled():
+            if bubble_collection and not sync_aligned_collection:
                 # Old-logprob capture needs one extra hidden row for shifted
                 # supervision.  A common ``N * window_rows`` token budget would
                 # therefore admit only N-1 samples after Bubble concentrates
@@ -4735,6 +4900,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
 
         selected_indices = collect_mask.nonzero(as_tuple=False).flatten().tolist()
+        if sync_aligned_collection:
+            if routed_owner_ranks != tuple(range(owner_count)):
+                routing = torch.tensor(routed_owner_ranks, dtype=owner_rank.dtype)
+                owner_rank[collect_mask] = routing[
+                    owner_rank[collect_mask] % len(routed_owner_ranks)
+                ]
+                owner_counts = torch.bincount(
+                    owner_rank[collect_mask], minlength=owner_count
+                ).tolist()
+                owner_token_counts = [count * hidden_rows for count in owner_counts]
+            eligible_owner_ranks = routed_owner_ranks
         hard_counts = [
             int((collect_mask & is_hard & (owner_rank == owner)).sum())
             for owner in range(owner_count)
@@ -4758,6 +4934,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "collection_shortfall": collection_limit - selected_count,
             "actual_hard_ratio": hard_added / selected_count if selected_count else 0.0,
         }
+        if sync_aligned_collection:
+            selection_metrics["sync_aligned_collection"] = 1
         for owner in range(owner_count):
             selection_metrics[f"hard_count_owner_{owner}"] = hard_counts[owner]
             selection_metrics[f"normal_count_owner_{owner}"] = normal_counts[owner]
@@ -5229,6 +5407,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             payload,
         )
         self._speco_last_collected_samples = outcome.collected_samples
+        self._speco_last_collected_step = (
+            int(self.global_steps) if outcome.collected_samples > 0 else None
+        )
         self._speco_last_oldlogprob_collected_samples = outcome.collected_samples
         self._speco_last_oldlogprob_collected_rows = collected_rows
         self._speco_last_oldlogprob_payload_mib = payload_bytes / float(1024 * 1024)
@@ -5269,6 +5450,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_raw_drafter_samples = 0
         direct_collected = int(getattr(self, "_speco_direct_collected_samples", 0) or 0)
         self._speco_last_collected_samples = direct_collected
+        self._speco_last_collected_step = (
+            int(self.global_steps) if direct_collected > 0 else None
+        )
         collection_plan = self._speco_plan_drafter_collection(
             DrafterCollectionSource.SGLANG
         )
@@ -5336,6 +5520,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         total_collected = direct_collected + outcome.collected_samples
         self._speco_last_collected_samples = total_collected
+        self._speco_last_collected_step = (
+            int(self.global_steps) if total_collected > 0 else None
+        )
         return total_collected
 
     def _speco_owner_route_mapping(self):
@@ -5837,6 +6024,59 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         )
         return metrics
 
+    @staticmethod
+    def _speco_validate_target_lm_head_acks(
+        results: Any,
+        target_version: object,
+        worker_ids: tuple[str, ...] | None,
+    ) -> tuple[str, ...]:
+        """Only successful, same-version target ranks make a head ready."""
+        # An empty TrainingPlan target tuple also means broadcast (not an
+        # empty acknowledgement domain), notably for full-collective top-ups.
+        expected = {str(worker) for worker in worker_ids} if worker_ids else None
+        accepted: set[str] = set()
+        seen: set[str] = set()
+        remaining = [results]
+        while remaining:
+            ack = remaining.pop()
+            if isinstance(ack, (list, tuple)):
+                remaining.extend(ack)
+                continue
+            if not isinstance(ack, dict) or ack.get("worker_id") is None:
+                raise RuntimeError(
+                    f"Invalid Bubble target lm_head ACK: target_version={target_version} ack={ack}"
+                )
+            worker = str(ack["worker_id"])
+            if worker in seen:
+                raise RuntimeError(
+                    f"Duplicate Bubble target lm_head ACK: target_version={target_version} worker={worker}"
+                )
+            seen.add(worker)
+            if ack.get("accepted") is not True:
+                if (expected is None or worker not in expected) and ack.get(
+                    "reason"
+                ) in {
+                    "not_target_worker",
+                    "not_in_training_group",
+                    "disabled",
+                }:
+                    continue
+                raise RuntimeError(
+                    f"Rejected Bubble target lm_head ACK: target_version={target_version} worker={worker} reason={ack.get('reason')}"
+                )
+            if ack.get("global_step") != target_version or (
+                expected is not None and worker not in expected
+            ):
+                raise RuntimeError(
+                    f"Mismatched Bubble target lm_head ACK: target_version={target_version} worker={worker} acknowledged_version={ack.get('global_step')} expected_workers={expected}"
+                )
+            accepted.add(worker)
+        if not accepted or (expected is not None and accepted != expected):
+            raise RuntimeError(
+                f"Incomplete Bubble target lm_head ACKs: target_version={target_version} expected_workers={expected} accepted_workers={sorted(accepted)}"
+            )
+        return tuple(sorted(accepted))
+
     def _speco_advance_target_lm_head_prefetch(self) -> dict[str, Any]:
         """Advance the Bubble-only target-head state machine without waiting."""
 
@@ -5899,11 +6139,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         # ``ray.wait`` above proved the apply RPC is complete, so this get is
         # non-blocking and only surfaces a worker-side exception.
-        self._ray_get_if_needed(refs)
+        acknowledgements = self._ray_get_if_needed(refs)
+        try:
+            ready_workers = self._speco_validate_target_lm_head_acks(
+                acknowledgements, target_version, pending.get("target_worker_ids")
+            )
+        except RuntimeError:
+            self._pending_target_lm_head_sync = None
+            self._speco_ready_target_lm_head_versions.discard(int(target_version))
+            self._speco_ready_target_lm_head_workers.pop(int(target_version), None)
+            raise
         self._pending_target_lm_head_sync = None
         evicted_versions = self._speco_mark_target_lm_head_version_ready(
             target_version,
-            worker_ids=pending.get("target_worker_ids"),
+            worker_ids=ready_workers,
         )
         print(
             "[BubbleTime] target_lm_head_prefetch_ready: "
@@ -5985,11 +6234,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         else:
             self._speco_ready_target_lm_head_workers.pop(version, None)
         evicted_versions: list[int] = []
+        protected_versions = set(
+            self._speco_get_drafter_scheduler().protected_target_lm_head_versions()
+        )
+        # Always retain the just-acknowledged payload as well as the immutable
+        # head needed by the active quota (including its pending publication).
+        protected_versions.add(version)
+        candidates = sorted(
+            self._speco_ready_target_lm_head_versions - protected_versions
+        )
         while (
             len(self._speco_ready_target_lm_head_versions)
             > _SPECO_TARGET_LM_HEAD_READY_VERSION_LIMIT
+            and candidates
         ):
-            version = min(self._speco_ready_target_lm_head_versions)
+            version = candidates.pop(0)
             self._speco_ready_target_lm_head_versions.remove(version)
             self._speco_ready_target_lm_head_workers.pop(version, None)
             evicted_versions.append(version)
@@ -6109,6 +6368,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if defer_device_apply:
             payload = dict(payload)
             payload["defer_device_apply"] = True
+            if self._speco_rollout_idle_worker_enabled():
+                payload["require_target_head_ack"] = True
+                payload["protected_target_versions"] = (
+                    self._speco_get_drafter_scheduler().protected_target_lm_head_versions()
+                )
             if target_worker_ids:
                 payload["target_worker_ids"] = tuple(
                     str(worker_id) for worker_id in target_worker_ids
@@ -6189,7 +6453,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return metrics
 
         wait_started = time.perf_counter()
-        self._ray_get_if_needed(pending.get("refs"))
+        acknowledgements = self._ray_get_if_needed(pending.get("refs"))
+        if self._speco_rollout_idle_worker_enabled():
+            self._speco_validate_target_lm_head_acks(
+                acknowledgements,
+                pending.get("target_version", pending.get("global_step")),
+                pending.get("target_worker_ids"),
+            )
         finished = time.perf_counter()
         wait_elapsed = finished - wait_started
         dispatch_elapsed = float(pending.get("dispatch_elapsed", 0.0) or 0.0)
@@ -7219,6 +7489,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 self._speco_rollout_idle_event_bus_name() or "",
             )
             if not input_is_validation:
+                if self._speco_rollout_idle_worker_enabled():
+                    self._speco_last_raw_drafter_samples = 0
+                    self._speco_last_collected_samples = 0
+                    self._speco_last_collected_step = None
                 self._speco_direct_sample_ids = set()
                 self._speco_direct_collected_samples = 0
                 self._speco_runtime_idle_events_this_generation = 0
@@ -7410,6 +7684,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 return original_compute_old_log_prob(batch)
 
             oldlogprob_started = time.perf_counter()
+            if self._speco_rollout_idle_worker_enabled() and getattr(
+                self, "_speco_last_collected_step", None
+            ) != int(self.global_steps):
+                # Non-collection steps return early below. Never carry their
+                # predecessor's sample count into head export or scheduling.
+                self._speco_last_raw_drafter_samples = 0
+                self._speco_last_collected_samples = 0
+                self._speco_last_collected_step = None
             self._speco_last_hard_selection_metrics = {}
             self._speco_last_oldlogprob_candidate_samples = 0
             self._speco_last_oldlogprob_planned_samples = 0
@@ -7745,42 +8027,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_log_drafter_training_plan(training_plan, metrics)
             if not training_plan.launch and not pending_drafter_publishes:
                 metrics.update(self._speco_prepare_hot_writer_head_at_safe_point())
-            if (
-                training_plan.launch
-                and (
-                    training_plan.reason == "quota_topup_training_ready"
-                    or (
-                        self._speco_rollout_idle_worker_enabled()
-                        and self._speco_get_drafter_scheduler().needs_idle_optimizer_bootstrap(
-                            self._speco_drafter_schedule_config()
-                        )
-                    )
-                )
-                and self._pending_target_lm_head_sync is not None
-            ):
-                # A quota top-up is deliberately subordinate to the PPO
-                # critical path.  Never let its synchronous preflight queue
-                # behind an unfinished target-head transfer; preserve the
-                # debt and retry at a later safe point instead.
-                pending_target_version = self._pending_target_lm_head_sync.get(
-                    "target_version"
-                )
-                print(
-                    "[BubbleTime] training_quota_topup_deferred: "
-                    "reason=target_lm_head_prefetch_pending "
-                    f"plan_id={training_plan.plan_id} "
-                    f"target_version={pending_target_version}",
-                    flush=True,
-                )
-                metrics["bubble/training_quota_topup_deferred"] = 1
-                training_plan = replace(
-                    training_plan,
-                    launch=False,
-                    reason="quota_topup_lm_head_prefetch_pending",
-                    max_batches=0,
-                    publish_after_success=False,
-                )
-                metrics.update(training_plan.metrics())
+            training_plan, topup_gate_metrics = self._speco_gate_bubble_quota_topup(
+                training_plan
+            )
+            metrics.update(topup_gate_metrics)
             if getattr(self, "_speco_drafter_frozen", False):
                 training_plan = dataclasses.replace(
                     training_plan, launch=False, reason="drafter_convergence_frozen"

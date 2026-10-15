@@ -162,6 +162,23 @@ signals through `trigger_mode`; the scheduler should continue an unfinished
 quota on the same data snapshot rather than repeatedly collecting new data that
 will not be trained.
 
+With quota enabled and `trigger_mode=interval`, old-logprob collection first
+selects samples using Sync's logical-owner sample/token budgets, hard-sample
+policy, and hidden-state windows. It then routes the selected set to the current
+writer without selecting again. Thus a two-owner `16 + 16` budget stays at 32
+samples both before and after writer election, subject to the same candidate
+and token limits as Sync. `drafter/selection/sync_aligned_collection=1` identifies
+this path. Adaptive collection retains its existing writer-local
+minimum and budget policy. This aligns collection, not bitwise optimizer updates
+or end-to-end quality; those still need device validation.
+
+Initial writer election uses recent, recency-weighted observations with a
+confidence discount for sparse history instead of selecting an old p75 spike.
+This changes only the initial election score, not training admission deadlines
+or the ownership of an already-trained writer. Completed training reports
+`bubble/training_quota_debt_before` and `bubble/training_quota_debt_after`;
+`bubble/training_quota_debt_steps` in its result is the post-training value.
+
 `allow_critical_path_fallback=true` lets the scheduler top up unfinished quota
 on the critical path when idle windows are not enough. This is useful for
 quality-alignment and stability testing. For pure production throughput tests,
@@ -537,9 +554,20 @@ training/optimizer/checkpoint counters, replay and target-head snapshots, and
 each rank's canonical post-training RNG. Validate layouts before applying shards;
 change ownership only after all destination ACKs. A hot source must have enough
 confirmed idle for parking and transfer, never offload it during its rollout.
+The transfer also requires another active serving group to hide its cost. With
+only two groups, a resident source and an idle destination leave no serving
+overlap, so that handoff is skipped; a parked source does not need a device lease.
 Enabling migration with keep-hot therefore does not guarantee a switch. Partial
 apply/ACK failure is fatal. FSDP2/DTensor and unequal-topology handoffs are not
 enabled by this CPU-shard protocol.
+
+A prewarmed destination is parked under its idle resource lease before import;
+the switch budget includes parking and a cold destination restart, even with
+keep-hot enabled. Unsupported/uninitialized state or a layout-validation failure
+is retried only after the quota/version or candidate changes, not on every event
+poll. Pre-apply rejection keeps the source as owner; partial apply or missing
+destination ACKs remain fatal. Logits-based training does not require a target-head
+prefetch ACK to migrate.
 
 First test reclaim with migration disabled. On the Linux training host:
 
@@ -659,6 +687,25 @@ lightweight cleanup, and sample-bound metadata; CPU target-head version history
 is allocated only for Bubble.
 
 These safeguards need aligned GPU/NPU runs for performance and quality claims.
+New idle launches require a live serving lease on another group. The driver
+skips launch preparation when every known rollout group has released serving;
+the lease bus checks live ownership atomically again before granting training.
+When the last serving request releases or cancels its lease, the bus also marks
+active overlap plans for reclaim through the existing independent watcher,
+without waiting for driver event draining or adding another RPC.
+This prevents late event delivery from starting work after generation has ended,
+but cannot preempt an optimizer step already in flight. Restart all actors after
+deploying this lease-protocol update.
+
+Historical window estimates are replica-specific. Once three real
+`generation_completed` tails exist, their recent median caps the older p75;
+an old long window cannot indefinitely override consistently short recent tails.
+The first optimizer step of each idle plan logs
+`optimizer_first_step_breakdown`, including accumulated micro-batch preparation
+and existing forward/reduction/backward/optimizer host timings. These diagnostics
+add no device synchronization or collective; asynchronous device execution means
+they are not a precise kernel-time breakdown.
+
 Keep writer migration disabled initially, complete at least three quotas, verify
 all-rank publish ACKs, compare optimizer steps/loss/acceptance length, and include
 all startup, parking, reclaim, and publication costs in end-to-end timing.

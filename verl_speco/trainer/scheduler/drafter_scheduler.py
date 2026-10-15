@@ -1010,14 +1010,24 @@ class DrafterScheduler:
             replica_ranks = self._replica_ranks_for_worker_group(worker_ids)
         else:
             replica_ranks = tuple(sorted(self._replica_idle_window_samples_sec))
-        conservative_windows = [
-            _conservative_percentile(
-                self._replica_idle_window_samples_sec[rank],
-                quantile=0.75,
+        conservative_windows = []
+        for rank in replica_ranks:
+            history = self._replica_idle_window_samples_sec.get(rank)
+            if not history:
+                continue
+            window = _conservative_percentile(history, quantile=0.75)
+            tails = self._replica_idle_windows_by_source.get(rank, {}).get(
+                "generation_completed", ()
             )
-            for rank in replica_ranks
-            if self._replica_idle_window_samples_sec.get(rank)
-        ]
+            if len(tails) >= 3:
+                # A formerly early replica may now finish last repeatedly.
+                # Bound its old p75 with its recent real generation tails;
+                # never borrow another replica's longer idle or reclaim wait.
+                window = min(
+                    window,
+                    _conservative_percentile(list(tails)[-3:], quantile=0.5),
+                )
+            conservative_windows.append(window)
         if not conservative_windows:
             return None
         # A multi-replica collective is bounded by its shortest member, while
@@ -1036,10 +1046,29 @@ class DrafterScheduler:
             return self._current_idle_writer_group(assign_default=True)
         writer_group = self._current_idle_writer_group(assign_default=False)
 
-        def candidate_key(group: tuple[str, ...]) -> tuple[float, int]:
-            historical = self._effective_historical_idle_window_sec(worker_ids=group)
+        def candidate_key(group: tuple[str, ...]) -> tuple[float, int, int]:
+            # Election is not admission: a high historical percentile is too
+            # optimistic for choosing a long-lived optimizer owner. Discount
+            # sparse observations and give the latest real tails more weight.
+            scores = []
+            counts = []
+            for rank in self._replica_ranks_for_worker_group(group):
+                tails = self._replica_idle_windows_by_source.get(rank, {}).get(
+                    "generation_completed", ()
+                )
+                history = tails or self._replica_idle_window_samples_sec.get(rank, ())
+                recent = list(history)[-4:]
+                if not recent:
+                    return (-1.0, 0, int(group == writer_group))
+                score = recent[0]
+                for value in recent[1:]:
+                    score = 0.75 * value + 0.25 * score
+                confidence = min(len(recent) / 3.0, 1.0)
+                scores.append(score * confidence)
+                counts.append(min(len(recent), 3))
             return (
-                float(historical) if historical is not None else -1.0,
+                min(scores, default=-1.0),
+                min(counts, default=0),
                 int(group == writer_group),
             )
 
@@ -2541,6 +2570,20 @@ class DrafterScheduler:
                     groups.append(tuple(group))
         return tuple(groups)
 
+    def rollout_generation_tail_complete(self) -> bool:
+        """All known replicas released serving; there is no proven overlap left."""
+        workers = {
+            worker
+            for group in self._replica_idle_worker_groups.values()
+            for worker in group
+        }
+        return bool(workers) and all(
+            (state := self._idle_workers.get(worker)) is not None
+            and state.status == "idle"
+            and state.memory_released
+            for worker in workers
+        )
+
     def select_idle_training_resources(
         self,
         config: DrafterScheduleConfig,
@@ -3283,6 +3326,15 @@ class DrafterScheduler:
             flush=True,
         )
 
+    def protected_target_lm_head_versions(self) -> tuple[int, ...]:
+        """Keep the quota's supervision head until training and publish ACK."""
+        version = self._training_quota_data_version
+        if version is None and self._training_quota_collection_step is not None:
+            # Debt reaches zero before the staged weights are applied. Keep
+            # protecting the completed cycle until publish releases backpressure.
+            version = self._training_quota_last_registered_data_version
+        return () if version is None else (int(version),)
+
     def _training_quota_age_steps(self, global_step: object) -> int:
         if self._training_quota_oldest_cycle_step is None:
             return 0
@@ -3533,7 +3585,37 @@ class DrafterScheduler:
                 require_interval=False,
             )
         if not plan.launch:
+            if (
+                config.execution_strategy
+                is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+                and self._training_quota_force_completion_due(
+                    context.global_step, config
+                )
+            ):
+                raise RuntimeError(
+                    "[BubbleTime] quota_completion_blocked: "
+                    f"step={context.global_step} "
+                    f"required_target_version={self._training_quota_data_version} "
+                    f"debt_steps={self._training_quota_debt_steps} "
+                    f"debt_age_steps={self._training_quota_age_steps(context.global_step)} "
+                    f"writer_group={writer_group} reason={plan.reason} "
+                    f"buffer_samples={getattr(data_status, 'buffer_samples', None)} "
+                    f"trainable_samples={getattr(data_status, 'trainable_samples', None)} "
+                    f"observed_target_version={getattr(data_status, 'target_version', None)} "
+                    f"worker_snapshots={getattr(data_status, 'worker_snapshots', None)}. "
+                    "No matching data/head can complete the overdue quota. "
+                    "Restore the original data/head snapshot or restart from a valid checkpoint; "
+                    "do not substitute the current actor head or discard the training debt."
+                )
             return None
+        # The temporary Sync config above only selects a blocking budget.
+        # Top-up still belongs to Bubble's original quota and frozen head.
+        plan = replace(
+            plan,
+            required_target_version=(
+                None if config.use_logits else self._training_quota_data_version
+            ),
+        )
         if bootstrap_due:
             logger.warning(
                 "[BubbleTime] quota_optimizer_bootstrap_planned: step=%s writer=%s quota_steps=%s historical_window_s=%s",
@@ -3688,10 +3770,16 @@ class DrafterScheduler:
     def prepare_training_execution(self, plan: TrainingPlan) -> dict[str, Any]:
         if not plan.launch:
             return {"drafter/target_lm_head_synced": 0}
-        if plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
+        if (
+            plan.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+            or plan.reason
+            in {"quota_topup_training_ready", "quota_forced_completion_ready"}
+        ):
             # The exact head for buffered step N data is cached before the step
             # N actor update.  Fetching the live actor head inside step N+1
             # rollout would both block the bubble and select the wrong version.
+            # This also applies to a Bubble full-collective top-up whose
+            # execution strategy is Sync, not just replica-local idle plans.
             return {"drafter/target_lm_head_synced": 0}
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
@@ -3831,6 +3919,7 @@ class DrafterScheduler:
         force_completion_due = False
         if (
             context.allow_quota_topup
+            and not context.drafter_frozen
             and context.config.execution_strategy
             is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
         ):
@@ -4398,11 +4487,15 @@ class DrafterScheduler:
                 context.data_status.data_version if context.data_status else None
             ),
             "required_target_version": (
+                # Sync exports the current step's head after this status query;
+                # only Bubble reuses the quota's historical target version.
                 None
                 if config.use_logits
                 else (
                     context.data_status.target_version
-                    if context.data_status is not None
+                    if config.execution_strategy
+                    is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+                    and context.data_status is not None
                     else _as_int(context.global_step)
                 )
             ),
@@ -4679,6 +4772,7 @@ class DrafterScheduler:
             "quota_topup_training_ready",
             "quota_forced_completion_ready",
         }
+        quota_debt_before = self._training_quota_debt_steps
         if outcome.trained:
             if (
                 is_quota_topup
@@ -4755,6 +4849,15 @@ class DrafterScheduler:
                 f"debt_before={debt_before} "
                 f"debt_after={self._training_quota_debt_steps}",
                 flush=True,
+            )
+
+        if quota_accounted_training:
+            outcome.metrics.update(
+                {
+                    "bubble/training_quota_debt_before": quota_debt_before,
+                    "bubble/training_quota_debt_after": self._training_quota_debt_steps,
+                    "bubble/training_quota_debt_steps": self._training_quota_debt_steps,
+                }
             )
 
         if outcome.trained and outcome.successful_steps > 0:

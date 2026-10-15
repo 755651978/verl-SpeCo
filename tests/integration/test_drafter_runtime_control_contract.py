@@ -665,6 +665,7 @@ def test_bubble_target_head_prefetch_ignores_transient_fallback_plan() -> None:
         step=4,
     )
     trainer._speco_last_collected_samples = 31
+    trainer._speco_last_collected_step = trainer.global_steps
 
     # A scheduler event may temporarily select a synchronous fallback plan
     # when no version is trainable.  Prefetch eligibility must continue to

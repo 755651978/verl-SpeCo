@@ -20,6 +20,57 @@ def _local_event_bus():
     return rollout_idle_events._event_bus_actor_class(_LocalRay)()
 
 
+def test_idle_training_requires_live_serving_overlap_but_sync_does_not():
+    bus = _local_event_bus()
+    assert bus.reserve_training(
+        ("0", "1"), "late", 0.0, require_active_rollout=True
+    ) == {"acquired": False, "reason": "no_active_rollout"}
+    assert not bus._training_owners
+    assert bus.acquire_rollout(("2", "3"), {"lease_request_id": "peer"})["acquired"]
+    assert bus.reserve_training(
+        ("0", "1"), "overlap", 0.0, require_active_rollout=True
+    )["acquired"]
+    bus.release_training(("0", "1"), "overlap")
+    bus.release_rollout(("2", "3"), {})
+    assert not bus.reserve_training(
+        ("0", "1"), "too-late", 0.0, require_active_rollout=True
+    )["acquired"]
+    # Explicit non-overlapped reservations retain the legacy behavior.
+    assert bus.reserve_training(("0", "1"), "sync", 0.0)["acquired"]
+
+
+def test_overlap_check_does_not_allow_training_on_a_serving_group():
+    bus = _local_event_bus()
+    assert bus.acquire_rollout(("0", "1"), {"lease_request_id": "own"})["acquired"]
+    assert not bus.reserve_training(
+        ("0", "1"), "busy", 0.0, require_active_rollout=True
+    )["acquired"]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_last_serving_release_reclaims_overlap_without_driver_poll(cancel):
+    bus = _local_event_bus()
+    for worker in ("2", "3"):
+        assert bus.acquire_rollout((worker,), {"lease_request_id": worker})["acquired"]
+    assert bus.reserve_training(("0",), "overlap", 0.0, require_active_rollout=True)[
+        "acquired"
+    ]
+    # Legacy explicit reservations are not opportunistic overlap plans.
+    assert bus.reserve_training(("1",), "explicit", 0.0)["acquired"]
+    bus.release_rollout(("2",), {})
+    assert not bus.training_reclaim_status("overlap", "0")["requested"]
+    if cancel:
+        bus.cancel_rollout_wait("3")
+    else:
+        bus.release_rollout(("3",), {})
+    bus.drain()
+    assert bus.training_reclaim_status("overlap", "0")["requested"]
+    assert not bus.training_reclaim_status("explicit", "1")["requested"]
+    bus.release_training(("0",), "overlap")
+    assert "overlap" not in bus._overlap_required_plans
+    assert not bus.training_reclaim_status("overlap", "0")["active"]
+
+
 def test_cancelled_waiter_does_not_starve_future_idle_training():
     bus = _local_event_bus()
     bus.reserve_training(("0",), "old", 0.0)
