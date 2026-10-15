@@ -6656,11 +6656,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and publish_plan.asynchronous
             and publish_outcome.published
         ):
-            if (
-                getattr(self, "_speco_freeze_policy", None) is not None
-                and self._speco_rollout_idle_worker_enabled()
-            ):
-                self._speco_freeze_observe_publish({"drafter/published": 1})
+            # Submission/staging is not a completed publication. Bubble's
+            # freeze clock is notified only by the validated apply-ACK path.
             pending_contexts = getattr(self, "_pending_drafter_publish_contexts", None)
             if not isinstance(pending_contexts, list):
                 pending_contexts = []
@@ -6713,6 +6710,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 publish_plan.source_global_step
             )
             scheduler.record_training_quota_publish_completed(self.global_steps)
+            if (
+                getattr(self, "_speco_freeze_policy", None) is not None
+                and self._speco_rollout_idle_worker_enabled()
+            ):
+                # Direct Bubble publication has already validated all apply
+                # ACKs. Ordinary Sync keeps its existing outer-hook observer.
+                self._speco_freeze_observe_publish({"drafter/published": 1})
             self._speco_record_writer_switch_decision()
         elif publish_plan is not None and publish_outcome is not None:
             logger.warning(

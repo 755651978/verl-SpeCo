@@ -4459,6 +4459,9 @@ class DrafterBaseTrainer:
     def _prepare_training_batch(
         self,
         buffer_steps: int = 2,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
     ) -> Optional[dict[str, torch.Tensor]]:
         """Prepare a batch for training using Ulysses SP to remove padding.
 
@@ -4508,8 +4511,20 @@ class DrafterBaseTrainer:
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
         elif self.use_data_buffer and len(self.data_buffer) > 0:
-            if same_step_target_head_required:
+            if not self._bubble_time_enabled and (
+                min_sample_step is not None or max_sample_step is not None
+            ):
+                available_data = self._filter_training_data_by_step(
+                    self.data_buffer.get_all_data(),
+                    current_step=current_step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
+            elif same_step_target_head_required:
                 buffer_steps = 0
+                available_data = self.data_buffer.get_data_from_last_n_steps(
+                    buffer_steps
+                )
             else:
                 # Use data from last N RL steps via DataBuffer
                 buffer_steps = int(
@@ -4517,7 +4532,9 @@ class DrafterBaseTrainer:
                         "sample_last_n_steps", buffer_steps
                     )
                 )
-            available_data = self.data_buffer.get_data_from_last_n_steps(buffer_steps)
+                available_data = self.data_buffer.get_data_from_last_n_steps(
+                    buffer_steps
+                )
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
                     items = available_data
@@ -4536,11 +4553,12 @@ class DrafterBaseTrainer:
         else:
             # Fall back to current step data only. collected_data can contain
             # older rollout steps when drafter training is triggered sparsely.
-            current_step_data = [
-                item
-                for item in self.collected_data
-                if int(item.get("step", current_step)) == current_step
-            ]
+            current_step_data = self._filter_training_data_by_step(
+                self.collected_data,
+                current_step=current_step,
+                min_sample_step=min_sample_step,
+                max_sample_step=max_sample_step,
+            )
             if len(current_step_data) < effective_batch_size:
                 if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
@@ -5426,21 +5444,79 @@ class DrafterBaseTrainer:
         return batch
 
     def _sync_batch_readiness(self, has_local_batch: bool) -> bool:
-        dp_group = self._get_dp_group()
-        if dp_group is None or self._get_dp_world_size() <= 1:
+        if getattr(self, "_bubble_time_enabled", False):
+            group = self._full_training_group()
+            world_size = self._full_training_world_size()
+        else:
+            group = self._get_dp_group()
+            world_size = self._get_dp_world_size()
+        if group is None or world_size <= 1:
             return has_local_batch
 
+        started = (
+            time.perf_counter() if getattr(self, "_bubble_time_enabled", False) else 0.0
+        )
         readiness = torch.tensor(
             [1 if has_local_batch else 0],
             device=self.runtime_device,
             dtype=torch.int32,
         )
-        dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=dp_group)
-        return bool(readiness.item())
+        dist.all_reduce(readiness, op=dist.ReduceOp.MIN, group=group)
+        ready = bool(readiness.item())
+        if getattr(self, "_bubble_time_enabled", False):
+            self.record_training_timing(
+                "timing_s/drafter_batch_readiness", time.perf_counter() - started
+            )
+        return ready
 
-    def prepare_training_batch(self) -> Optional[dict[str, torch.Tensor]]:
+    @staticmethod
+    def _filter_training_data_by_step(
+        data: Any,
+        *,
+        current_step: int,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        min_step = current_step if min_sample_step is None else int(min_sample_step)
+        max_step = current_step if max_sample_step is None else int(max_sample_step)
+        return [
+            item
+            for item in data
+            if min_step <= int(item.get("step", current_step)) <= max_step
+        ]
+
+    def prepare_training_batch(
+        self,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> Optional[dict[str, torch.Tensor]]:
         with self._ulysses_group_context():
-            return self._prepare_training_batch()
+            return self._prepare_training_batch(
+                min_sample_step=min_sample_step,
+                max_sample_step=max_sample_step,
+            )
+
+    def _prepare_training_batch_for_step(self, **sample_bounds):
+        """Agree on batch readiness before any writer enters model collectives."""
+        batch = None
+        try:
+            batch = self.prepare_training_batch(
+                **{
+                    key: value
+                    for key, value in sample_bounds.items()
+                    if value is not None
+                }
+            )
+        except Exception:
+            if not getattr(self, "_bubble_time_enabled", False):
+                raise
+            logger.exception(
+                "Bubble batch preparation failed; stopping the writer group"
+            )
+        if not self._sync_batch_readiness(batch is not None):
+            return None
+        return batch
 
     def reserve_training_data(
         self,
@@ -5618,6 +5694,8 @@ class DrafterBaseTrainer:
         sample_last_n_steps: int = 2,
         require_full_batch: bool = False,
         target_version: int | None = None,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
     ) -> dict[str, Any]:
         """Return a non-mutating snapshot of data that can form training batches.
 
@@ -5638,10 +5716,53 @@ class DrafterBaseTrainer:
             for item in self.collected_data
             if int(item.get("step", current_step)) == current_step
         ]
+        bubble = getattr(self, "_bubble_time_enabled", False)
         buffer_data = (
-            self.data_buffer.get_available_data() if self.use_data_buffer else []
+            (
+                self.data_buffer.get_available_data()
+                if bubble
+                else self.data_buffer.get_all_data()
+            )
+            if self.use_data_buffer
+            else []
         )
-        if self.use_data_buffer and buffer_data:
+        effective_min_sample_step = min_sample_step
+        effective_max_sample_step = max_sample_step
+        if not bubble:
+            # Sync retains main's complete cross-step pool and head version.
+            # Single-version replay is a Bubble quota constraint, not a Sync filter.
+            if self.use_data_buffer and buffer_data:
+                if min_sample_step is not None or max_sample_step is not None:
+                    trainable_data = self._filter_training_data_by_step(
+                        buffer_data,
+                        current_step=current_step,
+                        min_sample_step=min_sample_step,
+                        max_sample_step=max_sample_step,
+                    )
+                else:
+                    recent_steps = (
+                        0 if same_step_data_required else int(sample_last_n_steps)
+                    )
+                    trainable_data = self.data_buffer.get_data_from_last_n_steps(
+                        recent_steps
+                    )
+                    effective_min_sample_step = max(0, current_step - recent_steps)
+                    effective_max_sample_step = current_step
+            else:
+                trainable_data = self._filter_training_data_by_step(
+                    self.collected_data,
+                    current_step=current_step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
+                effective_min_sample_step = (
+                    current_step if min_sample_step is None else min_sample_step
+                )
+                effective_max_sample_step = (
+                    current_step if max_sample_step is None else max_sample_step
+                )
+            selected_target_version = getattr(self, "_target_lm_head_weight_step", None)
+        elif self.use_data_buffer and buffer_data:
             requested_target_version = (
                 None if target_version is None else int(target_version)
             )
@@ -5738,8 +5859,12 @@ class DrafterBaseTrainer:
             "buffer_version": self.buffer_version,
             "data_version": max(sample_steps) if sample_steps else None,
             "trainable_valid_tokens": trainable_valid_tokens,
-            "min_sample_step": min(sample_steps) if sample_steps else None,
-            "max_sample_step": max(sample_steps) if sample_steps else None,
+            "min_sample_step": (min(sample_steps) if sample_steps else None)
+            if bubble
+            else effective_min_sample_step,
+            "max_sample_step": (max(sample_steps) if sample_steps else None)
+            if bubble
+            else effective_max_sample_step,
         }
 
     def _mark_buffer_changed(self) -> None:
@@ -5823,12 +5948,22 @@ class DrafterBaseTrainer:
             logger.exception(f"Standalone training step {step} failed with error: {e}")
             return False
 
-    async def training_step(self, step: int) -> bool:
+    async def training_step(
+        self,
+        step: int,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> bool:
         self._sampling_accumulation_steps = 1
         self._sampling_micro_index = 0
         try:
             with torch.enable_grad():
-                return await self._training_step_impl(step)
+                return await self._training_step_impl(
+                    step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
         except Exception as e:  # noqa: BLE001
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
@@ -5838,6 +5973,9 @@ class DrafterBaseTrainer:
         step: int,
         accumulation_steps: int,
         can_start_micro_batch: Callable[[int], bool] | None = None,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
     ) -> bool:
         """Execute one Bubble optimizer step from reserved micro-batches."""
 
@@ -5845,48 +5983,55 @@ class DrafterBaseTrainer:
         self._sampling_accumulation_steps = accumulation_steps
         self._sampling_micro_index = 0
         if accumulation_steps == 1:
-            return await self.training_step(step)
-        batches: list[dict[str, torch.Tensor]] = []
+            return await self.training_step(
+                step, min_sample_step=min_sample_step, max_sample_step=max_sample_step
+            )
         batch_items: list[list[dict[str, Any]]] = []
         self._active_accumulation_item_ids: set[int] = set()
-        try:
-            for micro_index in range(accumulation_steps):
-                self._sampling_micro_index = micro_index
-                batch = self.prepare_training_batch()
-                if not self._sync_batch_readiness(batch is not None) or batch is None:
-                    self._last_prepared_training_items = []
-                    return False
-                batches.append(batch)
-                items = list(self._last_prepared_training_items)
-                batch_items.append(items)
-                self._active_accumulation_item_ids.update(id(item) for item in items)
-        finally:
-            self._active_accumulation_item_ids = set()
-
         self.optimizer.zero_grad(set_to_none=True)
         try:
             with torch.enable_grad():
-                for micro_index, batch in enumerate(batches):
+                for micro_index in range(accumulation_steps):
                     if can_start_micro_batch is not None and not can_start_micro_batch(
                         micro_index
                     ):
                         self.optimizer.zero_grad(set_to_none=True)
                         self._last_prepared_training_items = []
                         return False
-                    if not await self._training_step_on_batch(
-                        batch,
-                        step,
-                        accumulation_steps=accumulation_steps,
-                        accumulation_index=micro_index,
-                    ):
+                    self._sampling_micro_index = micro_index
+                    # Only this micro-batch resides on device. Replay sampling
+                    # has its own deterministic RNG/cursor, independent of forward.
+                    batch = self._prepare_training_batch_for_step(
+                        min_sample_step=min_sample_step, max_sample_step=max_sample_step
+                    )
+                    if batch is None:
                         self.optimizer.zero_grad(set_to_none=True)
                         self._last_prepared_training_items = []
                         return False
+                    items = list(self._last_prepared_training_items)
+                    batch_items.append(items)
+                    self._active_accumulation_item_ids.update(
+                        id(item) for item in items
+                    )
+                    try:
+                        if not await self._training_step_on_batch(
+                            batch,
+                            step,
+                            accumulation_steps=accumulation_steps,
+                            accumulation_index=micro_index,
+                        ):
+                            self.optimizer.zero_grad(set_to_none=True)
+                            self._last_prepared_training_items = []
+                            return False
+                    finally:
+                        del batch
         except Exception as e:  # noqa: BLE001
             self.optimizer.zero_grad(set_to_none=True)
             self._last_prepared_training_items = []
             logger.exception(f"Accumulated training step {step} failed with error: {e}")
             return False
+        finally:
+            self._active_accumulation_item_ids = set()
 
         self._consume_training_items([item for items in batch_items for item in items])
         self._last_prepared_training_items = []
@@ -5907,7 +6052,13 @@ class DrafterBaseTrainer:
         finally:
             set_ulysses_sequence_parallel_group(prev_group)
 
-    async def _training_step_impl(self, step: int) -> bool:
+    async def _training_step_impl(
+        self,
+        step: int,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> bool:
         """Execute a single training step."""
         if not self.model:
             logger.debug("No model available for training")
@@ -5931,14 +6082,21 @@ class DrafterBaseTrainer:
             return False
 
         prepare_ts = time.time()
-        batch = self.prepare_training_batch()
+        bubble = getattr(self, "_bubble_time_enabled", False)
+        if bubble:
+            batch = self._prepare_training_batch_for_step(
+                min_sample_step=min_sample_step, max_sample_step=max_sample_step
+            )
+        else:
+            # Keep Sync's original timing boundary: readiness is not part of
+            # batch preparation, and no Bubble control helper is involved.
+            batch = self.prepare_training_batch(
+                min_sample_step=min_sample_step, max_sample_step=max_sample_step
+            )
         self.record_training_timing(
             "timing_s/drafter_prepare_batch", time.time() - prepare_ts
         )
-        if not self._sync_batch_readiness(batch is not None):
-            logger.debug(
-                f"[DrafterTrainer rank {self.rank}] Skipping step {step} due to missing drafter batch"
-            )
+        if not bubble and not self._sync_batch_readiness(batch is not None):
             return False
         if batch is None:
             logger.debug(

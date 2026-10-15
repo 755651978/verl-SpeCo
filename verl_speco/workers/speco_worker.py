@@ -1819,6 +1819,11 @@ class SpecoWorker(Worker):
                 if required_target_version is not None
                 else None
             ),
+            **{
+                key: training_plan[key]
+                for key in ("min_sample_step", "max_sample_step")
+                if execution_strategy == "sync" and training_plan.get(key) is not None
+            },
         )
         actual_data_version = data_status.get("data_version")
         planned_data_version = training_plan.get("data_version")
@@ -2550,6 +2555,12 @@ class SpecoWorker(Worker):
                             can_start_micro_batch=(
                                 None if coordinated_idle else can_start_micro_batch
                             ),
+                            **{
+                                key: training_plan[key]
+                                for key in ("min_sample_step", "max_sample_step")
+                                if execution_strategy == "sync"
+                                and training_plan.get(key) is not None
+                            },
                         )
                     except Exception as error:  # noqa: BLE001
                         step_error = error
@@ -2832,6 +2843,12 @@ class SpecoWorker(Worker):
             data_status_after = self.trainer.get_training_data_status(
                 sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
+                **{
+                    key: training_plan[key]
+                    for key in ("min_sample_step", "max_sample_step")
+                    if execution_strategy == "sync"
+                    and training_plan.get(key) is not None
+                },
             )
             result["buffer_size_after"] = int(data_status_after["trainable_samples"])
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)

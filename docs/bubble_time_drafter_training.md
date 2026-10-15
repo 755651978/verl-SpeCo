@@ -1,6 +1,6 @@
 # Bubble Time Drafter Training
 
-Last updated: 10/13/2026
+Last updated: 10/15/2026
 
 Bubble Time is the rollout-idle execution path for online drafter co-training.
 Its goal is to keep the same drafter-training quality target as synchronous
@@ -618,6 +618,17 @@ cleanup must successfully park model, optimizer, and target-head state before
 returning training resources; it preserves training counters. Keep-hot remains
 an explicit memory/performance trade-off and bypasses this parking path.
 
+Batch readiness and recoverable preparation failures are agreed within the
+writer group, never across unrelated rollout groups. The scalar readiness
+collective replaces the former DP-only check; its Bubble cost is reported in
+`timing_s/drafter_batch_readiness`. Accumulation prepares and releases one device
+micro-batch at a time while retaining deterministic replay order, distinct
+samples within the optimizer step, and combined valid-token normalization.
+Deadline/reclaim decisions still stop coordinated Bubble training only at a
+complete optimizer boundary. Quota size and idle-window admission are unchanged.
+Sync retains main's cross-step pool and passes sample bounds through inspection
+and batch preparation; Bubble alone pins the quota's target version.
+
 Explicit `training_groups` must match complete runtime training collectives.
 Metadata discovery or lease-group configuration failure is fatal in Bubble,
 rather than falling back to guessed group sizes. Independent replica-local
@@ -629,6 +640,10 @@ Bubble checks rank coverage, phase, and version for staging and live apply ACKs.
 Missing, duplicate, stale, or mixed-phase ACKs cannot release a quota or authorize
 writer migration. An inconsistent training result after optimizer progress also
 stops the run instead of silently retrying divergent shards.
+When convergence freeze is enabled, a Bubble publication advances its version
+clock exactly once after validated live apply ACKs, never at submission/staging.
+Failed publication does not advance the clock. Ordinary Sync retains its
+existing outer-hook freeze observer and batch-preparation timing boundary.
 
 Generation lease waits have request-scoped cancellation cleanup. A cancelled or
 timed-out wait cannot leave a stale serving-priority marker that blocks future
