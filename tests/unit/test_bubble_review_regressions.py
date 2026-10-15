@@ -78,6 +78,35 @@ def _sampling_trainer():
     return obj
 
 
+@pytest.mark.parametrize("runner", [None, "0", "1"])
+@pytest.mark.parametrize("confidence_alpha", [0.0, 1.0])
+def test_merged_dspark_publish_filters_only_untrained_confidence_head(
+    monkeypatch, runner, confidence_alpha
+):
+    if runner is None:
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", runner)
+    cls = _methods(
+        "verl_speco/trainer/base_trainer.py",
+        "DrafterBaseTrainer",
+        {"_is_frozen_publish_param"},
+    )
+    worker = cls()
+    worker.backend = SimpleNamespace(
+        model_type="dspark", confidence_head_alpha=confidence_alpha
+    )
+    worker._frozen_param_names = []
+    for name in (
+        "draft_model.confidence_head.proj.weight",
+        "draft_model.confidence_head.proj.bias",
+    ):
+        assert worker._is_frozen_publish_param(name) == (confidence_alpha == 0.0)
+    assert not worker._is_frozen_publish_param("draft_model.fc.weight")
+    worker._frozen_param_names = ["confidence_head."]
+    assert worker._is_frozen_publish_param("draft_model.confidence_head.proj.weight")
+
+
 def _draw_micro_batch(obj, pool):
     items = obj._sample_replay_items(pool, 2)
     if obj._sampling_micro_index == 1:
