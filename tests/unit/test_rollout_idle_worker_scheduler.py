@@ -1409,7 +1409,7 @@ def test_writer_small_window_is_not_hidden_by_other_group_migration(capsys) -> N
     assert "budget_deficit_s=" in capsys.readouterr().out
 
 
-def test_local_topup_calibrates_overhead_and_separate_totals() -> None:
+def test_local_topup_preserves_idle_overhead_and_separate_totals() -> None:
     scheduler = DrafterScheduler()
     config = _idle_config()
     idle = TrainingPlan(
@@ -1438,11 +1438,169 @@ def test_local_topup_calibrates_overhead_and_separate_totals() -> None:
     )
     scheduler._record_training_outcome(idle, outcome)
     topup = replace(idle, reason="quota_topup_training_ready")
-    scheduler._record_training_outcome(topup, outcome)
-    assert outcome.metrics["bubble/idle_optimizer_steps_total"] == 1
-    assert outcome.metrics["bubble/critical_path_topup_optimizer_steps_total"] == 1
+    topup_outcome = replace(
+        outcome,
+        metrics={
+            **outcome.metrics,
+            "timing_s/drafter_worker_preflight": 30.0,
+            "timing_s/drafter_worker_cleanup": 20.0,
+            "timing_s/drafter_worker_memory_park": 10.0,
+        },
+    )
+    scheduler._record_training_outcome(topup, topup_outcome)
+    assert topup_outcome.metrics["bubble/idle_optimizer_steps_total"] == 1
+    assert (
+        topup_outcome.metrics["bubble/critical_path_topup_optimizer_steps_total"] == 1
+    )
+    assert topup_outcome.metrics["timing_s/drafter_topup_cleanup"] == 20.0
     assert scheduler._effective_idle_startup_reserve_sec(config, ("0", "1")) == 3.0
     assert scheduler._effective_idle_tail_reserve_sec(config) == 2.0
+
+
+@pytest.mark.parametrize("final", [False, True])
+def test_topup_cleanup_does_not_poison_log49_idle_budget(final) -> None:
+    scheduler = DrafterScheduler()
+    config = replace(_idle_config(), idle_worker_initial_batch_estimate_sec=None)
+    group = ("2", "3")
+    plan = TrainingPlan(
+        launch=True,
+        reason="quota_forced_completion_ready"
+        if final
+        else "quota_topup_training_ready",
+        interval_matched=True,
+        source_global_step=9,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        max_batches=3,
+        publish_after_success=final,
+        target_worker_ids=group,
+        gradient_accumulation_steps=2,
+    )
+    outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=3,
+        worker_results=[],
+        elapsed_sec=4.0,
+        reason="trained",
+        metrics={
+            "timing_s/drafter_worker_preflight": 3.727,
+            "timing_s/drafter_worker_cleanup_nonpark": 0.693,
+            "timing_s/drafter_publish_snapshot": 1.0 if final else 0.0,
+        },
+        raw_results=[
+            {
+                "worker_id": "2",
+                "successful_steps": 3,
+                "optimizer_step_samples_sec": [4.3, 0.32, 0.32],
+                "optimizer_warmup_steps": 0,
+            }
+        ],
+    )
+    scheduler._training_quota_debt_steps = 3 if final else 20
+    scheduler._record_training_outcome(plan, outcome)
+    assert scheduler._training_quota_debt_steps == (0 if final else 17)
+    assert scheduler._idle_optimizer_steps_total == 0
+    assert scheduler._critical_path_topup_optimizer_steps_total == 3
+    assert group in scheduler._idle_optimizer_initialized_groups
+    assert group in scheduler._idle_worker_hot_prewarmed_groups
+    assert not scheduler._idle_worker_startup_samples_sec
+    assert not scheduler._idle_worker_partial_tail_samples_sec
+    assert not scheduler._idle_worker_final_tail_samples_sec
+    assert not scheduler._idle_worker_first_step_samples_sec
+    assert not scheduler._idle_worker_restore_samples
+    assert not scheduler._idle_worker_batch_samples_sec
+    assert scheduler._idle_worker_batch_estimate_sec is None
+    # Bootstrap still has a measured steady-state reference, excluding step 1.
+    assert scheduler._effective_idle_batch_estimate_sec(config) == pytest.approx(0.16)
+    assert scheduler._effective_idle_startup_reserve_sec(config, group) == 0
+    assert scheduler._effective_idle_tail_reserve_sec(config) == 0
+    if final:
+        assert scheduler._effective_idle_tail_reserve_sec(
+            config, final=True
+        ) == pytest.approx(1.693)
+    assert outcome.metrics["timing_s/drafter_worker_cleanup_nonpark"] == 0.693
+    assert outcome.metrics["timing_s/drafter_topup_cleanup_nonpark"] == 0.693
+    # True idle cleanup continues to constrain admission; it is not disabled.
+    scheduler.record_idle_training_outcome(
+        replace(
+            outcome,
+            metrics={
+                "timing_s/drafter_worker_cleanup_nonpark": 0.03,
+            },
+        ),
+        worker_ids=group,
+    )
+    assert scheduler._effective_idle_tail_reserve_sec(config) == pytest.approx(0.03)
+    assert scheduler._minimum_idle_training_window_sec(config, worker_ids=group) < 0.672
+    scheduler._idle_worker_batch_estimate_sec = 0.2
+    scheduler._idle_worker_batch_samples_sec.append(0.2)
+    scheduler._record_training_outcome(plan, outcome)
+    assert scheduler._effective_idle_batch_estimate_sec(config) == pytest.approx(0.2)
+    assert list(scheduler._idle_worker_batch_samples_sec) == [0.2]
+
+
+def test_normal_sync_does_not_calibrate_idle_or_topup_budgets() -> None:
+    scheduler = DrafterScheduler()
+    plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        source_global_step=9,
+        execution_strategy=DrafterExecutionStrategy.SYNC,
+        max_batches=3,
+        publish_after_success=True,
+    )
+    outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=3,
+        worker_results=[],
+        elapsed_sec=9.0,
+        reason="trained",
+        metrics={"timing_s/drafter_worker_cleanup": 8.0},
+        raw_results=[
+            {"successful_steps": 3, "optimizer_step_samples_sec": [4.0, 2.0, 2.0]}
+        ],
+    )
+    scheduler._record_training_outcome(plan, outcome)
+    assert not scheduler._idle_worker_partial_tail_samples_sec
+    assert not scheduler._idle_worker_final_tail_samples_sec
+    assert not scheduler._idle_worker_batch_samples_sec
+    assert not scheduler._quota_topup_batch_samples_sec
+    assert not scheduler._quota_topup_final_tail_samples_sec
+    assert "timing_s/drafter_topup_cleanup" not in outcome.metrics
+    assert outcome.metrics["timing_s/drafter_worker_cleanup"] == 8.0
+
+
+def test_cold_idle_keeps_separate_topup_offload_safety_reference() -> None:
+    scheduler = DrafterScheduler()
+    plan = TrainingPlan(
+        launch=True,
+        reason="quota_topup_training_ready",
+        interval_matched=True,
+        source_global_step=9,
+        execution_strategy=DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER,
+        max_batches=1,
+        publish_after_success=False,
+        target_worker_ids=("0", "1"),
+    )
+    outcome = TrainingOutcome(
+        trained=True,
+        successful_steps=1,
+        worker_results=[],
+        raw_results=[],
+        elapsed_sec=5.0,
+        reason="trained",
+        metrics={
+            "timing_s/drafter_worker_cleanup_nonpark": 0.693,
+            "timing_s/drafter_worker_memory_park": 2.0,
+        },
+    )
+    scheduler._record_training_outcome(plan, outcome)
+    assert not scheduler._idle_worker_partial_tail_samples_sec
+    assert not scheduler._idle_worker_park_samples_sec
+    hot = replace(_idle_config(), idle_worker_keep_hot_between_plans=True)
+    assert scheduler._effective_idle_tail_reserve_sec(hot) == 0
+    cold = replace(hot, idle_worker_keep_hot_between_plans=False)
+    assert scheduler._effective_idle_tail_reserve_sec(cold) == 2.0
 
 
 def test_quota_publish_preserves_optimizer_owner_across_cycles() -> None:
@@ -2818,7 +2976,8 @@ def test_optimizer_warmup_does_not_poison_idle_batch_estimate(
         ],
     )
     scheduler._record_training_outcome(plan, outcome)
-    assert list(scheduler._idle_worker_batch_samples_sec) == pytest.approx([0.175, 0.2])
+    assert not scheduler._idle_worker_batch_samples_sec
+    assert list(scheduler._quota_topup_batch_samples_sec) == pytest.approx([0.175, 0.2])
     assert (
         scheduler._effective_idle_batch_estimate_sec(
             replace(_idle_config(), idle_worker_initial_batch_estimate_sec=None)

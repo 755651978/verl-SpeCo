@@ -853,6 +853,12 @@ def export_actor_lm_head_weight(
         worker, normalized_row_indices
     )
     if tensor is not None:
+        from verl_speco.integration.phase_timing import phase_span
+
+        trace_labels = {
+            "enabled": _worker_bubble_enabled(worker),
+            "rank": getattr(worker, "rank", None),
+        }
         # FSDP2 exposes each parameter as a DTensor. Export only the projection
         # instead of enumerating/materializing the entire actor checkpoint.
         # All mesh ranks execute full_tensor; only rank zero retains the payload.
@@ -867,26 +873,32 @@ def export_actor_lm_head_weight(
                     from verl.utils.device import get_device_name
 
                     device = torch.device(get_device_name())
-                    tensor = tensor.to(device=device)
-                weight = tensor.detach().full_tensor()
+                    with phase_span("lm_head_device_restore", **trace_labels):
+                        tensor = tensor.to(device=device)
+                with phase_span("lm_head_gather", **trace_labels):
+                    weight = tensor.detach().full_tensor()
             else:
                 weight = tensor.detach()
             if getattr(worker, "rank", None) != 0:
                 return None
-            weight = weight.to(device="cpu", dtype=torch.bfloat16).contiguous()
+            with phase_span("lm_head_cpu_copy", **trace_labels):
+                weight = weight.to(device="cpu", dtype=torch.bfloat16)
+            with phase_span("lm_head_cpu_contiguous", **trace_labels):
+                weight = weight.contiguous()
             logger.info(
                 "[actor lm_head export] direct_full name=%s shape=%s",
                 name,
                 tuple(weight.shape),
             )
-            return {
-                "name": name,
-                "weight": weight,
-                "row_indices": None,
-                "source_vocab_size": int(weight.shape[0]),
-                "selected_rows": 0,
-                "export_strategy": "direct_full",
-            }
+            with phase_span("lm_head_payload_build", **trace_labels):
+                return {
+                    "name": name,
+                    "weight": weight,
+                    "row_indices": None,
+                    "source_vocab_size": int(weight.shape[0]),
+                    "selected_rows": 0,
+                    "export_strategy": "direct_full",
+                }
     if require_head_only:
         raise RuntimeError(
             "Async Bubble export requires the FSDP2 head-only path; refusing full actor reload: "
@@ -996,6 +1008,19 @@ class DraftWeightPublishMixin:
         install_oldlogprob_hidden_runtime_for_worker(self)
         result = super().init_model(*args, **kwargs)
         validate_oldlogprob_hidden_runtime_for_worker(self)
+        from verl_speco.integration.phase_timing import (
+            install_engine_phase_timing,
+            install_ref_worker_phase_timing,
+        )
+
+        if _worker_bubble_enabled(self):
+            install_ref_worker_phase_timing(self)
+            for role in ("actor", "ref"):
+                engine = getattr(getattr(self, role, None), "engine", None)
+                if engine is not None:
+                    install_engine_phase_timing(
+                        engine, role=role, rank=getattr(self, "rank", None)
+                    )
         return result
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
@@ -1004,11 +1029,18 @@ class DraftWeightPublishMixin:
         row_indices: Any = None,
         keep_model_on_device: bool = False,
     ):
-        return export_actor_lm_head_weight(
-            self,
-            row_indices=row_indices,
-            keep_model_on_device=keep_model_on_device,
-        )
+        from verl_speco.integration.phase_timing import phase_span
+
+        with phase_span(
+            "lm_head_export",
+            enabled=_worker_bubble_enabled(self),
+            rank=getattr(self, "rank", None),
+        ):
+            return export_actor_lm_head_weight(
+                self,
+                row_indices=row_indices,
+                keep_model_on_device=keep_model_on_device,
+            )
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def get_actor_lm_head_export_capability(self):
@@ -1029,12 +1061,19 @@ class DraftWeightPublishMixin:
     ):
         # Export itself remains serialized on the actor. The caller must fence
         # completion before mutating actor weights; only the RPC return is async.
-        return export_actor_lm_head_weight(
-            self,
-            row_indices=row_indices,
-            keep_model_on_device=keep_model_on_device,
-            require_head_only=True,
-        )
+        from verl_speco.integration.phase_timing import phase_span
+
+        with phase_span(
+            "lm_head_export",
+            enabled=_worker_bubble_enabled(self),
+            rank=getattr(self, "rank", None),
+        ):
+            return export_actor_lm_head_weight(
+                self,
+                row_indices=row_indices,
+                keep_model_on_device=keep_model_on_device,
+                require_head_only=True,
+            )
 
     @staticmethod
     def _materialize_draft_weights_payload(weights):

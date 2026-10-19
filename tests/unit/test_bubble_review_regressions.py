@@ -53,8 +53,70 @@ def _methods(path, class_name, names, **namespace):
         type_ignores=[],
     )
     namespace.setdefault("logger", logging.getLogger(__name__))
+    namespace.setdefault("__file__", str(path))
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace["Subject"]
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_sync_publish_boundary_always_waits_before_generation(pending):
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_publish_boundary"},
+    )
+    driver = cls()
+    driver._speco_rollout_idle_worker_enabled = lambda: False
+    driver._pending_drafter_publish_refs = [object()] if pending else None
+    calls = []
+
+    def wait():
+        calls.append("publish_completed")
+        driver._pending_drafter_publish_refs = None
+        return int(pending)
+
+    def unexpected_poll():
+        pytest.fail("Sync must not use Bubble's nonblocking publish policy")
+
+    driver._speco_wait_pending_drafter_publish = wait
+    driver._speco_poll_pending_drafter_publish = unexpected_poll
+    assert driver._speco_publish_boundary() == {}
+    calls.append("generation_started")
+    assert calls == ["publish_completed", "generation_started"]
+    assert driver._pending_drafter_publish_refs is None
+
+
+@pytest.mark.parametrize("pending,lag", [(False, 0), (True, 1), (True, 2)])
+def test_bubble_publish_boundary_preserves_bounded_lag(pending, lag):
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_publish_boundary"},
+        time=time,
+    )
+    driver = cls()
+    driver._speco_rollout_idle_worker_enabled = lambda: True
+    driver._speco_poll_pending_drafter_publish = lambda: {
+        "bubble/publish_pending": int(pending),
+        "bubble/publish_lag_steps": lag,
+    }
+    driver._speco_drafter_schedule_config = lambda: SimpleNamespace(
+        idle_worker_max_publish_lag_steps=2
+    )
+    waits = []
+
+    def wait():
+        waits.append(True)
+        return 1
+
+    driver._speco_wait_pending_drafter_publish = wait
+    metrics = driver._speco_publish_boundary()
+    must_wait = pending and lag >= 2
+    assert bool(waits) == must_wait
+    assert metrics["bubble/publish_pending"] == int(pending and not must_wait)
+    if must_wait:
+        assert metrics["bubble/publish_acknowledged"] == 1
+        assert metrics["bubble/publish_forced_by_lag"] == 1
 
 
 def _sampling_trainer():

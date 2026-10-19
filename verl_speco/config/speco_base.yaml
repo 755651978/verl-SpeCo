@@ -531,6 +531,13 @@ actor_rollout_ref:
             # rollout may keep serving an older drafter version.
             max_publish_lag_steps: 2
             max_pending_publish: 1
+            # Bubble-only, opt-in: stage an already cached CPU snapshot before
+            # upstream weight sync. Never exports GPU weights on this path;
+            # commit and publication ACK remain at their existing boundaries.
+            early_publish_staging: false
+            # Experimental bounded retry: same hot writer, one optimizer step
+            # per idle episode, backed by same-replica completed tail history.
+            historical_window_readmission: false
             # Repeated per-token generation slowdown means the predicted idle
             # window was unsafe. Pause new Bubble launches briefly instead of
             # continuing to interfere at a one-batch cap.

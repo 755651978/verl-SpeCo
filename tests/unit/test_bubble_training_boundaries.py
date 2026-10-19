@@ -476,6 +476,49 @@ def test_reclaim_runs_between_atomic_optimizer_steps(worker_class):
     assert callbacks == [None]
 
 
+@pytest.mark.parametrize("reclaim", [False, True])
+def test_conditional_multistep_plan_checks_remaining_time_and_reclaim(
+    worker_class, monkeypatch, reclaim
+):
+    worker, plan, callbacks = _prepared_worker(
+        worker_class, reclaim_after_first=reclaim
+    )
+    clock = [100.0]
+    monkeypatch.setitem(
+        worker_class.train_drafter.__globals__,
+        "time",
+        SimpleNamespace(time=lambda: clock[0], perf_counter=lambda: clock[0]),
+    )
+    plan.update(
+        idle_window_source="historical_survival",
+        idle_batch_estimate_sec=0.353,
+        deadline_ts=101.38,
+    )
+    original = worker.trainer.training_accumulation_step
+    cleanup_calls = []
+
+    async def train(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        clock[0] += 0.767 if len(callbacks) == 1 else 0.353
+        return result
+
+    async def cleanup(*args, **kwargs):
+        cleanup_calls.append(True)
+
+    worker.trainer.training_accumulation_step = train
+    worker.trainer.cleanup_training = cleanup
+    worker.trainer.prepare_model_state_dict_for_publish = lambda step: pytest.fail(
+        "A conditional partial plan must not stage a final snapshot"
+    )
+    result = asyncio.run(worker.train_drafter(plan))
+    assert result["successful_steps"] == (1 if reclaim else 2)
+    assert result["stop_reason"] == (
+        "reclaim_requested" if reclaim else "deadline_reached"
+    )
+    assert clock[0] < plan["deadline_ts"]
+    assert cleanup_calls == [True]
+
+
 def test_first_idle_optimizer_breakdown_uses_per_plan_deltas(worker_class, caplog):
     worker, plan, callbacks = _prepared_worker(worker_class)
     worker.trainer._training_metric_sums = {"timing_s/drafter_forward_loss": 100.0}
@@ -944,6 +987,9 @@ def test_background_finalize_failure_is_not_swallowed(continuation_driver_class)
     driver._speco_rollout_idle_worker_enabled = lambda: True
     driver._speco_rollout_idle_event_bus_name = lambda: "test-bus"
     driver._speco_rollout_idle_poll_interval_sec = lambda: 0.001
+    driver._speco_drafter_schedule_config = lambda: SimpleNamespace(
+        idle_worker_historical_window_readmission=False
+    )
     failure = CollectionFinalizeError(
         "partial",
         CollectionOutcome(

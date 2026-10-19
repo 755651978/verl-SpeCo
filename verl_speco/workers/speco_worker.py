@@ -3106,7 +3106,7 @@ class SpecoWorker(Worker):
         }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def maybe_publish(self):
+    def maybe_publish(self, *, cached_snapshot_only: bool = False):
         if (
             not self.enable_drafter
             or not self.in_drafter_train_group
@@ -3121,6 +3121,11 @@ class SpecoWorker(Worker):
             getattr(self, "_deferred_publish_snapshot_step", None)
             == self.last_global_step
         ):
+            if cached_snapshot_only:
+                # Early host staging must never initiate FSDP gathering or
+                # device export. Leave the snapshot and optimizer fence intact
+                # for the original post-weight-update publication path.
+                return None
             # Invoked on all writer ranks by ONE_TO_ALL at the safe point.
             # No optimizer step or new quota may run before publication ACK.
             started = time.perf_counter()

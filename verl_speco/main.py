@@ -31,6 +31,7 @@ def drafter_diagnostic_env() -> dict[str, str]:
         for name in (
             "VERL_DRAFTER_MEMORY_DIAGNOSTICS",
             "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
+            "VERL_SPECO_PHASE_TIMING",
         )
         if name in os.environ
     }
@@ -104,6 +105,40 @@ def _strip_speco_overlay_for_native_run(config) -> None:
             del config["speco"]
 
 
+def configure_phase_diagnostic_runtime_env(config) -> None:
+    """Keep opt-in Bubble driver diagnostics visible in Ray's root env too.
+
+    The actor-class override below is still needed for already running Ray
+    clusters. Configuring both also survives upstream wrappers that replace
+    class runtime options (for example a profiler runtime environment).
+    """
+    value = os.environ.get("VERL_SPECO_PHASE_TIMING", "")
+    if (
+        value.lower() not in {"1", "true", "yes"}
+        or _config_get(
+            config,
+            "actor_rollout_ref",
+            "rollout",
+            "drafter",
+            "training",
+            "scheduler",
+            "execution",
+            "strategy",
+            default="sync",
+        )
+        != "rollout_idle_worker"
+    ):
+        return
+    from omegaconf import OmegaConf
+
+    OmegaConf.update(
+        config,
+        "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_PHASE_TIMING",
+        value,
+        force_add=True,
+    )
+
+
 def run(config) -> None:
     """Resolve SPECO/verl compatibility, device and the task-runner dispatch."""
 
@@ -132,6 +167,7 @@ def run(config) -> None:
 
     from verl_speco.integration.task_runner import SpecoTaskRunner
 
+    configure_phase_diagnostic_runtime_env(config)
     runner = ray.remote(num_cpus=1)(SpecoTaskRunner)
     diagnostic_env = drafter_diagnostic_env()
     if diagnostic_env:

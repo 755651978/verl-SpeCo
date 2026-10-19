@@ -28,6 +28,8 @@ class BeforeActorUpdateContext:
     # before any worker prepare RPC (notably the target lm-head sync).
     drafter_frozen: bool = False
     idle_continuation_plan: TrainingPlan | None = None
+    # Only the normal final PPO step may request early debt completion.
+    force_quota_completion: bool = False
 
 
 @dataclass(frozen=True)

@@ -49,6 +49,7 @@ from verl_speco.trainer.checkpoint import trim_process_host_memory
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+_ACCEPTANCE_HOOK_STATUS: tuple[bool, bool, bool] | None = None
 
 SPECO_DRAFTER_CONFIG_ENV = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
 SPECO_VLLM_DRAFT_UPDATE_USE_SHM_ENV = "VERL_SPECO_VLLM_DRAFT_UPDATE_USE_SHM"
@@ -2979,9 +2980,18 @@ def patch_vllm_worker_proc_entrypoint() -> bool:
 def install_vllm_spec_decode_acceptance_logging() -> bool:
     """Install speculative acceptance logs in parent and EngineCore processes."""
 
+    global _ACCEPTANCE_HOOK_STATUS
     scheduler_patched = patch_vllm_spec_decode_acceptance_logging()
     request_acceptance_patched = patch_vllm_request_acceptance_stats()
     engine_core_patched = patch_vllm_engine_core_entrypoint()
+    status = (scheduler_patched, request_acceptance_patched, engine_core_patched)
+    if status != _ACCEPTANCE_HOOK_STATUS:
+        _ACCEPTANCE_HOOK_STATUS = status
+        logger.warning(
+            "[SpeCoAcceptance] hooks: vllm_version=%s scheduler=%s request=%s engine_core=%s",
+            getattr(sys.modules.get("vllm"), "__version__", "unknown"),
+            *status,
+        )
     return scheduler_patched or request_acceptance_patched or engine_core_patched
 
 
@@ -3013,17 +3023,29 @@ def _new_vllm_spec_decode_stats() -> dict[str, float]:
 
 
 def _record_vllm_spec_decode_scheduler_stats(
-    target: dict[str, float], scheduler_stats: Any
-) -> None:
-    spec_stats = getattr(scheduler_stats, "spec_decoding_stats", None)
-    if spec_stats is None:
-        return
-    drafts = _int_or_zero(getattr(spec_stats, "num_drafts", 0))
-    accepted_tokens = _int_or_zero(getattr(spec_stats, "num_accepted_tokens", 0))
-    if drafts <= 0 and accepted_tokens <= 0:
-        return
-    target["drafts"] += drafts
-    target["accepted_tokens"] += accepted_tokens
+    target: dict[str, float], scheduler_stats: Any, iteration_stats: Any = None
+) -> str | None:
+    """Read one counter source per callback; never sum mirrored API fields."""
+    for source, record in (
+        ("scheduler", scheduler_stats),
+        ("iteration", iteration_stats),
+    ):
+        spec_stats = _get_nested(record, ("spec_decoding_stats",), None)
+        raw_drafts = _get_nested(spec_stats, ("num_drafts",), None)
+        raw_accepted = _get_nested(spec_stats, ("num_accepted_tokens",), None)
+        if raw_drafts is None or raw_accepted is None:
+            continue
+        try:
+            drafts = _int_or_zero(raw_drafts)
+            accepted_tokens = _int_or_zero(raw_accepted)
+        except OverflowError:
+            continue
+        if drafts <= 0 or accepted_tokens < 0:
+            continue
+        target["drafts"] += drafts
+        target["accepted_tokens"] += accepted_tokens
+        return source
+    return None
 
 
 def _vllm_spec_decode_stats_to_metrics(stats: dict[str, float]) -> dict[str, float]:
@@ -3163,17 +3185,29 @@ def _build_speco_vllm_stat_logger(server: Any):
 
         def record(
             self,
-            scheduler_stats,
-            iteration_stats,
+            scheduler_stats=None,
+            iteration_stats=None,
             mm_cache_stats=None,
             engine_idx: int = 0,
         ):
-            del iteration_stats, mm_cache_stats
+            del mm_cache_stats
             stats = getattr(server, "_speco_vllm_spec_decode_pending_stats", None)
             if not isinstance(stats, dict):
                 stats = _new_vllm_spec_decode_stats()
                 server._speco_vllm_spec_decode_pending_stats = stats
-            _record_vllm_spec_decode_scheduler_stats(stats, scheduler_stats)
+            source = _record_vllm_spec_decode_scheduler_stats(
+                stats, scheduler_stats, iteration_stats
+            )
+            if (
+                source
+                and getattr(server, "_speco_acceptance_stats_source", None) != source
+            ):
+                server._speco_acceptance_stats_source = source
+                logger.warning(
+                    "[SpeCoAcceptance] stats_source_ready: source=%s engine_idx=%s",
+                    source,
+                    engine_idx,
+                )
 
         def log_engine_initialized(self):
             return None
@@ -3302,6 +3336,13 @@ class _SpecoVLLMHttpServerMixin:
             stat_loggers = list(call_kwargs.get("stat_loggers") or [])
             stat_loggers.append(_build_speco_vllm_stat_logger(self))
             call_kwargs["stat_loggers"] = stat_loggers
+            logger.warning(
+                "[SpeCoAcceptance] stat_logger_registered: vllm_version=%s "
+                "replica_rank=%s enable_log_stats=%s",
+                getattr(sys.modules.get("vllm"), "__version__", "unknown"),
+                getattr(self, "replica_rank", 0),
+                call_kwargs.get("enable_log_stats", "runtime_default"),
+            )
             return original_from_vllm_config(*call_args, **call_kwargs)
 
         if original_signature is not None:
@@ -3511,9 +3552,8 @@ class _SpecoVLLMHttpServerMixin:
                         )
                     self._speco_rollout_resource_lease_active = False
                     self._speco_rollout_release_verified = False
-        extra_fields = getattr(output, "extra_fields", None)
-        if isinstance(extra_fields, dict):
-            self._speco_add_vllm_spec_decode_extra_fields(extra_fields)
+        # Only the outer generate() drains acceptance counters. Draining here
+        # consumed them before that wrapper overwrote the output with zeros.
         return output
 
 

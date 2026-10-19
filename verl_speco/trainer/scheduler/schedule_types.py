@@ -219,6 +219,12 @@ class DrafterScheduleConfig:
     idle_worker_speculative_window_multiplier: float = 1.5
     idle_worker_max_publish_lag_steps: int = 2
     idle_worker_max_pending_publish: int = 1
+    # Opt-in host staging before actor-to-rollout weight sync; never adds idle
+    # GPU work or changes the generation-boundary commit/ACK policy.
+    idle_worker_early_publish_staging: bool = False
+    # Opt-in, one-step retry for an already hot writer whose live idle period
+    # outlasts its short forecast. Never overrides an explicit runtime deadline.
+    idle_worker_historical_window_readmission: bool = False
     idle_worker_dynamic_batch_cap: bool = True
     idle_worker_initial_dynamic_batches: int | None = None
     idle_worker_gen_slowdown_threshold: float = 0.08
@@ -359,6 +365,12 @@ class DrafterScheduleConfig:
             ),
             idle_worker_max_pending_publish=max(
                 int(idle_get("max_pending_publish", 1) or 1), 1
+            ),
+            idle_worker_early_publish_staging=bool(
+                idle_get("early_publish_staging", False)
+            ),
+            idle_worker_historical_window_readmission=bool(
+                idle_get("historical_window_readmission", False)
             ),
             idle_worker_dynamic_batch_cap=bool(idle_get("dynamic_batch_cap", True)),
             idle_worker_initial_dynamic_batches=_optional_int(
@@ -715,6 +727,11 @@ class TrainingPlan:
     idle_startup_reserve_sec: float | None = None
     idle_first_step_extra_sec: float = 0.0
     idle_continuation: bool = False
+    # A reclaim/failure must not be reinterpreted as a short forecast expiry.
+    idle_readmission_blocked: bool = False
+    # Driver-only epoch snapshot. Only a confirmed intervening generation on
+    # every participating worker can detach a continuation from its old lease.
+    idle_generation_epochs: tuple[tuple[str, int], ...] = ()
     idle_tail_reserve_sec: float | None = None
     idle_reclaim_penalty_sec: float | None = None
     idle_trainable_batches: int | None = None

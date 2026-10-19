@@ -224,6 +224,24 @@ Useful metrics:
 - `bubble/training_quota_debt_steps`: unfinished drafter-training quota.
 - `drafter/train_successful_steps_max`: successful drafter optimizer steps.
 
+Acceptance observability uses the same path for Sync and Bubble. Each generated
+output drains vLLM aggregate counters exactly once; nested idle-lease wrappers
+must not replace those counters with an empty second snapshot. The callback
+accepts speculative stats on either scheduler or iteration records, choosing
+one source instead of double-counting mirrored fields. When aggregate stats are
+missing, complete, valid, uniquely identified request rows can supply the
+fallback: `1 + sum(accepted_tokens) / sum(verify_rounds)`, not an unweighted
+average of request means. Missing or incomplete statistics omit the metric;
+they do not produce a synthetic acceptance length of zero or one.
+
+No additional flag is needed for the low-frequency `[SpeCoAcceptance]` messages:
+startup `hooks` and `stat_logger_registered` report runtime compatibility;
+`stats_source_ready` reports the first usable callback source; one
+`rollout_stats` line per generation return reports the PPO step, source,
+availability, verify rounds and accepted-token count. If `available=False`,
+check the reported reason and startup messages before comparing quality.
+These diagnostics do not add per-token logs, device synchronization or RPCs.
+
 When comparing with synchronous drafter training, exclude checkpoint-save steps
 from the speed calculation because checkpoint I/O is orthogonal to Bubble Time.
 
@@ -744,3 +762,156 @@ critical path. Excluding checkpoint-save steps, the observed result was:
 The expected healthy pattern is that Bubble Time retains the speculative
 decoding gain from the trained drafter, while reducing the amount of drafter
 training that blocks the PPO critical path.
+
+## Optional cached-host publish staging
+
+`actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.early_publish_staging=true`
+opts Bubble into staging an already cached CPU publish snapshot immediately
+before the upstream actor-to-rollout weight update, after PPO has finished.
+The host staging RPC may overlap that update. It does not run in the idle event
+loop, reserve extra idle time, change training quotas/deadlines, or ask a writer
+to gather/export GPU parameters. Existing budgeted idle snapshot preparation is
+unchanged. If the snapshot was deferred or is absent, the original post-update
+publish path still prepares and submits it. Sync and synchronous publication
+ignore this option; the default is `false`.
+
+Only completed, publishable Bubble plans from the current step are eligible.
+An existing pending publication, active generation, validation, checkpoint, or
+remaining quota debt prevents early staging. Successful staging removes the
+deferred queue entry exactly once, but keeps publication backpressure until the
+original commit path validates all apply ACKs. No live inference weights or
+version counters change during staging. Submission/ACK failures retain the
+existing fail-closed behavior rather than silently retrying an ambiguous send.
+
+`bubble/early_publish_staging_submitted` and
+`bubble/early_publish_staging_cache_miss` identify the path used;
+`timing_s/drafter_early_publish_staging` measures its exposed preparation/submission
+cost, not overlap saved. This timer overlaps the ordinary publish-fetch/update
+timers and must not be added to them. Compare whole weight-update/step time,
+residual publish waits and generation time with the option on/off. CPU, host
+memory, RPC and transport contention can outweigh the overlap: this option does
+not guarantee a speedup or zero interference. No real-device benefit is implied
+by passing CPU contract tests.
+
+## Bounded hot-writer readmission experiment
+
+`scheduler.idle_worker.historical_window_readmission=false` remains the default.
+To diagnose missed long/short alternating tails, enable it in a separate Bubble
+experiment with `keep_hot_between_plans=true`. This does not change the normal
+historical forecast or reduce the length of normal admitted plans.
+
+Only the existing hot writer with initialized optimizer state and an unfinished
+quota can retry. Its whole group must still be confirmed idle with memory
+released, without an explicit runtime deadline. The current idle episode must
+first outlast the normal forecast. At least three of the last sixteen completed
+tails of that same replica must have survived this age; the shortest residual
+is used as an estimate. Other replicas and pre-generation/request gaps are not
+borrowed. This is not a guarantee of future idle time.
+
+Quiet event polls may reconsider this condition at most every 250 ms, with no
+new thread or data-inspection RPC until the resource budget is sufficient.
+There is at most one admission attempt per idle episode. Duplicate idle
+notifications do not grant a new window: every writer rank must pass through a
+newer generation epoch before another attempt is allowed. Complete optimizer
+steps are capped by the estimated remaining window and the existing training
+caps, within one lease and one absolute deadline. The worker checks the deadline
+and reclaim before each step; the estimate does not guarantee all planned steps
+will fit. Data/head version checks, atomic leases, inspection elapsed-time
+deduction, cleanup reserves, reclaim and slowdown cooldowns remain in force.
+The last quota step is excluded so a retry cannot trigger a final snapshot.
+Expired runtime deadlines, cold writers and incomplete groups are not retried.
+Look for `[BubbleTime] idle_historical_readmission` and
+`window_source=historical_survival`. Normal plans may still train many steps.
+
+Validate additional idle steps against reclaim waits and end-to-end time;
+disable this experiment if the extra work delays rollout or actor/ref updates.
+Test it separately from `early_publish_staging` to keep results attributable.
+
+An expired historical plan may now enter this same bounded readmission path
+after completing useful work, provided its writer and data/head versions still
+match the current quota. A reclaimed or failed plan, or a real runtime deadline,
+never gains an extension. Successful plans within the original absolute deadline
+continue normally. Measured in-budget exhaustion of a historical forecast no
+longer collapses the next independent window's dynamic cap; missing timing,
+actual overruns, real deadlines and slowdown protection retain their safeguards.
+
+## Completing a finite run
+
+On the resolved final PPO step, Bubble quotas finish their already registered
+debt using the original writer/data/head, then drain staging/apply ACKs before
+returning to upstream checkpoint and final validation. This can add visible
+final-step time: include it when comparing equal training work with Sync.
+No new collection is created for this drain, no live writer migration is added,
+and periodic checkpoints and Sync retain their existing behavior. This path is
+not run from exception cleanup. It respects `allow_critical_path_fallback` and
+the freeze policy; if the remaining quota cannot be completed under those
+policies or the original data/head is unavailable, finalization raises explicitly
+instead of silently reporting an undertrained successful result. Observe
+`bubble/final_quota_completed=1` and `timing_s/drafter_final_publish_wait`.
+
+## Optional phase diagnostics
+
+For a short Bubble diagnostic run, set `VERL_SPECO_PHASE_TIMING=true` in the
+launch environment (for example, `export VERL_SPECO_PHASE_TIMING=true` in Bash).
+The entrypoint forwards it to the Ray actor tree. It is disabled by default;
+Sync does not install engine/ref diagnostic wrappers even if the variable is set.
+The entrypoint also forwards this switch through the root Ray runtime environment
+for Bubble, without replacing custom environment variables or `working_dir`.
+Check for `[SpecoPhaseSetup] driver_enabled=True` in addition to worker spans;
+worker-only spans do not confirm that the driver/ref/collection hooks are active.
+Phase records now use one diagnostic-only stderr handler, independently of the
+driver/Hydra logger's disabled flag, inherited level or propagation. Setup logs
+include the imported trainer path, process ID, environment value and trainer
+logger state. No global/root training log level is changed. Thus missing driver
+records can be distinguished from an old deployed module or a disabled hook,
+rather than repeatedly changing the launch environment alone.
+This option does not change quotas, admission, reclaim, publication ordering,
+training data, or optimizer steps. It adds no accelerator synchronization or
+Ray waits. Logging does have overhead: use a short run covering collection and
+publication, then unset the variable for performance measurements.
+
+`[SpecoPhase]` JSON records include process ID, rank where available, host wall
+start/end timestamps, monotonic elapsed time and failure status. They cover:
+
+- Collection set-step, stage, commit and finalize RPCs, with collection IDs.
+- Actual worker-side LM-head export, rather than driver submit-to-poll latency.
+- Driver ref execution, with the pending target version observed at entry (no
+  polling is added). Driver old-logprob and actor update are also traced.
+- Available actor/ref engine mode enter/exit, `to`, `infer_batch` and
+  `train_batch` calls. Migration records include device/model/optimizer/grad
+  flags; combined model/optimizer transfers remain combined. Engine mode enter
+  and exit expose restore/offload work without changing upstream engine code.
+
+The step metrics expose `timing_s/phase_ref_driver`,
+`timing_s/phase_old_log_prob_driver`, `timing_s/phase_actor_update_driver` and
+`timing_s/oldlogprob_{prepare,compute,collect,collect_rpc}`. Capture fields
+`oldlogprob_{select,sp_merge,concat,cpu_copy,ray_put}` are worker-summed host
+timers, not additional serial overhead. Nested timers overlap: do not add them
+to the enclosing old-logprob/actor/step durations. Engine timers are host times,
+not precise GPU kernel times; asynchronous kernels may finish later. Missing
+engine records on unsupported backends do not mean zero compute/transfer cost.
+
+Correlate worker export and ref time intervals on synchronized host clocks to
+check overlap; overlap alone does not prove contention. Ref/old-logprob metrics
+carry explicit source steps. Existing weight-update breakdown metrics still
+refer to `bubble/weight_update_source_step`, which can precede the log row step.
+Do not combine weight-update details with the current row without realigning.
+
+Head/ref diagnostics additionally split the FSDP2 head-only path into
+`lm_head_device_restore` (when needed), `lm_head_gather`, `lm_head_cpu_copy`,
+`lm_head_cpu_contiguous`, and `lm_head_payload_build`. All participating ranks
+still perform the same collective; only the original payload owner copies to
+CPU. No extra device synchronization is inserted.
+
+`ref_driver`, `ref_worker`, and nested ref engine spans share a `trace_id` and
+`source_step`. `dispatch_to_worker_observed_s` is a cross-process wall-clock
+difference including transport and scheduling, not isolated Ray queue latency;
+it requires aligned host clocks. `worker_entry_to_call_s` is a local monotonic
+duration locating delays between the existing worker RPC entry and engine calls.
+The temporary trace metadata is restored after the driver call.
+
+`lm_head_driver_materialize` measures the existing get after readiness was
+observed; `ready_observed_age_s` includes the driver's polling interval and must
+not be interpreted as pure serialization or transfer time. Ray serialization
+after worker return is not directly timed. `lm_head_export_fence` records the
+existing pre-PPO wait, without adding a new wait or changing execution order.
