@@ -141,6 +141,38 @@ def test_run_bypasses_to_native_verl_when_drafter_disabled(monkeypatch) -> None:
     assert "verl_speco.integration.task_runner" not in sys.modules
 
 
+@pytest.mark.parametrize("use_v1", [False, True])
+def test_native_bypass_selects_required_upstream_runner(monkeypatch, use_v1) -> None:
+    pytest.importorskip("verl", reason="dispatch contract needs verl")
+    pytest.importorskip("ray", reason="dispatch contract needs ray")
+    import sys
+    from types import SimpleNamespace
+
+    import verl.trainer.main_ppo as main_ppo
+
+    from verl_speco.main import run
+
+    calls = _patch_verl_entry(monkeypatch)
+    v1_runner, legacy_runner = object(), object()
+    monkeypatch.setattr(main_ppo, "TaskRunnerV1", v1_runner, raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.trainer.main_ppo_v0",
+        SimpleNamespace(TaskRunner=legacy_runner),
+    )
+
+    def required_runner(config, task_runner_class):
+        calls.append(task_runner_class)
+        assert "drafter" not in config.actor_rollout_ref.rollout
+
+    monkeypatch.setattr(main_ppo, "run_ppo", required_runner)
+    config = _config()
+    config.trainer = {"use_v1": use_v1}
+    run(config)
+    assert calls == [v1_runner if use_v1 else legacy_runner]
+    assert "verl_speco.integration.task_runner" not in sys.modules
+
+
 def test_run_uses_speco_task_runner_when_drafter_enabled(monkeypatch) -> None:
     pytest.importorskip("verl", reason="dispatch contract needs verl")
     pytest.importorskip("ray", reason="dispatch contract needs ray")

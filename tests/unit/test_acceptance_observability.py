@@ -159,7 +159,7 @@ def test_generate_drains_acceptance_once_and_restores_trainer_metric(
 
 @pytest.mark.parametrize("kind", ["scheduler", "iteration", "both", "dict"])
 def test_acceptance_callback_compatibility_does_not_double_count(kind):
-    spec = SimpleNamespace(num_drafts=4, num_accepted_tokens=12)
+    spec = SimpleNamespace(num_drafts=4, num_draft_tokens=20, num_accepted_tokens=12)
     scheduler = (
         SimpleNamespace(spec_decoding_stats=spec)
         if kind in {"scheduler", "both"}
@@ -172,14 +172,18 @@ def test_acceptance_callback_compatibility_does_not_double_count(kind):
     )
     if kind == "dict":
         iteration = {
-            "spec_decoding_stats": {"num_drafts": 4, "num_accepted_tokens": 12}
+            "spec_decoding_stats": {
+                "num_drafts": 4,
+                "num_draft_tokens": 20,
+                "num_accepted_tokens": 12,
+            }
         }
     stats = runtime._new_vllm_spec_decode_stats()
     source = runtime._record_vllm_spec_decode_scheduler_stats(
         stats, scheduler, iteration
     )
     assert source == ("scheduler" if scheduler is not None else "iteration")
-    assert stats == {"drafts": 4, "accepted_tokens": 12}
+    assert stats == {"drafts": 4, "draft_tokens": 20, "accepted_tokens": 12}
 
 
 def test_stat_logger_consumes_iteration_only_keyword_callback(monkeypatch):
@@ -195,6 +199,7 @@ def test_stat_logger_consumes_iteration_only_keyword_callback(monkeypatch):
     )
     assert server._speco_vllm_spec_decode_pending_stats == {
         "drafts": 2,
+        "draft_tokens": 0,
         "accepted_tokens": 0,
     }
     assert server._speco_acceptance_stats_source == "iteration"
