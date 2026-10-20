@@ -216,12 +216,14 @@ class DrafterScheduleConfig:
     idle_worker_group_mode: str = "auto"
     idle_worker_group_size: int | None = None
     idle_worker_training_groups: tuple[tuple[str, ...], ...] = ()
-    idle_worker_speculative_window_multiplier: float = 1.5
     idle_worker_max_publish_lag_steps: int = 2
     idle_worker_max_pending_publish: int = 1
     # Opt-in host staging before actor-to-rollout weight sync; never adds idle
     # GPU work or changes the generation-boundary commit/ACK policy.
     idle_worker_early_publish_staging: bool = False
+    # Bubble-only CPU snapshot reference transport and mode-local calibration.
+    idle_worker_head_reference_transport: bool = True
+    idle_worker_calibrated_budgets: bool = True
     # Opt-in, one-step retry for an already hot writer whose live idle period
     # outlasts its short forecast. Never overrides an explicit runtime deadline.
     idle_worker_historical_window_readmission: bool = False
@@ -356,10 +358,6 @@ class DrafterScheduleConfig:
             .lower(),
             idle_worker_group_size=_optional_int(idle_get("group_size", None)),
             idle_worker_training_groups=training_groups,
-            idle_worker_speculative_window_multiplier=max(
-                float(idle_get("speculative_window_multiplier", 1.5) or 1.5),
-                1.0,
-            ),
             idle_worker_max_publish_lag_steps=max(
                 int(idle_get("max_publish_lag_steps", 2) or 0), 0
             ),
@@ -369,6 +367,10 @@ class DrafterScheduleConfig:
             idle_worker_early_publish_staging=bool(
                 idle_get("early_publish_staging", False)
             ),
+            idle_worker_head_reference_transport=bool(
+                idle_get("head_reference_transport", True)
+            ),
+            idle_worker_calibrated_budgets=bool(idle_get("calibrated_budgets", True)),
             idle_worker_historical_window_readmission=bool(
                 idle_get("historical_window_readmission", False)
             ),

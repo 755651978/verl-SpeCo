@@ -74,8 +74,8 @@ def _driver(*, target_hot=True, rejection=None, source_resident=False):
         _idle_optimizer_initialized_groups={source},
         _idle_worker_park_samples_sec=deque([0.75]),
         record_memory_park_elapsed=lambda value: None,
-        _effective_idle_tail_reserve_sec=lambda config: 0,
-        _effective_idle_batch_estimate_sec=lambda config: 0.25,
+        _effective_idle_tail_reserve_sec=lambda config, *, worker_ids=None: 0,
+        _effective_idle_batch_estimate_sec=lambda config, worker_ids=None: 0.25,
         _idle_gradient_accumulation_steps=lambda config, workers: 1,
         _effective_idle_startup_reserve_sec=lambda config, workers: 0
         if workers in hot
@@ -193,6 +193,35 @@ def test_migration_parks_both_sides_and_budgets_cold_target(
         target + (source if source_resident else ())
     )
     assert leases[0]["worker_ids"] == released[0]["worker_ids"]
+
+
+def test_migration_prices_target_group_cleanup_and_optimizer_step():
+    obj, scheduler, group, source, target, parked, costs, leases, _ = _driver(
+        target_hot=False
+    )
+    queries = []
+
+    def tail(config, *, worker_ids=None):
+        queries.append(("tail", worker_ids))
+        return 4.0 if worker_ids == target else 0.1
+
+    def batch(config, worker_ids=None):
+        queries.append(("step", worker_ids))
+        return 2.0 if worker_ids == target else 0.25
+
+    scheduler._effective_idle_tail_reserve_sec = tail
+    scheduler._effective_idle_batch_estimate_sec = batch
+    scheduler.select_idle_training_resources = lambda config: SimpleNamespace(
+        available=True, minimum_idle_window_sec=8.0
+    )
+    result = obj._speco_migrate_idle_writer_if_useful(_config())
+    # Transfer >= 0.5s + cold startup 3s + target tail 4s + target step 2s
+    # does not fit. The cheap source group's estimates must not authorize it.
+    assert queries == [("tail", target), ("step", target)]
+    assert costs[-1] >= 7.5
+    assert result["bubble/writer_migration_window_too_small"] == 1
+    assert not group.exports and not parked and not leases
+    assert scheduler._idle_worker_writer_group == source
 
 
 @pytest.mark.parametrize("reason", ["layout", "unsupported", "validation_ack"])

@@ -1464,6 +1464,92 @@ def test_worker_rpc_forwards_head_protection_only_for_bubble(bubble):
     assert calls[0].get("protected_target_versions") == ((4,) if bubble else None)
 
 
+@pytest.mark.parametrize(
+    "runtime, oldlogprob, bubble, expected_samples",
+    [
+        ("sglang", False, True, 22),
+        ("sglang", True, True, 20),
+        ("vllm", False, True, 20),
+        ("sglang", False, False, 20),
+    ],
+)
+def test_streamed_replay_adds_only_available_same_version_samples_between_plans(
+    runtime, oldlogprob, bubble, expected_samples
+):
+    worker = _head_lifecycle_worker()
+    worker.config.rollout.name = runtime
+    worker.config.rollout.drafter.training["collect_hidden_states_from_old_logprob"] = (
+        oldlogprob
+    )
+    worker._bubble_time_enabled = bubble
+    worker.reserve_training_data(
+        plan_id="early", target_version=4, max_batches=1, retain_replay_session=True
+    )
+    session = worker._training_replay_sessions[4]
+    used = session["items"][0]
+    worker._active_training_replay_cursor = 8
+    worker._active_training_replay_used_items[id(used)] = used
+    worker.finalize_training_data_reservation("early", consume=False)
+    worker.release_training_data_reservation("early")
+
+    late = [{"target_version": 4, "id": index} for index in (20, 21)]
+    for sample in late:
+        worker.data_buffer.add_batch(sample)
+    worker.data_buffer.add_batch({"target_version": 5, "id": "other-version"})
+    worker.data_buffer.add_batch(
+        {"target_version": 4, "id": "other-plan", "_drafter_reserved_by": "peer"}
+    )
+
+    # Even the final blocking top-up must see samples committed after plan one.
+    reservation = worker.reserve_training_data(
+        plan_id="topup", target_version=4, max_batches=20, retain_replay_session=False
+    )
+    assert reservation["reserved_samples"] == expected_samples
+    assert session is worker._training_replay_sessions[4]
+    assert worker._active_training_replay_cursor == 8
+    assert worker._active_training_replay_used_items == {id(used): used}
+    assert all(item["target_version"] == 4 for item in session["items"])
+    assert all(item["id"] != "other-plan" for item in session["items"])
+    assert all(item["_drafter_reserved_by"] == "topup" for item in session["items"])
+    worker.finalize_training_data_reservation("topup", consume=False)
+    worker.release_training_data_reservation("topup")
+    again = worker.reserve_training_data(
+        plan_id="again", target_version=4, max_batches=20, retain_replay_session=True
+    )
+    assert again["reserved_samples"] == expected_samples  # no duplicate append
+    assert worker._active_training_replay_cursor == 8
+
+
+def test_streamed_replay_keeps_running_plan_immutable_until_release():
+    worker = _head_lifecycle_worker()
+    worker.config.rollout.name = "sglang"
+    worker.reserve_training_data(
+        plan_id="running", target_version=4, max_batches=1, retain_replay_session=True
+    )
+    items = list(worker._training_replay_sessions[4]["items"])
+    late = {"target_version": 4, "id": "late-long"}
+    worker.data_buffer.add_batch(late)
+    assert worker._training_replay_sessions[4]["items"] == items
+    assert late.get("_drafter_reserved_by") is None
+    assert (
+        len(
+            [
+                item
+                for item in worker.data_buffer.get_available_data(
+                    target_version=4, reservation_id="running"
+                )
+                if item.get("_drafter_reserved_by") == "running"
+            ]
+        )
+        == 20
+    )
+
+    worker.finalize_training_data_reservation("running", consume=False)
+    worker.release_training_data_reservation("running")
+    worker.reserve_training_data(plan_id="next", target_version=4, max_batches=20)
+    assert worker._training_replay_sessions[4]["items"][-1] is late
+
+
 def test_worker_replay_session_protects_head_without_driver_metadata():
     torch = pytest.importorskip("torch")
     worker = _head_lifecycle_worker()

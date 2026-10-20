@@ -3281,22 +3281,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_historical_window_readmission_enabled = self._speco_drafter_schedule_config().idle_worker_historical_window_readmission
         bus_name = self._speco_rollout_idle_event_bus_name()
         if not bus_name:
-            print(
-                "[BubbleTime] idle_event_loop: not_started reason=missing_event_bus",
-                flush=True,
-            )
             logger.warning(
-                "[BubbleTime] rollout idle event loop not started: missing event bus"
+                "[BubbleTime] idle_event_loop: not_started reason=missing_event_bus"
             )
             return None, None
         poll_interval = self._speco_rollout_idle_poll_interval_sec()
-        print(
-            "[BubbleTime] idle_event_loop: starting "
-            f"bus={bus_name} poll_interval_s={poll_interval:.3f}",
-            flush=True,
-        )
         logger.warning(
-            "[BubbleTime] starting rollout idle event loop: bus=%s poll_interval_s=%.3f",
+            "[BubbleTime] idle_event_loop: starting bus=%s poll_interval_s=%.3f",
             bus_name,
             poll_interval,
         )
@@ -3560,12 +3551,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             tuple(emitted_worker_ids),
             max(deadline_ts - time.time(), 0.0),
         )
-        print(
-            "[BubbleTime] fallback_idle: emitted "
-            f"reason={reason} replica_ranks={replica_ranks} "
-            f"worker_ids={tuple(emitted_worker_ids)}",
-            flush=True,
-        )
         metrics = scheduler.idle_worker_metrics()
         metrics.update(
             {
@@ -3750,7 +3735,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         total_switch_cost = (
             migration_estimate
             + target_startup
-            + scheduler._effective_idle_tail_reserve_sec(config)
+            + scheduler._effective_idle_tail_reserve_sec(config, worker_ids=target)
         )
         target, decision_metrics = scheduler.writer_switch_decision(
             config, cost_sec=total_switch_cost
@@ -3759,7 +3744,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if target is None:
             return metrics
         needed = total_switch_cost + scheduler._effective_idle_batch_estimate_sec(
-            config
+            config, target
         ) * scheduler._idle_gradient_accumulation_steps(config, target)
         # Pick only the approved target and charge the transfer before launch.
         version = scheduler._idle_worker_writer_state_version
@@ -6109,6 +6094,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     and all(record.get("supported") for record in active)
                 )
                 self._speco_actor_head_only_capability = capability
+                self._speco_actor_head_reference_capability = bool(
+                    capability
+                    and all(record.get("reference_transport") for record in active)
+                )
                 logger.warning(
                     "[BubbleTime] target_head_export_capability: async_head_only=%s workers=%s",
                     capability,
@@ -6127,9 +6116,20 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             and actor_veomni_param_offload
         )
         fetch_started = time.perf_counter()
+        reference_transport = bool(
+            async_head_only
+            and getattr(self, "_speco_actor_head_reference_capability", False)
+            and self._speco_drafter_schedule_config().idle_worker_head_reference_transport
+        )
+        reference_kwargs = (
+            {"reference_transport": True, "target_version": int(self.global_steps)}
+            if reference_transport
+            else {}
+        )
         payload_refs = get_actor_lm_head_weight(
             row_indices,
             keep_model_on_device=keep_actor_model_on_device,
+            **reference_kwargs,
         )
         fetch_submit_elapsed = time.perf_counter() - fetch_started
         bubble_prefetch = (
@@ -6149,9 +6149,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "selected_rows": selected_rows,
                 "source_vocab_size": source_vocab_size,
                 "target_worker_ids": target_worker_ids,
+                "reference_transport": reference_transport,
             }
             return {
                 "drafter/target_lm_head_synced": 0,
+                "bubble/head_reference_transport": int(reference_transport),
                 "drafter/target_lm_head_selected_rows": selected_rows,
                 "drafter/target_lm_head_source_vocab_size": source_vocab_size,
                 "drafter/target_lm_head_target_workers": (
@@ -6616,6 +6618,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if isinstance(payload, dict)
             else "unknown"
         )
+        referenced = isinstance(payload, dict) and "target_head_ref" in payload
+        if referenced and not self._speco_rollout_idle_worker_enabled():
+            raise RuntimeError("Reference head dispatch is restricted to Bubble")
+        if referenced and (
+            target_version is None
+            or payload.get("target_version") != int(target_version)
+        ):
+            raise RuntimeError(
+                "Bubble target head reference does not match its quota version"
+            )
         # Reconstructing supervision from last hidden states requires a fresh
         # target head for every drafter backend. Stage the payload on CPU while
         # the actor updates, then apply it when the drafter activates.
@@ -6647,6 +6659,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             payload_arg, global_step=global_step_arg
         )
         dispatch_elapsed = time.perf_counter() - dispatch_started
+        if referenced:
+            logger.warning(
+                "[BubbleTime] target_head_reference_dispatched: target_version=%s "
+                "workers=%s bytes=%s driver_tensor_materialized=0 submit_s=%.4f",
+                target_version,
+                target_worker_ids,
+                payload.get("head_payload_bytes", 0),
+                dispatch_elapsed,
+            )
         metrics = {
             "drafter/target_lm_head_apply_deferred": int(defer_device_apply),
             "drafter/target_lm_head_selected_rows": selected_rows,
@@ -6658,6 +6679,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
+        if self._speco_rollout_idle_worker_enabled():
+            metrics.update(
+                {
+                    "bubble/head_reference_transport": int(referenced),
+                    "bubble/head_driver_tensor_materialized": int(not referenced),
+                    "timing_s/drafter_head_reference_dispatch_submit": dispatch_elapsed
+                    if referenced
+                    else 0.0,
+                }
+            )
         pending = {
             "refs": pending_refs,
             "global_step": self.global_steps
@@ -6995,13 +7026,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                         context.get("source_global_step"),
                         stage_elapsed_sec,
                     )
-                    print(
-                        "[BubbleTime] publish_stage_ack: "
-                        f"plan_id={context.get('plan_id')} "
-                        f"source_step={context.get('source_global_step')} "
-                        f"stage_wait_s={stage_elapsed_sec:.4f}",
-                        flush=True,
-                    )
                 commit_started = time.perf_counter()
                 commit_result = self._ray_get_if_needed(
                     self.speco_commit_staged_drafter_weights(source_version)
@@ -7074,16 +7098,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 stage_elapsed_sec,
                 commit_elapsed_sec,
                 elapsed_sec,
-            )
-            print(
-                "[BubbleTime] publish_succeeded: "
-                f"plan_id={context.get('plan_id')} "
-                f"source_step={context.get('source_global_step')} "
-                f"workers={context.get('worker_ids')} "
-                f"stage_wait_s={stage_elapsed_sec:.4f} "
-                f"commit_s={commit_elapsed_sec:.4f} "
-                f"elapsed_s={elapsed_sec:.4f} mode=async_two_phase",
-                flush=True,
             )
             print(
                 "[BubbleTime] publish_version: "
@@ -7166,6 +7180,35 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return scheduler.wait_pending_publish()
 
     def _speco_get_published_drafter_weights(self):
+        prefetched = getattr(self, "_speco_publish_snapshot_prefetch", None)
+        if prefetched is not None and self._speco_rollout_idle_worker_enabled():
+            if int(prefetched["source_step"]) != int(self.global_steps):
+                raise RuntimeError(
+                    "Bubble publish snapshot prefetch crossed its source version"
+                )
+            waited = time.perf_counter()
+            published = self._ray_get_if_needed(prefetched["refs"]) or []
+            self._speco_publish_snapshot_prefetch = None
+            payload = self._first_non_null(published)
+            self._speco_publish_snapshot_prefetch_metrics = {
+                "timing_s/drafter_publish_snapshot_prefetch_wait": time.perf_counter()
+                - waited,
+                "bubble/publish_snapshot_prefetch_consumed": int(payload is not None),
+                "bubble/publish_snapshot_source_step": int(prefetched["source_step"]),
+            }
+            logger.warning(
+                "[BubbleTime] publish_snapshot_prefetch_consumed: source_step=%s "
+                "cached=%s wait_s=%.4f",
+                prefetched["source_step"],
+                payload is not None,
+                self._speco_publish_snapshot_prefetch_metrics[
+                    "timing_s/drafter_publish_snapshot_prefetch_wait"
+                ],
+            )
+            if payload is not None:
+                return payload
+            if getattr(self, "_speco_publish_cached_snapshot_only", False):
+                return None
         if getattr(self, "_speco_publish_cached_snapshot_only", False):
             published = (
                 self._ray_get_if_needed(
@@ -7211,6 +7254,46 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         scheduler = self._speco_get_drafter_scheduler()
         if config.training_quota_enable and scheduler._training_quota_debt_steps > 0:
             return False, {}
+        # Start only in this post-PPO, pre-weight-sync safe window. Preparing a
+        # cached CPU payload may overlap upstream weight sync, not generation,
+        # ref/actor computation, or GPU snapshot gathering. A pending export is
+        # consumed by the normal safe-point publisher, never submitted twice.
+        prefetched = getattr(self, "_speco_publish_snapshot_prefetch", None)
+        prefetch_metrics: dict[str, Any] = {}
+        if prefetched is not None and int(prefetched["source_step"]) != int(
+            plan.source_global_step
+        ):
+            raise RuntimeError(
+                "Bubble snapshot prefetch belongs to another publication"
+            )
+        if prefetched is None and not getattr(plan, "publish_snapshot_deferred", False):
+            group_getter = getattr(self, "_require_speco_worker_group", None)
+            worker_group = group_getter() if callable(group_getter) else None
+            export = getattr(worker_group, "maybe_publish_async", None)
+            if callable(export):
+                submitted = time.perf_counter()
+                refs = export(source_step=int(plan.source_global_step))
+                self._speco_publish_snapshot_prefetch = prefetched = {
+                    "refs": refs,
+                    "source_step": int(plan.source_global_step),
+                }
+                prefetch_metrics = {
+                    "bubble/publish_snapshot_prefetch_submitted": 1,
+                    "timing_s/drafter_publish_snapshot_prefetch_submit": time.perf_counter()
+                    - submitted,
+                }
+        if prefetched is not None and not self._speco_ray_refs_ready(
+            prefetched["refs"]
+        ):
+            logger.warning(
+                "[BubbleTime] publish_snapshot_prefetch_pending: step=%s overlap=upstream_weight_sync",
+                plan.source_global_step,
+            )
+            return False, {
+                **prefetch_metrics,
+                "bubble/publish_snapshot_prefetch_pending_before_weight_sync": 1,
+                "bubble/early_publish_staging_submitted": 0,
+            }
         started = time.perf_counter()
         self._speco_publish_cached_snapshot_only = True
         try:
@@ -7223,6 +7306,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         metrics["timing_s/drafter_early_publish_staging"] = (
             time.perf_counter() - started
         )
+        metrics.update(prefetch_metrics)
         logger.info(
             "[BubbleTime] early_publish_staging: plan_id=%s step=%s submitted=%s",
             plan.plan_id,
@@ -7345,13 +7429,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 publish_plan.source_global_step,
                 getattr(training_plan, "target_worker_ids", ()),
             )
-            print(
-                "[BubbleTime] publish_submitted: "
-                f"plan_id={getattr(training_plan, 'plan_id', None)} "
-                f"source_step={publish_plan.source_global_step} "
-                f"workers={getattr(training_plan, 'target_worker_ids', ())}",
-                flush=True,
-            )
         elif (
             publish_plan is not None
             and publish_outcome is not None
@@ -7367,13 +7444,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 getattr(training_plan, "plan_id", None),
                 publish_plan.source_global_step,
                 getattr(training_plan, "target_worker_ids", ()),
-            )
-            print(
-                "[BubbleTime] publish_succeeded: "
-                f"plan_id={getattr(training_plan, 'plan_id', None)} "
-                f"source_step={publish_plan.source_global_step} "
-                f"workers={getattr(training_plan, 'target_worker_ids', ())} mode=sync",
-                flush=True,
             )
             scheduler.record_rollout_drafter_publish_completed(
                 publish_plan.source_global_step
@@ -7396,15 +7466,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 publish_plan.reason,
                 publish_outcome.attempted,
             )
-            print(
-                "[BubbleTime] publish_skipped: "
-                f"plan_id={getattr(training_plan, 'plan_id', None)} "
-                f"source_step={publish_plan.source_global_step} "
-                f"reason={publish_plan.reason} "
-                f"attempted={publish_outcome.attempted}",
-                flush=True,
-            )
         metrics = dict(event.metrics or {})
+        snapshot_metrics = getattr(
+            self, "_speco_publish_snapshot_prefetch_metrics", None
+        )
+        if snapshot_metrics:
+            metrics.update(snapshot_metrics)
+            self._speco_publish_snapshot_prefetch_metrics = {}
         if getattr(self, "_speco_ci_result", None) is not None:
             self._speco_ci_result.record_metrics(metrics)
         return metrics

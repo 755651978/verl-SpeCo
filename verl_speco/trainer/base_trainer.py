@@ -5650,7 +5650,33 @@ class DrafterBaseTrainer:
             sessions = {}
             setattr(self, "_training_replay_sessions", sessions)
         session = sessions.get(int(target_version))
+        session_added_samples = 0
         if session is not None:
+            rollout_cfg = getattr(getattr(self, "config", None), "rollout", None)
+            training_cfg = getattr(
+                getattr(rollout_cfg, "drafter", None), "training", {}
+            )
+            if (
+                getattr(self, "_bubble_time_enabled", False)
+                and str(getattr(rollout_cfg, "name", "")).lower() == "sglang"
+                and not training_cfg.get(
+                    "collect_hidden_states_from_old_logprob", False
+                )
+                and getattr(self, "_active_training_reservation_id", None) is None
+            ):
+                # SGLang can commit more same-version samples while another
+                # replica is still generating. Expand only at a plan boundary;
+                # never change an in-flight reservation or restart its sampler.
+                known_items = {id(item) for item in session["items"]}
+                new_items = [
+                    item
+                    for item in self.data_buffer.get_available_data(
+                        target_version=int(target_version)
+                    )
+                    if id(item) not in known_items
+                ]
+                session["items"].extend(new_items)
+                session_added_samples = len(new_items)
             reserved = self.data_buffer.reserve_samples(
                 str(plan_id), list(session["items"])
             )
@@ -5698,12 +5724,13 @@ class DrafterBaseTrainer:
         )
         logger.warning(
             "[BubbleTime] reserve training data: rank=%s plan_id=%s target_version=%s "
-            "reserved_samples=%s max_samples=%s",
+            "reserved_samples=%s max_samples=%s session_added_samples=%s",
             self.rank,
             plan_id,
             target_version,
             len(reserved),
             max_samples,
+            session_added_samples,
         )
         return {"reserved_samples": len(reserved), "target_version": target_version}
 

@@ -161,6 +161,88 @@ def validate_veomni_parallel_layout(config: Any) -> dict[str, Any]:
     return layout
 
 
+def pack_target_head_reference(payload: dict, target_version: int) -> dict:
+    """Put one immutable CPU snapshot; return only small driver metadata.
+
+    BF16 is carried as uint8 bytes so Ray can use its NumPy object-store
+    transport without pickling a large torch storage. No numerical conversion
+    or device operation is performed here.
+    """
+    torch = _torch_module()
+    from verl_speco.integration.phase_timing import phase_span
+
+    weight = payload["weight"]
+    if weight.device.type != "cpu" or weight.dtype != torch.bfloat16:
+        raise RuntimeError("Bubble head reference requires a CPU BF16 snapshot")
+    encoded = dict(payload)
+    encoded["weight"] = weight.view(torch.uint8).numpy()
+    encoded["head_weight_encoding"] = "bf16_uint8"
+    encoded["target_version"] = int(target_version)
+    with phase_span("lm_head_object_store_put", target_version=target_version):
+        payload_ref = _ray_module().put(encoded)
+    return {
+        "target_head_ref": payload_ref,
+        "target_version": int(target_version),
+        "export_strategy": payload.get("export_strategy", "unknown"),
+        "source_vocab_size": payload.get("source_vocab_size", 0),
+        "head_payload_bytes": int(encoded["weight"].nbytes),
+    }
+
+
+def resolve_target_head_reference(payload: dict, target_version: int | None) -> dict:
+    """Resolve on selected drafter ranks, preserving driver-owned safeguards."""
+    if "target_head_ref" not in payload:
+        return payload
+    ray = _ray_module()
+    ref = payload["target_head_ref"]
+    if (
+        target_version is None
+        or not isinstance(ref, ray.ObjectRef)
+        or payload.get("target_version") != target_version
+    ):
+        raise RuntimeError("Invalid Bubble target head reference/version")
+    from verl_speco.integration.phase_timing import phase_span
+
+    with phase_span("lm_head_worker_resolve", target_version=target_version):
+        decoded = ray.get(ref)
+        if (
+            not isinstance(decoded, dict)
+            or decoded.get("target_version") != target_version
+            or decoded.get("head_weight_encoding") != "bf16_uint8"
+        ):
+            raise RuntimeError("Mismatched Bubble target head object-store snapshot")
+        import numpy as np
+        import warnings
+
+        bits = decoded.get("weight")
+        if (
+            not isinstance(bits, np.ndarray)
+            or bits.dtype != np.uint8
+            or bits.ndim != 2
+            or bits.shape[-1] % 2
+            or not bits.flags.c_contiguous
+        ):
+            raise RuntimeError("Invalid Bubble target head BF16 bit array")
+        torch = _torch_module()
+        # The shared CPU snapshot is read-only supervision. Backend sync only
+        # reads/caches it; applying it copies into the device head, never back.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="The given NumPy array is not writable"
+            )
+            weight = torch.from_numpy(bits).view(torch.bfloat16)
+        result = {**decoded, "weight": weight}
+        for key in (
+            "defer_device_apply",
+            "require_target_head_ack",
+            "target_worker_ids",
+            "protected_target_versions",
+        ):
+            if key in payload:
+                result[key] = payload[key]
+        return result
+
+
 def materialize_draft_weights_payload(weights: Any) -> tuple[Any, bool]:
     """Resolve direct tensor payloads or Ray ObjectRef-backed payloads."""
 
@@ -871,6 +953,7 @@ def export_actor_lm_head_weight(
     row_indices: Any = None,
     keep_model_on_device: bool = False,
     require_head_only: bool = False,
+    copy_cpu_snapshot: bool = False,
 ) -> Optional[dict]:
     """Export actor lm_head or tied embedding rows from an actor-rollout worker."""
 
@@ -923,7 +1006,10 @@ def export_actor_lm_head_weight(
             if getattr(worker, "rank", None) != 0:
                 return None
             with phase_span("lm_head_cpu_copy", **trace_labels):
-                weight = weight.to(device="cpu", dtype=torch.bfloat16)
+                if copy_cpu_snapshot:
+                    weight = weight.to(device="cpu", dtype=torch.bfloat16, copy=True)
+                else:
+                    weight = weight.to(device="cpu", dtype=torch.bfloat16)
             with phase_span("lm_head_cpu_contiguous", **trace_labels):
                 weight = weight.contiguous()
             logger.info(
@@ -1096,6 +1182,7 @@ class DraftWeightPublishMixin:
             "participating": bool(getattr(self, "_is_actor", False)),
             "reason": reason,
             "name": name,
+            "reference_transport": True,
         }
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
@@ -1103,6 +1190,8 @@ class DraftWeightPublishMixin:
         self,
         row_indices: Any = None,
         keep_model_on_device: bool = False,
+        reference_transport: bool = False,
+        target_version: int | None = None,
     ):
         # Export itself remains serialized on the actor. The caller must fence
         # completion before mutating actor weights; only the RPC return is async.
@@ -1113,6 +1202,23 @@ class DraftWeightPublishMixin:
             enabled=_worker_bubble_enabled(self),
             rank=getattr(self, "rank", None),
         ):
+            if reference_transport:
+                if target_version is None or not _worker_bubble_enabled(self):
+                    raise RuntimeError(
+                        "Target head reference export requires a Bubble version"
+                    )
+                payload = export_actor_lm_head_weight(
+                    self,
+                    row_indices=row_indices,
+                    keep_model_on_device=keep_model_on_device,
+                    require_head_only=True,
+                    copy_cpu_snapshot=True,
+                )
+                return (
+                    pack_target_head_reference(payload, target_version)
+                    if payload is not None
+                    else None
+                )
             return export_actor_lm_head_weight(
                 self,
                 row_indices=row_indices,

@@ -531,9 +531,6 @@ actor_rollout_ref:
             full_collective_fallback: false
             event_bus_name: null
             event_poll_interval_sec: 0.05
-            # Runtime request completion is speculative until the replica
-            # manager closes assignment for the current generation epoch.
-            speculative_window_multiplier: 1.5
             # Let asynchronous staging overlap later work, but bound how long
             # rollout may keep serving an older drafter version.
             max_publish_lag_steps: 2
@@ -542,8 +539,14 @@ actor_rollout_ref:
             # upstream weight sync. Never exports GPU weights on this path;
             # commit and publication ACK remain at their existing boundaries.
             early_publish_staging: false
-            # Experimental bounded retry: same hot writer, one optimizer step
-            # per idle episode, backed by same-replica completed tail history.
+            # Bubble-only, capability checked. Driver forwards an immutable
+            # CPU head reference rather than materializing a full torch tensor.
+            head_reference_transport: true
+            # Use recent per-writer steady steps and matching cleanup mode.
+            # Keeps first-step overhead, deadline and reclaim guards separate.
+            calibrated_budgets: true
+            # Experimental bounded retry: same hot writer, budgeted optimizer
+            # steps per idle episode, backed by same-replica completed history.
             historical_window_readmission: false
             # Repeated per-token generation slowdown means the predicted idle
             # window was unsafe. Pause new Bubble launches briefly instead of

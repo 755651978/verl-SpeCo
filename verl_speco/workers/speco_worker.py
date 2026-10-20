@@ -511,12 +511,6 @@ class SpecoWorker(Worker):
                 self.rank,
                 tuple(changed_paths),
             )
-            print(
-                "[BubbleTime] replica_local_fsdp_override: "
-                f"rank={self.rank} paths={tuple(changed_paths)} "
-                "reason=mixed_requires_grad_requires_use_orig_params",
-                flush=True,
-            )
         return trainer_config
 
     def _ensure_process_group_initialized(self):
@@ -654,16 +648,6 @@ class SpecoWorker(Worker):
                 tuple(self.sync_collective_ranks or self.full_collective_ranks),
                 self.training_group_world_size,
                 self.dp_group_world_size,
-            )
-            print(
-                "[BubbleTime] replica_local_training_mesh: "
-                f"rank={self.rank} replica_rank={self.replica_rank} "
-                f"training_group_ranks={tuple(self.training_group_ranks)} "
-                "sync_collective_ranks="
-                f"{tuple(self.sync_collective_ranks or self.full_collective_ranks)} "
-                f"training_group_world_size={self.training_group_world_size} "
-                f"dp_group_world_size={self.dp_group_world_size}",
-                flush=True,
             )
             self.trainer = DrafterBaseTrainer(
                 config=trainer_config,
@@ -1503,6 +1487,14 @@ class SpecoWorker(Worker):
                     }
                 )
 
+        if "target_head_ref" in payload:
+            if not getattr(self.trainer, "_bubble_time_enabled", False):
+                raise RuntimeError("Reference head transport is restricted to Bubble")
+            from verl_speco.integration.rollout_publish import (
+                resolve_target_head_reference,
+            )
+
+            payload = resolve_target_head_reference(payload, global_step)
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
         source_vocab_size = payload.get("source_vocab_size")
@@ -1670,15 +1662,6 @@ class SpecoWorker(Worker):
                 tuple(getattr(self, "training_group_ranks", [])),
                 repr(activation_error) if activation_error is not None else "",
             )
-            print(
-                "[BubbleTime] idle_prewarm_failed: "
-                f"worker_id={self.rank} rank={self.rank} "
-                f"replica_rank={self.replica_rank} oom={replica_local_oom} "
-                f"elapsed_s={result['elapsed_sec']:.3f} "
-                f"group={tuple(getattr(self, 'training_group_ranks', []))} "
-                f"target_workers={tuple(sorted(target_worker_ids))}",
-                flush=True,
-            )
             return result
 
         logger.warning(
@@ -1691,15 +1674,6 @@ class SpecoWorker(Worker):
             result["elapsed_sec"],
             tuple(getattr(self, "training_group_ranks", [])),
             tuple(sorted(target_worker_ids)),
-        )
-        print(
-            "[BubbleTime] idle_prewarm_succeeded: "
-            f"worker_id={self.rank} rank={self.rank} "
-            f"replica_rank={self.replica_rank} elapsed_s={result['elapsed_sec']:.3f} "
-            f"group={tuple(getattr(self, 'training_group_ranks', []))} "
-            f"target_workers={tuple(sorted(target_worker_ids))} "
-            "resident_until_training=True",
-            flush=True,
         )
         return result
 
@@ -2096,18 +2070,6 @@ class SpecoWorker(Worker):
                     tuple(self.training_group_ranks),
                     tuple(self.sync_collective_ranks or self.full_collective_ranks),
                     repr(activation_error) if activation_error is not None else "",
-                )
-                print(
-                    "[BubbleTime] replica_local_unavailable: "
-                    f"plan_id={training_plan.get('plan_id', '')} "
-                    f"worker_id={self.rank} rank={self.rank} "
-                    f"replica_rank={self.replica_rank} reason=activation_failed "
-                    f"oom={replica_local_oom} "
-                    f"activation_s={result['activation_elapsed_sec']:.3f} "
-                    f"training_group_ranks={tuple(self.training_group_ranks)} "
-                    "sync_collective_ranks="
-                    f"{tuple(self.sync_collective_ranks or self.full_collective_ranks)}",
-                    flush=True,
                 )
                 if activation_error is not None and not replica_local_oom:
                     logger.error(
@@ -2530,15 +2492,6 @@ class SpecoWorker(Worker):
                             float(deadline_ts) - now_ts,
                             self._drafter_reclaim_requested,
                         )
-                        print(
-                            f"[BubbleTime] {log_prefix}: "
-                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
-                            "reason=deadline_reached "
-                            f"now_ts={now_ts:.6f} deadline_ts={float(deadline_ts):.6f} "
-                            f"remaining_s={float(deadline_ts) - now_ts:.4f} "
-                            f"reclaim_requested={self._drafter_reclaim_requested}",
-                            flush=True,
-                        )
                         break
                     if shared_stop_reason == "next_batch_budget_too_small" or (
                         not coordinated_idle
@@ -2582,19 +2535,6 @@ class SpecoWorker(Worker):
                             idle_batch_estimate_sec,
                             self._drafter_reclaim_requested,
                         )
-                        print(
-                            f"[BubbleTime] {log_prefix}: "
-                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
-                            "reason=next_batch_budget_too_small "
-                            f"batch_index={batch_index} "
-                            f"successful_steps={result['successful_steps']} "
-                            f"now_ts={now_ts:.6f} "
-                            f"deadline_ts={float(deadline_ts):.6f} "
-                            f"remaining_s={remaining_s:.4f} "
-                            f"batch_estimate_s={idle_batch_estimate_sec:.4f} "
-                            f"reclaim_requested={self._drafter_reclaim_requested}",
-                            flush=True,
-                        )
                         break
                     if shared_stop_reason == "reclaim_requested" or (
                         not coordinated_idle and self._drafter_reclaim_requested
@@ -2613,25 +2553,17 @@ class SpecoWorker(Worker):
                         logger.warning(
                             "[BubbleTime] %s: plan_id=%s "
                             "worker_id=%s rank=%s reason=reclaim_requested "
-                            "now_ts=%.6f deadline_ts=%s reclaim_requested=True",
+                            "now_ts=%.6f deadline_ts=%s reclaim_requested=True "
+                            "activation_s=%.3f preflight_s=%.3f preflight_to_stop_s=%.3f",
                             log_prefix,
                             plan_id,
                             self.rank,
                             self.rank,
                             now_ts,
                             deadline_ts,
-                        )
-                        print(
-                            f"[BubbleTime] {log_prefix}: "
-                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
-                            "reason=reclaim_requested "
-                            f"now_ts={now_ts:.6f} deadline_ts={deadline_ts} "
-                            f"activation_s={prepared_activation_elapsed_sec:.3f} "
-                            f"preflight_s={prepared_preflight_elapsed_sec:.3f} "
-                            "preflight_to_stop_s="
-                            f"{result.get('preflight_to_stop_sec', 0.0):.3f} "
-                            "reclaim_requested=True",
-                            flush=True,
+                            prepared_activation_elapsed_sec,
+                            prepared_preflight_elapsed_sec,
+                            float(result.get("preflight_to_stop_sec", 0.0)),
                         )
                         break
                     if not result["first_batch_started"]:
@@ -2652,15 +2584,6 @@ class SpecoWorker(Worker):
                             float(
                                 result.get("preflight_to_first_batch_sec", 0.0) or 0.0
                             ),
-                        )
-                        print(
-                            "[BubbleTime] training_first_batch_start: "
-                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
-                            f"activation_s={prepared_activation_elapsed_sec:.3f} "
-                            f"preflight_s={prepared_preflight_elapsed_sec:.3f} "
-                            "preflight_to_first_batch_s="
-                            f"{result.get('preflight_to_first_batch_sec', 0.0):.3f}",
-                            flush=True,
                         )
                     result["attempted_steps"] += 1
                     step_error: BaseException | None = None
@@ -2806,17 +2729,6 @@ class SpecoWorker(Worker):
                             deadline_ts,
                             self._drafter_reclaim_requested,
                             repr(step_error) if step_error is not None else "",
-                        )
-                        print(
-                            "[BubbleTime] training_stopped: "
-                            f"plan_id={plan_id} worker_id={self.rank} rank={self.rank} "
-                            f"reason={result['reason']} "
-                            f"batch_index={batch_index} "
-                            f"attempted_steps={result['attempted_steps']} "
-                            f"successful_steps={result['successful_steps']} "
-                            f"now_ts={now_after_step_ts:.6f} deadline_ts={deadline_ts} "
-                            f"reclaim_requested={self._drafter_reclaim_requested}",
-                            flush=True,
                         )
                         break
                 if (
@@ -3168,6 +3080,30 @@ class SpecoWorker(Worker):
             "validated": True,
             "optimizer_steps": state["optimizer_steps"],
         }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def maybe_publish_async(self, *, source_step: int):
+        # Cached CPU snapshot only: never enter a GPU export collective.
+        if (
+            not self.enable_drafter
+            or not self.in_drafter_train_group
+            or self.trainer is None
+            or not getattr(self.trainer, "_bubble_time_enabled", False)
+            or self.last_global_step is None
+            or int(self.last_global_step) != int(source_step)
+        ):
+            return None
+        started = time.perf_counter()
+        result = self.maybe_publish(cached_snapshot_only=True)
+        logger.warning(
+            "[BubbleTime] publish_snapshot_prefetch_worker: rank=%s source_step=%s "
+            "elapsed_s=%.4f cached=%s",
+            self.rank,
+            source_step,
+            time.perf_counter() - started,
+            result is not None,
+        )
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def maybe_publish(self, *, cached_snapshot_only: bool = False):

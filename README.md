@@ -42,6 +42,8 @@ including how to add a new execution or collection strategy, see the
 For the rollout-idle Bubble Time execution path, including the quota lifecycle,
 safe writer switching, key metrics, and recommended configuration, see
 [Bubble Time drafter training](docs/bubble_time_drafter_training.md).
+For a paired 4-GPU DSpark/vLLM launch, use the
+[Bubble/Sync example](examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh).
 
 ## Performance Preview
 

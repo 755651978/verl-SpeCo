@@ -309,7 +309,6 @@ def test_speculative_idle_window_waits_for_generation_confirmation() -> None:
     config = replace(
         _idle_config(),
         idle_worker_training_groups=(("0",),),
-        idle_worker_speculative_window_multiplier=1.5,
     )
     confirmed = DrafterScheduler()
     confirmed.on_worker_event(
@@ -1384,7 +1383,7 @@ def test_topup_is_not_reported_as_idle_training(reason) -> None:
     )
 
 
-def test_writer_small_window_is_not_hidden_by_other_group_migration(capsys) -> None:
+def test_writer_small_window_is_not_hidden_by_other_group_migration(caplog) -> None:
     scheduler = DrafterScheduler()
     scheduler._idle_worker_writer_group = ("0",)
     scheduler._idle_worker_writer_state_version = 10
@@ -1406,7 +1405,7 @@ def test_writer_small_window_is_not_hidden_by_other_group_migration(capsys) -> N
     assert resources.reason == "window_too_small"
     assert resources.worker_ids == ("0",)
     assert resources.minimum_idle_window_sec == pytest.approx(0.5)
-    assert "budget_deficit_s=" in capsys.readouterr().out
+    assert "budget_deficit_s=" in caplog.text
 
 
 def test_local_topup_preserves_idle_overhead_and_separate_totals() -> None:
@@ -4488,18 +4487,29 @@ def test_before_fit_bootstraps_rollout_idle_models_on_cpu() -> None:
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
-def test_before_fit_activation_still_runs_for_sync_training() -> None:
+@pytest.mark.parametrize("initial_payload", [None, {"weights_ref": "revision-zero"}])
+def test_before_fit_activation_still_runs_for_sync_training(initial_payload) -> None:
     trainer = _trainer_with_idle_config()
     trainer.config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["scheduler"][
         "execution"
     ]["strategy"] = "sync"
     recorder = _ActivationRecorder()
     trainer._drafter_scheduler = recorder
+    payload_requests = []
+    trainer._speco_get_published_drafter_weights = lambda: (
+        payload_requests.append(True) or initial_payload
+    )
 
     trainer._speco_activate_drafter_training_model_before_fit()
 
     assert recorder.calls == 1
     assert recorder.prewarm_calls == 0
+    assert payload_requests == [True]
+    if initial_payload:
+        assert trainer._speco_last_published_drafter_payload is initial_payload
+        assert trainer._speco_last_published_drafter_step == 0
+    else:
+        assert not hasattr(trainer, "_speco_last_published_drafter_payload")
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
@@ -4513,13 +4523,16 @@ def test_trainer_generation_completion_does_not_create_synthetic_idle_window() -
     complete_metrics = trainer._speco_emit_rollout_generation_completed(output)
 
     assert start_metrics["bubble/idle_workers"] == 0
-    assert complete_metrics == {}
+    assert complete_metrics["bubble/generation_boundary_idle_confirmed"] == 0
+    assert complete_metrics["bubble/speculative_idle_confirmed"] == 0
+    assert "bubble/observed_idle_windows" not in complete_metrics
+    assert trainer._drafter_scheduler._replica_idle_window_samples_sec == {}
     assert trainer._drafter_scheduler.idle_worker_metrics()["bubble/idle_workers"] == 0
     assert output.non_tensor_batch["drafter_sample"][0]["id"] == "a"
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
-def test_generation_completion_does_not_pollute_runtime_idle_window_history() -> None:
+def test_generation_completion_closes_runtime_idle_windows_once() -> None:
     trainer = _trainer_with_idle_config()
     scheduler = trainer._drafter_scheduler
     output = _FakeGenerationOutput([])
@@ -4534,12 +4547,31 @@ def test_generation_completion_does_not_pollute_runtime_idle_window_history() ->
             )
         )
     trainer._speco_runtime_idle_events_this_generation = 2
+    trainer._speco_rollout_idle_fallback_deadline_ts = lambda: 120.0
 
-    metrics = trainer._speco_emit_rollout_generation_completed(output)
+    metrics = trainer._speco_emit_rollout_generation_completed(
+        output, generation_complete_ts=105.0
+    )
 
-    assert metrics == {}
-    assert scheduler._replica_idle_window_samples_sec == {}
-    assert scheduler._replica_idle_started_at == {0: 100.0, 1: 101.0}
+    assert metrics["bubble/generation_boundary_idle_confirmed"] == 2
+    assert metrics["bubble/observed_idle_windows"] == 2
+    assert metrics["bubble/observed_idle_window_min_s"] == pytest.approx(4.0)
+    assert metrics["bubble/observed_idle_window_max_s"] == pytest.approx(5.0)
+    assert list(scheduler._replica_idle_window_samples_sec[0]) == [5.0]
+    assert list(scheduler._replica_idle_window_samples_sec[1]) == [4.0]
+    assert scheduler._replica_idle_started_at == {}
+    assert all(
+        state.confirmed_at_generation_boundary and state.must_be_ready_at == 120.0
+        for state in scheduler._idle_workers.values()
+    )
+
+    # Closing again cannot count post-rollout bookkeeping as extra rollout idle.
+    repeated_metrics = trainer._speco_emit_rollout_generation_completed(
+        output, generation_complete_ts=110.0
+    )
+    assert "bubble/observed_idle_windows" not in repeated_metrics
+    assert list(scheduler._replica_idle_window_samples_sec[0]) == [5.0]
+    assert list(scheduler._replica_idle_window_samples_sec[1]) == [4.0]
 
 
 @pytest.mark.skipif(SpecoRayPPOTrainer is None, reason="ray/verl is not installed")
@@ -4764,6 +4796,7 @@ def test_post_rollout_reclaim_hands_completion_to_safe_publish_callback() -> Non
     outcome = TrainingOutcome(
         trained=True,
         successful_steps=1,
+        worker_results=[],
         raw_results=[],
         elapsed_sec=0.1,
         reason="completed",

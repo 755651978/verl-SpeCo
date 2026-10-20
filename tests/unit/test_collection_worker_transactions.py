@@ -21,6 +21,7 @@ def _worker() -> SpecoWorker:
     worker = SpecoWorker.__new__(SpecoWorker)
     worker.replica_rank = 0
     worker.worker_incarnation = "worker-0"
+    worker.is_drafter_group_leader = True
     data_buffer = DataBuffer(max_size=8)
     data_buffer.buffer.append({"value": "before"})
     data_buffer._current_step = 4

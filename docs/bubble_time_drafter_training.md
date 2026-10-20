@@ -1,6 +1,6 @@
 # Bubble Time Drafter Training
 
-Last updated: 10/15/2026
+Last updated: 10/20/2026
 
 Bubble Time is the rollout-idle execution path for online drafter co-training.
 Its goal is to keep the same drafter-training quality target as synchronous
@@ -23,6 +23,70 @@ This keeps Bubble Time from producing an artificial speedup by simply doing
 less drafter training. In quality-alignment runs, use the same optimizer-step
 quota, batch size, effective global batch, learning rate, and sampling order as
 the synchronous configuration.
+
+## Paired GPU Example
+
+The [4-GPU DSpark/vLLM example](../examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh)
+reuses the regular DSpark launch and switches only the execution/quota policy
+between Bubble and Sync. Set compatible local checkpoints and dataset paths:
+
+```bash
+export MODEL_PATH=/path/to/Qwen3-8B
+export DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+export TRAIN_FILE=/path/to/train.parquet
+export TEST_FILE=/path/to/validation.parquet
+
+SPECO_TRAINING_MODE=sync CKPTS_DIR=./checkpoints/dspark_sync \
+  bash examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh
+
+SPECO_TRAINING_MODE=bubble CKPTS_DIR=./checkpoints/dspark_bubble \
+  bash examples/bubble_time/run_qwen3-8b_drafter_dspark_vllm.sh
+```
+
+Run both modes from the same initial target/drafter checkpoints, on the same
+hardware and software stack, without another workload sharing the devices.
+The recipe uses 4 GPUs, TP=2, SP=2, 32 rollout prompts, 20 drafter optimizer
+steps per cycle and collection/training intervals of 4. Both modes use the
+same sample caps, per-GPU drafter batch size and learning rate. Bubble retains
+the scheduler's automatic gradient accumulation compensation for its smaller
+writer group; verify the reported effective batch and completed optimizer
+steps instead of comparing only the per-GPU batch setting. These settings
+align the training workload, not bitwise parameters or identical sampled
+generation trajectories.
+
+The default run lasts 40 PPO steps with periodic validation/checkpoint saves
+disabled to simplify timing comparison. The final-quota drain is still required;
+include shutdown/drain time when comparing complete jobs. Caller Hydra overrides
+are forwarded last, for example `trainer.total_training_steps=100`.
+
+This is an interval/quality-alignment recipe, not the adaptive production policy:
+critical-path fallback is enabled to complete overdue 20-step quotas. It does
+not promise that all training is hidden. Writer migration and early publish
+staging remain disabled for attribution. Keep-hot defaults to false to reduce
+memory pressure. With measured memory headroom, set `SPECO_KEEP_HOT=true` on the
+Bubble command to avoid repeated activation; compare throughput, memory and
+reclaim waits before retaining it. No GPU capacity or speedup is guaranteed.
+
+In this example's Bubble mode, `VERL_DRAFTER_KEEP_HOT_TRIM_CACHE` defaults to
+`true` and is exported to workers. It only trims unused allocator cache when
+keep-hot is active; live training tensors remain resident. Override it with
+`VERL_DRAFTER_KEEP_HOT_TRIM_CACHE=false` to compare cache reuse costs. The Sync
+example and the library-wide default remain unchanged. Trimming can incur
+cleanup/reallocation overhead and does not guarantee OOM safety.
+
+For profiling, enable `VERL_SPECO_PHASE_TIMING=true` on a diagnostic run. For a
+performance comparison, keep detailed phase/memory diagnostics disabled in both
+modes. Check `bubble/idle_optimizer_steps_total`,
+`bubble/critical_path_topup_optimizer_steps_total`, quota debt, publish ACKs,
+`drafter/spec_decode/mean_acceptance_length`, output token counts and per-token
+Generation/actor timing. Do not sum per-step counters that can be overwritten
+when several plans finish in one PPO step; use cumulative counters and quota
+repayment records.
+
+The example is also listed in the manually triggered E2E workflow. That workflow
+applies its own short smoke-test overrides; a smoke pass does not validate this
+recipe's 20-step quotas, idle utilization or speedup. Use the commands above
+for paired performance runs.
 
 ## Execution Flow
 
@@ -676,6 +740,19 @@ optimizer counter and accumulation micro-index, so rounding does not restart
 at every quota. This preserves the sampling policy, not bitwise equivalence
 between different distributed topologies or identical acceptance lengths.
 
+For SGLang rollout-stage collection, later commits of the same target version
+join the replay pool only between training plans, after the preceding reservation
+has been released. In-flight plans remain immutable; the sampling cursor and
+used-item accounting continue without resetting. Other target versions and
+samples reserved by another plan are excluded. This prevents late samples from
+being permanently excluded from a still-open quota, but does not retroactively
+change earlier optimizer steps or guarantee that every sample is drawn. Sync and
+old-logprob collection keep their existing snapshot behavior.
+
+Writer migration budgets use the destination group's cleanup and optimizer-step
+estimates, in addition to transfer and cold activation costs. Migration remains
+optional and still requires the existing idle lease and version/ACK checks.
+
 Replica-local FSDP1 clips the full writer-group gradient norm through FSDP's
 subgroup-aware API. Sync FSDP2/DDP retain the ordinary clipping path. Cold Bubble
 cleanup must successfully park model, optimizer, and target-head state before
@@ -915,3 +992,76 @@ observed; `ready_observed_age_s` includes the driver's polling interval and must
 not be interpreted as pure serialization or transfer time. Ray serialization
 after worker return is not directly timed. `lm_head_export_fence` records the
 existing pre-PPO wait, without adding a new wait or changing execution order.
+
+### Independent head, publication and idle-budget optimizations
+
+For a combined Bubble experiment, use:
+
+```bash
+actor_rollout_ref.rollout.drafter.training.publish_async=true \
+actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.head_reference_transport=true \
+actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.early_publish_staging=true \
+actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.calibrated_budgets=true
+```
+
+Head reference transport and calibrated budgets default to true; early publish
+staging remains opt-in and also requires `training.publish_async=true`.
+Existing launch commands explicitly setting either option to false
+must be updated. All three paths are Bubble-only; Sync keeps its existing head
+RPC, publication boundary and training policy. Each flag can be disabled
+independently for attribution. Their performance effects are not independent:
+host-memory traffic and transport can still contend, so compare total step time.
+
+The FSDP2 head-only exporter advertises reference-transport capability. When
+supported, it creates an immutable CPU BF16 snapshot, puts its uint8 byte view
+into Ray's NumPy object store, and returns small versioned metadata. The driver
+forwards the nested reference without loading the tensor. Only selected drafter
+ranks resolve it; BF16 bits, CPU staging, protected versions and ACK checks are
+preserved. No full actor reload or additional device synchronization is added.
+Unsupported exporters retain their existing path. CPU copy and object-store
+insertion still cost time; this does not promise to eliminate the entire ref gap.
+
+Look for `target_head_reference_dispatched`, `bubble/head_reference_transport=1`
+and `bubble/head_driver_tensor_materialized=0`. With phase timing enabled,
+`lm_head_driver_materialize` now measures lightweight metadata on this path;
+`lm_head_object_store_put` and `lm_head_worker_resolve` expose the actual payload
+work elsewhere. Inspect these alongside `ref_driver`/`ref_worker`, not in place
+of end-to-end timing. Phase spans may nest and must not be summed blindly.
+
+At the post-PPO weight-sync boundary, early staging first requests only the
+already cached CPU publish snapshot through a non-blocking RPC. If it is not
+ready, upstream weight sync runs immediately; the original safe publisher later
+consumes that same request once. If ready, staging may overlap weight sync.
+Missing cached/deferred GPU snapshots retain the existing safe-point export;
+this path never starts a GPU gather. Apply and all-worker ACKs are unchanged.
+Track `publish_snapshot_prefetch_worker`,
+`bubble/publish_snapshot_prefetch_submitted`,
+`bubble/publish_snapshot_prefetch_pending_before_weight_sync`,
+`bubble/publish_snapshot_prefetch_consumed`, and
+`timing_s/drafter_publish_snapshot_prefetch_wait` together with
+`timing_s/drafter_update_weights_hook` and `timing_s/update_weights`.
+
+Budget calibration uses the latest four non-first optimizer-step samples of
+the selected writer, normalized by gradient accumulation. A minimum of three
+samples is required; the conservative 90th percentile is retained. Explicit
+batch-time overrides win. Cleanup has separate writer/hot-cold/partial-final
+histories, also requiring three recent samples. Top-ups never enter these idle
+histories. Unknown modes fall back to the previous conservative estimates.
+`idle_budget` logs `calibrated_budgets`, `writer_steady_samples` and
+`writer_partial_tail_samples` alongside the actual reserves and planned steps.
+The quota, dataset snapshot, first-step reserve, deadline, runtime lease,
+slowdown protection and reclaim checks are not relaxed.
+
+### Logging and retired configuration
+
+Bubble lifecycle events that previously appeared both as logger records and
+`print` output now have a single WARNING/ERROR record, visible with the existing
+default WARN level. The `idle_budget`, `idle_resource_window_too_small`,
+`idle_window_timeline`, training-start/stop and publication ACK records retain
+their diagnostic fields. Detailed phase and memory diagnostics remain opt-in;
+this cleanup does not enable INFO/DEBUG globally or change Sync execution.
+
+The unused `idle_worker.speculative_window_multiplier` setting has been removed.
+Delete that override from old launch commands; no runtime decision depended on
+it. Keep-hot, writer migration, window safety, quota and optimization switches
+remain supported because they still control real behavior.
