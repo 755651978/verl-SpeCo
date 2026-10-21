@@ -8781,6 +8781,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # this step, next rollout not started). A coinciding periodic save
             # in the base loop coalesces to a no-op via _save_checkpoint.
             self._speco_maybe_save_freeze_branch_checkpoint()
+            if getattr(self, "_speco_deferred_checkpoint_step", None) is not None:
+                self._speco_retry_deferred_checkpoint()
             self._speco_flush_request_accept_len_payloads()
             if phase_diagnostics:
                 keys = (
@@ -9142,7 +9144,48 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         finally:
             self._speco_wait_pending_drafter_checkpoint()
 
+    def _speco_checkpoint_pending_quota(self) -> bool:
+        """Inspect cached state only; checkpoint retries must not launch work."""
+        if not self._speco_rollout_idle_worker_enabled():
+            return False
+        scheduler = self._speco_get_drafter_scheduler()
+        return (
+            scheduler._training_quota_debt_steps > 0
+            or scheduler._training_quota_collection_step is not None
+        )
+
+    def _speco_retry_deferred_checkpoint(self) -> None:
+        # Use the existing pre-weight-sync save point. Saving after rollout
+        # weights are woken can change GPU residency during checkpoint export.
+        if (
+            getattr(self, "_speco_deferred_checkpoint_step", None) is not None
+            and not getattr(self, "_speco_checkpoint_in_progress", False)
+            and not getattr(self, "_speco_validation_in_progress", False)
+            and not getattr(self, "_speco_rollout_idle_generation_open", False)
+            and not self._speco_checkpoint_pending_quota()
+        ):
+            self._save_checkpoint()
+
     def _save_checkpoint(self):
+        if self._speco_checkpoint_pending_quota():
+            # Do not serialize orphaned replay pins or silently discard debt on
+            # resume. Leave training/publication unchanged and save at a later
+            # complete-quota boundary, using that boundary's actual RL step.
+            if (
+                self._speco_is_final_training_step()
+                or getattr(self, "_speco_freeze_branch_save_pending", None) is not None
+            ):
+                raise RuntimeError(
+                    "Cannot save a final/freeze checkpoint with an unfinished Bubble quota"
+                )
+            if getattr(self, "_speco_deferred_checkpoint_step", None) is None:
+                self._speco_deferred_checkpoint_step = int(self.global_steps)
+                logger.warning(
+                    "[BubbleTime] checkpoint_deferred: requested_step=%s "
+                    "reason=quota_or_publication_pending; retry after quota publication",
+                    self.global_steps,
+                )
+            return None
         # A freeze-branch event save runs inside the patched _update_actor,
         # immediately before the base loop reaches its own periodic save point.
         # When both land on the same step the full chain must run exactly
@@ -9157,6 +9200,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "step; skipping duplicate save",
                 self.global_steps,
             )
+            self._speco_deferred_checkpoint_step = None
             return None
         # A checkpoint boundary must not retain an async publish payload or let
         # draft loading overlap actor/drafter serialization. This is redundant
@@ -9177,6 +9221,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 with boundary_stage(timings, "quiesce_and_publish_wait"):
                     self._speco_quiesce_bubble_for_checkpoint()
                     self._speco_wait_pending_drafter_publish()
+                    if self._speco_checkpoint_pending_quota():
+                        raise RuntimeError(
+                            "Bubble quota changed while quiescing checkpoint"
+                        )
                 with boundary_stage(timings, "drafter_save_wait"):
                     self._speco_save_drafter_checkpoint(wait=True)
                 with boundary_stage(timings, "freeze_state_save"):
@@ -9184,6 +9232,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 with boundary_stage(timings, "upstream_save"):
                     result = super()._save_checkpoint()
             self._speco_last_checkpoint_saved_step = self.global_steps
+            requested_step = getattr(self, "_speco_deferred_checkpoint_step", None)
+            if requested_step is not None:
+                logger.warning(
+                    "[BubbleTime] deferred_checkpoint_saved: requested_step=%s saved_step=%s",
+                    requested_step,
+                    self.global_steps,
+                )
+            self._speco_deferred_checkpoint_step = None
             return result
         finally:
             self._speco_checkpoint_in_progress = False

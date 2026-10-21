@@ -1578,6 +1578,11 @@ class DrafterBaseTrainer:
                     or int(buffer_state.get("version", 0)) != 1
                 ):
                     raise RuntimeError("invalid buffer state")
+                from verl_speco.trainer.checkpoint import (
+                    validate_checkpoint_buffer_ownership,
+                )
+
+                validate_checkpoint_buffer_ownership(buffer_state)
                 self.data_buffer.buffer.clear()
                 self.data_buffer.buffer.extend(buffer_state.get("data_buffer", []))
                 self.data_buffer._current_step = buffer_state.get("data_buffer_step")
@@ -2331,7 +2336,7 @@ class DrafterBaseTrainer:
     def _speco_checkpoint_buffer_state(self) -> dict[str, Any] | None:
         if not self.use_data_buffer:
             return None
-        return {
+        state = {
             "version": 1,
             "buffer_version": int(self.buffer_version),
             "current_rl_step": int(self.current_rl_step),
@@ -2339,6 +2344,10 @@ class DrafterBaseTrainer:
             "data_buffer": list(self.data_buffer.buffer),
             "collected_data": list(self.collected_data),
         }
+        from verl_speco.trainer.checkpoint import validate_checkpoint_buffer_ownership
+
+        validate_checkpoint_buffer_ownership(state)
+        return state
 
     def save_checkpoint(
         self,

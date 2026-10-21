@@ -1,6 +1,24 @@
 # Bubble Time Drafter Training
 
-Last updated: 10/20/2026
+Last updated: 10/21/2026
+
+### Periodic checkpoint safety
+
+Bubble defers a periodic checkpoint while a collected quota is unfinished or
+awaiting publication acknowledgement. The save request is retried at the existing
+post-actor-update, pre-weight-sync safe point, without forcing extra
+training or changing collection, loss, or publication policy. The checkpoint uses
+the actual later RL step for both actor and drafter; it never labels later weights
+with the originally requested step. Repeated save requests coalesce.
+
+This adds no per-step model copies or additional checkpoint payload. It can delay
+the latest recovery point if a quota takes a long time to finish; look for
+`[BubbleTime] checkpoint_deferred`. Final/freeze saves fail explicitly if their
+quota is unfinished, instead of silently producing an incomplete recovery point.
+Older checkpoints containing pinned/reserved replay samples are rejected on
+restore because their quota/session owners were not persisted. Resume from a
+checkpoint taken after quota publication; removing ownership flags would lose
+unfinished training.
 
 ## Acceptance sidecar file I/O
 
@@ -1190,3 +1208,19 @@ summary, then compare the first three steps with an otherwise identical run
 without this switch. A consistent change implicates the polling path; no change
 means the serving/backend or external contention still needs investigation.
 Do not compare this diagnostic ablation as a production throughput result.
+
+## Qwen3-8B DSpark GPU observation
+
+![Qwen3-8B DSpark Sync versus Bubble, steps 1-45](assets/bubble_time/qwen3_8b_sync_bubble.png)
+
+Across matched RL steps 1-45, including warm-up, mean step time decreased from
+204.11 to 195.87 seconds (4.0%), generation from 68.41 to 66.55 seconds (2.7%),
+and reported `timing_s/drafter` from 9.24 to 1.93 seconds (79.2%). Cumulative
+training step time excludes separately reported validation time.
+
+This is an observed timing comparison, not an equal-workload or equal-quality
+benchmark: Sync completed 220 drafter optimizer steps and 11 publications;
+Bubble completed 205 steps (37 idle and 168 top-up) and 10 publications, with
+15 steps still owed. Bubble's run stopped after step 45 with a worker SIGTERM,
+so full 50-step wall-clock time cannot be compared. Asynchronous work and
+publication waits can be charged outside `timing_s/drafter`.
