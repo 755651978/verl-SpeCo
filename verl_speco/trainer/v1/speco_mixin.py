@@ -1282,9 +1282,16 @@ class SpecoV1Mixin:
         """Read cumulative EngineCore counters when RequestOutput has no stats."""
 
         from verl_speco.integration.vllm_runtime import (
+            _drafter_config_from_config,
+            _vllm_acceptance_sidecar_enabled,
             SPECO_VLLM_SPEC_DECODE_SIDECAR_KEY,
             read_vllm_spec_decode_sidecar_totals,
         )
+
+        if not _vllm_acceptance_sidecar_enabled(
+            _drafter_config_from_config(self.config)
+        ):
+            return {}
 
         run_dir = getattr(
             getattr(getattr(self, "config", None), "trainer", None),

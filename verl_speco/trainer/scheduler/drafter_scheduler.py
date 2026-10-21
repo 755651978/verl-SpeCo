@@ -25,7 +25,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any, Sequence, cast
 from uuid import uuid4
@@ -1184,18 +1184,71 @@ class DrafterScheduler:
         return min(survivors)
 
     def should_retry_idle_admission(
-        self, config: DrafterScheduleConfig, *, now: float | None = None
+        self,
+        config: DrafterScheduleConfig | Callable[[], DrafterScheduleConfig],
+        *,
+        now: float | None = None,
     ) -> bool:
-        """Cheap retry gate for quiet event polls; never inspects worker data."""
+        """Reject impossible/throttled quiet retries before resolving config.
+
+        A factory avoids reconstructing an OmegaConf-backed schedule on every
+        50ms empty poll. These cached prerequisites already exist in the full
+        readmission gate; live-window, deadline and epoch checks remain there.
+        """
+        checked_at = time.time() if now is None else now
+        if (
+            self._training_quota_debt_steps <= 1
+            or self._idle_worker_writer_state_version is None
+            or self._idle_worker_prebatch_reclaim_streak > 0
+        ):
+            return False
+        group = self._current_idle_writer_group(assign_default=False)
+        if (
+            group is None
+            or group not in self._idle_worker_hot_prewarmed_groups
+            or group not in self._idle_optimizer_initialized_groups
+        ):
+            return False
+        # An empty poll during generation is not an admission attempt. In
+        # particular it must not throttle the first usable live idle poll.
+        states = [self._idle_workers.get(worker) for worker in group]
+        if any(
+            state is None
+            or state.status != "idle"
+            or not state.memory_released
+            or state.idle_confidence is not IdleWindowConfidence.CONFIRMED
+            or state.must_be_ready_at is not None
+            or state.confirmed_at_generation_boundary
+            for state in states
+        ):
+            return False
+        ranks = self._replica_ranks_for_worker_group(group)
+        if len(ranks) != 1:
+            return False
+        started = self._replica_idle_started_at.get(ranks[0])
+        forecast = self._effective_historical_idle_window_sec(worker_ids=group)
+        if (
+            started is None
+            or forecast is None
+            or not math.isfinite(forecast)
+            or forecast <= 0
+        ):
+            return False
+        age = max(checked_at - started, 0.0)
+        if age < forecast:
+            return False
+        # A short forecast can leave less than 250ms in which the unchanged
+        # survival gate proves one optimizer step fits (log8, step11). Check
+        # at the event-poll cadence only near that boundary, then back off.
+        retry_interval = 0.05 if age - forecast < 0.25 else 0.25
+        if checked_at - self._idle_readmission_last_check_ts < retry_interval:
+            return False
+        config = config() if callable(config) else config
         if not config.idle_worker_historical_window_readmission:
             return False
+        # Charge factory time before evaluating the real residual window.
         now = time.time() if now is None else now
-        if now - self._idle_readmission_last_check_ts < 0.25:
-            return False
         self._idle_readmission_last_check_ts = now
-        group = self._current_idle_writer_group(assign_default=False)
-        if group is None:
-            return False
         window = self._historical_idle_readmission_window(config, group, now=now)
         return window is not None and window >= self._minimum_idle_training_window_sec(
             config, worker_ids=group
@@ -1944,15 +1997,18 @@ class DrafterScheduler:
         if self._worker_executor is None:
             raise RuntimeError("Drafter worker executor has not been bound")
         probe_started = time.perf_counter()
-        statuses = self._worker_executor.get_training_data_status(
-            sample_last_n_steps=config.sample_last_n_steps,
-            require_full_batch=config.require_full_batch,
-            worker_ids=worker_ids,
-            target_version=target_version,
-        )
+        from verl_speco.integration.generation_diagnostics import background_span
+
+        with background_span("data_probe"):
+            statuses = self._worker_executor.get_training_data_status(
+                sample_last_n_steps=config.sample_last_n_steps,
+                require_full_batch=config.require_full_batch,
+                worker_ids=worker_ids,
+                target_version=target_version,
+            )
         status = self.data_status_policy.aggregate(statuses, global_step=global_step)
         if config.execution_strategy is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER:
-            logger.warning(
+            logger.debug(
                 "[BubbleTime] training_data_probe: step=%s workers=%s "
                 "target_version=%s elapsed_s=%.4f",
                 global_step,
@@ -1982,7 +2038,7 @@ class DrafterScheduler:
                 }
                 timeline["driver_received_ts"] = time.time()
                 self._replica_idle_timeline[replica] = timeline
-                logger.warning(
+                logger.debug(
                     "[BubbleTime] idle_event_timeline: replica=%s release_source=%s timestamps=%s",
                     replica,
                     event.get("release_source"),
@@ -2984,7 +3040,7 @@ class DrafterScheduler:
                     source = "historical_survival"
             if minimum_window < min_idle_window_sec:
                 window_too_small_seen = True
-                logger.warning(
+                logger.debug(
                     "[BubbleTime] idle_resource_window_too_small: reason=window_too_small "
                     "group_id=idle-group-%s group=%s minimum_window_s=%.3f "
                     "min_required_s=%.3f budget_deficit_s=%.3f historical_window_s=%s source=%s "

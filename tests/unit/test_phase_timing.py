@@ -93,6 +93,7 @@ def test_root_diagnostic_env_preserves_custom_ray_settings(
     from verl_speco.main import configure_phase_diagnostic_runtime_env
 
     monkeypatch.setenv("VERL_SPECO_PHASE_TIMING", "true" if enabled else "false")
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", "true")
     config = OmegaConf.create(
         {
             "actor_rollout_ref": {
@@ -127,6 +128,7 @@ def test_root_diagnostic_env_preserves_custom_ray_settings(
     assert env.working_dir == "/workspace"
     if bubble and enabled:
         assert env.env_vars.VERL_SPECO_PHASE_TIMING == "true"
+        assert env.env_vars.VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL == "true"
     else:
         assert OmegaConf.to_container(config) == before
 

@@ -191,7 +191,7 @@ def test_cached_only_worker_cannot_export_deferred_gpu_snapshot():
     assert worker._deferred_publish_optimizer_step == 20
 
 
-def _weight_update_hook(driver, queue, original, drain):
+def _weight_update_hook(driver, queue, original, drain, *, diagnostics=False):
     path = (
         Path(__file__).resolve().parents[2] / "verl_speco/trainer/speco_ray_trainer.py"
     )
@@ -209,6 +209,9 @@ def _weight_update_hook(driver, queue, original, drain):
         time=time,
         logger=SimpleNamespace(warning=lambda *args: None),
         pending_drafter_publish={"ready": False},
+        phase_diagnostics=diagnostics,
+        control_snapshot=lambda owner: {},
+        emit_summary=lambda *args, **kwargs: None,
     )
     module = ast.Module(
         body=[
@@ -224,7 +227,10 @@ def _weight_update_hook(driver, queue, original, drain):
 
 
 @pytest.mark.parametrize("bubble,staged", [(False, False), (True, False), (True, True)])
-def test_production_hook_orders_stage_before_sync_and_retains_fallback(bubble, staged):
+@pytest.mark.parametrize("diagnostics", [False, True])
+def test_production_hook_orders_stage_before_sync_and_retains_fallback(
+    bubble, staged, diagnostics
+):
     driver, pending, _, _ = _driver()
     driver._speco_rollout_idle_worker_enabled = lambda: bubble
     events = []
@@ -255,7 +261,9 @@ def test_production_hook_orders_stage_before_sync_and_retains_fallback(bubble, s
             else {}
         )
 
-    assert _weight_update_hook(driver, queue, original, drain)(None) == "result"
+    assert _weight_update_hook(
+        driver, queue, original, drain, diagnostics=diagnostics
+    )(None) == "result"
     assert events == (
         ["upstream_sync"]
         if not bubble

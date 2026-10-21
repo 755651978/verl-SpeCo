@@ -712,3 +712,167 @@ def test_disabled_quiet_poll_adds_no_scheduler_queries():
         "disabled retry queried scheduler"
     )
     assert driver._speco_service_rollout_idle_events() == {}
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "no_debt",
+        "final_step",
+        "no_state",
+        "no_group",
+        "cold",
+        "cold_optimizer",
+        "reclaim",
+        "throttled",
+    ],
+)
+def test_quiet_retry_skips_config_factory_without_ready_writer(monkeypatch, guard):
+    scheduler, _, _ = _hot_writer(monkeypatch)
+    if guard == "no_debt":
+        scheduler._training_quota_debt_steps = 0
+    elif guard == "final_step":
+        scheduler._training_quota_debt_steps = 1
+    elif guard == "no_state":
+        scheduler._idle_worker_writer_state_version = None
+    elif guard == "no_group":
+        scheduler._idle_worker_writer_group = None
+    elif guard == "cold":
+        scheduler._idle_worker_hot_prewarmed_groups.clear()
+    elif guard == "cold_optimizer":
+        scheduler._idle_optimizer_initialized_groups.clear()
+    elif guard == "reclaim":
+        scheduler._idle_worker_prebatch_reclaim_streak = 1
+    elif guard == "throttled":
+        scheduler._idle_readmission_last_check_ts = 99.9
+    assert not scheduler.should_retry_idle_admission(
+        lambda: pytest.fail("impossible quiet retry parsed config"), now=100.0
+    )
+
+
+def test_quiet_retry_resolves_lazy_config_only_at_retry_interval(monkeypatch):
+    scheduler, config, _ = _hot_writer(monkeypatch)
+    calls = []
+
+    def resolve():
+        calls.append(True)
+        return config
+
+    assert scheduler.should_retry_idle_admission(resolve, now=100.0)
+    assert not scheduler.should_retry_idle_admission(resolve, now=100.1)
+    assert scheduler.should_retry_idle_admission(resolve, now=100.3)
+    assert len(calls) == 2
+
+
+def test_lazy_config_time_is_charged_to_live_window(monkeypatch):
+    scheduler, config, _ = _hot_writer(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(
+        "verl_speco.trainer.scheduler.drafter_scheduler.time.time", lambda: clock[0]
+    )
+
+    def resolve():
+        clock[0] = 110.0
+        return config
+
+    # All recorded tails have expired by the time configuration resolves.
+    assert not scheduler.should_retry_idle_admission(resolve)
+    assert scheduler._idle_readmission_last_check_ts == 110.0
+
+
+def test_log8_step11_short_live_tail_does_not_miss_readmission(monkeypatch):
+    scheduler, config, group = _hot_writer(monkeypatch)
+    config = replace(config, idle_worker_initial_batch_estimate_sec=0.2941769229946658)
+    # Only prior completed writer tails: never use step11's future 2.025s tail.
+    tails = [
+        0.13772559,
+        2.96871924,
+        0.09742641,
+        4.73100591,
+        0.11418986,
+        0.12435579,
+        0.12220764,
+        0.12342143,
+        0.11599874,
+        0.63566518,
+    ]
+    scheduler._replica_idle_window_samples_sec[0] = deque(tails, maxlen=32)
+    scheduler._replica_idle_windows_by_source[0]["generation_completed"] = deque(
+        tails, maxlen=32
+    )
+    scheduler._replica_idle_started_at[0] = 100.0
+    for worker in group:
+        scheduler._idle_workers[worker].event_ts = 100.0
+    scheduler._idle_readmission_last_check_ts = 99.95
+    # At 50ms the forecast has not elapsed. At 150ms the same historical
+    # safety gate already proves a 0.485s residual, enough for a bounded step.
+    assert not scheduler.should_retry_idle_admission(config, now=100.05)
+    assert scheduler.should_retry_idle_admission(config, now=100.15)
+    monkeypatch.setattr(
+        "verl_speco.trainer.scheduler.drafter_scheduler.time.time", lambda: 100.15
+    )
+    scheduler._training_quota_data_version = 8
+    context = replace(
+        _context(),
+        data_status=replace(_status("0", batches=20), data_version=8, target_version=8),
+    )
+    plan = scheduler.prepare_idle_worker_training_plan(context, config)
+    assert plan.launch and plan.max_batches == 1
+    assert plan.idle_window_source == "historical_survival"
+    assert plan.deadline_ts <= 100.63566518
+    assert not scheduler.should_retry_idle_admission(config, now=100.20)
+
+
+@pytest.mark.parametrize("blocked", ["busy", "not_released", "deadline", "boundary"])
+def test_quiet_retry_does_not_parse_config_outside_live_idle(monkeypatch, blocked):
+    scheduler, _, group = _hot_writer(monkeypatch)
+    state = scheduler._idle_workers[group[0]]
+    if blocked == "busy":
+        state.status = "generating"
+    elif blocked == "not_released":
+        state.memory_released = False
+    elif blocked == "deadline":
+        state.must_be_ready_at = 102.0
+    else:
+        state.confirmed_at_generation_boundary = True
+    assert not scheduler.should_retry_idle_admission(
+        lambda: pytest.fail("no usable live idle; configuration must stay lazy"),
+        now=100.0,
+    )
+
+
+@pytest.mark.parametrize("has_event", [False, True])
+def test_no_quota_quiet_gate_preserves_event_and_completion_servicing(
+    monkeypatch, has_event
+):
+    scheduler, _, _ = _hot_writer(monkeypatch)
+    scheduler._training_quota_debt_steps = 0
+    cls = _methods(
+        "verl_speco/trainer/speco_ray_trainer.py",
+        "SpecoRayPPOTrainer",
+        {"_speco_service_rollout_idle_events"},
+    )
+    driver = cls()
+    serviced = []
+    driver._speco_rollout_idle_generation_open = True
+    driver._speco_historical_window_readmission_enabled = True
+    driver._speco_bubble_training_lock = nullcontext
+
+    def drain():
+        serviced.append("events")
+        return {"bubble/events": 1} if has_event else {}
+
+    driver._speco_drain_rollout_idle_events = drain
+    driver._speco_release_completed_rollout_training_lease = (
+        lambda: serviced.append("completion") or {}
+    )
+    driver._speco_get_drafter_scheduler = lambda: scheduler
+    driver._speco_drafter_schedule_config = lambda: pytest.fail(
+        "empty quota parsed config"
+    )
+    driver._speco_try_launch_rollout_idle_training = (
+        lambda: serviced.append("launch") or {}
+    )
+    driver._speco_record_rollout_idle_metrics = lambda metrics: None
+    driver._speco_service_rollout_idle_events()
+    assert serviced == ["events", "completion"] + (["launch"] if has_event else [])

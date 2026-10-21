@@ -5707,8 +5707,12 @@ class DrafterBaseTrainer:
                 sessions[int(target_version)] = session
         if require_full_batch and len(reserved) < max(int(self.batch_size), 1):
             self.data_buffer.release_reservation(str(plan_id))
+            if session is not None:
+                self.data_buffer.unpin_replay_samples(session["items"])
             sessions.pop(int(target_version), None)
             reserved = []
+        if reserved and getattr(self, "_bubble_time_enabled", False):
+            self.data_buffer.pin_replay_samples(reserved)
         self._active_training_reservation_id = str(plan_id) if reserved else None
         self._active_training_target_version = int(target_version) if reserved else None
         # Bubble Time owns a version-homogeneous snapshot for the whole plan.
@@ -5749,6 +5753,8 @@ class DrafterBaseTrainer:
             session["used_items"] = self._active_training_replay_used_items
         if not consume:
             return 0
+        if session is not None:
+            self.data_buffer.unpin_replay_samples(session["items"])
         used_items = list(self._active_training_replay_used_items.values())
         consumed = self.data_buffer.consume(str(plan_id), used_items)
         if target_version is not None:
@@ -6581,6 +6587,23 @@ class DrafterBaseTrainer:
 
     def _log_training_memory(self, stage: str) -> None:
         """Opt-in local storage accounting; never gather FSDP shards."""
+        if getattr(self, "_bubble_time_enabled", False):
+            from verl_speco.integration.phase_timing import phase_timing_enabled
+
+            if phase_timing_enabled():
+                from verl_speco.integration.generation_diagnostics import (
+                    allocator_snapshot,
+                    emit_summary,
+                )
+
+                emit_summary(
+                    "drafter_residency",
+                    rank=getattr(self, "rank", None),
+                    stage=stage,
+                    device_resident=getattr(self, "_training_device_resident", None),
+                    optimizer_steps=getattr(self, "optimizer_steps_total", None),
+                    allocator=allocator_snapshot(getattr(self, "device_module", None)),
+                )
         if not _env_flag_enabled("VERL_DRAFTER_MEMORY_DIAGNOSTICS"):
             return
         try:

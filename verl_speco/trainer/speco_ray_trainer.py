@@ -2609,6 +2609,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not self._speco_rollout_idle_worker_enabled():
             os.environ.pop(SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV, None)
             return None
+        from verl_speco.integration.bubble_logging import configure_bubble_logger
+        from verl_speco.trainer.scheduler import drafter_scheduler
+
+        configure_bubble_logger(logger)
+        configure_bubble_logger(drafter_scheduler.logger)
         name = self._speco_rollout_idle_event_bus_name()
         if not name:
             name = f"speco-rollout-idle-{os.getpid()}-{uuid.uuid4().hex}"
@@ -2719,7 +2724,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if events:
             metrics["bubble/runtime_worker_events_drained"] = len(lifecycle_events)
             metrics["bubble/runtime_sample_events_drained"] = len(sample_events)
-            logger.warning(
+            logger.debug(
                 "[BubbleTime] drained rollout events: lifecycle=%s samples=%s "
                 "idle_workers=%s callback_verified=%s generation_idle_events=%s",
                 len(lifecycle_events),
@@ -3166,6 +3171,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     ready_target_workers,
                     tuple(sorted(self._speco_ready_target_lm_head_versions)),
                 )
+            from verl_speco.integration.generation_diagnostics import record_admission
+
+            record_admission(plan)
             print(
                 "[BubbleTime] idle_launch_decision: "
                 f"launch={getattr(plan, 'launch', False)} "
@@ -3263,17 +3271,24 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             ):
                 retry_admission = (
                     self._speco_get_drafter_scheduler().should_retry_idle_admission(
-                        self._speco_drafter_schedule_config()
+                        self._speco_drafter_schedule_config
                     )
                 )
             if (metrics or retry_admission) and allow_launch:
-                metrics.update(self._speco_try_launch_rollout_idle_training())
+                launch_metrics = self._speco_try_launch_rollout_idle_training()
+                from verl_speco.integration.generation_diagnostics import (
+                    record_gate_metrics,
+                )
+
+                record_gate_metrics(launch_metrics)
+                metrics.update(launch_metrics)
             elif metrics:
                 metrics["bubble/post_generation_launch_suppressed"] = 1
             self._speco_record_rollout_idle_metrics(metrics)
             return metrics
 
     def _speco_start_rollout_idle_event_loop(self):
+        self._speco_idle_poll_diagnostics = None
         if not self._speco_rollout_idle_worker_enabled() or getattr(
             self, "_speco_validation_in_progress", False
         ):
@@ -3286,7 +3301,33 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
             return None, None
         poll_interval = self._speco_rollout_idle_poll_interval_sec()
-        logger.warning(
+        from verl_speco.integration.phase_timing import phase_timing_enabled
+        from verl_speco.integration.generation_diagnostics import (
+            background_diagnostics,
+            background_span,
+            emit_runtime_identity,
+            empty_idle_poll_ablation_allowed,
+        )
+
+        diagnostic_counts = {} if phase_timing_enabled() else None
+        self._speco_idle_poll_diagnostics = diagnostic_counts
+        emit_runtime_identity(
+            self,
+            "bubble_driver",
+            getattr(self, "_speco_start_rollout_idle_event_loop", None),
+        )
+        if empty_idle_poll_ablation_allowed(
+            self, lambda: self._speco_drafter_training_config()
+        ):
+            assert diagnostic_counts is not None
+            diagnostic_counts["diagnostic_empty_poll_paused"] = 1
+            logger.warning(
+                "[BubbleTime] idle_event_loop: diagnostic_paused "
+                "reason=before_first_oldlogprob_collection "
+                "leases_preserved=True post_rollout_drain_preserved=True"
+            )
+            return None, None
+        logger.debug(
             "[BubbleTime] idle_event_loop: starting bus=%s poll_interval_s=%.3f",
             bus_name,
             poll_interval,
@@ -3296,7 +3337,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         def run_loop() -> None:
             while not stop_event.wait(poll_interval):
                 try:
-                    self._speco_service_rollout_idle_events()
+                    if diagnostic_counts is None:
+                        self._speco_service_rollout_idle_events()
+                    else:
+                        with (
+                            background_diagnostics(diagnostic_counts),
+                            background_span("service"),
+                        ):
+                            self._speco_service_rollout_idle_events()
                 except CollectionFinalizeError as exc:
                     # Do not swallow an ambiguous collection transaction and
                     # retry admission against committed-but-unfinalized data.
@@ -7732,6 +7780,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         phase_diagnostics = (
             phase_timing_enabled() and self._speco_rollout_idle_worker_enabled()
         )
+        from verl_speco.integration.generation_diagnostics import (
+            control_snapshot,
+            emit_summary,
+            idle_snapshot,
+        )
+
         if self._speco_rollout_idle_worker_enabled():
             log_driver_phase_setup(
                 enabled=phase_diagnostics,
@@ -7895,6 +7949,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             )
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
+            diagnostic_started = time.perf_counter() if phase_diagnostics else None
             generation_metrics = self._speco_publish_boundary()
             input_is_validation = bool(
                 getattr(self, "_speco_validation_in_progress", False)
@@ -8122,6 +8177,40 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     # overlap window. Fail closed instead of moving drafter
                     # work onto the PPO critical path.
                     generation_metrics["bubble/no_confirmed_idle_window"] = 1
+                if diagnostic_started is not None:
+                    from verl_speco.integration.generation_diagnostics import (
+                        emit_summary,
+                    )
+
+                    counts = dict(
+                        getattr(self, "_speco_idle_poll_diagnostics", None) or {}
+                    )
+                    for name, value in counts.items():
+                        if not isinstance(value, (int, float)):
+                            continue
+                        key = (
+                            f"timing_s/bubble_background_{name}"
+                            if name.endswith("_s")
+                            else f"bubble/background_{name}"
+                        )
+                        generation_metrics[key] = value
+                    generation_metrics["timing_s/bubble_generation_prepare"] = (
+                        rollout_rpc_started - diagnostic_started
+                    )
+                    emit_summary(
+                        "driver_rollout",
+                        source_step=int(self.global_steps),
+                        prepare_s=rollout_rpc_started - diagnostic_started,
+                        rollout_rpc_s=rollout_rpc_elapsed,
+                        return_to_ready_s=boundary_metrics[
+                            "timing_s/bubble_rollout_return_to_ready"
+                        ],
+                        reclaim_wait_s=boundary_metrics[
+                            "timing_s/drafter_reclaim_wait"
+                        ],
+                        background=counts,
+                        idle=idle_snapshot(self),
+                    )
                 self._speco_store_rollout_metrics(gen_batch_output)
                 self._speco_populate_request_accept_len_records(gen_batch_output)
                 # Version that actually served THIS generation. Read after the
@@ -8507,6 +8596,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "actor_update_driver",
                     metrics=metrics,
                     source_step=int(self.global_steps),
+                    control=control_snapshot(self),
                 ):
                     actor_output = original_update_actor(*args, **kwargs)
             else:
@@ -8692,6 +8782,32 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # in the base loop coalesces to a no-op via _save_checkpoint.
             self._speco_maybe_save_freeze_branch_checkpoint()
             self._speco_flush_request_accept_len_payloads()
+            if phase_diagnostics:
+                keys = (
+                    "timing_s/phase_actor_update_driver",
+                    "timing_s/phase_ref_driver",
+                    "timing_s/oldlogprob_compute",
+                    "timing_s/oldlogprob_collect",
+                    "timing_s/drafter",
+                    "timing_s/drafter_target_lm_head_export_fence",
+                    "timing_s/drafter_sync_target_lm_head_fetch",
+                    "timing_s/drafter_sync_target_lm_head_dispatch",
+                    "timing_s/drafter_train_rpc",
+                    "timing_s/drafter_async_training_work",
+                    "timing_s/drafter_memory_park_before_update_actor",
+                    "timing_s/drafter_publish_fetch_snapshot",
+                    "timing_s/drafter_publish_safe_point",
+                    "bubble/idle_optimizer_steps_total",
+                    "bubble/critical_path_topup_optimizer_steps_total",
+                    "drafter/collected_samples",
+                    "drafter/train_successful_steps_max",
+                )
+                emit_summary(
+                    "actor_hook",
+                    source_step=int(self.global_steps),
+                    control=control_snapshot(self),
+                    metrics={key: metrics[key] for key in keys if key in metrics},
+                )
             return self._speco_update_output_metrics(actor_output, metrics)
 
         def update_weights_with_speco(manager_self, *args, **kwargs):
@@ -8750,6 +8866,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 # attach to.  Preserve the result for the next actor metrics flush
                 # so publish success and its safe-point cost remain observable.
                 self._speco_record_rollout_idle_metrics(publish_metrics)
+                if phase_diagnostics:
+                    emit_summary(
+                        "weight_update",
+                        source_step=int(self.global_steps),
+                        upstream_s=actor_sync_elapsed,
+                        drafter_hook_s=max(hook_elapsed - actor_sync_elapsed, 0.0),
+                        total_s=hook_elapsed,
+                        control=control_snapshot(self),
+                        publish_metrics={
+                            key: value
+                            for key, value in publish_metrics.items()
+                            if key.startswith("timing_s/")
+                            or key in {"drafter/published", "bubble/publish_pending"}
+                        },
+                    )
                 return self._speco_update_output_metrics(result, publish_metrics)
 
             if pending_drafter_publish["ready"]:
@@ -8843,6 +8974,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "ref_driver",
                     metrics=phase_metrics,
                     head_target_version=phase_metrics["bubble/ref_head_target_version"],
+                    control=control_snapshot(self),
                     **({"source_step": int(self.global_steps), **trace}),
                 ):
                     result = original_compute_ref_log_prob(*args, **kwargs)
@@ -8855,6 +8987,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "old_log_prob_driver",
                 metrics=phase_metrics,
                 source_step=int(self.global_steps),
+                control=control_snapshot(self),
             ):
                 result = compute_old_log_prob_with_speco(trainer_self, *args, **kwargs)
             if self._speco_oldlogprob_collection_enabled():
@@ -9035,11 +9168,21 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # publish operation in flight. Quiesce those operations first;
             # the explicit publish wait below also preserves the upstream
             # barrier for synchronous and rollout-only configurations.
-            self._speco_quiesce_bubble_for_checkpoint()
-            self._speco_wait_pending_drafter_publish()
-            self._speco_save_drafter_checkpoint(wait=True)
-            self._speco_freeze_save_state()
-            result = super()._save_checkpoint()
+            from verl_speco.integration.generation_diagnostics import (
+                pipeline_boundary,
+                boundary_stage,
+            )
+
+            with pipeline_boundary(self, "checkpoint") as timings:
+                with boundary_stage(timings, "quiesce_and_publish_wait"):
+                    self._speco_quiesce_bubble_for_checkpoint()
+                    self._speco_wait_pending_drafter_publish()
+                with boundary_stage(timings, "drafter_save_wait"):
+                    self._speco_save_drafter_checkpoint(wait=True)
+                with boundary_stage(timings, "freeze_state_save"):
+                    self._speco_freeze_save_state()
+                with boundary_stage(timings, "upstream_save"):
+                    result = super()._save_checkpoint()
             self._speco_last_checkpoint_saved_step = self.global_steps
             return result
         finally:
@@ -9059,12 +9202,22 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_service_rollout_idle_events(allow_launch=False)
         self._speco_validation_in_progress = True
         try:
-            with self._speco_bubble_training_lock():
-                metrics = self._speco_reclaim_rollout_idle_workers_before_generation()
-                self._speco_record_rollout_idle_metrics(metrics)
-                self._speco_wait_target_lm_head_prefetch()
-                self._speco_wait_pending_drafter_publish()
-            return super()._validate(*args, **kwargs)
+            from verl_speco.integration.generation_diagnostics import (
+                pipeline_boundary,
+                boundary_stage,
+            )
+
+            with pipeline_boundary(self, "validation_body") as timings:
+                with boundary_stage(timings, "quiesce_and_publish_wait"):
+                    with self._speco_bubble_training_lock():
+                        metrics = (
+                            self._speco_reclaim_rollout_idle_workers_before_generation()
+                        )
+                        self._speco_record_rollout_idle_metrics(metrics)
+                        self._speco_wait_target_lm_head_prefetch()
+                        self._speco_wait_pending_drafter_publish()
+                with boundary_stage(timings, "upstream_validation"):
+                    return super()._validate(*args, **kwargs)
         finally:
             # Clear events while the validation guard is still raised, even
             # when evaluation fails or is interrupted.

@@ -1520,6 +1520,34 @@ def test_streamed_replay_adds_only_available_same_version_samples_between_plans(
     assert worker._active_training_replay_cursor == 8
 
 
+def test_replay_snapshot_survives_capacity_pressure_until_quota_finalization():
+    worker = _head_lifecycle_worker()
+    samples = worker.data_buffer.get_all_data()
+    worker.data_buffer = type(worker.data_buffer)(max_size=len(samples))
+    for sample in samples:
+        worker.data_buffer.add_batch(sample)
+    worker.reserve_training_data(
+        plan_id="first", target_version=4, max_batches=1, retain_replay_session=True
+    )
+    session = worker._training_replay_sessions[4]
+    assert all(item.get("_drafter_replay_pinned") for item in session["items"])
+    assert not worker.data_buffer.add_batch({"id": "late", "target_version": 4})
+    worker.finalize_training_data_reservation("first", consume=False)
+    worker.release_training_data_reservation("first")
+    # A retained quota is still pinned even with no active RPC reservation.
+    assert not worker.data_buffer.add_batch({"id": "later", "target_version": 4})
+    assert worker.reserve_training_data(
+        plan_id="final", target_version=4, max_batches=20
+    )["reserved_samples"] == len(samples)
+    used = session["items"][0]
+    worker._active_training_replay_used_items = {id(used): used}
+    assert worker.finalize_training_data_reservation("final", consume=True) == 1
+    worker.release_training_data_reservation("final")
+    assert 4 not in worker._training_replay_sessions
+    assert all(not item.get("_drafter_replay_pinned") for item in samples)
+    assert worker.data_buffer.add_batch({"id": "next-quota", "target_version": 5})
+
+
 def test_streamed_replay_keeps_running_plan_immutable_until_release():
     worker = _head_lifecycle_worker()
     worker.config.rollout.name = "sglang"

@@ -156,6 +156,9 @@ actor_rollout_ref:
         cuda_graph_max_bs: null
 
       vllm:
+        # File-based fallback for acceptance metrics. False disables sidecar
+        # directory creation/read/write; request and engine stats stay enabled.
+        acceptance_sidecar_enabled: true
         draft_tensor_parallel_size: null
         max_model_len: null
         enforce_eager: null

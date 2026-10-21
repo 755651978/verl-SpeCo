@@ -1400,7 +1400,10 @@ def test_writer_small_window_is_not_hidden_by_other_group_migration(caplog) -> N
                 must_be_ready_at=100.0 + window,
             )
         )
-    resources = scheduler.select_idle_training_resources(config, now=100.0)
+    with caplog.at_level(
+        logging.DEBUG, logger="verl_speco.trainer.scheduler.drafter_scheduler"
+    ):
+        resources = scheduler.select_idle_training_resources(config, now=100.0)
     assert not resources.available
     assert resources.reason == "window_too_small"
     assert resources.worker_ids == ("0",)

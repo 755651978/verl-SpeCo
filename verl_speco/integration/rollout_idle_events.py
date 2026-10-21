@@ -19,6 +19,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV = "VERL_SPECO_ROLLOUT_IDLE_EVENT_BUS"
 DRAFTER_SAMPLE_READY_EVENT = "drafter_sample_ready"
 
+# One reader handle per polling thread, not a growing process-wide actor map.
+# Keep drain RPCs fresh; only avoid the redundant named-actor lookup per poll.
+_event_drain_reader = threading.local()
+
 
 def _ray_module():
     try:
@@ -679,10 +683,22 @@ def drain_rollout_idle_events(name: str | None) -> list[dict[str, Any]]:
         return []
     ray = _ray_module()
     if ray is None or not getattr(ray, "is_initialized", lambda: False)():
+        _event_drain_reader.cached = None
         return []
     try:
-        actor = ray.get_actor(name)
-        return list(ray.get(actor.drain.remote()) or [])
+        from verl_speco.integration.generation_diagnostics import background_span
+
+        with background_span("event_drain"):
+            cached = getattr(_event_drain_reader, "cached", None)
+            if cached is None or cached[0] is not ray or cached[1] != name:
+                actor = ray.get_actor(name)
+                _event_drain_reader.cached = (ray, name, actor)
+            else:
+                actor = cached[2]
+            return list(ray.get(actor.drain.remote()) or [])
     except Exception as exc:  # noqa: BLE001
+        # The actor may have been restarted/replaced under the same name.
+        # Resolve it again next poll; never reuse events from a previous drain.
+        _event_drain_reader.cached = None
         logger.debug("Unable to drain SPECO rollout idle events from %s: %s", name, exc)
         return []

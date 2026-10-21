@@ -34,6 +34,7 @@ def drafter_diagnostic_env() -> dict[str, str]:
             "VERL_DRAFTER_MEMORY_DIAGNOSTICS",
             "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE",
             "VERL_SPECO_PHASE_TIMING",
+            "VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
         )
         if name in os.environ
     }
@@ -139,6 +140,14 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
         value,
         force_add=True,
     )
+    ablation = os.environ.get("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL")
+    if ablation is not None:
+        OmegaConf.update(
+            config,
+            "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
+            ablation,
+            force_add=True,
+        )
 
 
 def run(config) -> None:

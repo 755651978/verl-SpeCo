@@ -2,6 +2,26 @@
 
 Last updated: 10/20/2026
 
+## Acceptance sidecar file I/O
+
+For a paired Bubble/Sync performance run, disable the file-based acceptance
+fallback explicitly on both runs:
+
+```bash
+actor_rollout_ref.rollout.drafter.vllm.acceptance_sidecar_enabled=False
+```
+
+Restart the driver and rollout workers after changing this option. The default
+is `true` for compatibility. With `false`, SPECO does not auto-create a sidecar
+directory and skips sidecar reads/writes even if a stale path is present. The
+worker logs `disabled by config; no file IO` once. Checkpoints, model execution,
+in-memory acceptance counters, request/engine metrics, and Bubble event-bus and
+resource-lease selection remain unchanged. If request/engine metrics are absent,
+the file fallback also remains unavailable; do not interpret missing acceptance
+metrics as zero acceptance. This option controls acceptance statistics only, not
+checkpoint files or other sidecars. Re-enable it with `True` if the file fallback
+is required. Do not clear `trainer.default_local_dir` to disable statistics.
+
 Bubble Time is the rollout-idle execution path for online drafter co-training.
 Its goal is to keep the same drafter-training quality target as synchronous
 training, while moving as much drafter optimizer work as possible into rollout
@@ -1065,3 +1085,108 @@ The unused `idle_worker.speculative_window_multiplier` setting has been removed.
 Delete that override from old launch commands; no runtime decision depended on
 it. Keep-hot, writer migration, window safety, quota and optimization switches
 remain supported because they still control real behavior.
+
+### Diagnosing Generation regressions before the first quota
+
+Set `VERL_SPECO_PHASE_TIMING=true` on both paired runs. In addition to phase
+records, `[SpecoGeneration]` emits host-only JSON summaries without new RPCs,
+GPU synchronization, token-content logging or per-token output:
+
+- `kind=replica_episode` works on both Sync and Bubble vLLM serving paths.
+  It reports request counts, failures, sum/max admission wait, initialization,
+  lease-lock/acquire wait, original `generate`, release and remaining wrapper
+  time. `slowest` retains only the slowest request's timings, input/output
+  lengths (when available), verify rounds and acceptance statistics.
+- `kind=driver_rollout` reports the Bubble step's pre-generation preparation,
+  rollout RPC, return-to-ready and reclaim wait. Its `background` counters
+  report service polls, event-drain RPCs and data probes, each with count and
+  sum/max wall time. These counters also appear as `bubble/background_*` and
+  `timing_s/bubble_background_*` metrics.
+
+A serving episode ends when its admitted requests drain. It is not necessarily
+one complete PPO rollout: correlate `replica_rank`, `episode` and
+`source_step_min/max`; the step is a submission hint, not a serving revision.
+The last episode is emitted immediately, without waiting for the next step.
+Concurrent request durations overlap, and background spans are nested and
+overlap generation. Never add their sums to derive end-to-end overhead.
+`generate_s` includes upstream serving queues and is not isolated GPU kernel
+time. Cancelled/failed requests remain failures; diagnostics do not retry them.
+
+For the initial regression, compare the first three steps before collection or
+training. Large admission/lease waits suggest a control-path delay; large
+original-generate time with small waits points to the serving path, batching
+or device contention. Use a longer run separately to verify idle training,
+quota completion and publication. Diagnostics are off by default and do not
+change quotas, deadlines, polling intervals, sampling or publish ordering.
+
+#### Following the complete Bubble critical path
+
+With the same diagnostic switch, the following records complete the overview:
+
+| Record | What to inspect |
+| --- | --- |
+| `driver_rollout.idle.replicas` | Every replica's `current_generation_group_tail_s`, last observed tail, last four tails, worker states and writer ownership. A null current tail means no measurement for this generation, not zero idle; older observations are explicitly separate. A nonwriter tail is only a potential training opportunity. |
+| `driver_rollout.background` | `admission_reasons`, `gate_counts` and `last_admission` distinguish window budget, head readiness, pending training, publication backpressure and lease races. Counts are planning attempts, not optimizer steps. |
+| `SpecoPhase` ref/actor driver records | Cached `control` state at phase entry shows pending head export, active plan, quota debt and publication state without polling workers. Existing engine spans separate restore/offload and computation. |
+| `actor_hook` | Collection, head fence, actor computation, idle work and synchronous top-up metrics. Durations retain their original definitions and are not all additive. |
+| `weight_update` | Upstream target-weight synchronization versus Bubble publication/control overhead; inspect the explicit source step. |
+| `drafter_residency` | Process-local allocated/reserved bytes at activation, parking and keep-hot cache trimming. No tensor traversal, accelerator synchronization or device-wide free-memory query is added. |
+| `checkpoint` | Quiesce/publication wait, drafter-save wait, freeze-state save and upstream checkpoint save. Existing ordering and exception behavior remain unchanged. |
+| `validation_body` | Quiesce/publication wait versus upstream evaluation; final event cleanup remains outside this body timer. |
+
+Keep `VERL_DRAFTER_MEMORY_DIAGNOSTICS=false` unless detailed tensor-storage
+accounting is specifically needed. The lightweight residency records above
+work independently of that heavier option. They describe this process's
+allocator only, not all other processes on the same GPU/NPU.
+
+First diagnose the no-training Generation regression with steps 1--3, then run
+through at least two completed quota/publication cycles. For a performance
+claim, compare matched Sync/Bubble workloads separately with diagnostics off,
+exclude or separately report save/evaluation steps, and compare output tokens,
+acceptance, optimizer-step counts and published versions as well as wall time.
+These diagnostics identify costs; they do not themselves guarantee a speedup.
+
+#### Missing native engine timings and a controlled no-data comparison
+
+`runtime_identity` is emitted once per diagnostic driver/server process. It
+identifies loaded function paths and bytecode fingerprints, diagnostic schema,
+the vLLM version, engine class, `log_stats` and capture-hook installation. The
+fingerprints describe loaded functions, not a claimed Git commit; compare runs
+with the same Python version and source paths.
+
+Each `replica_episode` now counts `engine_timing_status_counts`; its slowest
+request includes `engine_timing_status` with output/final-output counts, metric
+type and available timestamp field names. This distinguishes an unobserved
+engine output, a missing final flag, missing metrics and invalid/missing timing
+fields from a genuine zero duration. Both legacy RequestMetrics and recent V1
+RequestStateStats are recognized. Core monotonic timestamps are never subtracted
+from the frontend wall-clock arrival time. Native timings are optional; logging
+and vLLM statistics are not force-enabled to manufacture them.
+
+`kind=sidecar_io` additionally reports cumulative synchronous acceptance-counter
+file-write/replace calls, sum/max time and failures in each model worker. Records
+are limited to one per 30 seconds; a short final interval may not be reported.
+No extra files or RPCs are introduced. On shared/NAS storage this identifies a
+potential serving-path I/O cost, but the same path is used by Sync: measure both
+before attributing a Bubble regression to it. Do not sum TP workers' concurrent
+durations as rollout wall time.
+
+For a diagnostic A/B of background polling *before the first collection*, use
+the same Bubble command and set:
+
+```bash
+export VERL_SPECO_PHASE_TIMING=true
+export VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL=true
+```
+
+This switch defaults off and is not a production tuning setting. It pauses only
+the background polling thread when collection is exclusively from old-logprob,
+quota mode is enabled, the first collection step has not passed, and no quota,
+training state, initialized optimizer, head operation or publication exists.
+Serving admission/resource leases and the post-rollout event drain remain
+unchanged. It never pauses SGLang rollout collection or a later quota's idle
+training. Confirm `diagnostic_empty_poll_paused=1` in the driver background
+summary, then compare the first three steps with an otherwise identical run
+without this switch. A consistent change implicates the polling path; no change
+means the serving/backend or external contention still needs investigation.
+Do not compare this diagnostic ablation as a production throughput result.

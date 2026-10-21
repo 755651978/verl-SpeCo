@@ -20,6 +20,72 @@ def _local_event_bus():
     return rollout_idle_events._event_bus_actor_class(_LocalRay)()
 
 
+def test_event_poll_reuses_handle_but_always_drains_fresh_events(monkeypatch):
+    lookups, drains = [], []
+    actor = SimpleNamespace(
+        drain=SimpleNamespace(
+            remote=lambda: drains.append(True) or [{"event_ts": len(drains)}]
+        )
+    )
+    ray = SimpleNamespace(
+        is_initialized=lambda: True,
+        get_actor=lambda name: lookups.append(name) or actor,
+        get=lambda result: result,
+    )
+    monkeypatch.setattr(rollout_idle_events, "_ray_module", lambda: ray)
+    assert rollout_idle_events.drain_rollout_idle_events("poll-cache") == [
+        {"event_ts": 1}
+    ]
+    assert rollout_idle_events.drain_rollout_idle_events("poll-cache") == [
+        {"event_ts": 2}
+    ]
+    assert lookups == ["poll-cache"]
+    assert len(drains) == 2
+    rollout_idle_events.drain_rollout_idle_events("new-bus")
+    assert lookups == ["poll-cache", "new-bus"]
+
+
+def test_event_poll_invalidates_failed_actor_handle(monkeypatch):
+    lookups = []
+    failed = [False]
+
+    def drain():
+        if failed[0]:
+            raise RuntimeError("actor replaced")
+        return [{"event_type": "WORKER_IDLE"}]
+
+    actor = SimpleNamespace(drain=SimpleNamespace(remote=drain))
+    ray = SimpleNamespace(
+        is_initialized=lambda: True,
+        get_actor=lambda name: lookups.append(name) or actor,
+        get=lambda result: result,
+    )
+    monkeypatch.setattr(rollout_idle_events, "_ray_module", lambda: ray)
+    assert rollout_idle_events.drain_rollout_idle_events("restart")
+    failed[0] = True
+    assert rollout_idle_events.drain_rollout_idle_events("restart") == []
+    failed[0] = False
+    assert rollout_idle_events.drain_rollout_idle_events("restart")
+    assert lookups == ["restart", "restart"]
+
+
+def test_event_poll_clears_handle_on_ray_disconnect(monkeypatch):
+    initialized, lookups = [True], []
+    actor = SimpleNamespace(drain=SimpleNamespace(remote=lambda: []))
+    ray = SimpleNamespace(
+        is_initialized=lambda: initialized[0],
+        get_actor=lambda name: lookups.append(name) or actor,
+        get=lambda result: result,
+    )
+    monkeypatch.setattr(rollout_idle_events, "_ray_module", lambda: ray)
+    rollout_idle_events.drain_rollout_idle_events("session")
+    initialized[0] = False
+    assert rollout_idle_events.drain_rollout_idle_events("session") == []
+    initialized[0] = True
+    rollout_idle_events.drain_rollout_idle_events("session")
+    assert lookups == ["session", "session"]
+
+
 def test_idle_training_requires_live_serving_overlap_but_sync_does_not():
     bus = _local_event_bus()
     assert bus.reserve_training(

@@ -49,6 +49,8 @@ def test_drafter_diagnostic_env_only_forwards_explicit_switches(monkeypatch) -> 
 
     monkeypatch.delenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", raising=False)
     monkeypatch.delenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", raising=False)
+    monkeypatch.delenv("VERL_SPECO_PHASE_TIMING", raising=False)
+    monkeypatch.delenv("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", raising=False)
     assert drafter_diagnostic_env() == {}
     monkeypatch.setenv("VERL_DRAFTER_MEMORY_DIAGNOSTICS", "true")
     monkeypatch.setenv("VERL_DRAFTER_KEEP_HOT_TRIM_CACHE", "false")
@@ -57,6 +59,11 @@ def test_drafter_diagnostic_env_only_forwards_explicit_switches(monkeypatch) -> 
         "VERL_DRAFTER_MEMORY_DIAGNOSTICS": "true",
         "VERL_DRAFTER_KEEP_HOT_TRIM_CACHE": "false",
     }
+    monkeypatch.setenv("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL", "true")
+    assert (
+        drafter_diagnostic_env()["VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL"]
+        == "true"
+    )
 
 
 def test_should_bypass_true_when_drafter_disabled() -> None:

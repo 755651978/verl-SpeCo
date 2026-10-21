@@ -67,7 +67,30 @@ class DataBuffer:
         if self.max_size <= 0:
             return False
         if len(self.buffer) >= self.max_size:
-            evicted = self.buffer.popleft()
+            # Reservations and retained Bubble replay sessions own their
+            # samples until quota finalization. Keep the ordinary Sync FIFO
+            # path O(1); only scan when its oldest item is protected.
+            oldest = self.buffer[0]
+            if oldest.get("_drafter_reserved_by") is not None or oldest.get(
+                "_drafter_replay_pinned", False
+            ):
+                index = next(
+                    (
+                        index
+                        for index, sample in enumerate(self.buffer)
+                        if sample.get("_drafter_reserved_by") is None
+                        and not sample.get("_drafter_replay_pinned", False)
+                    ),
+                    None,
+                )
+                if index is None:
+                    # Never grow the buffer or sacrifice a running quota to
+                    # admit late samples. Existing collection caps still apply.
+                    return False
+                evicted = self.buffer[index]
+                del self.buffer[index]
+            else:
+                evicted = self.buffer.popleft()
             evicted_id = evicted.get("_speco_global_sample_id")
             if evicted_id is not None:
                 self._global_sample_ids.discard(evicted_id)
@@ -143,6 +166,15 @@ class DataBuffer:
         for sample in selected:
             sample["_drafter_reserved_by"] = str(reservation_id)
         return selected
+
+    def pin_replay_samples(self, samples: list[dict[str, Any]]) -> None:
+        """Retain Bubble samples across release/re-reserve plan boundaries."""
+        for sample in samples:
+            sample["_drafter_replay_pinned"] = True
+
+    def unpin_replay_samples(self, samples: list[dict[str, Any]]) -> None:
+        for sample in samples:
+            sample.pop("_drafter_replay_pinned", None)
 
     def release_reservation(self, reservation_id: str) -> int:
         released = 0
