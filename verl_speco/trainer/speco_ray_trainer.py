@@ -37,7 +37,10 @@ from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
+from verl_speco.integration.rollout_publish import (
+    resolve_drafter_publish_payload,
+    target_lm_head_export_metrics,
+)
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_ID_SPACE_KEY,
     OLD_LOGPROB_SOURCE_BATCH_INDICES_KEY,
@@ -3832,6 +3835,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if isinstance(payload, dict)
             else "unknown"
         )
+        logger.warning(
+            "[actor lm_head export diagnostics] step=%s strategy=%s details=%s",
+            self.global_steps,
+            export_strategy,
+            payload.get(
+                "export_diagnostics", {"fallback_reason": "worker_metadata_missing"}
+            )
+            if isinstance(payload, dict)
+            else {"fallback_reason": "worker_metadata_missing"},
+        )
         # Reconstructing supervision from last hidden states requires a fresh
         # target head for every drafter backend. Stage the payload on CPU while
         # the actor updates, then apply it when the drafter activates.
@@ -3857,6 +3870,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
+        metrics.update(target_lm_head_export_metrics(payload))
         pending = {
             "refs": pending_refs,
             "dispatch_finished": dispatch_started + dispatch_elapsed,

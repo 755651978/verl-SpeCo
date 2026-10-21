@@ -26,6 +26,11 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     "verl_speco/backends/dspark_trainer_backend.py",
     "verl_speco/integration/sglang_patch.py",
     "verl_speco/integration/sglang_runtime.py",
+    # GPU-only transfer dispatch at the actor/drafter publication boundary.
+    "verl_speco/integration/rollout_publish.py",
+    # Host residency and snapshot copy implementations own device dispatch.
+    "verl_speco/trainer/gpu_transfer.py",
+    "verl_speco/trainer/publish_state.py",
     # Dispatches on ``device.type`` and only names the backends in literals;
     # no device API is called from this module.
     "verl_speco/ops/dspark_fused_loss.py",

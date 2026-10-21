@@ -28,6 +28,28 @@ def _metric_float(value: object) -> float | None:
         return None
 
 
+def _forward_residency_metrics(results: list[dict[str, object]]) -> dict[str, float]:
+    """Maximum host span per stage; individual maxima need not share a rank."""
+    import math
+
+    metrics: dict[str, float] = {}
+    for result in results:
+        for key, raw_value in result.items():
+            if not isinstance(key, str) or not key.startswith(
+                (
+                    "timing_s/drafter_activation_",
+                    "timing_s/drafter_cleanup_",
+                    "timing_s/drafter_gpu_",
+                    "drafter/gpu_",
+                )
+            ):
+                continue
+            value = _metric_float(raw_value)
+            if value is not None and math.isfinite(value) and value >= 0:
+                metrics[key] = max(metrics.get(key, 0.0), value)
+    return metrics
+
+
 # Per-block drafter training scalars that SpecoWorker.get_training_metrics()
 # reports in each worker result (e.g. dspark/confidence_loss). The summary dict
 # built by TrainingOutcome.from_execution is a fixed whitelist of drafter/*
@@ -255,6 +277,7 @@ class TrainingOutcome:
                 metrics[metric_key] = max(values)
 
         metrics["timing_s/drafter_train_rpc"] = execution.elapsed_sec
+        metrics.update(_forward_residency_metrics(normalized_results))
         outcome_reason = (
             execution.reason if result_consistent else "worker_result_inconsistent"
         )

@@ -1244,6 +1244,25 @@ class SpecoWorker(Worker):
         if not payload:
             return {"accepted": False, "applied": False, "reason": "missing_payload"}
 
+        if "head_wire" in payload:
+            from verl_speco.integration.tensor_wire import (
+                decode_cpu_tensors,
+                tensor_payload_bytes,
+            )
+
+            resolve_started = time.perf_counter()
+            decoded = decode_cpu_tensors(payload["head_wire"])
+            if set(decoded) != {"weight"}:
+                raise ValueError("Invalid target head wire names")
+            payload = {**payload, "weight": decoded["weight"]}
+            logger.warning(
+                "[drafter head wire] action=decode rank=%s version=%s bytes=%s elapsed_s=%.4f",
+                self.rank,
+                global_step,
+                tensor_payload_bytes(decoded),
+                time.perf_counter() - resolve_started,
+            )
+
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
         source_vocab_size = payload.get("source_vocab_size")
@@ -1507,6 +1526,14 @@ class SpecoWorker(Worker):
                 "publish_snapshot_cached": 0,
             }
         )
+        result.update(
+            {
+                f"timing_s/drafter_activation_{stage}": elapsed
+                for stage, elapsed in getattr(
+                    self.trainer, "_last_activation_stage_timings", {}
+                ).items()
+            }
+        )
 
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
@@ -1555,6 +1582,15 @@ class SpecoWorker(Worker):
                     clear_data=result["successful_steps"] > 0
                 )
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
+                result.update(
+                    {
+                        f"timing_s/drafter_cleanup_{stage}": elapsed
+                        for stage, elapsed in getattr(
+                            self.trainer, "_last_cleanup_stage_timings", {}
+                        ).items()
+                    }
+                )
+                result.update(getattr(self.trainer, "_gpu_transfer_metrics", {}))
 
             result["trained"] = result["successful_steps"] > 0
             result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
@@ -1599,7 +1635,50 @@ class SpecoWorker(Worker):
             return None
 
         try:
-            weights_ref = ray.put(weights)
+            from verl_speco.integration.rollout_publish import _get_nested
+            from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+            numpy_transport = getattr(
+                self, "device_name", ""
+            ) == "cuda" and gpu_transfer_enabled(
+                _get_nested(
+                    getattr(self, "config", None),
+                    ("rollout", "drafter", "training"),
+                    None,
+                ),
+                "gpu_publish_numpy_transport",
+            )
+            wire = None
+            wire_bytes = None
+            encode_started = time.perf_counter()
+            if numpy_transport:
+                from verl_speco.integration.tensor_wire import (
+                    encode_cpu_tensors,
+                    tensor_payload_bytes,
+                )
+
+                wire = encode_cpu_tensors(weights)
+                if wire is not None:
+                    wire_bytes = tensor_payload_bytes(weights)
+            encode_s = time.perf_counter() - encode_started
+            put_started = time.perf_counter()
+            weights_ref = ray.put(wire if wire is not None else weights)
+            logger.warning(
+                "[drafter publish wire] step=%s encoding=%s entries=%s payload_bytes=%s encode_s=%.4f put_s=%.4f fallback_reason=%s",
+                self.last_global_step,
+                "numpy_bytes_v1" if wire is not None else "torch",
+                len(weights),
+                wire_bytes,
+                encode_s,
+                time.perf_counter() - put_started,
+                "none"
+                if wire is not None
+                else (
+                    "unsupported_tensor_layout"
+                    if numpy_transport
+                    else "disabled_or_non_cuda"
+                ),
+            )
         finally:
             reclaim = release_draft_weights_payload(weights)
             logger.warning(

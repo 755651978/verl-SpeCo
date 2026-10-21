@@ -197,6 +197,13 @@ actor_rollout_ref:
         # Async publish with freeze economics.enabled=true is rejected pending cost accounting.
         publish_async: false
         publish_dtype: null
+        # GPU FSDP2 hot publish: select entries before gathering; checkpoints
+        # keep their full-state path. Set false for a legacy-path A/B comparison.
+        publish_trainable_only_export: true
+        # One rollback switch for CUDA host reuse and lossless transport.
+        gpu_transfer_optimizations: true
+        # Retained CPU model-shard buffers per training rank; head cache is extra.
+        gpu_offload_pool_max_gib: 8
         publish_param_name_patterns: null
         draft_update_use_shm: null
         draft_update_weights_bucket_megabytes: null
