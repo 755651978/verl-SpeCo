@@ -96,9 +96,14 @@ def _config_set(config: Any, key: str, value: Any) -> None:
     setattr(config, key, value)
 
 
-def _is_oom_error(error: BaseException) -> bool:
+def _is_oom_error(error: BaseException | dict[str, Any]) -> bool:
     text = f"{type(error).__name__}: {error}".lower()
-    return "out of memory" in text or "oom" in text or "memory allocation" in text
+    return (
+        "out of memory" in text
+        or "outofmemoryerror" in text
+        or "oom" in text
+        or "memory allocation" in text
+    )
 
 
 def _is_ray_object_ref(value) -> bool:
@@ -1108,6 +1113,11 @@ class SpecoWorker(Worker):
             return
         trainer.collected_data = cast(deque, snapshot["collected_data"])
         trainer.data_buffer.buffer = cast(deque, snapshot["data_buffer"])
+        trainer.data_buffer._global_sample_ids = {
+            sample_id
+            for sample in trainer.data_buffer.buffer
+            if (sample_id := sample.get("_speco_global_sample_id")) is not None
+        }
         trainer.data_buffer._current_step = cast(
             Optional[int], snapshot["data_buffer_step"]
         )
@@ -2694,8 +2704,13 @@ class SpecoWorker(Worker):
                         if (
                             execution_strategy == "rollout_idle_worker"
                             and self._use_replica_local_idle_training()
-                            and step_error is not None
-                            and _is_oom_error(step_error)
+                            and (
+                                (step_error is not None and _is_oom_error(step_error))
+                                or (
+                                    training_error is not None
+                                    and _is_oom_error(training_error)
+                                )
+                            )
                         ):
                             result.update(
                                 {

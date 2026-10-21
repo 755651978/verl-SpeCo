@@ -57,6 +57,25 @@ def test_collection_buffer_snapshot_restores_data_and_version() -> None:
     assert worker.trainer.buffer_version == 3
 
 
+def test_collection_rollback_restores_dedup_index_and_allows_retry() -> None:
+    worker = _worker()
+    worker.last_global_step = 4
+    buffer = worker.trainer.data_buffer
+    buffer.max_size = 1
+    buffer.clear()
+    original = {"_speco_global_sample_id": "original"}
+    new_sample = {"_speco_global_sample_id": "retry"}
+    assert buffer.add_batch(original)
+    worker._collection_commit_journals["collection"] = worker._snapshot_collection_buffer()
+    assert buffer.add_batch(new_sample)  # Evicts the original ID, too.
+
+    worker.rollback_rollout_features([{"collection_id": "collection"}])
+
+    assert list(buffer.buffer) == [original]
+    assert not buffer.add_batch(dict(original))
+    assert buffer.add_batch(dict(new_sample))
+
+
 def test_expired_collection_stages_are_removed() -> None:
     worker = _worker()
     worker._staged_rollout_features = {

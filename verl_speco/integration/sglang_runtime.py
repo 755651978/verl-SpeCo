@@ -1537,7 +1537,6 @@ class _SpecoSGLangHttpServerMixin:
         clean_params = dict(sampling_params)
         clean_params.pop("_verl_global_steps", None)
         clean_params.pop("_verl_skip_drafter_collection", None)
-        clean_params.pop("_verl_skip_rollout_idle_event", None)
         return clean_params
 
     async def set_global_steps(self, global_steps: int):

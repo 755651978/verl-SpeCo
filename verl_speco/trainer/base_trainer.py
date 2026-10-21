@@ -4594,16 +4594,16 @@ class DrafterBaseTrainer:
         self._last_prepared_training_items = []
 
         # A Bubble Time plan owns an exact, version-homogeneous reservation.
-        if self._active_training_reservation_id is not None:
+        reservation_id = getattr(self, "_active_training_reservation_id", None)
+        if reservation_id is not None:
             available_data = self.data_buffer.get_available_data(
                 target_version=self._active_training_target_version,
-                reservation_id=self._active_training_reservation_id,
+                reservation_id=reservation_id,
             )
             available_data = [
                 item
                 for item in available_data
-                if item.get("_drafter_reserved_by")
-                == self._active_training_reservation_id
+                if item.get("_drafter_reserved_by") == reservation_id
                 and id(item)
                 not in getattr(self, "_active_accumulation_item_ids", set())
             ]

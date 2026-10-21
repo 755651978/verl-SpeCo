@@ -285,9 +285,15 @@ def _load_methods(relative_path, class_name, names, namespace):
     selected = ast.ClassDef(
         name="Subject", bases=[], keywords=[], body=methods, decorator_list=[]
     )
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[selected], type_ignores=[])),
+            ast.fix_missing_locations(
+                ast.Module(body=[*helpers, selected], type_ignores=[])
+            ),
             str(path),
             "exec",
         ),
@@ -302,6 +308,7 @@ def worker_class():
         "verl_speco/workers/speco_worker.py",
         "SpecoWorker",
         {
+            "_is_oom_error",
             "_bubble_group_control_value",
             "_bubble_optimizer_stop_reason",
             "_bubble_can_stage_snapshot",
@@ -312,6 +319,7 @@ def worker_class():
             "train_drafter",
         },
         {
+            "Any": object,
             "asyncio": asyncio,
             "time": __import__("time"),
             "logger": logging.getLogger(__name__),
@@ -465,6 +473,35 @@ def _prepared_worker(worker_class, *, reclaim_after_first=False):
         "publish_after_success": False,
     }
     return worker, plan, callbacks
+
+
+@pytest.mark.parametrize("raised", [False, True])
+@pytest.mark.parametrize("oom", [False, True])
+def test_failed_training_marks_only_oom_replica_unavailable(worker_class, raised, oom):
+    worker, plan, _ = _prepared_worker(worker_class)
+    worker._use_replica_local_idle_training = lambda: True
+    worker.training_group_ranks = [0]
+    worker.sync_collective_ranks = [0]
+    worker.full_collective_ranks = [0]
+    message = "CUDA out of memory" if oom else "invalid batch"
+
+    async def fail(*args, **kwargs):
+        if raised:
+            raise RuntimeError(message)
+        worker.trainer.last_training_error = {
+            "type": "OutOfMemoryError" if oom else "ValueError",
+            "message": message,
+        }
+        return False
+
+    worker.trainer.training_accumulation_step = fail
+    result = asyncio.run(worker.train_drafter(plan))
+    assert result.get("replica_local_unavailable", False) is oom
+    assert result["successful_steps"] == 0
+    assert len(result["errors"]) == 1
+    if oom:
+        assert result["reason"] == "replica_local_oom"
+        assert result["training_group_ranks"] == [0]
 
 
 def test_reclaim_runs_between_atomic_optimizer_steps(worker_class):

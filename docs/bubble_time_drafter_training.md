@@ -2,6 +2,19 @@
 
 Last updated: 10/21/2026
 
+### Compatibility limits
+
+Bubble Time currently requires the legacy trainer. V1 rejects
+`scheduler.execution.strategy=rollout_idle_worker` before worker setup because
+its rollout idle event bus lifecycle is not integrated.
+
+Bubble Time also rejects an enabled convergence-freeze policy with
+`drafter_convergence_freeze.economics.enabled=true`, including when
+`publish_async=false`. Bubble publication is asynchronous and does not yet
+provide the paired probes and complete per-quota costs required by the ROI gate.
+Use `economics.enabled=false` for Bubble, or synchronous drafter execution for
+ROI-based freezing.
+
 ### Periodic checkpoint safety
 
 Bubble defers a periodic checkpoint while a collected quota is unfinished or

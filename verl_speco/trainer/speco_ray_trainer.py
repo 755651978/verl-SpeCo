@@ -1668,6 +1668,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not cfg.get("enabled", False):
             return None
         economics = cfg.get("economics", {}) or {}
+        if (
+            economics.get("enabled", False)
+            and self._speco_drafter_schedule_config().execution_strategy
+            is DrafterExecutionStrategy.ROLLOUT_IDLE_WORKER
+        ):
+            raise ValueError(
+                "Bubble Time (rollout_idle_worker) with "
+                "drafter_convergence_freeze.economics.enabled=true is not supported "
+                "until paired probes and full quota costs are integrated; "
+                "set economics.enabled=false or scheduler.execution.strategy=sync"
+            )
         # shortcut: reject async ROI gating until completion waits are attributed correctly.
         if training_cfg.get("publish_async", False) and economics.get("enabled", False):
             raise ValueError(
@@ -5352,6 +5363,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     ) -> int:
         if not collect_plan:
             return 0
+        # V1 can collect several local batches under one global step. Keep a
+        # distinct identity per plan, stable when that plan is retried.
+        sample_namespace = collect_plan.get("sample_namespace")
+        if sample_namespace is None:
+            sample_namespace = uuid.uuid4().hex
+            collect_plan["sample_namespace"] = sample_namespace
         hard_sampling_enabled = bool(collect_plan.get("hard_enabled", False))
         hidden_states = tu.get(output, OLD_LOGPROB_HIDDEN_STATES_KEY)
         hidden_refs = self._speco_flatten_non_tensor_rows(
@@ -5569,7 +5586,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "replica_rank": owner,
                 "source_replica_rank": owner,
                 "_speco_global_sample_id": (
-                    f"oldlogprob:{self.global_steps}:{batch_idx}:{prompt_len}:"
+                    f"oldlogprob:{sample_namespace}:{batch_idx}:{prompt_len}:"
                     f"{response_len}:{int(valid_positions[0].item())}"
                 ),
             }
