@@ -421,6 +421,93 @@ def test_run_producer_publishes_samples_then_eos(
     assert sample.metadata["last_hidden_state_norm"] == "target_final_norm"
 
 
+@pytest.mark.parametrize("batch_size", [None, 2, 3])
+@pytest.mark.parametrize("backend", ["file", "mooncake"])
+def test_reference_producer_never_reads_or_normalizes_hidden(tmp_path, monkeypatch, batch_size, backend):
+    import verl_speco.standalone_tq_producer as producer
+    from verl_speco.producer.vllm_feature_client import VllmResponse
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["hidden_states_store"] = {"backend": backend}
+    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {
+        "payload_kind": "vllm_reference"
+    }
+    monkeypatch.setattr(producer, "_load_target_depth", lambda *args: 32)
+    monkeypatch.setattr(producer, "load_vllm_final_norm", lambda *a, **kw: pytest.fail("Producer loaded norm"))
+    monkeypatch.setattr(producer, "feature_from_vllm_payload", lambda *a, **kw: pytest.fail("Producer converted hidden"))
+    monkeypatch.setattr(producer, "encode_sample", lambda *a, **kw: pytest.fail("Encoded tensor fields"))
+
+    class ReferencePool(_Pool):
+        async def prefill(self, request):
+            pytest.fail("Eager hidden read was requested")
+
+        async def prefill_reference(self, request):
+            path = self.root / f"{request.sequence_no}.safetensors"
+            # Invalid tensor data is intentional: Producer must never open it.
+            path.write_bytes(b"not a tensor file")
+            self.paths.append(path)
+            if backend == "mooncake":
+                return VllmResponse(None, "http://vllm:8000/v1", handle=f"hs-{request.sequence_no}",
+                                    transfer_params={"handle": f"hs-{request.sequence_no}", "version": 1})
+            return VllmResponse(str(path), "http://vllm:8000/v1")
+
+    class MetadataTransport(_Transport):
+        def put_metadata(self, key, *, tag):
+            self.records[key] = tag
+
+    batches = []
+    measured_rows = []
+    original_metrics = producer.producer_window_metrics
+
+    def capture_metrics(rows, elapsed):
+        measured_rows.extend(rows)
+        return original_metrics(rows, elapsed)
+
+    monkeypatch.setattr(producer, "producer_window_metrics", capture_metrics)
+
+    async def submit(entries):
+        batches.append(entries)
+        await asyncio.sleep(0.05)
+        return {"transport_seconds": 0.01, "retry_wait_seconds": 0.005, "attempts": 2}
+
+    class NoTQ:
+        def __getattr__(self, name):
+            pytest.fail(f"Ray file publication accessed TQ: {name}")
+
+    pool, transport = ReferencePool(tmp_path), MetadataTransport()
+    options = {} if batch_size is None else {
+        "on_references": submit, "reference_batch_size": batch_size,
+    }
+    result = asyncio.run(run_producer(
+        config, transport=transport if batch_size is None else NoTQ(),
+        tokenizer=_Tokenizer(), client_pool=pool, **options,
+    ))
+    if batch_size is not None:
+        assert [len(batch) for batch in batches] == [2]
+        assert all(item["tag"]["backend"] == backend for item in batches[0])
+        if backend == "mooncake":
+            assert all(item["tag"]["transfer_params"]["handle"] == item["tag"]["handle"] for item in batches[0])
+        assert all(path.exists() for path in pool.paths)
+        assert all(item["tag"]["payload_kind"] == "vllm_reference" for item in batches[0])
+        assert result.published_count == 2
+        assert len(measured_rows) == 2
+        for row in measured_rows:
+            timing = row["timing"]
+            assert timing["publish_transport"] == 0.01  # Full RPC latency, not divided by two.
+            assert timing["publish_attempts"] == 2
+            assert timing["metadata_submit"] > 0
+            assert timing["active"] + timing["backpressure"] <= timing["e2e"] + 1e-5
+            assert not any(key.startswith("tq_") for key in timing)
+        return
+    assert result.published_count == 2
+    records = [tag for tag in transport.records.values() if tag.get("record_type") == "sample"]
+    assert len(records) == 2 and all(tag["payload_kind"] == "vllm_reference" for tag in records)
+    assert all(path.exists() for path in pool.paths)
+    assert all(key not in transport.payloads for key, tag in transport.records.items() if tag in records)
+
+
 def test_run_producer_publishes_samples_concurrently(tmp_path: Path) -> None:
     input_path = tmp_path / "input.jsonl"
     _write_input(input_path)
@@ -440,6 +527,20 @@ def test_run_producer_publishes_samples_concurrently(tmp_path: Path) -> None:
     assert stats.published_count == 2
     assert transport.max_active_puts == 2
     assert any(tag.get("status") == "eos" for tag in transport.records.values())
+
+
+@pytest.mark.parametrize("ending", [False, True])
+def test_reference_batch_flushes_on_timeout_or_end(ending):
+    from verl_speco.standalone_tq_producer import _PUBLISH_DONE, _collect_reference_batch
+
+    async def run():
+        queue = asyncio.Queue()
+        if ending:
+            await queue.put(_PUBLISH_DONE)
+        batch, done = await _collect_reference_batch(queue, "first", 4, timeout=0.01)
+        assert batch == ["first"] and done is ending
+
+    asyncio.run(run())
 
 
 def test_run_producer_logs_perf_window_at_info(
@@ -1612,7 +1713,7 @@ def test_run_producer_put_failure_keeps_temporary_file_and_omits_eos(
     assert not any(tag.get("status") == "eos" for tag in transport.records.values())
     assert pool.closed and transport.closed
     assert "Producer task failed task=publisher" in caplog.text
-    assert "'tq_put'" in caplog.text
+    assert "'publish_submit'" in caplog.text
 
 
 def test_validate_producer_rejects_consumer_partition_mismatch(tmp_path: Path) -> None:
@@ -1818,3 +1919,105 @@ def test_drain_pending_samples_disabled_with_zero_timeout() -> None:
             _UnexpectedTransport(), "run-a", timeout=0.0, poll_interval=0.0
         )
     )
+
+
+@pytest.mark.parametrize("accept_first", [False, True])
+def test_cancel_reference_producer_cleans_only_unsubmitted_results(tmp_path, monkeypatch, accept_first):
+    import verl_speco.standalone_tq_producer as producer
+    from verl_speco.producer.vllm_feature_client import VllmResponse
+    from types import SimpleNamespace
+
+    input_path = tmp_path / "input.jsonl"
+    _write_input(input_path)
+    input_path.write_text(input_path.read_text(encoding="utf-8") * 10, encoding="utf-8")
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["hidden_states_store"] = {"backend": "mooncake"}
+    config["speco"]["standalone_tq_producer"]["publish_queue_size"] = 1
+    config["actor_rollout_ref"]["rollout"]["drafter"]["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
+    monkeypatch.setattr(producer, "_load_target_depth", lambda *a: 32)
+    generated, submitted, deleted = set(), set(), []
+    ready = asyncio.Event()
+    store = SimpleNamespace(release=deleted.append)
+
+    class Pool(_Pool):
+        async def prefill_reference(self, request):
+            handle = f"hs-{request.sequence_no}"
+            generated.add(handle)
+            if len(generated) >= 4 + int(accept_first):
+                ready.set()
+            return VllmResponse(None, "http://vllm:8000/v1", handle=handle, store=store)
+
+    async def submit(entries):
+        if accept_first and not submitted:
+            submitted.update(item["tag"]["handle"] for item in entries)
+            return {}
+        await asyncio.Event().wait()
+
+    async def exercise():
+        task = asyncio.create_task(run_producer(
+            config, transport=_Transport(), tokenizer=_Tokenizer(), client_pool=Pool(tmp_path),
+            on_references=submit, reference_batch_size=1,
+        ))
+        # One result is in the publisher, one in the queue, and others can be
+        # blocked in queue.put. All remain producer-owned until RPC success.
+        try:
+            await asyncio.wait_for(ready.wait(), timeout=5)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(exercise())
+    assert set(deleted) == generated - submitted
+    assert len(deleted) == len(set(deleted))
+    assert bool(submitted) == accept_first
+
+
+def test_eagle3_filters_short_reference_and_fills_batch_budget(tmp_path, monkeypatch):
+    import verl_speco.standalone_tq_producer as producer
+    from verl_speco.producer.vllm_feature_client import VllmResponse
+    from verl_speco.trainer.tq_feature_store import ReadyEntry, ReferenceFeatureStore
+    from safetensors.torch import save_file
+
+    input_path = tmp_path / "input.jsonl"
+    records = [{"sample_id": name, "prompt": name + ":", "response": "answer"}
+               for name in ("short", "valid-a", "valid-b")]
+    input_path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
+    config = _config(input_path)
+    config["speco"]["standalone_tq_producer"]["max_samples"] = 2
+    config["speco"]["standalone_tq_producer"]["vllm_aux_hidden_state_layer_ids"] = [2, 8]
+    drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
+    drafter["speculative_algorithm"] = "EAGLE3"
+    drafter["training"]["transfer_queue"]["expected_feature"] = {"payload_kind": "vllm_reference"}
+    monkeypatch.setattr(producer, "_load_target_depth", lambda *a: 32)
+
+    class Tokenizer:
+        def __call__(self, text, **kwargs):
+            length = 2 if text.endswith(":") else (3 if text.startswith("short:") else 6)
+            return {"input_ids": list(range(length))}
+
+    requested, batches = [], []
+    class Pool(_Pool):
+        async def prefill_reference(self, request):
+            requested.append(request.sample_id)
+            raw = await super().prefill(request)
+            save_file(raw.payload, raw.temporary_path)
+            return VllmResponse(raw.temporary_path, raw.endpoint_url)
+
+    async def submit(entries):
+        batches.append(entries)
+
+    stats = asyncio.run(run_producer(
+        config, tokenizer=Tokenizer(), client_pool=Pool(tmp_path),
+        on_references=submit, reference_batch_size=2,
+    ))
+    assert stats.filtered_count == 1
+    assert stats.published_count == 2
+    assert set(requested) == {"valid-a", "valid-b"}
+    assert [len(batch) for batch in batches] == [2]
+    store = ReferenceFeatureStore({"run_id": "run-a", "ray": {"address": "unused"}})
+    store.connect()
+    entries = [ReadyEntry(item["key"], item["tag"]) for item in batches[0]]
+    assert all(len(entry.tag["request"]["feature_positions"]) == 5 for entry in entries)
+    batch = store.prepare_batch(entries, pin_memory=False)
+    assert batch["input_ids"].shape == (1, 6)
