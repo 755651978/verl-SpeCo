@@ -27,6 +27,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 from verl_speco.integration import rollout_publish
+from verl_speco.trainer.scheduler import DrafterExecutionStrategy
 
 
 def _worker(module, rank=0, strategy="fsdp2"):
@@ -147,11 +148,19 @@ def test_driver_returns_worker_diagnostics_in_metrics_and_logs(caplog):
     )
     module = ast.parse("from __future__ import annotations")
     module.body.append(method)
+    dispatch_method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_speco_dispatch_target_lm_head_payload"
+    )
+    module.body.append(dispatch_method)
     namespace = {
         "time": time,
         "logger": logging.getLogger("head-export-test"),
         "_get_nested": rollout_publish._get_nested,
         "target_lm_head_export_metrics": rollout_publish.target_lm_head_export_metrics,
+        "DrafterExecutionStrategy": DrafterExecutionStrategy,
     }
     exec(compile(module, str(path), "exec"), namespace)  # noqa: S102 - execute repository method under test
     diagnostics = {
@@ -166,6 +175,10 @@ def test_driver_returns_worker_diagnostics_in_metrics_and_logs(caplog):
         config={},
         global_steps=8,
         device_name="cpu",
+        _speco_rollout_idle_worker_enabled=lambda: False,
+        _speco_drafter_schedule_config=lambda: SimpleNamespace(
+            execution_strategy=DrafterExecutionStrategy.SYNC
+        ),
         _speco_drafter_training_config=dict,
         _speco_get_drafter_target_lm_head_row_selection=lambda: None,
         _speco_actor_rollout_method=lambda name: lambda *args, **kwargs: [payload],
@@ -174,6 +187,9 @@ def test_driver_returns_worker_diagnostics_in_metrics_and_logs(caplog):
         _speco_build_drafter_target_lm_head_sync_args=lambda value: (value, 8, None),
         speco_sync_target_lm_head_weight=lambda *args, **kwargs: object(),
     )
+    worker._speco_dispatch_target_lm_head_payload = lambda value, **kwargs: namespace[
+        dispatch_method.name
+    ](worker, value, **kwargs)
     with caplog.at_level(logging.WARNING):
         metrics, pending = namespace[method.name](worker)
     assert pending is not None

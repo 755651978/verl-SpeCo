@@ -104,7 +104,9 @@ def test_empty_wire_is_rejected():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("config_layout", ["scoped", "root", "serialized"])
+@pytest.mark.parametrize(
+    "config_layout", ["scoped", "root", "serialized", "serialized_new"]
+)
 def test_actor_head_wire_preserves_metadata_and_exact_values(
     monkeypatch, enabled, config_layout
 ):
@@ -127,13 +129,19 @@ def test_actor_head_wire_preserves_metadata_and_exact_values(
     )
     training = {"gpu_transfer_optimizations": enabled}
     scoped = {"rollout": {"drafter": {"training": training}}}
-    if config_layout == "serialized":
+    if config_layout.startswith("serialized"):
         import json
 
         worker = type(
             "Worker",
             (),
-            {"_speco_sglang_drafter_config_env": json.dumps({"training": training})},
+            {
+                (
+                    "_speco_drafter_config_env"
+                    if config_layout == "serialized_new"
+                    else "_speco_sglang_drafter_config_env"
+                ): json.dumps({"training": training})
+            },
         )()
         # Actual verl workers may retain runtime drafter fields but omit training.
         worker.config = {"rollout": {"drafter": {"enable": True}}}
@@ -173,6 +181,31 @@ def test_host_cache_checkpoint_state_after_restore(tmp_path):
     model.load_state_dict(torch.load(checkpoint, weights_only=True))
     assert torch.equal(parameter, expected)
     assert parameter.dtype == expected.dtype and not parameter.requires_grad
+
+
+def test_bubble_head_export_keeps_its_own_reference_transport(monkeypatch):
+    payload = {
+        "weight": torch.ones(4, 3, dtype=torch.bfloat16),
+        "row_indices": None,
+        "export_strategy": "direct_full",
+    }
+    monkeypatch.setattr(
+        rollout_publish, "export_actor_lm_head_weight", lambda *a, **k: payload
+    )
+    worker = SimpleNamespace(
+        config={
+            "rollout": {
+                "drafter": {
+                    "training": {
+                        "gpu_transfer_optimizations": True,
+                        "scheduler": {"execution": {"strategy": "rollout_idle_worker"}},
+                    }
+                }
+            }
+        }
+    )
+    result = rollout_publish.DraftWeightPublishMixin.get_actor_lm_head_weight(worker)
+    assert result is payload and "head_wire" not in result
 
 
 def test_worker_head_wire_forwards_version_and_apply_contract():
@@ -219,6 +252,19 @@ def test_worker_head_wire_forwards_version_and_apply_contract():
         "source_vocab_size": 4,
         "defer_device_apply": True,
     }
+    # Target filtering must happen before decoding any large or invalid payload.
+    rejected = namespace["sync_target_lm_head_weight"](
+        worker,
+        {
+            **payload,
+            "target_worker_ids": ("other",),
+            "require_target_head_ack": True,
+            "head_wire": "must not be decoded",
+        },
+        42,
+    )
+    assert rejected["reason"] == "not_target_worker" and rejected["worker_id"] == "0"
+    assert len(calls) == 1
 
 
 def test_publish_materialization_decodes_both_legacy_and_numpy_refs(monkeypatch):

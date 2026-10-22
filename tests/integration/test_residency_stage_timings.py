@@ -70,6 +70,7 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
     trainer = namespace["DrafterBaseTrainer"]()
     trainer._test_offload_cache_flags = offload_cache_flags
     trainer.rank = 0
+    trainer._log_training_memory = lambda stage: None
     trainer.model = torch.nn.Linear(2, 2, bias=False)
     with torch.no_grad():
         trainer.model.weight.copy_(torch.arange(4).reshape(2, 2) / 7)
@@ -263,3 +264,26 @@ def test_activation_stops_after_batched_copy_failure(monkeypatch):
     assert not trainer._training_active
     assert "load_model" not in events and "load_optimizer" not in events
     assert "injected batched copy failure" in str(trainer.last_activation_error)
+
+
+def test_bubble_activation_keeps_legacy_restore_and_stage_names(monkeypatch):
+    from verl_speco.trainer import gpu_transfer
+
+    events = []
+    trainer = _trainer(events)
+    trainer._bubble_time_enabled = True
+    trainer._training_active = False
+    trainer._gpu_model_offload_reuse = True
+    trainer._drafter_strategy = lambda: "fsdp2"
+    trainer.training_device_mesh = object()
+    monkeypatch.setattr(
+        gpu_transfer,
+        "load_model_from_host",
+        lambda *a, **k: pytest.fail("Bubble must retain its existing restore path"),
+    )
+    assert asyncio.run(trainer.activate_training_model())
+    assert "load_model" in events
+    assert {"model_restore", "host_head_apply", "head_move", "head_apply"} <= set(
+        trainer._last_activation_stage_timings
+    )
+    assert "load_model" not in trainer._last_activation_stage_timings

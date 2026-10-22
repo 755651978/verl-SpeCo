@@ -123,6 +123,7 @@ def _distributed_check(rank, rendezvous, backend):
         model = _model(mesh)
         trainer = _trainer_type()()
         trainer.rank = rank
+        trainer.clear_pending_publish_state_dict()
         trainer.model = model
         trainer.training_device_mesh = mesh
         trainer._frozen_param_names = ["frozen."]
