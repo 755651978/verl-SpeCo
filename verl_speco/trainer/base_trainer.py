@@ -850,14 +850,21 @@ class DrafterBaseTrainer:
     def _offload_optimizer_state_to_cpu(self) -> None:
         if self.optimizer is None or not self.optimizer.state:
             return
-        if not self._use_blocking_npu_optimizer_offload():
+        first_offload = (
+            device_name in {"npu", "cuda"}
+            and self._drafter_strategy() == "fsdp2"
+            and not getattr(
+                self.optimizer, "_speco_first_blocking_optimizer_offload_done", False
+            )
+        )
+        if not first_offload and not self._use_blocking_npu_optimizer_offload():
             offload_fsdp_optimizer(self.optimizer)
             return
 
-        # Ascend may surface asynchronous optimizer D2H failures only at the
-        # later device synchronize. Use blocking copies for this long-lived
-        # state so failures are attributed to the actual transfer and no AICPU
-        # work remains pending when activation cleanup reclaims the device.
+        # Complete FSDP2's first accelerator-state transfer before activation
+        # cleanup; later calls retain verl's asynchronous path. Keep VeOmni's
+        # existing NPU safety policy blocking on every call.
+        offloaded = False
         for state in self.optimizer.state.values():
             if not isinstance(state, dict):
                 continue
@@ -867,6 +874,13 @@ class DrafterBaseTrainer:
                 )
                 if local_value is not None and local_value.device.type != "cpu":
                     state[key] = value.to("cpu", non_blocking=False)
+                    offloaded = True
+        # Empty/CPU-only initialization and failed copies must not consume the
+        # first-offload marker. A replacement optimizer gets its own lifecycle.
+        if first_offload and offloaded:
+            setattr(
+                self.optimizer, "_speco_first_blocking_optimizer_offload_done", True
+            )
 
     def _drafter_strategy(self) -> str:
         """Drafter parallelism strategy (see :func:`resolve_drafter_strategy`)."""
