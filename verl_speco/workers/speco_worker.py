@@ -398,6 +398,12 @@ class SpecoWorker(Worker):
     ):
         Worker.__init__(self)
         self.config = config
+        self._speco_require_physical_identity = bool(
+            kwargs.get("require_resource_identity", False)
+        )
+        self._speco_require_lease_offload = bool(
+            kwargs.get("require_lease_offload", False)
+        )
         self.role = role
         if device_name is None:
             raise ValueError(
@@ -1765,6 +1771,10 @@ class SpecoWorker(Worker):
                 "reason": "ok",
             }
         )
+        if getattr(self, "_speco_require_physical_identity", False):
+            from verl_speco.integration.resource_identity import resource_identity
+
+            result.update(resource_identity(self.rank))
         return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -2879,8 +2889,13 @@ class SpecoWorker(Worker):
                 )
                 park_before_deadline = bool(
                     execution_strategy == "rollout_idle_worker"
-                    and training_plan.get("idle_park_after_training", False)
-                    and training_plan.get("deadline_ts") is not None
+                    and (
+                        getattr(self, "_speco_require_lease_offload", False)
+                        or (
+                            training_plan.get("idle_park_after_training", False)
+                            and training_plan.get("deadline_ts") is not None
+                        )
+                    )
                 )
                 cleanup_started = time.perf_counter()
                 await self.trainer.cleanup_training(
@@ -2972,6 +2987,13 @@ class SpecoWorker(Worker):
             result["buffer_size_after"] = int(data_status_after["trainable_samples"])
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
+            result["cost_train_started_ts"] = start_ts
+            result["cost_train_finished_ts"] = start_ts + result["elapsed_sec"]
+            if prepared_ready_ts is not None:
+                result["cost_prepare_started_ts"] = (
+                    prepared_ready_ts - prepared_preflight_elapsed_sec
+                )
+                result["cost_prepare_finished_ts"] = prepared_ready_ts
             result["reclaim_received_via_bus"] = int(
                 getattr(self, "_drafter_reclaim_source", None) == "lease_bus"
             )

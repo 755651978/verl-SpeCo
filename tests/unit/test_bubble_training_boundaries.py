@@ -286,7 +286,8 @@ def _load_methods(relative_path, class_name, names, namespace):
         name="Subject", bases=[], keywords=[], body=methods, decorator_list=[]
     )
     helpers = [
-        node for node in module.body
+        node
+        for node in module.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
     exec(
@@ -511,6 +512,22 @@ def test_reclaim_runs_between_atomic_optimizer_steps(worker_class):
     assert result["stop_reason"] == "reclaim_requested"
     assert result["replay_session_retained"] == 1
     assert callbacks == [None]
+
+
+def test_standalone_training_offloads_before_returning_lease_completion(worker_class):
+    worker, plan, _ = _prepared_worker(worker_class)
+    worker._speco_require_lease_offload = True
+    parked = []
+
+    async def park(*, strict):
+        assert strict
+        parked.append(True)
+
+    worker.trainer.release_training_memory_after_activation = park
+    result = asyncio.run(worker.train_drafter(plan))
+    assert result["trained"]
+    assert parked == [True]
+    assert result["training_residency_retained"] == 0
 
 
 @pytest.mark.parametrize("reclaim", [False, True])
