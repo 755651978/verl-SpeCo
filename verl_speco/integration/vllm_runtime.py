@@ -295,7 +295,13 @@ def _resolve_torch_rebuild_func(func: Any):
     if isinstance(func, str):
         from torch.multiprocessing import reductions
 
-        resolved = getattr(reductions, func.rsplit(".", 1)[-1], None)
+        name = func.rsplit(".", 1)[-1]
+        if name == "rebuild_npu_tensor":
+            from torch_npu.multiprocessing import reductions as npu_reductions
+
+            resolved = getattr(npu_reductions, name, None)
+        else:
+            resolved = getattr(reductions, name, None)
         if callable(resolved):
             return resolved
     raise TypeError(f"Unsupported IPC rebuild function: {func!r}")
@@ -307,10 +313,17 @@ def _speco_rebuild_ipc_compat(handle: tuple[Any, tuple], device_id: int | None =
     func, args = handle
     rebuild = _resolve_torch_rebuild_func(func)
     list_args = list(args)
-    if device_id is not None and rebuild is reductions.rebuild_cuda_tensor:
+    is_npu_rebuild = (
+        getattr(rebuild, "__name__", None) == "rebuild_npu_tensor"
+        and getattr(rebuild, "__module__", None)
+        == "torch_npu.multiprocessing.reductions"
+    )
+    if device_id is not None and (
+        rebuild is reductions.rebuild_cuda_tensor or is_npu_rebuild
+    ):
         if len(list_args) <= 6:
             raise ValueError(
-                f"CUDA IPC rebuild args do not include a device id slot: len={len(list_args)}"
+                f"{'NPU' if is_npu_rebuild else 'CUDA'} IPC rebuild args do not include a device id slot: len={len(list_args)}"
             )
         list_args[6] = device_id
     return rebuild(*list_args)

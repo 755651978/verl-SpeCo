@@ -3304,3 +3304,32 @@ def test_ipc_cuda_handle_only_remaps_storage_device(monkeypatch):
     assert args == tuple(range(15))
     with pytest.raises(ValueError, match="CUDA IPC"):
         vllm_runtime._speco_rebuild_ipc_compat((rebuild, (1, 2, 3)), 2)
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+@pytest.mark.parametrize("device_id", [None, 0, 2])
+def test_ipc_npu_handle_remaps_only_receiver_device(monkeypatch, serialized, device_id):
+    import sys
+    from types import ModuleType
+
+    pytest.importorskip("torch")
+
+    def rebuild_npu_tensor(*args):
+        return args
+
+    rebuild_npu_tensor.__module__ = "torch_npu.multiprocessing.reductions"
+    module = ModuleType("torch_npu.multiprocessing.reductions")
+    module.rebuild_npu_tensor = rebuild_npu_tensor
+    package = ModuleType("torch_npu.multiprocessing")
+    package.reductions = module
+    monkeypatch.setitem(sys.modules, "torch_npu.multiprocessing", package)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    func = module.__name__ + ".rebuild_npu_tensor" if serialized else rebuild_npu_tensor
+    args = tuple(range(15))
+    result = vllm_runtime._speco_rebuild_ipc_compat((func, args), device_id)
+    expected = args if device_id is None else args[:6] + (device_id,) + args[7:]
+    assert result == expected
+    assert args == tuple(range(15))
+    if device_id is not None:
+        with pytest.raises(ValueError, match="NPU IPC"):
+            vllm_runtime._speco_rebuild_ipc_compat((func, (1, 2, 3)), device_id)

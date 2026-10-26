@@ -780,3 +780,45 @@ def test_pinned_pool_is_bounded_and_failure_is_not_retried(monkeypatch):
             model, torch.device("cuda"), device_module=torch.cuda
         )[0]
     assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("failed_copy", [1, 2])
+def test_model_offload_waits_on_copy_failure_without_rebinding(
+    monkeypatch, failed_copy
+):
+    from types import SimpleNamespace
+
+    model = torch.nn.Linear(3, 4)
+    before = copy.deepcopy(model.state_dict())
+    pointers = [p.data_ptr() for p in model.parameters()]
+    source_pointers = set(pointers)
+    original_device = torch.Tensor.device
+    original_copy = torch.Tensor.copy_
+    events = []
+
+    def reported_device(tensor):
+        if tensor.data_ptr() in source_pointers:
+            return torch.device("cuda:0")
+        return original_device.__get__(tensor)
+
+    def copy_tensor(destination, source, **kwargs):
+        assert kwargs["non_blocking"]
+        events.append("copy")
+        if events.count("copy") == failed_copy:
+            raise RuntimeError("injected model offload copy failure")
+        return original_copy(destination, source, **kwargs)
+
+    def current_stream(device):
+        assert device == torch.device("cuda:0")
+        return SimpleNamespace(synchronize=lambda: events.append("wait"))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "device", property(reported_device))
+        patch.setattr(torch.Tensor, "copy_", copy_tensor)
+        with pytest.raises(RuntimeError, match="injected model offload copy failure"):
+            ModelHostBufferPool(1024).offload(
+                model, device_module=SimpleNamespace(current_stream=current_stream)
+            )
+    assert events == ["copy"] * failed_copy + ["wait"]
+    assert [p.data_ptr() for p in model.parameters()] == pointers
+    torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)

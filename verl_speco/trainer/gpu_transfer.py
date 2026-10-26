@@ -335,30 +335,37 @@ class ModelHostBufferPool:
         enqueue_started = time.perf_counter()
         async_devices = set()
         stats["batched_copy_tensors"] = 0
-        for tensor in tensors.values():
-            host = staged[id(tensor)]
-            local = host.to_local() if isinstance(host, DTensor) else host
-            source = tensor.to_local() if isinstance(tensor, DTensor) else tensor
-            pin = local.is_pinned()
-            stats["copied_bytes"] += local.numel() * local.element_size()
-            if pin:
-                stats["pinned_bytes"] += local.numel() * local.element_size()
-            # Pageable CUDA copies also support non-blocking submission. Keep
-            # every source and destination alive and join the stream once before
-            # exposing host storage to FSDP, rather than synchronizing each copy.
-            # No additional staging buffers or pinned-memory budget is required.
-            asynchronous = source.device.type == "cuda" and device_module is not None
-            host.copy_(tensor.detach(), non_blocking=asynchronous)
-            if asynchronous:
-                stats["batched_copy_tensors"] += 1
-                async_devices.add(source.device)
-        stats["copy_enqueue_s"] = time.perf_counter() - enqueue_started
-        wait_started = time.perf_counter()
-        if async_devices:
-            # One wait per source device, before FSDP view reconstruction.
+        try:
+            for tensor in tensors.values():
+                host = staged[id(tensor)]
+                local = host.to_local() if isinstance(host, DTensor) else host
+                source = tensor.to_local() if isinstance(tensor, DTensor) else tensor
+                pin = local.is_pinned()
+                stats["copied_bytes"] += local.numel() * local.element_size()
+                if pin:
+                    stats["pinned_bytes"] += local.numel() * local.element_size()
+                # Pageable CUDA copies also support non-blocking submission. Keep
+                # every source and destination alive and join the stream once before
+                # exposing host storage to FSDP, rather than synchronizing each copy.
+                # No additional staging buffers or pinned-memory budget is required.
+                asynchronous = (
+                    source.device.type == "cuda" and device_module is not None
+                )
+                if asynchronous:
+                    # A failing copy may already have submitted device work.
+                    async_devices.add(source.device)
+                host.copy_(tensor.detach(), non_blocking=asynchronous)
+                if asynchronous:
+                    stats["batched_copy_tensors"] += 1
+        finally:
+            stats["copy_enqueue_s"] = time.perf_counter() - enqueue_started
+            wait_started = time.perf_counter()
+            # Join submitted copies even when a later copy raises, while all
+            # source and destination references are still alive. Failed copies
+            # must propagate without rebinding any model parameter.
             for device in async_devices:
                 device_module.current_stream(device).synchronize()
-        stats["copy_wait_s"] = time.perf_counter() - wait_started
+            stats["copy_wait_s"] = time.perf_counter() - wait_started
         apply_started = time.perf_counter()
         model._apply(lambda tensor: staged[id(tensor)])
         if {

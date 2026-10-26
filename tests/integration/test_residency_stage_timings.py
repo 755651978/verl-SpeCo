@@ -16,6 +16,7 @@
 import ast
 import asyncio
 import copy
+import json
 import logging
 import time
 from concurrent.futures import Future
@@ -40,7 +41,12 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
         for node in cls.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name
-        in {"_residency_stage", "activate_training_model", "cleanup_training"}
+        in {
+            "_residency_stage",
+            "activate_training_model",
+            "cleanup_training",
+            "_record_gpu_transfer",
+        }
     ]
     cls.bases, cls.decorator_list = [], []
     module = ast.parse("from __future__ import annotations")
@@ -55,6 +61,8 @@ def _trainer(events, *, fail_offload=False, skip=False, device="cuda"):
             raise RuntimeError("offload failure")
 
     namespace = {
+        "logging": logging,
+        "json": json,
         "time": time,
         "asyncio": asyncio,
         "torch": torch,
