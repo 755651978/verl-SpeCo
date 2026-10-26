@@ -45,7 +45,11 @@ def materialize(output, stored, index):
     from verl_speco.integration.tensor_wire import decode_cpu_tensors
 
     payload = decode_cpu_tensors(stored[ref])
-    tensor = payload["hidden"] if isinstance(payload, dict) else payload
+    tensor = (
+        payload.get("hidden", payload.get("hidden_states"))
+        if isinstance(payload, dict)
+        else payload
+    )
     return tensor[meta["chunk_start"] : meta["chunk_start"] + meta["chunk_length"]]
 
 
@@ -60,23 +64,49 @@ def test_host_row_selection_preserves_order_and_duplicates(indices):
         )
 
 
-def test_sparse_export_preserves_sorted_rows_owners_and_sources(store, monkeypatch):
+@pytest.mark.parametrize("with_logz", [False, True])
+@pytest.mark.parametrize("gpu", [False, True])
+def test_sparse_export_preserves_sorted_rows_owners_and_sources(
+    store, monkeypatch, with_logz, gpu
+):
     source = torch.arange(28, dtype=torch.float32).reshape(7, 4)
     indices = torch.tensor([2, 0, 2, 0, 2, 0, 0])
     positions = torch.tensor([2, 1, 0, 0, 1, 1, -1])
-    hidden = {"rows": source, "batch_indices": indices, "row_indices": positions}
+    monkeypatch.setenv(
+        "VERL_SPECO_DRAFTER_CONFIG",
+        json.dumps({"training": {"gpu_transfer_optimizations": True}}),
+    )
+    hidden = {
+        "rows": DeviceTensor(source) if gpu else source,
+        "batch_indices": indices,
+        "row_indices": positions,
+    }
+    target_logz = torch.arange(7, dtype=torch.float32).reshape(7, 1) + 0.125
+    output = {runtime.OLD_LOGPROB_HIDDEN_STATES_KEY: hidden}
+    if with_logz:
+        output[runtime.OLD_LOGPROB_TARGET_LOGZ_KEY] = {
+            "rows": target_logz,
+            "batch_indices": indices,
+            "row_indices": positions,
+        }
     # No scalar extraction is required from the control tensors.
     monkeypatch.setattr(torch.Tensor, "item", lambda *_a: pytest.fail("scalar read"))
-    result = runtime._put_oldlogprob_hidden_refs(
-        {runtime.OLD_LOGPROB_HIDDEN_STATES_KEY: hidden}, batch()
-    )
+    result = runtime._put_oldlogprob_hidden_refs(output, batch())
     assert torch.equal(materialize(result, store, 0), source[[3, 1, 5]])
     assert torch.equal(materialize(result, store, 2), source[[2, 4, 0]])
     metas = result[runtime.OLD_LOGPROB_HIDDEN_REF_META_KEY]
     assert metas[0]["owner"] == 1 and metas[0]["source_batch_index"] == 205
     assert metas[2]["owner"] == 0 and metas[2]["source_batch_index"] == 93
     assert metas[1] is None
-    for payload in store.values():
+    from verl_speco.integration.tensor_wire import decode_cpu_tensors
+
+    for value in store.values():
+        decoded = decode_cpu_tensors(value)
+        payload = (
+            decoded.get("hidden", decoded.get("hidden_states"))
+            if isinstance(decoded, dict)
+            else decoded
+        )
         assert payload.storage_offset() == 0
         assert (
             payload.untyped_storage().nbytes()
@@ -85,6 +115,16 @@ def test_sparse_export_preserves_sorted_rows_owners_and_sources(store, monkeypat
     snapshot = materialize(result, store, 0).clone()
     source.fill_(99)
     assert torch.equal(materialize(result, store, 0), snapshot)
+
+    if with_logz:
+        for index, expected_sources in [(0, [3, 1, 5]), (2, [2, 4, 0])]:
+            ref = result[runtime.OLD_LOGPROB_HIDDEN_REFS_KEY][index]
+            decoded = decode_cpu_tensors(store[ref])
+            meta = metas[index]
+            start, length = meta["chunk_start"], meta["chunk_length"]
+            actual = decoded["target_logz"][start : start + length]
+            assert actual.dtype == torch.float32
+            assert torch.equal(actual, target_logz[expected_sources])
 
 
 class DeviceTensor(torch.Tensor):
@@ -179,6 +219,7 @@ def test_export_diagnostics_are_once_per_mode_not_per_token(
     assert "snapshot=independent" in records[0].message
 
 
+@pytest.mark.parametrize("with_logz", [False, True])
 @pytest.mark.parametrize("enabled", [False, True, None])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("legacy_env", [False, True])
@@ -188,6 +229,7 @@ def test_cuda_collection_respects_master_switch_and_preserves_values(
     enabled,
     dtype,
     legacy_env,
+    with_logz,
 ):
     canonical = "VERL_SPECO_DRAFTER_CONFIG"
     legacy = "VERL_SPECO_SGLANG_DRAFTER_CONFIG"
@@ -198,20 +240,39 @@ def test_cuda_collection_respects_master_switch_and_preserves_values(
         legacy if legacy_env else canonical, json.dumps({"training": training})
     )
     source = torch.arange(24, dtype=dtype).reshape(2, 3, 4)
+    target_logz = torch.arange(6, dtype=torch.float32).reshape(2, 3, 1) + 0.125
+    output = {
+        runtime.OLD_LOGPROB_HIDDEN_STATES_KEY: DeviceTensor(source),
+        runtime.OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY: [0, 2],
+    }
+    if with_logz:
+        output[runtime.OLD_LOGPROB_TARGET_LOGZ_KEY] = target_logz
     result = runtime._put_oldlogprob_hidden_refs(
-        {
-            runtime.OLD_LOGPROB_HIDDEN_STATES_KEY: DeviceTensor(source),
-            runtime.OLD_LOGPROB_SELECTED_BATCH_INDICES_KEY: [0, 2],
-        },
+        output,
         batch(),
     )
     assert all(
-        isinstance(payload, dict) == (enabled is not False)
+        (isinstance(payload, dict) and "_speco_cpu_tensor_wire_v1" in payload)
+        == (enabled is not False)
         for payload in store.values()
     )
     for index, expected in [(0, source[0]), (2, source[1])]:
         actual = materialize(result, store, index)
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    if with_logz:
+        from verl_speco.integration.tensor_wire import decode_cpu_tensors
+
+        for index, source_index in [(0, 0), (2, 1)]:
+            ref = result[runtime.OLD_LOGPROB_HIDDEN_REFS_KEY][index]
+            decoded = decode_cpu_tensors(store[ref])
+            meta = result[runtime.OLD_LOGPROB_HIDDEN_REF_META_KEY][index]
+            start, length = meta["chunk_start"], meta["chunk_length"]
+            actual = decoded["target_logz"][start : start + length]
+            assert actual.dtype == torch.float32
+            assert torch.equal(
+                actual.reshape(-1), target_logz[source_index].reshape(-1)
+            )
 
 
 def test_transport_config_cache_observes_runtime_switch_changes(monkeypatch):

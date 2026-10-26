@@ -118,11 +118,11 @@ async def _resolve_ray_object_ref(value):
     return value
 
 
-async def _resolve_hidden_state_chunks(
+async def _resolve_feature_chunks(
     chunks, expected_rows: int | None = None, *, resolved_cache=None, profile=None
 ):
     if not chunks:
-        return None
+        return None, None
     unique_refs: dict[Any, Any] = {}
     for chunk in chunks:
         if not isinstance(chunk, dict):
@@ -152,13 +152,23 @@ async def _resolve_hidden_state_chunks(
             kind = "numpy_chunks" if decoded is not value else "legacy_chunks"
             profile[kind] = profile.get(kind, 0) + 1
         if isinstance(decoded, dict) and "hidden" in decoded:
-            if set(decoded) != {"hidden"}:
+            if set(decoded) not in ({"hidden"}, {"hidden", "target_logz"}):
                 raise ValueError("Invalid collection hidden wire keys")
-            decoded = decoded["hidden"]
+            decoded = {
+                "hidden_states": decoded["hidden"],
+                **(
+                    {"target_logz": decoded["target_logz"]}
+                    if "target_logz" in decoded
+                    else {}
+                ),
+            }
         resolved_cache[key] = (ref, decoded)
-        if profile is not None and torch.is_tensor(decoded):
-            profile["resolved_bytes"] = profile.get("resolved_bytes", 0) + (
-                decoded.numel() * decoded.element_size()
+        if profile is not None:
+            values = decoded.values() if isinstance(decoded, dict) else (decoded,)
+            profile["resolved_bytes"] = profile.get("resolved_bytes", 0) + sum(
+                value.numel() * value.element_size()
+                for value in values
+                if torch.is_tensor(value)
             )
     if profile is not None:
         profile["resolve_s"] += resolve_s
@@ -177,7 +187,11 @@ async def _resolve_hidden_state_chunks(
         if ref is None:
             continue
         cache_key = ref if _is_ray_object_ref(ref) else id(ref)
-        tensor = resolved_cache[cache_key][1]
+        payload = resolved_cache[cache_key][1]
+        target_logz_tensor = (
+            payload.get("target_logz") if isinstance(payload, dict) else None
+        )
+        tensor = payload.get("hidden_states") if isinstance(payload, dict) else payload
         if not torch.is_tensor(tensor):
             continue
         tensor = cast(torch.Tensor, tensor)
@@ -186,6 +200,11 @@ async def _resolve_hidden_state_chunks(
         if length <= 0:
             continue
         part = tensor[start : start + length]
+        target_logz_part = (
+            cast(torch.Tensor, target_logz_tensor)[start : start + length]
+            if torch.is_tensor(target_logz_tensor)
+            else None
+        )
         row_indices = chunk.get("chunk_row_indices")
         if torch.is_tensor(row_indices):
             row_indices = cast(torch.Tensor, row_indices)
@@ -203,7 +222,7 @@ async def _resolve_hidden_state_chunks(
                 int(part.shape[0]),
             )
             continue
-        pieces.append((row_indices, part))
+        pieces.append((row_indices, part, target_logz_part))
         full_rows = max(
             full_rows,
             int(row_indices.max().item()) + 1 if int(row_indices.numel()) > 0 else 0,
@@ -211,27 +230,66 @@ async def _resolve_hidden_state_chunks(
         hidden_size = int(part.shape[-1])
         dtype = part.dtype
     if not pieces or hidden_size is None:
-        return None
-    # The common full-window case needs an independent writable snapshot, but
-    # not both zero-fill and scatter. Never expose a read-only Ray-backed view
-    # to downstream storage/training code.
+        return None, None
+    has_target_logz = all(target_part is not None for _, _, target_part in pieces)
+    if not has_target_logz and any(part is not None for _, _, part in pieces):
+        missing_chunks = [
+            {"chunk": index, "rows": indices.tolist()}
+            for index, (indices, _, target_part) in enumerate(pieces)
+            if target_part is None
+        ]
+        raise ValueError(
+            f"SPECO target_logz is missing from some feature chunks: {missing_chunks}"
+        )
+    # Keep an independent writable snapshot for a complete contiguous window.
     if (
         len(pieces) == 1
         and pieces[0][1].shape[0] == full_rows
         and pieces[0][1].device.type == "cpu"
+        and (pieces[0][2] is None or pieces[0][2].numel() == full_rows)
         and torch.equal(pieces[0][0], torch.arange(full_rows, dtype=torch.long))
     ):
         output = pieces[0][1].clone(memory_format=torch.contiguous_format)
+        target_part = pieces[0][2]
+        target_logz_output = (
+            target_part.reshape(-1).to(device="cpu", dtype=torch.float32, copy=True)
+            if target_part is not None
+            else None
+        )
         if profile is not None:
             profile["full_window_clones"] = profile.get("full_window_clones", 0) + 1
             profile["reconstruct_s"] += time.perf_counter() - reconstruct_started
-        return output.unsqueeze(0)
+        return output.unsqueeze(0), (
+            target_logz_output.unsqueeze(0) if target_logz_output is not None else None
+        )
     output = torch.zeros((full_rows, hidden_size), dtype=dtype)
-    for row_indices, part in pieces:
+    target_logz_output = (
+        torch.zeros((full_rows,), dtype=torch.float32) if has_target_logz else None
+    )
+    for row_indices, part, target_part in pieces:
         output[row_indices] = part.to(device=output.device, dtype=output.dtype)
+        if target_logz_output is not None and target_part is not None:
+            target_logz_output[row_indices] = target_part.reshape(-1).to(
+                device=target_logz_output.device, dtype=torch.float32
+            )
     if profile is not None:
         profile["reconstruct_s"] += time.perf_counter() - reconstruct_started
-    return output.unsqueeze(0)
+    return (
+        output.unsqueeze(0),
+        target_logz_output.unsqueeze(0) if target_logz_output is not None else None,
+    )
+
+
+async def _resolve_hidden_state_chunks(
+    chunks, expected_rows: int | None = None, *, resolved_cache=None, profile=None
+):
+    hidden, _ = await _resolve_feature_chunks(
+        chunks,
+        expected_rows=expected_rows,
+        resolved_cache=resolved_cache,
+        profile=profile,
+    )
+    return hidden
 
 
 @dataclass(frozen=True)
@@ -737,6 +795,7 @@ class SpecoWorker(Worker):
         hidden_states: torch.Tensor,
         target_logprobs: Optional[torch.Tensor] = None,
         *,
+        target_logz: Optional[torch.Tensor] = None,
         collection_id: Optional[str] = None,
     ) -> bool:
         if (
@@ -745,6 +804,9 @@ class SpecoWorker(Worker):
             or self.trainer is None
         ):
             return False
+        if target_logz is not None:
+            batch = dict(batch)
+            batch["target_logz"] = target_logz
         if self._drafter_training_mode() == "collect_only":
             return self._write_rollout_feature_sample(
                 batch, hidden_states, target_logprobs, collection_id=collection_id
@@ -876,6 +938,14 @@ class SpecoWorker(Worker):
             hidden_positions = hidden_positions.detach().cpu().long().reshape(-1)
         else:
             hidden_positions = None
+        target_logz = batch.get("target_logz")
+        if torch.is_tensor(target_logz):
+            target_logz = cast(torch.Tensor, target_logz).detach().cpu().float()
+            while target_logz.dim() > 1 and target_logz.size(0) == 1:
+                target_logz = target_logz.squeeze(0)
+            target_logz = target_logz.reshape(-1)[:hidden_rows].contiguous()
+        else:
+            target_logz = None
         feature_start, feature_end, position_ids = self._resolve_rollout_feature_window(
             full_input_ids,
             hidden_rows,
@@ -897,6 +967,14 @@ class SpecoWorker(Worker):
             _config_str(model_cfg.get("path", None)) if model_cfg is not None else ""
         )
         algorithm = str(self.config.rollout.drafter.speculative_algorithm).upper()
+        next_token_ids = None
+        next_token_loss_mask = None
+        if algorithm == "DSPARK":
+            candidate_ids = full_input_ids[feature_start + 1 : feature_end + 1]
+            candidate_mask = full_loss_mask[feature_start + 1 : feature_end + 1]
+            if candidate_ids.numel() == input_ids.numel():
+                next_token_ids = candidate_ids
+                next_token_loss_mask = candidate_mask
         default_hidden_layout = resolve_drafter_hidden_states_layout(
             algorithm,
             self.config.rollout.drafter.training,
@@ -920,6 +998,9 @@ class SpecoWorker(Worker):
             "full_sequence_length": int(full_input_ids.numel()),
             "feature_start": int(feature_start),
             "feature_end": int(feature_end),
+            "target_logz_temperature": self.config.rollout.drafter.training.get(
+                "lk_temperature", 1.0
+            ),
         }
         for key in (
             "hidden_position_start",
@@ -949,8 +1030,11 @@ class SpecoWorker(Worker):
             input_ids=input_ids,
             loss_mask=loss_mask,
             hidden_states=hidden_states,
+            target_logz=target_logz,
             target_logprobs=target_logprobs,
             position_ids=position_ids,
+            next_token_ids=next_token_ids,
+            next_token_loss_mask=next_token_loss_mask,
             metadata=metadata,
         )
         if collection_id is None:
@@ -1358,6 +1442,7 @@ class SpecoWorker(Worker):
                 if key in sample:
                     batch[key] = sample[key]
             hidden = sample.get("hidden_states")
+            target_logz = sample.get("target_logz")
             if hidden is None:
                 hidden_chunks = sample.get("hidden_states_ref_chunks")
                 if hidden_chunks:
@@ -1366,7 +1451,7 @@ class SpecoWorker(Worker):
                     if torch.is_tensor(hidden_positions):
                         hidden_positions = cast(torch.Tensor, hidden_positions)
                         expected_rows = int(hidden_positions.numel())
-                    hidden = await _resolve_hidden_state_chunks(
+                    hidden, target_logz = await _resolve_feature_chunks(
                         hidden_chunks,
                         expected_rows=expected_rows,
                         resolved_cache=resolved_chunks,
@@ -1374,9 +1459,14 @@ class SpecoWorker(Worker):
                     )
                 else:
                     direct_resolve_started = time.perf_counter()
-                    hidden = await _resolve_ray_object_ref(
+                    resolved = await _resolve_ray_object_ref(
                         sample.get("hidden_states_ref")
                     )
+                    if isinstance(resolved, dict):
+                        hidden = resolved.get("hidden_states")
+                        target_logz = resolved.get("target_logz")
+                    else:
+                        hidden = resolved
                     profile["direct_hidden_resolve_s"] += (
                         time.perf_counter() - direct_resolve_started
                     )
@@ -1396,6 +1486,7 @@ class SpecoWorker(Worker):
                 hidden_states=hidden,
                 target_logprobs=target_logprobs,
                 collection_id=collection_id,
+                target_logz=target_logz,
             )
             profile["store_s"] += time.perf_counter() - store_started
             if stored:
@@ -2577,6 +2668,31 @@ class SpecoWorker(Worker):
             try:
                 train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
+                get_data_stats = getattr(self.trainer, "get_training_data_stats", None)
+                data_stats = get_data_stats() if callable(get_data_stats) else None
+                if data_stats is not None:
+                    result.update(
+                        {
+                            "train_buffer_total": int(data_stats["buffer_total"]),
+                            "train_eligible_samples": int(
+                                data_stats["eligible_samples"]
+                            ),
+                        }
+                    )
+                    if self.is_drafter_group_leader:
+                        logger.warning(
+                            "[drafter data] rl_step=%s replica=%s buffer_total=%s "
+                            "eligible_samples=%s eligible_step_counts=%s "
+                            "sample_last_n_steps=%s batch_size=%s train_steps=%s",
+                            self.last_global_step,
+                            getattr(self, "replica_rank", None),
+                            data_stats["buffer_total"],
+                            data_stats["eligible_samples"],
+                            data_stats["eligible_step_counts"],
+                            data_stats["sample_last_n_steps"],
+                            data_stats["batch_size"],
+                            max_batches,
+                        )
                 for batch_index in range(max_batches):
                     deadline_ts = training_plan.get("deadline_ts")
                     shared_stop_reason = ""
@@ -2951,6 +3067,16 @@ class SpecoWorker(Worker):
                     result["optimizer_warmup_steps"],
                 )
                 result.update(self.trainer.get_training_metrics())
+                if self.is_drafter_group_leader:
+                    logger.warning(
+                        "[drafter data used] rl_step=%s replica=%s "
+                        "successful_steps=%s sample_draws=%s unique_samples=%s",
+                        self.last_global_step,
+                        getattr(self, "replica_rank", None),
+                        result["successful_steps"],
+                        int(result.get("drafter/train_sample_draws", 0)),
+                        int(result.get("drafter/train_unique_samples", 0)),
+                    )
                 if result["successful_steps"] > 0:
                     publish_quota_completed = bool(
                         (

@@ -42,6 +42,7 @@ def production():
     names = {
         "_resolve_ray_object_ref",
         "_resolve_hidden_state_chunks",
+        "_resolve_feature_chunks",
         "_commit_rollout_features",
     }
     methods = [
@@ -278,3 +279,78 @@ def test_sp_direct_rows_avoid_padding_and_return_independent_results(
     before = result[0].clone()
     rows.zero_()
     assert torch.equal(result[0], before)
+
+
+@pytest.mark.parametrize("wire", [False, True])
+@pytest.mark.parametrize("rows", [None, [2, 0, 1], [0, 0, 2]])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_feature_pair_roundtrip_keeps_alignment_fp32_logz_and_cache(
+    production, wire, rows, dtype
+):
+    source = torch.arange(12, dtype=dtype).reshape(3, 4)
+    logz = torch.tensor([[1.125], [2.25], [3.5]], dtype=torch.float32)
+    payload = (
+        encode_cpu_tensors({"hidden": source, "target_logz": logz})
+        if wire
+        else {"hidden_states": source, "target_logz": logz}
+    )
+    ref = Ref(payload)
+    cache, stats = {}, profile()
+
+    async def resolve():
+        return await production._resolve_feature_chunks(
+            [chunk(ref, rows=rows)],
+            expected_rows=3,
+            resolved_cache=cache,
+            profile=stats,
+        )
+
+    hidden, target_logz = asyncio.run(resolve())
+    indices = torch.tensor(rows if rows is not None else [0, 1, 2])
+    expected_h = torch.zeros_like(source)
+    expected_z = torch.zeros(3, dtype=torch.float32)
+    expected_h[indices] = source
+    expected_z[indices] = logz.reshape(-1)
+    assert torch.equal(hidden[0].view(torch.uint8), expected_h.view(torch.uint8))
+    assert target_logz.dtype == torch.float32
+    assert torch.equal(target_logz[0], expected_z)
+    hidden.zero_()
+    target_logz.zero_()
+    again_h, again_z = asyncio.run(resolve())
+    assert torch.equal(again_h[0], expected_h)
+    assert torch.equal(again_z[0], expected_z)
+    assert ref.awaits == 1 and stats["chunk_cache_hits"] == 1
+
+
+def test_commit_forwards_target_logz_with_hidden_features(production):
+    source = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
+    logz = torch.arange(6, dtype=torch.float32).reshape(6, 1) + 0.25
+    ref = Ref(encode_cpu_tensors({"hidden": source, "target_logz": logz}))
+    stored = []
+
+    def store(**kwargs):
+        stored.append((kwargs["hidden_states"], kwargs["target_logz"]))
+        return True
+
+    worker = SimpleNamespace(
+        trainer=SimpleNamespace(buffer_version=4),
+        replica_rank=0,
+        _collection_worker_result=lambda **kwargs: dict(
+            accepted_samples=0, rejected_samples=0, **kwargs
+        ),
+        _store_rollout_sample=store,
+    )
+    samples = [
+        {
+            "input_ids": None,
+            "prompts": None,
+            "responses": None,
+            "hidden_states_ref_chunks": [chunk(ref, start=start)],
+        }
+        for start in (0, 3)
+    ]
+    result = asyncio.run(production._commit_rollout_features(worker, "paired", samples))
+    assert result["accepted_samples"] == 2 and ref.awaits == 1
+    for index, start in enumerate((0, 3)):
+        assert torch.equal(stored[index][0][0], source[start : start + 3])
+        assert torch.equal(stored[index][1][0], logz[start : start + 3].reshape(-1))
