@@ -55,6 +55,313 @@ def trainer_for(mode):
     return trainer
 
 
+@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+def test_hot_quota_head_is_prepared_after_close_and_ack_before_target_resume(
+    monkeypatch, mode
+):
+    trainer = trainer_for(mode)
+    trainer._speco_init_state()
+    trainer.global_steps = 11
+    trainer.total_training_steps = 50
+    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = {
+        "keep_hot_between_plans": True
+    }
+    scheduler = trainer._drafter_scheduler
+    group = ("2", "3")
+    scheduler._idle_worker_writer_group = group
+    scheduler._idle_worker_hot_prewarmed_groups.add(group)
+    scheduler._training_quota_debt_steps = 20
+    scheduler._training_quota_data_version = 8
+    trainer._speco_ready_target_lm_head_versions.add(8)
+    trainer._speco_ready_target_lm_head_workers[8] = group
+    session = trainer._speco_bubble_session()
+    events = []
+    session.close = lambda boundary: events.append("close") or {}
+    trainer._speco_wait_target_lm_head_prefetch = lambda: events.append("ack")
+
+    def prepare(workers, version):
+        assert workers == group and version == 8
+        events.append("prepare")
+        return [
+            {
+                "worker_id": worker,
+                "prepared": True,
+                "target_version": 8,
+                "elapsed_sec": 0.2,
+            }
+            for worker in workers
+        ]
+
+    trainer._require_speco_worker_group = lambda: SimpleNamespace(
+        prepare_hot_drafter_target_head=prepare
+    )
+    native = TRAINERS[mode].__bases__[1]
+    monkeypatch.setattr(
+        native, "on_step_end", lambda self: events.append("target_resume")
+    )
+    trainer.on_step_end()
+    assert events == ["close", "ack", "prepare", "target_resume"]
+    assert scheduler._idle_worker_last_target_version[group] == 8
+    assert scheduler._training_quota_data_version == 8
+    assert trainer._pending_sync_metrics["bubble/hot_writer_head_prepared"] == 1
+    assert any(key.startswith("hot_head_prepare:8:") for key in session.costs.events)
+    count = len(session.costs.events)
+    assert trainer._speco_v1_prepare_hot_writer_head() == {}
+    assert len(session.costs.events) == count
+
+
+def test_separate_pool_never_uses_shared_gpu_head_preparation():
+    trainer = trainer_for("separate_async")
+    trainer._speco_prepare_hot_writer_head_at_safe_point = lambda: pytest.fail(
+        "serving lease required"
+    )
+    assert trainer._speco_v1_prepare_hot_writer_head() == {}
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+def test_head_preparation_ablation_preserves_quota_and_costs(mode):
+    trainer = trainer_for(mode)
+    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = {
+        "v1_head_preparation_enable": False
+    }
+    scheduler = trainer._drafter_scheduler
+    scheduler._training_quota_debt_steps = 20
+    scheduler._training_quota_data_version = 8
+    trainer._speco_prepare_hot_writer_head_at_safe_point = lambda: pytest.fail(
+        "head preparation disabled"
+    )
+    assert trainer._speco_v1_prepare_hot_writer_head() == {}
+    assert scheduler._training_quota_debt_steps == 20
+    assert scheduler._training_quota_data_version == 8
+    assert not trainer._speco_bubble_session().costs.events
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+def test_boundary_diagnostics_preserve_actor_order_and_failure(caplog, enabled, fails):
+    trainer = trainer_for("sync")
+    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = {
+        "boundary_diagnostics_enable": enabled
+    }
+    trainer._pending_target_lm_head_sync = None
+    trainer._speco_rollout_idle_generation_open = True
+    trainer._speco_stop_rollout_idle_event_loop = lambda *args: None
+    trainer._speco_service_rollout_idle_events = lambda **kwargs: {}
+    trainer._speco_emit_rollout_generation_completed = lambda *args: {}
+    events = []
+    trainer._speco_reclaim_rollout_idle_workers = (
+        lambda **kwargs: events.append("reclaim") or {}
+    )
+    trainer._speco_flush_idle_completed_publications = lambda *args: {}
+    trainer._speco_park_drafter_training_memory = lambda *args: {}
+    trainer._speco_pop_rollout_idle_metrics = lambda: {}
+
+    def update(batch, metrics):
+        events.append("actor")
+        if fails:
+            raise RuntimeError("actor failure")
+        return "result"
+
+    if fails:
+        with pytest.raises(RuntimeError, match="actor failure"):
+            trainer._speco_v1_bubble_update_actor(None, {}, update)
+    else:
+        assert trainer._speco_v1_bubble_update_actor(None, {}, update) == "result"
+    assert events == ["reclaim", "actor"]
+    records = [r.message for r in caplog.records if "v1_boundary:" in r.message]
+    expected = ["reclaim_begin", "reclaim_complete", "actor_begin"] + [
+        "actor_failed" if fails else "actor_end"
+    ]
+    assert len(records) == (4 if enabled else 0)
+    if enabled:
+        assert all(
+            f"event={event} " in record for event, record in zip(expected, records)
+        )
+        assert "event_thread_active=False generation_open=False" in records[1]
+
+
+def test_final_metrics_override_stale_event_quota_snapshot(monkeypatch):
+    trainer = trainer_for("sync")
+    trainer.global_steps = 42
+    scheduler = trainer._drafter_scheduler
+    scheduler._idle_optimizer_steps_total = 27
+    scheduler._critical_path_topup_optimizer_steps_total = 158
+    scheduler._training_quota_debt_steps = 15
+    scheduler._training_quota_data_version = 40
+    scheduler._training_quota_collection_step = 40
+    scheduler._training_quota_oldest_cycle_step = 40
+    trainer._speco_v1_spec_decode_metrics = lambda batch: {}
+    native = TRAINERS["sync"].__bases__[1]
+    monkeypatch.setattr(native, "_compute_metrics", lambda *args, **kwargs: None)
+    metrics = {
+        "bubble/training_quota_debt_steps": 19,
+        "bubble/idle_optimizer_steps_total": 23,
+    }
+    trainer._compute_metrics(None, metrics, {}, global_steps=42, epoch=0)
+    assert metrics["bubble/training_quota_debt_steps"] == 15
+    assert metrics["bubble/idle_optimizer_steps_total"] == 27
+    assert metrics["bubble/training_quota_debt_age_steps"] == 2
+    assert metrics["bubble/training_quota_data_version"] == 40
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
+def test_sample_end_keeps_training_outcome_from_forced_drain(monkeypatch, mode):
+    trainer = trainer_for(mode)
+    result = {
+        "drafter/trained": 1,
+        "drafter/train_successful_steps_max": 4,
+        "bubble/idle_optimizer_steps": 4,
+        "timing_s/drafter_async_training_work": 1.2,
+        "bubble/training_quota_debt_steps": 15,
+    }
+    trainer._speco_bubble_session().close = lambda boundary: dict(result)
+    trainer._speco_v1_admission = lambda method: None
+    native = TRAINERS[mode].__bases__[1]
+    monkeypatch.setattr(native, "on_sample_end", lambda self: None)
+    trainer.on_sample_end()
+    metrics = trainer._speco_pop_rollout_idle_metrics()
+    for key, value in result.items():
+        assert metrics[key] == value
+    assert trainer._speco_pop_rollout_idle_metrics() == {}
+
+
+@pytest.mark.parametrize("rl_step,quota_version", [(5, 4), (11, 8)])
+def test_sync_skipped_collection_advances_control_step_without_replacing_quota_head(
+    monkeypatch, rl_step, quota_version
+):
+    import asyncio
+    from verl.trainer.ppo.v1 import PPOTrainerSync
+    from verl_speco.workers.speco_worker import SpecoWorker
+
+    worker = SpecoWorker.__new__(SpecoWorker)
+    worker._rank = 2
+    worker.enable_drafter = worker.in_drafter_train_group = True
+    worker.worker_incarnation = "worker-2"
+    worker.last_global_step = quota_version
+    worker.device_name = "cpu"
+    selected = []
+
+    def select_head(version):
+        selected.append(version)
+        worker.trainer._target_lm_head_weight_step = version
+        return True
+
+    async def activate():
+        return True
+
+    worker.trainer = SimpleNamespace(
+        buffer_version=3,
+        _bubble_time_enabled=True,
+        _target_lm_head_weight_step=rl_step,
+        select_target_lm_head_version=select_head,
+        get_training_data_status=lambda **kwargs: {
+            "data_version": quota_version,
+            "trainable_batches": 20,
+        },
+        activate_training_model=activate,
+        clear_pending_publish_state_dict=lambda: None,
+        increment_rl_step=lambda step: None,
+    )
+    payload = {
+        "launch": True,
+        "execution_strategy": "sync",
+        "source_global_step": rl_step,
+        "plan_id": "quota-topup",
+        "data_version": quota_version,
+        "required_target_version": quota_version,
+        "max_batches": 20,
+        "worker_snapshots": {
+            "2": {
+                "worker_incarnation": "worker-2",
+                "buffer_version": 3,
+                "data_version": quota_version,
+            }
+        },
+    }
+    stale = asyncio.run(worker.preflight_drafter_training(payload))
+    assert stale["reason"] == "stale_training_plan"
+    assert stale["worker_global_step"] == quota_version
+    assert not selected
+
+    trainer = trainer_for("sync")
+    trainer.global_steps = rl_step
+    trainer._require_speco_worker_group = lambda: SimpleNamespace(
+        set_global_step=worker.set_global_step
+    )
+    events = []
+    trainer._speco_bubble_lifecycle = SimpleNamespace(
+        start=lambda: events.append(worker.last_global_step)
+    )
+    monkeypatch.setattr(
+        PPOTrainerSync,
+        "step",
+        lambda *args: asyncio.run(worker.preflight_drafter_training(payload)),
+    )
+    ready = trainer.step({}, {})
+    assert events == [rl_step]
+    assert ready["ready"]
+    assert ready["data_version"] == ready["target_version"] == quota_version
+    assert selected == [quota_version]
+
+
+@pytest.mark.parametrize("role", ["actor_rollout", "actor_rollout_ref"])
+def test_resource_identity_survives_native_colocated_worker_export(monkeypatch, role):
+    import ray
+    from verl.single_controller.base.worker import Worker
+    from verl.single_controller.ray.base import (
+        RayClassWithInitArgs,
+        create_colocated_worker_cls,
+    )
+    from verl_speco.integration import resource_identity
+    from verl_speco.integration.rollout_publish import DraftWeightPublishMixin
+
+    class RolloutWorker(DraftWeightPublishMixin, Worker):
+        pass
+
+    # Use the real 0.9 exporter: undecorated methods disappear, while ordinary
+    # ONE_TO_ALL exports have a role prefix unavailable on replica.workers.
+    exported = create_colocated_worker_cls(
+        {role: RayClassWithInitArgs(cls=ray.remote(RolloutWorker))}
+    )
+    remote_cls = exported.cls
+    assert "speco_resource_identity" in remote_cls.__ray_metadata__.method_meta.methods
+    raw = remote_cls.__ray_actor_class__
+    identity = {"rank": 0, "node_id": "node-a", "device_ids": ("3",)}
+    monkeypatch.setattr(resource_identity, "resource_identity", lambda rank: identity)
+    inner = RolloutWorker.__new__(RolloutWorker)
+    inner._rank = 0
+    outer = raw.__new__(raw)
+    outer.worker_dict = {role: inner}
+    assert outer.speco_resource_identity() == identity
+
+    trainer = trainer_for("sync")
+    trainer._require_speco_worker_group = lambda: SimpleNamespace(
+        get_drafter_training_resource_metadata=lambda: [
+            {
+                **identity,
+                "available": True,
+                "worker_id": "0",
+                "training_group_ranks": [0],
+            }
+        ]
+    )
+    replica = SimpleNamespace(
+        replica_rank=7,
+        workers=[
+            SimpleNamespace(
+                speco_resource_identity=SimpleNamespace(
+                    remote=outer.speco_resource_identity
+                )
+            )
+        ],
+    )
+    trainer.llm_server_manager = SimpleNamespace(get_replicas=lambda: [replica])
+    monkeypatch.setattr(ray, "get", lambda values: values)
+    result = trainer.speco_get_drafter_training_resource_metadata()
+    assert result[0]["replica_rank"] == 7
+    assert result[0]["device_ids"] == ("3",)
+
+
 @pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
 def test_generation_start_uses_authoritative_replica_groups(mode):
     trainer = trainer_for(mode)

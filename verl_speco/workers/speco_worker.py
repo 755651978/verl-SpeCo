@@ -2033,6 +2033,8 @@ class SpecoWorker(Worker):
             return result
         if training_plan.get("source_global_step") != self.last_global_step:
             result["reason"] = "stale_training_plan"
+            result["source_global_step"] = training_plan.get("source_global_step")
+            result["worker_global_step"] = self.last_global_step
             return result
 
         if execution_strategy == "rollout_idle_worker":

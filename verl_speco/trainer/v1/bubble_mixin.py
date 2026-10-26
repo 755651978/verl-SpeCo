@@ -4,11 +4,14 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from verl_speco.trainer.bubble_lifecycle import BubbleLifecycle
+
+logger = logging.getLogger(__name__)
 
 
 class V1BubbleMixin:
@@ -633,6 +636,7 @@ class V1BubbleMixin:
             # Native target synchronization already coordinates its own pool.
             # A plain actor update does not need a global Bubble probe drain.
             self._speco_wait_target_lm_head_prefetch()
+            metrics.update(self._speco_v1_prepare_hot_writer_head())
             result = parent()
             metrics.update(scheduler.training_work_metrics())
             self._pending_sync_metrics = {
@@ -706,6 +710,7 @@ class V1BubbleMixin:
                     raise RuntimeError("Final V1 Bubble quota remains incomplete")
             if topup_plan is not None or final_debt:
                 metrics.update(self._speco_park_drafter_training_memory("v1_topup"))
+            metrics.update(self._speco_v1_prepare_hot_writer_head())
             # The native mode owns actor target synchronization. Admission is
             # closed across both probe arms, even if native code resumes engines.
             result = parent()
@@ -728,12 +733,20 @@ class V1BubbleMixin:
                     else [self.checkpoint_manager]
                 ):
                     manager.sleep_replicas()
+                checkpoint_started = time.perf_counter()
                 self._save_checkpoint()
+                self._speco_v1_record_timing(
+                    "drafter_v1_checkpoint", time.perf_counter() - checkpoint_started
+                )
                 # Wake the serving engines with the same already-synchronized
                 # target before opening admission. No probe spans this update.
                 parent()
         if getattr(self, "_speco_freeze_branch_save_pending", None) is not None:
+            checkpoint_started = time.perf_counter()
             self._speco_maybe_save_freeze_branch_checkpoint()
+            self._speco_v1_record_timing(
+                "drafter_v1_checkpoint", time.perf_counter() - checkpoint_started
+            )
         self._pending_sync_metrics = {
             **(getattr(self, "_pending_sync_metrics", None) or {}),
             **metrics,
@@ -745,19 +758,102 @@ class V1BubbleMixin:
             session.start()
         return result
 
+    def _speco_v1_idle_option(self, name, default):
+        training = self.config.actor_rollout_ref.rollout.drafter.get("training", {})
+        return training.get("scheduler", {}).get("idle_worker", {}).get(name, default)
+
+    def _speco_v1_boundary_diagnostic(self, event, boundary):
+        if not self._speco_v1_idle_option("boundary_diagnostics_enable", False):
+            return
+        session = self._speco_bubble_session()
+        logger.warning(
+            "[BubbleTime] v1_boundary: step=%s event=%s boundary=%s "
+            "wall_ts=%.6f event_thread_active=%s generation_open=%s",
+            self.global_steps,
+            event,
+            boundary,
+            time.time(),
+            session.thread is not None,
+            getattr(self, "_speco_rollout_idle_generation_open", False),
+        )
+
+    def _speco_v1_prepare_hot_writer_head(self):
+        # The actor has finished/offloaded and the event loop has been joined.
+        # Separate mode keeps actor and rollout on independent pools and needs
+        # a lease on its serving pool; never use this shared-GPU safe point there.
+        if self._speco_v1_separate_bubble():
+            return {}
+        if not self._speco_v1_idle_option("v1_head_preparation_enable", True):
+            return {}
+        scheduler = self._speco_get_drafter_scheduler()
+        if scheduler._training_quota_debt_steps <= 0:
+            return {}
+        target = scheduler._training_quota_data_version
+        started = time.time()
+        metrics = self._speco_prepare_hot_writer_head_at_safe_point()
+        if metrics:
+            self._speco_bubble_session().costs.record_interval(
+                f"hot_head_prepare:{target}:{started}", started, time.time()
+            )
+        return metrics
+
     def _speco_v1_bubble_update_actor(self, batch, metrics, update):
+        started = time.perf_counter()
         separate = self._speco_v1_separate_bubble()
         if not separate:
             metrics.update(self._speco_bubble_session().close("v1_before_actor"))
         # Export was fenced inside the old-policy collection context.
         if self._pending_target_lm_head_sync is not None:
             metrics.update(self._speco_poll_target_lm_head_prefetch())
-        result = update(batch, metrics)
+        actor_started = time.perf_counter()
+        self._speco_v1_record_timing("drafter_v1_before_actor", actor_started - started)
+        self._speco_v1_boundary_diagnostic("actor_begin", "v1_update_actor")
+        try:
+            result = update(batch, metrics)
+        except BaseException:
+            self._speco_v1_boundary_diagnostic("actor_failed", "v1_update_actor")
+            raise
+        self._speco_v1_boundary_diagnostic("actor_end", "v1_update_actor")
+        after_started = time.perf_counter()
+        self._speco_v1_record_timing(
+            "actor_update_without_drafter", after_started - actor_started
+        )
         metrics.update(self._speco_pop_rollout_idle_metrics())
+        self._speco_v1_record_timing(
+            "drafter_v1_after_actor", time.perf_counter() - after_started
+        )
         return result
+
+    def _speco_v1_record_timing(self, name, seconds):
+        if self.__dict__.get("_speco_v1_timing_step") != self.global_steps:
+            self._speco_v1_timing_step = self.global_steps
+            self._speco_v1_timings = {}
+        timings = self._speco_v1_timings
+        timings[name] = timings.get(name, 0.0) + max(0.0, float(seconds))
+
+    def _speco_v1_timing_metrics(self):
+        if self.__dict__.get("_speco_v1_timing_step") != self.global_steps:
+            return {}
+        timings = self._speco_v1_timings
+        metrics = {f"timing_s/{name}": value for name, value in timings.items()}
+        metrics["timing_s/drafter"] = sum(
+            timings.get(name, 0.0)
+            for name in (
+                "drafter_v1_sample_end",
+                "drafter_v1_before_actor",
+                "drafter_v1_after_actor",
+                "drafter_v1_publish_blocking",
+            )
+        )
+        return metrics
 
     def step(self, metrics, timing_raw):
         if self._speco_rollout_idle_worker_enabled():
+            if not self._speco_v1_separate_bubble():
+                # Collection can be skipped while a quota remains outstanding.
+                # Advance the worker's control step before opening events, but
+                # leave the quota's data/head version pinned to its collection.
+                self._speco_set_drafter_global_step()
             self._speco_bubble_session().start()
         return super().step(metrics, timing_raw)
 

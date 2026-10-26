@@ -47,6 +47,102 @@ def config(mode):
     )
 
 
+def test_bubble_global_timing_excludes_actor_target_sync_and_checkpoint(monkeypatch):
+    from verl.trainer.ppo.v1 import PPOTrainerSync
+    from verl_speco.trainer.v1 import bubble_mixin
+
+    trainer = TRAINERS["sync"].__new__(TRAINERS["sync"])
+    trainer.config = config("sync")
+    trainer.global_steps = 1
+    trainer._pending_target_lm_head_sync = None
+    clock = [0.0]
+    monkeypatch.setattr(bubble_mixin.time, "perf_counter", lambda: clock[0])
+
+    def consume(seconds, result=None):
+        clock[0] += seconds
+        return result
+
+    trainer._speco_bubble_lifecycle = SimpleNamespace(
+        close=lambda boundary: consume(2, {})
+    )
+    monkeypatch.setattr(PPOTrainerSync, "on_sample_end", lambda self: None)
+    trainer.on_sample_end()
+    trainer._speco_pop_rollout_idle_metrics = lambda: consume(1, {})
+    for _ in range(2):
+        trainer._speco_v1_bubble_update_actor(None, {}, lambda *args: consume(10))
+
+    monkeypatch.setattr(PPOTrainerSync, "on_step_end", lambda self: consume(10))
+
+    def boundary(parent):
+        consume(3)
+        parent()
+        consume(5)
+        trainer._speco_v1_record_timing("drafter_v1_checkpoint", 5)
+        parent()  # Deferred checkpoint recovery can repeat native target sync.
+        consume(4)
+
+    trainer._speco_v1_bubble_step_end = boundary
+    trainer.on_step_end()
+    trainer._speco_v1_spec_decode_metrics = lambda batch: {}
+    monkeypatch.setattr(
+        PPOTrainerSync, "_compute_metrics", lambda *args, **kwargs: None
+    )
+    metrics = {}
+    trainer._compute_metrics(None, metrics, {}, global_steps=1, epoch=0)
+    assert metrics["timing_s/actor_update_without_drafter"] == 20
+    assert metrics["timing_s/drafter_v1_upstream_step_end"] == 20
+    assert metrics["timing_s/drafter_v1_step_end_total"] == 32
+    assert metrics["timing_s/drafter_v1_checkpoint"] == 5
+    assert metrics["timing_s/drafter"] == 15
+    trainer.global_steps = 2
+    trainer._speco_v1_record_timing("drafter_v1_before_actor", 1)
+    assert trainer._speco_v1_timing_metrics()["timing_s/drafter"] == 1
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_sync_bubble_logs_each_local_batch_even_without_feature_collection(
+    monkeypatch, tmp_path, frozen
+):
+    import json
+    import numpy as np
+    from verl.protocol import DataProto
+    from verl.trainer.ppo.v1 import PPOTrainerSync
+
+    trainer = TRAINERS["sync"].__new__(TRAINERS["sync"])
+    trainer.config = config("sync")
+    trainer._speco_init_state()
+    trainer.global_steps = 4
+    trainer._speco_drafter_frozen = frozen
+    trainer._speco_oldlogprob_collection_enabled = lambda: False
+    batches = []
+
+    def evidence(batch):
+        return None, DataProto(
+            non_tensor_batch={
+                "_speco_vllm_request_id": np.array([batch, None], dtype=object),
+                "_verl_request_mean_accept_len": np.array([2.5, None], dtype=object),
+            }
+        )
+
+    trainer._speco_v1_batch_data = evidence
+    monkeypatch.setattr(
+        PPOTrainerSync,
+        "_compute_old_log_prob",
+        lambda self, batch, metrics: batches.append(batch) or batch,
+    )
+    path = tmp_path / "requests.jsonl"
+    monkeypatch.setenv("VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH", str(path))
+    for batch in ("local-a", "local-b"):
+        assert trainer._compute_old_log_prob(batch, {}) == batch
+    trainer._speco_v1_bubble_step_end = lambda parent: "done"
+    assert trainer.on_step_end() == "done"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert batches == ["local-a", "local-b"]
+    assert len(rows) == 2
+    assert all(row["step"] == 4 and row["count"] == 1 for row in rows)
+    assert not trainer._speco_pending_request_accept_len_payloads
+
+
 @pytest.mark.parametrize("mode", list(("sync", "colocate_async", "separate_async")))
 def test_real_native_step_obeys_bubble_resource_boundary(mode):
     trainer = TRAINERS[mode].__new__(TRAINERS[mode])
@@ -54,6 +150,7 @@ def test_real_native_step_obeys_bubble_resource_boundary(mode):
     trainer.global_steps = 1
     trainer.parameter_sync_step = 2
     events = []
+    trainer._speco_set_drafter_global_step = lambda: events.append("worker_step")
     session = SimpleNamespace(
         start=lambda: events.append("bubble_start"),
         close=lambda boundary: events.append("bubble_close") or {},
@@ -95,6 +192,10 @@ def test_real_native_step_obeys_bubble_resource_boundary(mode):
     result = trainer.step({}, {})
     assert result.keys == ["row0", "row1"]
     assert events.index("bubble_start") < events.index("enqueue")
+    if mode != "separate_async":
+        assert events.index("worker_step") < events.index("bubble_start")
+    else:
+        assert "worker_step" not in events
     assert events.count("old_log_prob") == events.count("actor") == 2
     if mode != "separate_async":
         assert (
@@ -233,6 +334,7 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
     trainer.timing_raw = {}
     trainer._speco_v1_admission = lambda method: None
     trainer._speco_wait_target_lm_head_prefetch = lambda: None
+    trainer._speco_v1_prepare_hot_writer_head = lambda: {}
     trainer._speco_park_drafter_training_memory = lambda boundary: {}
     trainer._speco_freeze_policy = None
     manager = SimpleNamespace(

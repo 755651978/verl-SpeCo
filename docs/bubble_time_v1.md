@@ -1,12 +1,29 @@
 # Bubble Time 与 V1
 
-Last updated: 2026-10-23
+Last updated: 2026-10-26
 
 适配基线为上游 `release/v0.9.0`。PPO 主循环仍由上游 V1 trainer 执行；
 本仓库仅提供生命周期 hook、独立池 worker、数据采集和发布协议。
 V1 rollout 后端仍限于 vLLM。
 
 ## 配置
+
+性能定位时可以独立关闭 V1 共享池的安全边界 head 预热：
+
+```text
+actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.v1_head_preparation_enable=false
+actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.boundary_diagnostics_enable=true
+```
+
+head 预热默认开启，关闭只取消提前准备，训练前仍会加载并校验 quota 对应的 head；
+不改变 quota、writer、资源租约或发布规则。该预热路径仅用于 sync 和 colocate_async，
+separate_async 不走共享池的安全边界预热。
+诊断默认关闭，开启后输出 `v1_boundary` 的回收开始、回收完成、Actor 开始、
+正常结束或失败时间。结合已有 worker `training_cleanup_boundary` 的 plan/rank 时间
+检查生命周期顺序；驱动回收完成日志不是 GPU 硬件同步或带宽无竞争的证明。
+separate_async 的 Actor 与独立 rollout 池可以合法重叠。
+对照实验应从同一恢复点分别启动，仅改变预热开关，并比较实际 token、训练总步数、
+发布次数、剩余 quota 和端到端耗时。修改配置不能改变已经运行的任务。
 
 使用 `--config-name=speco_v1_trainer`，沿用以下配置：
 
@@ -21,6 +38,46 @@ actor_rollout_ref.rollout.drafter.training.scheduler.training_quota.allow_critic
 `actor_rollout_ref.rollout.drafter.training.drafter_convergence_freeze` 下的
 `enabled=true`、`economics.enabled=true` 和 `probe.enabled=true`。
 `mode=shadow` 只观察，`mode=active` 才实际冻结。原有窗口、覆盖率和漂移恢复阈值继续生效。
+
+### sync 的冻结指标与 hard sample
+
+Bubble V1 sync 复用请求级 acceptance 数据、hard sample 选样和冻结策略。
+hard sample 使用 training 下的 `dspark_hard_candidate_ratio` 与
+`dspark_hard_sample_ratio`，两者均大于零才启用；默认均为零。
+采集计划沿用 `dspark_collect_samples_per_step` 和 `dspark_hard_shortfall_policy`，
+不修改 PPO 的完整 batch。合成 padding 行不作为请求或 hard sample 证据。
+
+请求 acceptance 分布在每个 local batch 的 old-logprob 前记录，在 Bubble
+step-end 边界落盘；冻结关闭特征采集后仍记录，供分布变化排查使用。
+路径通过 `VERL_SPECO_REQUEST_ACCEPT_LEN_HIST_LOG_PATH` 设置，默认
+`/tmp/speco_vllm_request_accept_len_hist.jsonl`。选样指标使用
+`drafter/selection/*`，冻结状态沿用 `drafter_convergence_freeze` 的指标。
+冻结状态、ROI 和漂移恢复仍需按下文完成 GPU 验收。
+
+### 计时与 acceptance 指标
+
+`timing_s/drafter` 统计 Bubble 在 sample-end、actor 前后和发布边界增加的
+driver 耗时；不包含 PPO actor 更新、上游 actor target 同步、联合 checkpoint
+和已单独统计的 old-logprob 采集。后台训练工作量仍使用
+`timing_s/drafter_async_training_work`，不可与重叠的关键路径时间相加。
+`timing_s/actor_update_without_drafter` 和 `timing_s/drafter_v1_*` 提供分段时间，
+`timing_s/oldlogprob_*` 提供准备、计算、采集和恢复耗时。
+同一 global step 内多个 local batch 的 Bubble 时间累加后，在最终指标阶段输出。
+
+sync/colocate_async 在每轮采样和事件处理前更新 drafter worker 的控制 RL step，
+即使该轮因已有 quota 而跳过特征采集，也不能让 worker 停留在上次采集的 step。
+控制 step 与 quota 的数据/head 版本独立：例如 step 11 补齐 step 8 的 quota，
+计划的执行 step 为 11，训练数据和 head 仍固定为版本 8。
+separate_async 不采用这个全组同步，以免干扰跨步运行的后台训练。
+预检失败保留 `worker_preflight_failed`，日志包含 worker 原因及两侧 step，
+不会将未执行的预检失败误报为训练结果不一致。
+
+acceptlen 的日志名为 `drafter/spec_decode/mean_acceptance_length`，计算为
+`1 + accepted_tokens / verify_steps`。优先读取原生多轮请求计数，缺失时读取
+SpeCo 精确请求计数；engine 汇总 fallback 不冒充单个请求数据。
+`drafter/spec_decode/num_verify_steps`、`num_accepted_tokens` 和
+`request_stats_coverage` 等指标暴露计算分母与请求覆盖率。
+请求数据不足且没有启用可用 sidecar 时保留覆盖率，不伪造 acceptlen 数值。
 
 `separate_async` 固定将 drafter 训练 worker 放到独立 rollout placement groups，
 不新增部署模式。分配 GPU 时复用已有资源池，不申请额外 GPU。

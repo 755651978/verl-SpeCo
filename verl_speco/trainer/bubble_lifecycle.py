@@ -160,6 +160,9 @@ class BubbleLifecycle:
 
     def close(self, boundary: str) -> dict[str, Any]:
         owner = self.trainer
+        diagnostic = getattr(owner, "_speco_v1_boundary_diagnostic", None)
+        if diagnostic is not None:
+            diagnostic("reclaim_begin", boundary)
         generation_was_open = owner._speco_rollout_idle_generation_open
         owner._speco_rollout_idle_generation_open = False
         owner._speco_stop_rollout_idle_event_loop(self.stop_event, self.thread)
@@ -178,6 +181,8 @@ class BubbleLifecycle:
             )
             metrics.update(owner._speco_flush_idle_completed_publications(self.enqueue))
             metrics.update(owner._speco_park_drafter_training_memory(boundary))
+            if diagnostic is not None:
+                diagnostic("reclaim_complete", boundary)
             return metrics
 
     def published(self, plan_id: str) -> None:

@@ -237,7 +237,46 @@ def test_v1_metrics_fall_back_to_engine_core_acceptance_sidecars(monkeypatch, tm
     ] == pytest.approx(1 + 9 / 7)
     # Cumulative files are differenced, so the same snapshot is not reused by
     # the next global step.
-    assert trainer._speco_v1_spec_decode_metrics(batch) == {}
+    assert trainer._speco_v1_spec_decode_metrics(batch) == {
+        "drafter/spec_decode/requests_with_stats": 0,
+        "drafter/spec_decode/requests_missing_stats": 1,
+        "drafter/spec_decode/request_stats_coverage": 0,
+    }
+
+
+def test_acceptance_uses_exact_request_counters_with_coverage(monkeypatch):
+    cells = [
+        {
+            "_speco_vllm_request_verify_rounds": 2,
+            "_speco_vllm_request_accepted_tokens": 6,
+        },
+        {
+            "spec_num_verify_steps": 4,
+            "spec_num_accepted_tokens": 2,
+            "_speco_vllm_request_verify_rounds": 99,
+            "_speco_vllm_request_accepted_tokens": 99,
+        },
+        {"spec_num_verify_steps": float("nan"), "spec_num_accepted_tokens": 3},
+        {"spec_num_verify_steps": 100, "spec_num_accepted_tokens": 100},
+    ]
+    monkeypatch.setitem(
+        sys.modules,
+        "transfer_queue",
+        types.SimpleNamespace(kv_batch_get=lambda **kwargs: {"extra_fields": cells}),
+    )
+    batch = types.SimpleNamespace(
+        keys=list(range(4)),
+        partition_id="train",
+        tags=[{}, {}, {}, {"is_padding": True}],
+    )
+    metrics = SpecoV1Mixin()._speco_v1_spec_decode_metrics(batch)
+    assert metrics["drafter/spec_decode/mean_acceptance_length"] == pytest.approx(
+        1 + 8 / 6
+    )
+    assert metrics["drafter/spec_decode/num_verify_steps"] == 6
+    assert metrics["drafter/spec_decode/num_accepted_tokens"] == 8
+    assert metrics["drafter/spec_decode/requests_missing_stats"] == 1
+    assert metrics["drafter/spec_decode/request_stats_coverage"] == pytest.approx(2 / 3)
 
 
 def test_online_training_rejects_rollout_correction_bypass():

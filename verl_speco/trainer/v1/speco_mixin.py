@@ -858,7 +858,35 @@ class SpecoV1Mixin(V1BubbleMixin):
 
     def on_step_end(self):
         if self._speco_rollout_idle_worker_enabled():
-            return self._speco_v1_bubble_step_end(super().on_step_end)
+            started = time.perf_counter()
+            upstream_seconds = 0.0
+            parent = super().on_step_end
+
+            def timed_parent():
+                nonlocal upstream_seconds
+                upstream_started = time.perf_counter()
+                try:
+                    return parent()
+                finally:
+                    upstream_seconds += time.perf_counter() - upstream_started
+
+            try:
+                return self._speco_v1_bubble_step_end(timed_parent)
+            finally:
+                if getattr(self, "_speco_pending_request_accept_len_payloads", None):
+                    self._speco_flush_request_accept_len_payloads()
+                elapsed = time.perf_counter() - started
+                self._speco_v1_record_timing(
+                    "drafter_v1_upstream_step_end", upstream_seconds
+                )
+                self._speco_v1_record_timing("drafter_v1_step_end_total", elapsed)
+                checkpoint_seconds = self._speco_v1_timings.get(
+                    "drafter_v1_checkpoint", 0.0
+                )
+                self._speco_v1_record_timing(
+                    "drafter_v1_publish_blocking",
+                    elapsed - upstream_seconds - checkpoint_seconds,
+                )
         try:
             lifecycle_started = time.perf_counter()
             self._speco_prefetch_sync_cpu_snapshot()
@@ -1017,6 +1045,7 @@ class SpecoV1Mixin(V1BubbleMixin):
 
     def on_sample_end(self):
         if self._speco_rollout_idle_worker_enabled():
+            started = time.perf_counter()
             if not self._speco_v1_separate_bubble():
                 if (
                     str(self.config.trainer.v1.get("trainer_mode", "sync"))
@@ -1025,7 +1054,15 @@ class SpecoV1Mixin(V1BubbleMixin):
                     self._speco_v1_admission("speco_close_rollout_admission")
                     self._speco_colocate_admission_closed = True
                     self._speco_v1_training_admission_owned = True
-                self._speco_bubble_session().close("v1_sample_end")
+                # A final in-flight optimizer step can finish only during this
+                # drain. Retain its outcome instead of dropping the returned
+                # worker timings/trained flags before PPO logs this step.
+                self._speco_record_rollout_idle_metrics(
+                    self._speco_bubble_session().close("v1_sample_end")
+                )
+            self._speco_v1_record_timing(
+                "drafter_v1_sample_end", time.perf_counter() - started
+            )
             return super().on_sample_end()
         if not self._speco_colocate_probe_boundary_enabled():
             return super().on_sample_end()
@@ -1300,12 +1337,21 @@ class SpecoV1Mixin(V1BubbleMixin):
             self._speco_populate_request_accept_len_records(evidence)
 
     def _compute_old_log_prob(self, batch, metrics):
+        evidence = None
+        if self._speco_rollout_idle_worker_enabled():
+            _, evidence = self._speco_v1_batch_data(batch)
+            # Bubble bypasses the inline actor-update logger. Observe every
+            # local batch, including frozen steps with feature capture off.
+            self._speco_log_request_accept_len_variance_from_batch(
+                evidence, source="v1_oldlogprob"
+            )
         policy = getattr(self, "_speco_freeze_policy", None)
         if (
             policy is not None
             and getattr(self, "_speco_v1_evidence_step", None) != self.global_steps
         ):
-            _, evidence = self._speco_v1_batch_data(batch)
+            if evidence is None:
+                _, evidence = self._speco_v1_batch_data(batch)
             metrics["drafter/request_padding_rows"] = evidence.meta_info[
                 "speco_v1_padding_rows"
             ]
@@ -1661,10 +1707,13 @@ class SpecoV1Mixin(V1BubbleMixin):
 
         total_drafts = 0.0
         total_accepted = 0.0
-        real_requests = 0
         requests_with_stats = 0
         tags = list(getattr(batch, "tags", None) or [])
-        for index, fields in enumerate(extra_fields):
+        real_requests = sum(
+            not (index < len(tags) and tags[index].get("is_padding", False))
+            for index in range(len(batch.keys))
+        )
+        for index, fields in enumerate(extra_fields[: len(batch.keys)]):
             if index < len(tags) and bool(tags[index].get("is_padding", False)):
                 continue
             # TransferQueue returns object-backed values for ``extra_fields``
@@ -1672,7 +1721,6 @@ class SpecoV1Mixin(V1BubbleMixin):
             # through ``.data`` rather than being dict instances themselves.
             # The initial bridge only covered plain dicts, silently dropping
             # every real rollout counter.
-            real_requests += 1
             fields = getattr(fields, "data", fields)
             if not isinstance(fields, dict):
                 continue
@@ -1684,18 +1732,21 @@ class SpecoV1Mixin(V1BubbleMixin):
             total_drafts += drafts
             total_accepted += accepted
 
-        if total_drafts <= 0.0:
-            return self._speco_v1_spec_decode_sidecar_metrics()
-        return {
-            "drafter/spec_decode/mean_acceptance_length": 1.0
-            + total_accepted / total_drafts,
-            "drafter/spec_decode/num_verify_steps": total_drafts,
-            "drafter/spec_decode/num_accepted_tokens": total_accepted,
+        coverage = {
             "drafter/spec_decode/requests_with_stats": requests_with_stats,
             "drafter/spec_decode/requests_missing_stats": real_requests
             - requests_with_stats,
             "drafter/spec_decode/request_stats_coverage": requests_with_stats
             / max(real_requests, 1),
+        }
+        if total_drafts <= 0.0:
+            return {**coverage, **self._speco_v1_spec_decode_sidecar_metrics()}
+        return {
+            **coverage,
+            "drafter/spec_decode/mean_acceptance_length": 1.0
+            + total_accepted / total_drafts,
+            "drafter/spec_decode/num_verify_steps": total_drafts,
+            "drafter/spec_decode/num_accepted_tokens": total_accepted,
         }
 
     def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
@@ -1704,6 +1755,14 @@ class SpecoV1Mixin(V1BubbleMixin):
             batch, metrics, timing_raw, global_steps, epoch
         )
         metrics.update(self._speco_v1_spec_decode_metrics(batch))
+        if self.__dict__.get("_speco_v1_timing_step") == global_steps:
+            metrics.update(self._speco_v1_timing_metrics())
+        scheduler = self.__dict__.get("_drafter_scheduler")
+        if scheduler is not None and self._speco_rollout_idle_worker_enabled():
+            # Event/collection metrics may have been captured before a later
+            # completion repaid quota (or this step registered a new quota).
+            with self._speco_bubble_training_lock():
+                metrics.update(scheduler.training_quota_metrics(global_steps))
         if getattr(self, "_speco_freeze_policy", None) is not None:
             metrics.update(self._speco_freeze_metrics())
         if getattr(self, "_speco_ci_result", None) is not None:
