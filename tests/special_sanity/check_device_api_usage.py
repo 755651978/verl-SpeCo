@@ -21,6 +21,13 @@ from pathlib import Path
 # Files that are allowed to mention CUDA because they select backend/runtime
 # behavior at the verl/SpeCo integration boundary.
 CUDA_KEYWORD_CHECK_WHITELIST = [
+    # Entry point forwards opt-in diagnostics for the configured CUDA runtime;
+    # it does not allocate tensors or invoke accelerator APIs.
+    "verl_speco/main.py",
+    # Actor-side collection selects CUDA communication/transport implementations.
+    "verl_speco/integration/oldlogprob_runtime.py",
+    # Read-only build/allocator metadata; never moves tensors or synchronizes.
+    "verl_speco/trainer/performance_diagnostics.py",
     "verl_speco/backends/dflash_trainer_backend.py",
     "verl_speco/backends/domino_trainer_backend.py",
     "verl_speco/backends/dspark_trainer_backend.py",

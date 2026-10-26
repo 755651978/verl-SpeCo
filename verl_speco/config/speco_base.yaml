@@ -207,7 +207,9 @@ actor_rollout_ref:
         publish_trainable_only_export: true
         # One rollback switch for CUDA host reuse and lossless transport.
         gpu_transfer_optimizations: true
-        # Retained CPU model-shard buffers per training rank; head cache is extra.
+        # Experimental CPU snapshot overlap; opt in only after end-to-end A/B.
+        gpu_publish_snapshot_prefetch: false
+        # Shared retained CPU model/optimizer buffer budget per rank; head cache is extra.
         gpu_offload_pool_max_gib: 8
         publish_param_name_patterns: null
         draft_update_use_shm: null

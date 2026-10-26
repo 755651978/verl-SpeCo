@@ -227,10 +227,14 @@ class ModelHostBufferPool:
     failures are fatal; never fall back after a partially completed transition.
     """
 
-    def __init__(self, max_bytes, *, pinned=False, asynchronous=False):
+    def __init__(
+        self, max_bytes, *, pinned=False, asynchronous=False, pin_budget_bytes=256 << 20
+    ):
         self.max_bytes = max(int(max_bytes), 0)
         self.pinned = bool(pinned)
         self.asynchronous = bool(asynchronous and pinned)
+        self.pin_budget_bytes = min(max(int(pin_budget_bytes), 0), self.max_bytes)
+        self.pin_failed = False
         self.entries = {}
 
     @torch.no_grad()
@@ -287,24 +291,40 @@ class ModelHostBufferPool:
             if name in tensors and entry[0] == _signature(tensors[name])
         }
         retained = sum(entry[2] for entry in self.entries.values())
+        pinned_retained = sum(
+            entry[2]
+            for entry in self.entries.values()
+            if (
+                entry[1].to_local() if isinstance(entry[1], DTensor) else entry[1]
+            ).is_pinned()
+        )
         staged = {}
         for name, tensor in tensors.items():
             local = tensor.to_local() if isinstance(tensor, DTensor) else tensor
             size = local.numel() * local.element_size()
             entry = self.entries.get(name)
             if entry is None:
-                pin = self.pinned and local.device.type == "cuda"
+                pin = (
+                    self.pinned
+                    and not self.pin_failed
+                    and local.device.type == "cuda"
+                    and retained + size <= self.max_bytes
+                    and pinned_retained + size <= self.pin_budget_bytes
+                )
                 try:
                     host = torch.empty_like(tensor, device="cpu", pin_memory=pin)
                 except RuntimeError:
                     if not pin:
                         raise
+                    self.pin_failed = True
                     stats["pin_fallbacks"] += 1
                     host = torch.empty_like(tensor, device="cpu")
                 stats["allocated_bytes"] += size
                 if retained + size <= self.max_bytes:
                     self.entries[name] = (_signature(tensor), host, size)
                     retained += size
+                    if pin and not self.pin_failed:
+                        pinned_retained += size
                 else:
                     stats["uncached_bytes"] += size
             else:
@@ -314,6 +334,7 @@ class ModelHostBufferPool:
         stats["allocate_s"] = time.perf_counter() - allocate_started
         enqueue_started = time.perf_counter()
         async_devices = set()
+        stats["batched_copy_tensors"] = 0
         for tensor in tensors.values():
             host = staged[id(tensor)]
             local = host.to_local() if isinstance(host, DTensor) else host
@@ -322,9 +343,14 @@ class ModelHostBufferPool:
             stats["copied_bytes"] += local.numel() * local.element_size()
             if pin:
                 stats["pinned_bytes"] += local.numel() * local.element_size()
-            asynchronous = self.asynchronous and pin and source.device.type == "cuda"
+            # Pageable CUDA copies also support non-blocking submission. Keep
+            # every source and destination alive and join the stream once before
+            # exposing host storage to FSDP, rather than synchronizing each copy.
+            # No additional staging buffers or pinned-memory budget is required.
+            asynchronous = source.device.type == "cuda" and device_module is not None
             host.copy_(tensor.detach(), non_blocking=asynchronous)
             if asynchronous:
+                stats["batched_copy_tensors"] += 1
                 async_devices.add(source.device)
         stats["copy_enqueue_s"] = time.perf_counter() - enqueue_started
         wait_started = time.perf_counter()
@@ -344,6 +370,141 @@ class ModelHostBufferPool:
         stats.update(
             apply_s=time.perf_counter() - apply_started,
             pool_bytes=retained,
+            pool_pinned_bytes=pinned_retained,
+            pin_budget_bytes=self.pin_budget_bytes,
+            pin_disabled_after_failure=int(self.pin_failed),
+            elapsed_s=time.perf_counter() - started,
+            fallback_reason="none",
+        )
+        return True, stats
+
+
+class OptimizerHostBufferPool:
+    """Reuse exact CPU optimizer tensors; rebind only after all copies complete.
+
+    The caller shares its existing CPU-pool budget with model shards. No CUDA
+    allocation is retained, and optimizer.state_dict() does not include this
+    cache. Unsupported layouts/budgets decline before any state is modified.
+    """
+
+    def __init__(self):
+        self.entries = {}
+        self.pin_failed = False
+
+    @torch.no_grad()
+    def offload(self, optimizer, *, max_bytes, device_module):
+        started = time.perf_counter()
+        stats = {
+            "allocated_bytes": 0,
+            "reused_bytes": 0,
+            "copied_bytes": 0,
+            "pinned_bytes": 0,
+            "pin_fallbacks": 0,
+        }
+        tensors = []
+        for parameter, state in optimizer.state.items():
+            if not isinstance(state, dict):
+                continue
+            for key, value in state.items():
+                if not torch.is_tensor(value):
+                    continue
+                local = value.to_local() if isinstance(value, DTensor) else value
+                if local.device.type == "cpu":
+                    continue
+                if (
+                    type(value) not in (torch.Tensor, DTensor)
+                    or local.device.type != "cuda"
+                    or value.requires_grad
+                    or value.layout != torch.strided
+                    or not local.is_contiguous()
+                ):
+                    self.entries.clear()
+                    return False, {
+                        **stats,
+                        "fallback_reason": "unsupported_state_tensor",
+                    }
+                tensors.append(
+                    (
+                        (id(parameter), key),
+                        state,
+                        key,
+                        value,
+                        local.numel() * local.element_size(),
+                    )
+                )
+        if not tensors:
+            self.entries.clear()
+            return False, {**stats, "fallback_reason": "no_accelerator_state"}
+        total_bytes = sum(entry[4] for entry in tensors)
+        if total_bytes > max(int(max_bytes), 0):
+            self.entries.clear()
+            return False, {
+                **stats,
+                "fallback_reason": "shared_pool_budget",
+                "required_bytes": total_bytes,
+            }
+        signatures = {entry[0]: _signature(entry[3]) for entry in tensors}
+        self.entries = {
+            key: cached
+            for key, cached in self.entries.items()
+            if key in signatures and cached[0] == signatures[key]
+        }
+        allocate_started = time.perf_counter()
+        staged = {}
+        try:
+            for cache_key, state, key, value, size in tensors:
+                signature = signatures[cache_key]
+                cached = self.entries.get(cache_key)
+                if cached is not None and cached[0] == signature:
+                    host = cached[1]
+                    stats["reused_bytes"] += size
+                else:
+                    try:
+                        host = torch.empty_like(
+                            value, device="cpu", pin_memory=not self.pin_failed
+                        )
+                    except RuntimeError:
+                        if self.pin_failed:
+                            raise
+                        self.pin_failed = True
+                        stats["pin_fallbacks"] += 1
+                        host = torch.empty_like(value, device="cpu")
+                    stats["allocated_bytes"] += size
+                staged[cache_key] = (signature, host, size)
+        except RuntimeError:
+            # Nothing has been copied/rebound. Drop scratch and let the original
+            # incremental offloader handle unsupported allocation behavior.
+            staged.clear()
+            self.entries.clear()
+            return False, {**stats, "fallback_reason": "host_allocation_failed"}
+        stats["allocate_s"] = time.perf_counter() - allocate_started
+        copied_devices = set()
+        enqueue_started = time.perf_counter()
+        try:
+            for cache_key, state, key, value, size in tensors:
+                host = staged[cache_key][1]
+                local = value.to_local() if isinstance(value, DTensor) else value
+                host_local = host.to_local() if isinstance(host, DTensor) else host
+                # Record before enqueue so partially submitted copies are joined
+                # even if a later copy raises.
+                copied_devices.add(local.device)
+                host.copy_(value.detach(), non_blocking=True)
+                stats["copied_bytes"] += size
+                if host_local.is_pinned():
+                    stats["pinned_bytes"] += size
+        finally:
+            stats["copy_enqueue_s"] = time.perf_counter() - enqueue_started
+            wait_started = time.perf_counter()
+            for device in copied_devices:
+                device_module.current_stream(device).synchronize()
+            stats["copy_wait_s"] = time.perf_counter() - wait_started
+        for cache_key, state, key, value, size in tensors:
+            state[key] = staged[cache_key][1]
+        self.entries = staged
+        stats.update(
+            pool_bytes=total_bytes,
+            pool_budget_bytes=max(int(max_bytes), 0),
+            pin_disabled_after_failure=int(self.pin_failed),
             elapsed_s=time.perf_counter() - started,
             fallback_reason="none",
         )

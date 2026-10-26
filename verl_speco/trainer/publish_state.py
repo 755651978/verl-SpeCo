@@ -37,6 +37,7 @@ def export_fsdp2_publish_state(
     patterns: str | Sequence[str] | None,
     dtype: torch.dtype | None,
     cast_before_copy: bool = False,
+    diagnostics: dict | None = None,
 ) -> dict[str, torch.Tensor] | None:
     """Return leader-owned CPU snapshots, or None for unsupported layouts.
 
@@ -86,13 +87,17 @@ def export_fsdp2_publish_state(
     source_bytes = 0
     cast_s = 0.0
     host_copy_s = 0.0
+    gather_s = 0.0
+    async_devices = set()
     for name in sorted(selected):
+        gather_started = time.perf_counter()
         tensor = selected[name].detach()
         if isinstance(tensor, DTensor):
             mesh_device = torch.device(tensor.device_mesh.device_type)
             if tensor.to_local().device.type != mesh_device.type:
                 tensor = tensor.to(device=mesh_device)
             tensor = tensor.full_tensor()
+        gather_s += time.perf_counter() - gather_started
         if leader:
             source_bytes += tensor.numel() * tensor.element_size()
             cast_started = time.perf_counter()
@@ -101,12 +106,41 @@ def export_fsdp2_publish_state(
             cast_s += time.perf_counter() - cast_started
             # copy=True also isolates replicated CPU buffers from later updates.
             copy_started = time.perf_counter()
+            target_dtype = dtype or tensor.dtype
+            batched = (
+                cast_before_copy
+                and tensor.device.type == "cuda"
+                and tensor.dtype == target_dtype
+                and tensor.is_contiguous()
+            )
+            if batched:
+                async_devices.add(tensor.device)
             value = tensor.to(
-                device="cpu", dtype=dtype or tensor.dtype, copy=True
+                device="cpu", dtype=target_dtype, copy=True, non_blocking=batched
             ).contiguous()
             result[name] = value
             copied_bytes += value.numel() * value.element_size()
             host_copy_s += time.perf_counter() - copy_started
+    # The CPU snapshot must be complete before serialization or later training.
+    wait_started = time.perf_counter()
+    for device in async_devices:
+        torch.cuda.current_stream(device).synchronize()
+    wait_s = time.perf_counter() - wait_started
+    stats = {
+        "entries": len(result),
+        "source_bytes": source_bytes,
+        "payload_bytes": copied_bytes,
+        "skipped_bytes": skipped_bytes,
+        "gather_submit_s": gather_s,
+        "cast_submit_s": cast_s,
+        "host_copy_submit_s": host_copy_s,
+        "copy_wait_s": wait_s,
+        "batched_copy": int(bool(async_devices)),
+        "snapshot_independent": 1,
+        "elapsed_s": time.perf_counter() - started,
+    }
+    if diagnostics is not None:
+        diagnostics.update(stats)
     logger.warning(
         "[drafter publish] selective_fsdp2 rank=%s entries=%s copied_bytes=%s skipped_bytes=%s elapsed_s=%.4f",
         dist.get_rank(),
@@ -118,11 +152,12 @@ def export_fsdp2_publish_state(
     if leader:
         logger.warning(
             "[drafter publish transfer] cast_before_copy=%s source_bytes=%s payload_bytes=%s "
-            "cast_submit_s=%.4f host_copy_s=%.4f snapshot_independent=1",
+            "cast_submit_s=%.4f host_copy_s=%.4f snapshot_independent=1 details=%s",
             cast_before_copy,
             source_bytes,
             copied_bytes,
             cast_s,
             host_copy_s,
+            stats,
         )
     return result

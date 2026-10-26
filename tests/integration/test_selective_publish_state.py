@@ -122,6 +122,7 @@ def _distributed_check(rank, rendezvous, backend):
         mesh = dist.device_mesh.init_device_mesh(device_type, (2,))
         model = _model(mesh)
         trainer = _trainer_type()()
+        trainer._record_gpu_transfer = lambda scope, stats: None
         trainer.rank = rank
         trainer.clear_pending_publish_state_dict()
         trainer.model = model

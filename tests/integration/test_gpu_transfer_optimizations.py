@@ -711,3 +711,72 @@ def test_actor_config_resolution_prefers_explicit_disable_and_handles_bad_fallba
         None,
         "invalid_serialized_config",
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_pageable_batched_offload_finishes_before_return_and_reuses_storage(dtype):
+    model = torch.nn.Sequential(torch.nn.Linear(64, 64), torch.nn.Linear(64, 16)).to(
+        device="cuda", dtype=dtype
+    )
+    identities = {name: id(p) for name, p in model.named_parameters()}
+    pool = ModelHostBufferPool(1024 * 1024)
+    host_pointers = None
+    for iteration in range(3):
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(iteration + 1)
+        expected = {
+            name: p.detach().cpu().clone() for name, p in model.named_parameters()
+        }
+        used, stats = pool.offload(model, device_module=torch.cuda)
+        assert used and stats["batched_copy_tensors"] == len(expected)
+        assert stats["pinned_bytes"] == 0
+        assert {name: id(p) for name, p in model.named_parameters()} == identities
+        for name, p in model.named_parameters():
+            assert torch.equal(_bits(p), _bits(expected[name]))
+        pointers = {name: p.data_ptr() for name, p in model.named_parameters()}
+        if host_pointers is not None:
+            assert pointers == host_pointers
+            assert stats["allocated_bytes"] == 0
+        host_pointers = pointers
+        used, _ = load_model_from_host(
+            model, torch.device("cuda"), device_module=torch.cuda
+        )
+        assert used
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_pinned_pool_is_bounded_and_failure_is_not_retried(monkeypatch):
+    model = torch.nn.Sequential(torch.nn.Linear(16, 16), torch.nn.Linear(16, 16)).cuda()
+    pool = ModelHostBufferPool(1 << 20, pinned=True, pin_budget_bytes=1024)
+    used, stats = pool.offload(model, device_module=torch.cuda)
+    assert used and 0 < stats["pool_pinned_bytes"] <= 1024
+    assert stats["pool_pinned_bytes"] == stats["pinned_bytes"]
+    assert load_model_from_host(model, torch.device("cuda"), device_module=torch.cuda)[
+        0
+    ]
+    used, stats = pool.offload(model, device_module=torch.cuda)
+    assert used and stats["allocated_bytes"] == 0
+    assert stats["pool_pinned_bytes"] <= 1024
+
+    model = torch.nn.Linear(16, 16).cuda()
+    pool = ModelHostBufferPool(1 << 20, pinned=True)
+    original = torch.empty_like
+    attempts = []
+
+    def fail_pin(*args, **kwargs):
+        if kwargs.get("pin_memory", False):
+            attempts.append(1)
+            raise RuntimeError("injected pinned allocation failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty_like", fail_pin)
+    for _ in range(2):
+        used, stats = pool.offload(model, device_module=torch.cuda)
+        assert used and stats["pool_pinned_bytes"] == 0
+        assert stats["pin_disabled_after_failure"] == 1
+        assert load_model_from_host(
+            model, torch.device("cuda"), device_module=torch.cuda
+        )[0]
+    assert len(attempts) == 1

@@ -2907,6 +2907,12 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
         def __init__(self, value):
             self.value = value
 
+        def numel(self):
+            return 1
+
+        def element_size(self):
+            return 4
+
         def detach(self):
             raise AssertionError(
                 "streamed draft updates must not detach bucket tensors"
@@ -3010,6 +3016,8 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(
     assert inner_model.loaded == [[("fc.weight", "first")], second_bucket]
     skip_logged = "does not register 1 inference-only drafter param" in caplog.text
     assert skip_logged is not registers_confidence_head
+    assert f"payload_bytes={(len(second_bucket) + 1) * 4}" in caplog.text
+    assert "receive_s=" in caplog.text and "callback_submit_s=" in caplog.text
     assert inner_model.rebuilds == 1
     assert extension._speco_draft_runtime_revision == 1
     assert cache_events == ["rebuild", "synchronize", "empty_cache"]

@@ -15,10 +15,12 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import json
 import os
 import time
+import threading
 from contextlib import contextmanager
 from typing import Any, Optional, cast
 
@@ -336,7 +338,54 @@ def _release_publish_host_memory() -> dict[str, Any]:
     }
 
 
-def release_draft_weights_payload(weights: Any) -> dict[str, Any]:
+_publish_reclaim_policy = None
+_publish_reclaim_lock = threading.Lock()
+
+
+def _release_publish_host_memory_on_demand(released_bytes):
+    from verl_speco.integration.publish_reclaim import (
+        PublishReclaimPolicy,
+        cgroup_memory_pressure,
+    )
+    from verl_speco.trainer.checkpoint import (
+        collect_checkpoint_memory_snapshot,
+        format_checkpoint_memory_snapshot,
+    )
+
+    global _publish_reclaim_policy
+    with _publish_reclaim_lock:
+        if _publish_reclaim_policy is None:
+            _publish_reclaim_policy = PublishReclaimPolicy()
+            atexit.register(_release_publish_host_memory)
+        started = time.perf_counter()
+        snapshot = collect_checkpoint_memory_snapshot()
+        reason = _publish_reclaim_policy.decide(
+            released_bytes, snapshot, cgroup_pressure=cgroup_memory_pressure()
+        )
+        details = {
+            "reclaim_reason": reason,
+            "released_bytes": released_bytes,
+            "since_reclaim_bytes": _publish_reclaim_policy.pending_bytes,
+            "release_count": _publish_reclaim_policy.releases,
+        }
+        if reason == "deferred":
+            memory = format_checkpoint_memory_snapshot(snapshot)
+            return {
+                **details,
+                "reclaim_action": "deferred",
+                "heap_trimmed": False,
+                "memory_before": memory,
+                "memory_after": memory,
+                "elapsed_sec": time.perf_counter() - started,
+            }
+        result = _release_publish_host_memory()
+        _publish_reclaim_policy.reset()
+        return {**result, **details}
+
+
+def release_draft_weights_payload(
+    weights: Any, *, defer_host_reclaim: bool = False, released_bytes: int = 0
+) -> dict[str, Any]:
     """Drop a consumed publish payload before reclaiming allocator pages."""
 
     try:
@@ -353,7 +402,11 @@ def release_draft_weights_payload(weights: Any) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to clear drafter publish payload: %s", exc)
 
-    reclaim = _release_publish_host_memory()
+    reclaim = (
+        _release_publish_host_memory_on_demand(released_bytes)
+        if defer_host_reclaim and payload_cleared
+        else _release_publish_host_memory()
+    )
     return {
         "num_weights": int(num_weights),
         "payload_cleared": int(payload_cleared),
@@ -1422,9 +1475,16 @@ class DraftWeightPublishMixin:
         from verl_speco.integration.phase_timing import (
             install_engine_phase_timing,
             install_ref_worker_phase_timing,
+            phase_timing_enabled,
         )
 
-        if _worker_bubble_enabled(self):
+        sync_cuda_diagnostics = False
+        if phase_timing_enabled():
+            import torch
+
+            sync_cuda_diagnostics = torch.cuda.is_available()
+        if _worker_bubble_enabled(self) or sync_cuda_diagnostics:
+            # Helpers remain no-ops unless VERL_SPECO_PHASE_TIMING is enabled.
             install_ref_worker_phase_timing(self)
             for role in ("actor", "ref"):
                 engine = getattr(getattr(self, role, None), "engine", None)
