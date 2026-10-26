@@ -192,7 +192,8 @@ def test_v1_metrics_report_speco_mean_acceptance_length(monkeypatch):
             metrics["upstream/metrics"] = 1
 
     class Harness(SpecoV1Mixin, Upstream):
-        pass
+        # Isolate metrics from the legacy Ray facade in CPU-only tests.
+        _speco_freeze_policy = None
 
     batch = types.SimpleNamespace(
         keys=["a", "b", "padding"],

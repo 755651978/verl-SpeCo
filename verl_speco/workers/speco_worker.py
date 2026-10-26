@@ -118,7 +118,9 @@ async def _resolve_ray_object_ref(value):
     return value
 
 
-async def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
+async def _resolve_feature_chunks(
+    chunks, expected_rows: int | None = None, *, resolved_cache=None, profile=None
+):
     if not chunks:
         return None, None
     unique_refs: dict[Any, Any] = {}
@@ -127,11 +129,53 @@ async def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
             continue
         ref = chunk.get("ref")
         if ref is not None:
-            unique_refs.setdefault(id(ref), ref)
+            cache_key = ref if _is_ray_object_ref(ref) else id(ref)
+            unique_refs.setdefault(cache_key, ref)
+    # Scope this cache to one awaited commit. Keep owning refs alongside decoded
+    # views, preventing identity reuse and keeping object-store storage alive.
+    if resolved_cache is None:
+        resolved_cache = {}
+    missing = {
+        key: ref for key, ref in unique_refs.items() if key not in resolved_cache
+    }
+    resolve_started = time.perf_counter()
     resolved_values = await asyncio.gather(
-        *(_resolve_ray_object_ref(ref) for ref in unique_refs.values())
+        *(_resolve_ray_object_ref(ref) for ref in missing.values())
     )
-    resolved_cache = dict(zip(unique_refs, resolved_values, strict=True))
+    resolve_s = time.perf_counter() - resolve_started
+    decode_started = time.perf_counter()
+    from verl_speco.integration.tensor_wire import decode_cpu_tensors
+
+    for (key, ref), value in zip(missing.items(), resolved_values, strict=True):
+        decoded = decode_cpu_tensors(value)
+        if profile is not None:
+            kind = "numpy_chunks" if decoded is not value else "legacy_chunks"
+            profile[kind] = profile.get(kind, 0) + 1
+        if isinstance(decoded, dict) and "hidden" in decoded:
+            if set(decoded) not in ({"hidden"}, {"hidden", "target_logz"}):
+                raise ValueError("Invalid collection hidden wire keys")
+            decoded = {
+                "hidden_states": decoded["hidden"],
+                **(
+                    {"target_logz": decoded["target_logz"]}
+                    if "target_logz" in decoded
+                    else {}
+                ),
+            }
+        resolved_cache[key] = (ref, decoded)
+        if profile is not None:
+            values = decoded.values() if isinstance(decoded, dict) else (decoded,)
+            profile["resolved_bytes"] = profile.get("resolved_bytes", 0) + sum(
+                value.numel() * value.element_size()
+                for value in values
+                if torch.is_tensor(value)
+            )
+    if profile is not None:
+        profile["resolve_s"] += resolve_s
+        profile["decode_s"] += time.perf_counter() - decode_started
+        profile["unique_chunk_resolves"] += len(missing)
+        profile["chunk_cache_hits"] += len(unique_refs) - len(missing)
+    reconstruct_started = time.perf_counter()
     pieces = []
     full_rows = int(expected_rows or 0)
     hidden_size = None
@@ -142,8 +186,8 @@ async def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
         ref = chunk.get("ref")
         if ref is None:
             continue
-        cache_key = id(ref)
-        payload = resolved_cache[cache_key]
+        cache_key = ref if _is_ray_object_ref(ref) else id(ref)
+        payload = resolved_cache[cache_key][1]
         target_logz_tensor = (
             payload.get("target_logz") if isinstance(payload, dict) else None
         )
@@ -187,7 +231,6 @@ async def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
         dtype = part.dtype
     if not pieces or hidden_size is None:
         return None, None
-    output = torch.zeros((full_rows, hidden_size), dtype=dtype)
     has_target_logz = all(target_part is not None for _, _, target_part in pieces)
     if not has_target_logz and any(part is not None for _, _, part in pieces):
         missing_chunks = [
@@ -198,6 +241,28 @@ async def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
         raise ValueError(
             f"SPECO target_logz is missing from some feature chunks: {missing_chunks}"
         )
+    # Keep an independent writable snapshot for a complete contiguous window.
+    if (
+        len(pieces) == 1
+        and pieces[0][1].shape[0] == full_rows
+        and pieces[0][1].device.type == "cpu"
+        and (pieces[0][2] is None or pieces[0][2].numel() == full_rows)
+        and torch.equal(pieces[0][0], torch.arange(full_rows, dtype=torch.long))
+    ):
+        output = pieces[0][1].clone(memory_format=torch.contiguous_format)
+        target_part = pieces[0][2]
+        target_logz_output = (
+            target_part.reshape(-1).to(device="cpu", dtype=torch.float32, copy=True)
+            if target_part is not None
+            else None
+        )
+        if profile is not None:
+            profile["full_window_clones"] = profile.get("full_window_clones", 0) + 1
+            profile["reconstruct_s"] += time.perf_counter() - reconstruct_started
+        return output.unsqueeze(0), (
+            target_logz_output.unsqueeze(0) if target_logz_output is not None else None
+        )
+    output = torch.zeros((full_rows, hidden_size), dtype=dtype)
     target_logz_output = (
         torch.zeros((full_rows,), dtype=torch.float32) if has_target_logz else None
     )
@@ -207,14 +272,23 @@ async def _resolve_feature_chunks(chunks, expected_rows: int | None = None):
             target_logz_output[row_indices] = target_part.reshape(-1).to(
                 device=target_logz_output.device, dtype=torch.float32
             )
+    if profile is not None:
+        profile["reconstruct_s"] += time.perf_counter() - reconstruct_started
     return (
         output.unsqueeze(0),
         target_logz_output.unsqueeze(0) if target_logz_output is not None else None,
     )
 
 
-async def _resolve_hidden_state_chunks(chunks, expected_rows: int | None = None):
-    hidden, _ = await _resolve_feature_chunks(chunks, expected_rows=expected_rows)
+async def _resolve_hidden_state_chunks(
+    chunks, expected_rows: int | None = None, *, resolved_cache=None, profile=None
+):
+    hidden, _ = await _resolve_feature_chunks(
+        chunks,
+        expected_rows=expected_rows,
+        resolved_cache=resolved_cache,
+        profile=profile,
+    )
     return hidden
 
 
@@ -1311,6 +1385,21 @@ class SpecoWorker(Worker):
         )
         if not samples:
             return result
+        commit_started = time.perf_counter()
+        resolved_chunks: dict[Any, tuple[Any, Any]] = {}
+        profile: dict[str, float | int] = dict.fromkeys(
+            (
+                "resolve_s",
+                "decode_s",
+                "reconstruct_s",
+                "store_s",
+                "target_resolve_s",
+                "direct_hidden_resolve_s",
+                "unique_chunk_resolves",
+                "chunk_cache_hits",
+            ),
+            0,
+        )
         for sample in samples:
             if not sample:
                 result["rejected_samples"] += 1
@@ -1363,9 +1452,13 @@ class SpecoWorker(Worker):
                         hidden_positions = cast(torch.Tensor, hidden_positions)
                         expected_rows = int(hidden_positions.numel())
                     hidden, target_logz = await _resolve_feature_chunks(
-                        hidden_chunks, expected_rows=expected_rows
+                        hidden_chunks,
+                        expected_rows=expected_rows,
+                        resolved_cache=resolved_chunks,
+                        profile=profile,
                     )
                 else:
+                    direct_resolve_started = time.perf_counter()
                     resolved = await _resolve_ray_object_ref(
                         sample.get("hidden_states_ref")
                     )
@@ -1374,14 +1467,20 @@ class SpecoWorker(Worker):
                         target_logz = resolved.get("target_logz")
                     else:
                         hidden = resolved
+                    profile["direct_hidden_resolve_s"] += (
+                        time.perf_counter() - direct_resolve_started
+                    )
+            target_resolve_started = time.perf_counter()
             target_logprobs = sample.get("target_logprobs")
             if target_logprobs is None:
                 target_logprobs = await _resolve_ray_object_ref(
                     sample.get("target_logprobs_ref")
                 )
+            profile["target_resolve_s"] += time.perf_counter() - target_resolve_started
             if hidden is None:
                 result["rejected_samples"] += 1
                 continue
+            store_started = time.perf_counter()
             stored = self._store_rollout_sample(
                 batch=batch,
                 hidden_states=hidden,
@@ -1389,10 +1488,38 @@ class SpecoWorker(Worker):
                 collection_id=collection_id,
                 target_logz=target_logz,
             )
+            profile["store_s"] += time.perf_counter() - store_started
             if stored:
                 result["accepted_samples"] += 1
             else:
                 result["rejected_samples"] += 1
+        profile["commit_s"] = time.perf_counter() - commit_started
+        profile["other_s"] = max(
+            profile["commit_s"]
+            - sum(
+                profile[key]
+                for key in (
+                    "resolve_s",
+                    "decode_s",
+                    "reconstruct_s",
+                    "store_s",
+                    "target_resolve_s",
+                    "direct_hidden_resolve_s",
+                )
+            ),
+            0.0,
+        )
+        logger.warning(
+            "[SpecoCollectionReceive] collection_id=%s replica=%s samples=%s "
+            "accepted=%s rejected=%s stages=%s timing_mode=host_wall_no_device_sync",
+            collection_id,
+            getattr(self, "replica_rank", None),
+            len(samples),
+            result["accepted_samples"],
+            result["rejected_samples"],
+            profile,
+        )
+        result["collection_profile"] = profile
         result["buffer_version_after"] = int(
             self.trainer.buffer_version if self.trainer is not None else 0
         )
@@ -1572,6 +1699,25 @@ class SpecoWorker(Worker):
             )
 
             payload = resolve_target_head_reference(payload, global_step)
+        if "head_wire" in payload:
+            from verl_speco.integration.tensor_wire import (
+                decode_cpu_tensors,
+                tensor_payload_bytes,
+            )
+
+            resolve_started = time.perf_counter()
+            decoded = decode_cpu_tensors(payload["head_wire"])
+            if set(decoded) != {"weight"}:
+                raise ValueError("Invalid target head wire names")
+            payload = {**payload, "weight": decoded["weight"]}
+            logger.warning(
+                "[drafter head wire] action=decode rank=%s version=%s bytes=%s elapsed_s=%.4f",
+                self.rank,
+                global_step,
+                tensor_payload_bytes(decoded),
+                time.perf_counter() - resolve_started,
+            )
+
         weight = payload.get("weight")
         row_indices = payload.get("row_indices")
         source_vocab_size = payload.get("source_vocab_size")
@@ -2495,6 +2641,14 @@ class SpecoWorker(Worker):
                 "stop_reason": "",
             }
         )
+        result.update(
+            {
+                f"timing_s/drafter_activation_{stage}": elapsed
+                for stage, elapsed in getattr(
+                    self.trainer, "_last_activation_stage_timings", {}
+                ).items()
+            }
+        )
 
         with _preserve_process_rng_state(self.device_name):
             result["triggered"] = True
@@ -2714,10 +2868,23 @@ class SpecoWorker(Worker):
 
                     first_step_timings = (
                         dict(getattr(self.trainer, "_training_metric_sums", {}))
-                        if execution_strategy == "rollout_idle_worker"
+                        if (
+                            execution_strategy == "rollout_idle_worker"
+                            or (
+                                execution_strategy == "sync"
+                                and getattr(self, "device_name", "") == "cuda"
+                            )
+                        )
                         and batch_index == 0
                         else None
                     )
+                    compile_before = None
+                    if first_step_timings is not None and execution_strategy == "sync":
+                        from verl_speco.trainer.performance_diagnostics import (
+                            compilation_metadata,
+                        )
+
+                        compile_before = compilation_metadata()
                     try:
                         optimizer_step_started = time.perf_counter()
                         if execution_strategy == "sync":
@@ -2754,14 +2921,39 @@ class SpecoWorker(Worker):
                         }
                         result["first_optimizer_step_stage_sec"] = stage_times
                         logger.warning(
-                            "[BubbleTime] optimizer_first_step_breakdown: plan_id=%s "
+                            "%s optimizer_first_step_breakdown: plan_id=%s "
                             "rank=%s success=%s elapsed_s=%.4f stages_sec=%s "
                             "timing_mode=host_wall_no_device_sync",
+                            "[drafter]"
+                            if execution_strategy == "sync"
+                            else "[BubbleTime]",
                             plan_id,
                             self.rank,
                             step_ok,
                             first_step_elapsed,
                             stage_times,
+                        )
+                    if compile_before is not None:
+                        compile_after = compilation_metadata()
+                        counters = compile_before["counters"]
+                        delta = {
+                            key: value - counters.get(key, 0)
+                            for key, value in compile_after["counters"].items()
+                            if value != counters.get(key, 0)
+                        }
+                        logger.warning(
+                            "[drafter first step compile] rank=%s plan=%s success=%s elapsed_s=%.6f "
+                            "cache_env=%s counter_delta=%s timing_mode=host_wall_no_device_sync",
+                            self.rank,
+                            plan_id,
+                            step_ok,
+                            first_step_elapsed,
+                            {
+                                key: value
+                                for key, value in compile_after.items()
+                                if key != "counters"
+                            },
+                            delta,
                         )
                     training_error = getattr(self.trainer, "last_training_error", None)
                     if training_error is not None:
@@ -3011,6 +3203,15 @@ class SpecoWorker(Worker):
                         flush=True,
                     )
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
+                result.update(
+                    {
+                        f"timing_s/drafter_cleanup_{stage}": elapsed
+                        for stage, elapsed in getattr(
+                            self.trainer, "_last_cleanup_stage_timings", {}
+                        ).items()
+                    }
+                )
+                result.update(getattr(self.trainer, "_gpu_transfer_metrics", {}))
                 if coordinated_idle:
                     received_perf = getattr(
                         self, "_drafter_reclaim_received_perf", None
@@ -3199,13 +3400,16 @@ class SpecoWorker(Worker):
         }
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def maybe_publish_async(self, *, source_step: int):
+    def maybe_publish_async(self, *, source_step: int, sync_cpu_only: bool = False):
         # Cached CPU snapshot only: never enter a GPU export collective.
         if (
             not self.enable_drafter
             or not self.in_drafter_train_group
             or self.trainer is None
-            or not getattr(self.trainer, "_bubble_time_enabled", False)
+            or (
+                not getattr(self.trainer, "_bubble_time_enabled", False)
+                and not sync_cpu_only
+            )
             or self.last_global_step is None
             or int(self.last_global_step) != int(source_step)
         ):
@@ -3287,15 +3491,74 @@ class SpecoWorker(Worker):
             f"target_worker_ids={self._last_trained_target_worker_ids}",
             flush=True,
         )
+        defer_host_reclaim = False
+        wire = None
+        wire_bytes = None
         try:
-            weights_ref = ray.put(weights)
+            from verl_speco.integration.rollout_publish import _get_nested
+            from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+            numpy_transport = (
+                getattr(self, "device_name", "") == "cuda"
+                and self._last_trained_execution_strategy != "rollout_idle_worker"
+                and gpu_transfer_enabled(
+                    _get_nested(
+                        getattr(self, "config", None),
+                        ("rollout", "drafter", "training"),
+                        None,
+                    ),
+                    "gpu_publish_numpy_transport",
+                )
+            )
+            wire = None
+            wire_bytes = None
+            encode_started = time.perf_counter()
+            if numpy_transport:
+                from verl_speco.integration.tensor_wire import (
+                    encode_cpu_tensors,
+                    tensor_payload_bytes,
+                )
+
+                wire = encode_cpu_tensors(weights)
+                if wire is not None:
+                    wire_bytes = tensor_payload_bytes(weights)
+            encode_s = time.perf_counter() - encode_started
+            put_started = time.perf_counter()
+            weights_ref = ray.put(wire if wire is not None else weights)
+            defer_host_reclaim = wire is not None and not getattr(
+                self.trainer, "_bubble_time_enabled", False
+            )
+            logger.warning(
+                "[drafter publish wire] step=%s encoding=%s entries=%s payload_bytes=%s encode_s=%.4f put_s=%.4f fallback_reason=%s",
+                self.last_global_step,
+                "numpy_bytes_v1" if wire is not None else "torch",
+                len(weights),
+                wire_bytes,
+                encode_s,
+                time.perf_counter() - put_started,
+                "none"
+                if wire is not None
+                else (
+                    "unsupported_tensor_layout"
+                    if numpy_transport
+                    else "disabled_or_non_cuda"
+                ),
+            )
         finally:
-            reclaim = release_draft_weights_payload(weights)
+            # ray.put has finished serializing before its independent ObjectRef
+            # can escape. Drop NumPy views before releasing the snapshot storage.
+            wire = None
+            if defer_host_reclaim:
+                reclaim = release_draft_weights_payload(
+                    weights, defer_host_reclaim=True, released_bytes=wire_bytes or 0
+                )
+            else:
+                reclaim = release_draft_weights_payload(weights)
             logger.warning(
                 "[speco publish reclaim] role=producer global_steps=%s "
                 "num_weights=%s payload_cleared=%s allocator=%s action=%s "
                 "heap_trimmed=%s elapsed_sec=%.3f memory_before=(%s) "
-                "memory_after=(%s)",
+                "memory_after=(%s) policy=%s",
                 self.last_global_step,
                 reclaim["num_weights"],
                 reclaim["payload_cleared"],
@@ -3305,6 +3568,15 @@ class SpecoWorker(Worker):
                 float(reclaim.get("elapsed_sec", 0.0) or 0.0),
                 reclaim.get("memory_before"),
                 reclaim.get("memory_after"),
+                {
+                    key: reclaim.get(key)
+                    for key in (
+                        "reclaim_reason",
+                        "released_bytes",
+                        "since_reclaim_bytes",
+                        "release_count",
+                    )
+                },
             )
 
         return {"weights_ref": weights_ref}

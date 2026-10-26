@@ -628,6 +628,22 @@ class DrafterBaseTrainer:
         self.skip_heavy_cleanup_after_drafter_training = bool(
             training_cfg.get("skip_heavy_cleanup_after_drafter_training", False)
         )
+        from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+        self._gpu_head_host_reuse = (
+            not self._bubble_time_enabled
+            and gpu_transfer_enabled(training_cfg, "gpu_head_host_reuse")
+        )
+        self._gpu_optimizer_host_reuse = (
+            not self._bubble_time_enabled and gpu_transfer_enabled(training_cfg)
+        )
+        self._gpu_model_offload_reuse = (
+            not self._bubble_time_enabled
+            and gpu_transfer_enabled(training_cfg, "gpu_model_offload_reuse")
+        )
+        self._gpu_offload_pool_max_bytes = int(
+            float(training_cfg.get("gpu_offload_pool_max_gib", 8)) * 1024**3
+        )
         self.park_hccl_after_drafter_training = bool(
             training_cfg.get("park_hccl_after_drafter_training", False)
         )
@@ -855,30 +871,103 @@ class DrafterBaseTrainer:
                 self.optimizer, "_speco_first_blocking_optimizer_offload_done", False
             )
         )
-        if not first_offload and not self._use_blocking_npu_optimizer_offload():
-            offload_fsdp_optimizer(self.optimizer)
-            return
-
-        # Complete FSDP2's first accelerator-state transfer before activation
-        # cleanup; later calls retain verl's asynchronous path. Keep VeOmni's
-        # existing NPU safety policy blocking on every call.
-        offloaded = False
-        for state in self.optimizer.state.values():
-            if not isinstance(state, dict):
-                continue
-            for key, value in state.items():
-                local_value = (
-                    self._tensor_local_shard(value) if torch.is_tensor(value) else None
-                )
-                if local_value is not None and local_value.device.type != "cpu":
-                    state[key] = value.to("cpu", non_blocking=False)
-                    offloaded = True
-        # Empty/CPU-only initialization and failed copies must not consume the
-        # first-offload marker. A replacement optimizer gets its own lifecycle.
-        if first_offload and offloaded:
-            setattr(
-                self.optimizer, "_speco_first_blocking_optimizer_offload_done", True
+        diagnostic = (
+            device_name == "cuda"
+            and not self.__dict__.get("_bubble_time_enabled", False)
+            and logger.isEnabledFor(logging.DEBUG)
+        )
+        before = None
+        if diagnostic:
+            from verl_speco.trainer.performance_diagnostics import (
+                optimizer_state_metadata,
             )
+
+            before = optimizer_state_metadata(self.optimizer)
+        started = time.perf_counter()
+        try:
+            if (
+                device_name == "cuda"
+                and self._drafter_strategy() == "fsdp2"
+                and not self.__dict__.get("_bubble_time_enabled", False)
+                and self.__dict__.get("_gpu_optimizer_host_reuse", False)
+            ):
+                from verl_speco.trainer.gpu_transfer import OptimizerHostBufferPool
+
+                model_pool = self.__dict__.get("_gpu_model_host_pool")
+                model_bytes = (
+                    sum(entry[2] for entry in model_pool.entries.values())
+                    if model_pool is not None
+                    else 0
+                )
+                budget = max(self._gpu_offload_pool_max_bytes - model_bytes, 0)
+                pool = getattr(self.optimizer, "_speco_host_buffer_pool", None)
+                if pool is None:
+                    pool = OptimizerHostBufferPool()
+                    self.optimizer._speco_host_buffer_pool = pool
+                try:
+                    used, stats = pool.offload(
+                        self.optimizer,
+                        max_bytes=budget,
+                        device_module=self.device_module,
+                    )
+                except Exception:
+                    # A copy/wait failure must never fall through to a second
+                    # offload or allow cleanup to report a safe boundary.
+                    self.optimizer._speco_host_transition_failed = True
+                    raise
+                self._record_gpu_transfer(
+                    "optimizer_offload",
+                    {
+                        "used_pool": int(used),
+                        "first_blocking": int(first_offload),
+                        "model_pool_bytes": model_bytes,
+                        **stats,
+                    },
+                )
+                if used:
+                    # The pool has completed every copy before exposing CPU
+                    # state, preserving PR130's first-success completion fence.
+                    if first_offload:
+                        self.optimizer._speco_first_blocking_optimizer_offload_done = (
+                            True
+                        )
+                    return
+            if not first_offload and not self._use_blocking_npu_optimizer_offload():
+                offload_fsdp_optimizer(self.optimizer)
+                return
+
+            # Complete FSDP2's first accelerator-state transfer before activation
+            # cleanup; later calls retain verl's asynchronous path. Keep VeOmni's
+            # existing NPU safety policy blocking on every call.
+            offloaded = False
+            for state in self.optimizer.state.values():
+                if not isinstance(state, dict):
+                    continue
+                for key, value in state.items():
+                    local_value = (
+                        self._tensor_local_shard(value)
+                        if torch.is_tensor(value)
+                        else None
+                    )
+                    if local_value is not None and local_value.device.type != "cpu":
+                        state[key] = value.to("cpu", non_blocking=False)
+                        offloaded = True
+            # Empty/CPU-only initialization and failed copies must not consume the
+            # first-offload marker. A replacement optimizer gets its own lifecycle.
+            if first_offload and offloaded:
+                self.optimizer._speco_first_blocking_optimizer_offload_done = True
+        finally:
+            if before is not None:
+                logger.debug(
+                    "[drafter optimizer transfer] action=offload rank=%s step=%s first_blocking=%s "
+                    "elapsed_s=%.6f before=%s after=%s timing_mode=host_wall_no_device_sync",
+                    getattr(self, "rank", None),
+                    getattr(self, "current_rl_step", None),
+                    first_offload,
+                    time.perf_counter() - started,
+                    before,
+                    optimizer_state_metadata(self.optimizer),
+                )
 
     def _drafter_strategy(self) -> str:
         """Drafter parallelism strategy (see :func:`resolve_drafter_strategy`)."""
@@ -2655,18 +2744,70 @@ class DrafterBaseTrainer:
             self._pending_full_checkpoint_future = None
         return {"waited": True, "completed": True, "reason": "completed"}
 
+    @contextmanager
+    def _residency_stage(self, phase: str, stage: str):
+        """Measure host wall time without adding device or distributed fences.
+
+        Transfers may be asynchronous: their queued work can be charged to a
+        later existing synchronization. These are diagnostic spans, not isolated
+        device transfer durations, and must not change exception handling.
+        """
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            timings = getattr(self, f"_last_{phase}_stage_timings")
+            timings[stage] = timings.get(stage, 0.0) + time.perf_counter() - started
+
+    def _record_gpu_transfer(self, scope, stats):
+        metrics = getattr(self, "_gpu_transfer_metrics", None)
+        if metrics is None:
+            metrics = self._gpu_transfer_metrics = {}
+        for key, value in stats.items():
+            if isinstance(value, (int, float)):
+                name = (
+                    f"timing_s/drafter_gpu_{scope}_{key[:-2]}"
+                    if key.endswith("_s")
+                    else f"drafter/gpu_{scope}_{key}"
+                )
+                metrics[name] = value
+        # Numeric step metrics above remain available without duplicating their
+        # successful payloads in every rank's warning log. Keep fallbacks visible.
+        fallback = stats.get("fallback_reason") not in (None, "none")
+        level = logging.WARNING if fallback else logging.DEBUG
+        if logger.isEnabledFor(level):
+            logger.log(
+                level,
+                "[drafter gpu transfer] rank=%s step=%s scope=%s details=%s",
+                self.rank,
+                getattr(self, "current_rl_step", None),
+                scope,
+                json.dumps(stats, sort_keys=True),
+            )
+
     async def activate_training_model(self) -> bool:
         # 将模型和优化器状态从CPU加载到GPU，激活草稿模型进入训练状态
         start_ts = time.time()
         self.last_activation_error = None
-        activation_stage = "enter"
         self._last_activation_stage_timings: dict[str, float] = {}
+        self._gpu_transfer_metrics = {}
+        activation_stage = "enter"
 
         def timed(stage, operation):
             started = time.perf_counter()
             try:
                 return operation()
             finally:
+                if getattr(self, "_bubble_time_enabled", False):
+                    stage = {
+                        "apply_active_head": "head_apply",
+                        "apply_host_head": "host_head_apply",
+                        "build_model": "model_build",
+                        "load_model": "model_restore",
+                        "load_optimizer": "optimizer_restore",
+                        "load_target_head": "head_move",
+                        "apply_device_head": "head_apply",
+                    }.get(stage, stage)
                 self._last_activation_stage_timings[stage] = (
                     time.perf_counter() - started
                 )
@@ -2680,7 +2821,7 @@ class DrafterBaseTrainer:
             )
 
             if self._training_active and self.model is not None:
-                timed("head_apply", self._apply_pending_target_lm_head_weight)
+                timed("apply_active_head", self._apply_pending_target_lm_head_weight)
                 logger.debug(
                     f"[DrafterTrainer rank {getattr(self, 'rank', -1)}] activate_training_model reused active model "
                     f"elapsed={time.time() - start_ts:.2f}s"
@@ -2691,14 +2832,14 @@ class DrafterBaseTrainer:
             # Apply them before loading drafter model/optimizer state to keep
             # accelerator memory peaks low during activation.
             activation_stage = "apply_pending_target_head_on_host"
-            timed("host_head_apply", self._apply_pending_target_lm_head_weight)
+            timed("apply_host_head", self._apply_pending_target_lm_head_weight)
 
             if self.model is None:
                 logger.debug(
                     "Draft Model not initialized, calling build_draft_model during activation..."
                 )
                 activation_stage = "build_draft_model"
-                timed("model_build", self._build_draft_model)
+                timed("build_model", self._build_draft_model)
 
             # 只有当配置了 offload 或者当前模型不在 CUDA 上时执行加载
             first_param = next(self.model.parameters(), None)
@@ -2709,7 +2850,31 @@ class DrafterBaseTrainer:
             if self.is_offload_param or not is_on_cuda:
                 # 调用工具将 FSDP 分片移动到 GPU
                 activation_stage = "load_draft_model"
-                timed("model_restore", lambda: load_fsdp_model_to_gpu(self.model))
+
+                def restore_model():
+                    used_batched_load = False
+                    if (
+                        device_name == "cuda"
+                        and not getattr(self, "_bubble_time_enabled", False)
+                        and getattr(self, "_gpu_model_offload_reuse", False)
+                        and self._drafter_strategy() == "fsdp2"
+                        and self.training_device_mesh is not None
+                    ):
+                        from verl_speco.trainer.gpu_transfer import load_model_from_host
+
+                        used_batched_load, stats = load_model_from_host(
+                            self.model,
+                            self.runtime_device,
+                            device_module=self.device_module,
+                        )
+                        self._record_gpu_transfer(
+                            "model_load",
+                            {"used_batched_load": int(used_batched_load), **stats},
+                        )
+                    if not used_batched_load:
+                        load_fsdp_model_to_gpu(self.model)
+
+                timed("load_model", restore_model)
                 logger.debug("Loaded drafter model to GPU for training")
 
             if self.optimizer is not None and (
@@ -2719,18 +2884,47 @@ class DrafterBaseTrainer:
                 # 获取 device_id,否则在多卡环境优化器状态可能全部挤在 cuda:0 导致 OOM
                 current_dev_id = get_device_id()
                 activation_stage = "load_draft_optimizer"
-                timed(
-                    "optimizer_restore",
-                    lambda: load_fsdp_optimizer(
-                        optimizer=self.optimizer, device_id=current_dev_id
-                    ),
-                )
+
+                def restore_optimizer():
+                    diagnostic = (
+                        device_name == "cuda"
+                        and not self.__dict__.get("_bubble_time_enabled", False)
+                        and logger.isEnabledFor(logging.DEBUG)
+                    )
+                    before = None
+                    if diagnostic:
+                        from verl_speco.trainer.performance_diagnostics import (
+                            optimizer_state_metadata,
+                        )
+
+                        before = optimizer_state_metadata(self.optimizer)
+                    started = time.perf_counter()
+                    try:
+                        return load_fsdp_optimizer(
+                            optimizer=self.optimizer, device_id=current_dev_id
+                        )
+                    finally:
+                        if before is not None:
+                            logger.debug(
+                                "[drafter optimizer transfer] action=load rank=%s step=%s "
+                                "elapsed_s=%.6f before=%s after=%s timing_mode=host_wall_no_device_sync",
+                                self.rank,
+                                getattr(self, "current_rl_step", None),
+                                time.perf_counter() - started,
+                                before,
+                                optimizer_state_metadata(self.optimizer),
+                            )
+
+                timed("load_optimizer", restore_optimizer)
                 logger.debug("Loaded drafter optimizer to GPU for training")
 
             activation_stage = "load_target_lm_head"
-            timed("head_move", lambda: self._move_target_lm_head(self.runtime_device))
+            timed(
+                "load_target_head",
+                lambda: self._move_target_lm_head(self.runtime_device),
+            )
             activation_stage = "apply_pending_target_head_on_device"
-            timed("head_apply", self._apply_pending_target_lm_head_weight)
+            timed("apply_device_head", self._apply_pending_target_lm_head_weight)
 
             # 先标记初始化完成，然后开启 active 开关，确保训练循环不会读到中间状态
             self._training_initialized = True
@@ -3187,6 +3381,67 @@ class DrafterBaseTrainer:
             target_head = getattr(self.backend, attribute, None)
             if target_head is None:
                 continue
+            cache_enabled = device_name == "cuda" and getattr(
+                self, "_gpu_head_host_reuse", False
+            )
+            if cache_enabled:
+                from verl_speco.trainer.gpu_transfer import FrozenHeadHostCache
+
+                cache = getattr(self, "_gpu_head_host_cache", None)
+                if cache is None:
+                    cache = self._gpu_head_host_cache = FrozenHeadHostCache()
+                head = self._target_lm_head_module()
+                parameters = list(target_head.parameters())
+                eligible = (
+                    head is not None
+                    and len(parameters) == 1
+                    and parameters[0] is head.weight
+                    and not head.weight.requires_grad
+                    and not list(target_head.buffers())
+                )
+                version = self._target_lm_head_weight_step
+                destination = torch.device(device)
+                if eligible and destination.type == "cpu":
+                    reused, reason, avoided = cache.restore(head.weight, version)
+                    self._record_gpu_transfer(
+                        "head_restore",
+                        {
+                            "cache_hit": int(reused),
+                            "avoided_d2h_bytes": avoided,
+                            "fallback_reason": reason,
+                            "version": version,
+                            "dtype": str(head.weight.dtype),
+                        },
+                    )
+                    if reused:
+                        return True
+                elif eligible and destination.type == "cuda":
+                    captured = cache.capture(head.weight, version)
+                    target_head.to(device)
+                    if captured:
+                        cache.arm(head.weight)
+                    self._record_gpu_transfer(
+                        "head_capture",
+                        {
+                            "captured": int(captured),
+                            "version": version,
+                            "host_bytes": head.weight.numel()
+                            * head.weight.element_size()
+                            if captured
+                            else 0,
+                            "dtype": str(head.weight.dtype),
+                        },
+                    )
+                    return True
+                else:
+                    cache.clear()
+                    self._record_gpu_transfer(
+                        "head_restore",
+                        {
+                            "cache_hit": 0,
+                            "fallback_reason": "unsupported_or_trainable_head",
+                        },
+                    )
             target_head.to(device)
             logger.debug(
                 "[Rank %s] Moved %s to %s",
@@ -3210,6 +3465,9 @@ class DrafterBaseTrainer:
         source_weight = self._pending_target_lm_head_weight
         source_row_indices = self._pending_target_lm_head_row_indices
         source_vocab_size = self._pending_target_lm_head_source_vocab_size
+        cache = getattr(self, "_gpu_head_host_cache", None)
+        if cache is not None:
+            cache.clear()
         if source_row_indices is not None:
             if source_weight.dim() != 2:
                 raise ValueError(
@@ -3307,6 +3565,27 @@ class DrafterBaseTrainer:
                     target_weight.dtype,
                     time.perf_counter() - copy_started,
                 )
+        elif (
+            device_name == "cuda"
+            and getattr(self, "_gpu_head_host_reuse", False)
+            and target_weight.device.type == "cpu"
+            and source_weight.device.type == "cpu"
+        ):
+            copy_started = time.perf_counter()
+            # copy_ performs the same dtype conversion without a full-size .to()
+            # temporary, retaining ownership of the backend's CPU head storage.
+            target_weight.copy_(source_weight)
+            self._record_gpu_transfer(
+                "head_apply",
+                {
+                    "elapsed_s": time.perf_counter() - copy_started,
+                    "bytes": target_weight.numel() * target_weight.element_size(),
+                    "direct_cpu_copy": 1,
+                    "version": self._target_lm_head_weight_step,
+                    "source_dtype": str(source_weight.dtype),
+                    "target_dtype": str(target_weight.dtype),
+                },
+            )
         else:
             target_weight.copy_(
                 source_weight.to(
@@ -7097,6 +7376,43 @@ class DrafterBaseTrainer:
             load_fsdp_model_to_gpu(self.model)
 
         try:
+            training_cfg = self.config.rollout.drafter.training
+            if (
+                device_name == "cuda"
+                and not getattr(self, "_bubble_time_enabled", False)
+                and self.training_device_mesh is not None
+                and not isinstance(self.model, FSDP)
+                and not self._is_ddp_wrapped()
+                and dist.is_initialized()
+                and training_cfg.get("publish_trainable_only_export", True)
+            ):
+                from verl_speco.trainer.publish_state import export_fsdp2_publish_state
+
+                dtype = {
+                    "float32": torch.float32,
+                    "fp32": torch.float32,
+                    "float16": torch.float16,
+                    "fp16": torch.float16,
+                    "bfloat16": torch.bfloat16,
+                    "bf16": torch.bfloat16,
+                }.get(training_cfg.get("publish_dtype"))
+                from verl_speco.trainer.gpu_transfer import gpu_transfer_enabled
+
+                publish_stats: dict[str, Any] = {}
+                snapshot = export_fsdp2_publish_state(
+                    self.model,
+                    is_frozen=self._is_frozen_publish_param,
+                    trains_lm_head=getattr(self.backend, "trains_draft_lm_head", False),
+                    patterns=training_cfg.get("publish_param_name_patterns"),
+                    dtype=dtype,
+                    cast_before_copy=gpu_transfer_enabled(
+                        training_cfg, "gpu_publish_cast_before_copy"
+                    ),
+                    diagnostics=publish_stats,
+                )
+                if snapshot is not None:
+                    self._record_gpu_transfer("publish_snapshot", publish_stats)
+                    return snapshot or None
             trainable_state = self._get_trainable_state_dict()
             if not trainable_state:
                 return None
@@ -7383,6 +7699,7 @@ class DrafterBaseTrainer:
     ):
         # First set training as inactive to prevent further steps
         self._training_active = False
+        self._last_cleanup_stage_timings: dict[str, float] = {}
         self._last_keep_hot_cache_trim_elapsed_sec = 0.0
 
         # Wait for any pending async checkpoint save to complete
@@ -7393,7 +7710,10 @@ class DrafterBaseTrainer:
             try:
                 # Run the blocking .result() call in executor to avoid blocking the event loop
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._pending_checkpoint_future.result)
+                with self._residency_stage("cleanup", "checkpoint_wait"):
+                    await loop.run_in_executor(
+                        None, self._pending_checkpoint_future.result
+                    )
                 logger.debug(f"[Rank {self.rank}] Pending checkpoint save completed")
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Pending checkpoint save failed: {e}")
@@ -7403,7 +7723,8 @@ class DrafterBaseTrainer:
                 f"[Rank {self.rank}] Waiting for pending full drafter checkpoint save to complete..."
             )
             try:
-                await asyncio.wrap_future(self._pending_full_checkpoint_future)
+                with self._residency_stage("cleanup", "full_checkpoint_wait"):
+                    await asyncio.wrap_future(self._pending_full_checkpoint_future)
                 logger.debug(
                     f"[Rank {self.rank}] Pending full drafter checkpoint save completed"
                 )
@@ -7412,7 +7733,8 @@ class DrafterBaseTrainer:
             self._pending_full_checkpoint_future = None
         if self.optimizer is not None:
             try:
-                self.optimizer.zero_grad(set_to_none=True)
+                with self._residency_stage("cleanup", "zero_grad"):
+                    self.optimizer.zero_grad(set_to_none=True)
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to clear drafter gradients during cleanup: {e}")
         # Training and publish collectives have completed before cleanup. These
@@ -7469,37 +7791,104 @@ class DrafterBaseTrainer:
             return
 
         if self.model is not None:
+            pooled_offload = False
             try:
-                offload_fsdp_model_to_cpu(self.model)
+                with self._residency_stage("cleanup", "offload_model"):
+                    if (
+                        device_name == "cuda"
+                        and getattr(self, "_gpu_model_offload_reuse", False)
+                        and self._drafter_strategy() == "fsdp2"
+                        and self.training_device_mesh is not None
+                    ):
+                        from verl_speco.trainer.gpu_transfer import ModelHostBufferPool
+
+                        pool = getattr(self, "_gpu_model_host_pool", None)
+                        if pool is None:
+                            pool = self._gpu_model_host_pool = ModelHostBufferPool(
+                                self._gpu_offload_pool_max_bytes,
+                                pinned=True,
+                            )
+                        pooled_offload = True
+                        used_pool, stats = pool.offload(
+                            self.model, device_module=self.device_module
+                        )
+                        self._record_gpu_transfer(
+                            "model_offload", {"used_pool": int(used_pool), **stats}
+                        )
+                        if not used_pool:
+                            pooled_offload = False
+                            offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+                    elif device_name == "cuda":
+                        # Reclaim once after all offloads and the existing
+                        # synchronization, rather than inside the model helper.
+                        offload_fsdp_model_to_cpu(self.model, empty_cache=False)
+                    else:
+                        offload_fsdp_model_to_cpu(self.model)
                 logger.debug("Offloaded drafter model to CPU after training")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
+                if pooled_offload:
+                    raise RuntimeError(
+                        "GPU pooled model offload failed; refusing partial residency state"
+                    ) from e
                 logger.debug(f"Failed to offload drafter model during cleanup: {e}")
         if self.optimizer is not None:
             try:
-                self._offload_optimizer_state_to_cpu()
+                with self._residency_stage("cleanup", "offload_optimizer"):
+                    self._offload_optimizer_state_to_cpu()
                 logger.debug("Offloaded drafter optimizer state to CPU after training")
             except Exception as e:  # noqa: BLE001
+                if getattr(self.optimizer, "_speco_host_transition_failed", False):
+                    raise RuntimeError(
+                        "GPU optimizer offload did not complete; refusing unsafe cleanup"
+                    ) from e
                 if self._use_blocking_npu_optimizer_offload():
                     raise RuntimeError(
                         "NPU VeOmni drafter optimizer blocking offload failed during cleanup"
                     ) from e
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
         try:
-            self._move_target_lm_head("cpu")
+            with self._residency_stage("cleanup", "offload_target_head"):
+                self._move_target_lm_head("cpu")
         except Exception as e:  # noqa: BLE001
             logger.debug(f"Failed to offload drafter target head during cleanup: {e}")
         if clear_data:
-            self.collected_data.clear()
-            self.data_buffer.clear()  # Clear the cross-step data buffer
-            self._mark_buffer_changed()
+            with self._residency_stage("cleanup", "clear_data"):
+                self.collected_data.clear()
+                self.data_buffer.clear()  # Clear the cross-step data buffer
+                self._mark_buffer_changed()
         if self._full_checkpoint_executor is not None:
-            self._full_checkpoint_executor.shutdown(wait=False)
+            with self._residency_stage("cleanup", "executor_shutdown"):
+                self._full_checkpoint_executor.shutdown(wait=False)
             self._full_checkpoint_executor = None
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
+            allocator_stages = {}
+            if device_name == "cuda":
+                from verl_speco.trainer.performance_diagnostics import (
+                    allocator_metadata,
+                )
+
+                allocator_stages["before_sync"] = allocator_metadata(self.device_module)
             if hasattr(self.device_module, "synchronize"):
-                self.device_module.synchronize()
-            self.device_module.empty_cache()
-        self._park_idle_drafter_hccl()
+                with self._residency_stage("cleanup", "device_synchronize"):
+                    self.device_module.synchronize()
+            if device_name == "cuda":
+                allocator_stages["after_sync"] = allocator_metadata(self.device_module)
+            with self._residency_stage("cleanup", "empty_cache"):
+                self.device_module.empty_cache()
+            if device_name == "cuda":
+                allocator_stages["after_reclaim"] = allocator_metadata(
+                    self.device_module
+                )
+                self._record_gpu_transfer(
+                    "cleanup_allocator",
+                    {
+                        f"{stage}_{key}": value
+                        for stage, values in allocator_stages.items()
+                        for key, value in values.items()
+                    },
+                )
+        with self._residency_stage("cleanup", "park_hccl"):
+            self._park_idle_drafter_hccl()
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1

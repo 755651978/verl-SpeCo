@@ -109,7 +109,7 @@ def _strip_speco_overlay_for_native_run(config) -> None:
 
 
 def configure_phase_diagnostic_runtime_env(config) -> None:
-    """Keep opt-in Bubble driver diagnostics visible in Ray's root env too.
+    """Keep opt-in Bubble/CUDA diagnostics visible in Ray's root env too.
 
     The actor-class override below is still needed for already running Ray
     clusters. Configuring both also survives upstream wrappers that replace
@@ -130,6 +130,7 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
             default="sync",
         )
         != "rollout_idle_worker"
+        and _config_get(config, "trainer", "device", default="") != "cuda"
     ):
         return
     from omegaconf import OmegaConf
@@ -141,13 +142,51 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
         force_add=True,
     )
     ablation = os.environ.get("VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL")
-    if ablation is not None:
+    if (
+        ablation is not None
+        and _config_get(
+            config,
+            "actor_rollout_ref",
+            "rollout",
+            "drafter",
+            "training",
+            "scheduler",
+            "execution",
+            "strategy",
+            default="sync",
+        )
+        == "rollout_idle_worker"
+    ):
         OmegaConf.update(
             config,
             "ray_kwargs.ray_init.runtime_env.env_vars.VERL_SPECO_DIAGNOSTIC_PAUSE_EMPTY_IDLE_POLL",
             ablation,
             force_add=True,
         )
+
+
+def configure_compile_cache_runtime_env(config) -> dict[str, str]:
+    """Forward explicit compiler cache paths; never choose or create a directory."""
+    from omegaconf import OmegaConf
+
+    configured = (
+        _config_get(
+            config, "ray_kwargs", "ray_init", "runtime_env", "env_vars", default={}
+        )
+        or {}
+    )
+    cache_env = {}
+    for name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        value = configured.get(name) if name in configured else os.getenv(name)
+        if value is not None:
+            cache_env[name] = str(value)
+            OmegaConf.update(
+                config,
+                f"ray_kwargs.ray_init.runtime_env.env_vars.{name}",
+                str(value),
+                force_add=True,
+            )
+    return cache_env
 
 
 def run(config) -> None:
@@ -197,7 +236,10 @@ def run(config) -> None:
 
     configure_phase_diagnostic_runtime_env(config)
     runner = ray.remote(num_cpus=1)(SpecoTaskRunner)
-    diagnostic_env = drafter_diagnostic_env()
+    diagnostic_env = {
+        **configure_compile_cache_runtime_env(config),
+        **drafter_diagnostic_env(),
+    }
     if diagnostic_env:
         runner = runner.options(runtime_env={"env_vars": diagnostic_env})
     main_ppo.run_ppo(config, task_runner_class=runner)

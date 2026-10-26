@@ -40,7 +40,10 @@ from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
+from verl_speco.integration.rollout_publish import (
+    resolve_drafter_publish_payload,
+    target_lm_head_export_metrics,
+)
 from verl_speco.integration.rollout_idle_events import (
     DRAFTER_SAMPLE_READY_EVENT,
     SPECO_ROLLOUT_IDLE_EVENT_BUS_ENV,
@@ -5435,23 +5438,15 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not hidden_rows and not hidden_refs and not chunk_refs:
             raise RuntimeError("SPECO planned collection returned empty hidden payload")
         timing = self._speco_sum_timing_rows(tu.get(output, OLD_LOGPROB_TIMING_KEY))
-        if timing is not None and int(timing.numel()) >= 2:
-            self._speco_last_oldlogprob_select_elapsed_sec = (
-                float(timing[0].item()) / 1_000_000.0
+        from verl_speco.integration.oldlogprob_runtime import decode_oldlogprob_timing
+
+        for name, value in decode_oldlogprob_timing(timing).items():
+            suffix = (
+                ""
+                if name in {"control_bytes", "bulk_host_contexts"}
+                else "_elapsed_sec"
             )
-            self._speco_last_oldlogprob_sp_merge_elapsed_sec = (
-                float(timing[1].item()) / 1_000_000.0
-            )
-            if int(timing.numel()) >= 5:
-                self._speco_last_oldlogprob_concat_elapsed_sec = (
-                    float(timing[2].item()) / 1_000_000.0
-                )
-                self._speco_last_oldlogprob_cpu_copy_elapsed_sec = (
-                    float(timing[3].item()) / 1_000_000.0
-                )
-                self._speco_last_oldlogprob_ray_put_elapsed_sec = (
-                    float(timing[4].item()) / 1_000_000.0
-                )
+            setattr(self, f"_speco_last_oldlogprob_{name}{suffix}", value)
 
         prompts = batch.batch["prompts"]
         responses = batch.batch["responses"]
@@ -6713,6 +6708,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if isinstance(payload, dict)
             else "unknown"
         )
+        if not self._speco_rollout_idle_worker_enabled():
+            logger.warning(
+                "[actor lm_head export diagnostics] step=%s strategy=%s details=%s",
+                self.global_steps,
+                export_strategy,
+                payload.get(
+                    "export_diagnostics", {"fallback_reason": "worker_metadata_missing"}
+                )
+                if isinstance(payload, dict)
+                else {"fallback_reason": "worker_metadata_missing"},
+            )
         referenced = isinstance(payload, dict) and "target_head_ref" in payload
         if referenced and not self._speco_rollout_idle_worker_enabled():
             raise RuntimeError("Reference head dispatch is restricted to Bubble")
@@ -6774,6 +6780,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "timing_s/drafter_sync_target_lm_head_fetch": fetch_elapsed,
             "timing_s/drafter_sync_target_lm_head_dispatch": dispatch_elapsed,
         }
+        if not self._speco_rollout_idle_worker_enabled():
+            metrics.update(target_lm_head_export_metrics(payload))
         if self._speco_rollout_idle_worker_enabled():
             metrics.update(
                 {
@@ -7276,10 +7284,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_get_published_drafter_weights(self):
         prefetched = getattr(self, "_speco_publish_snapshot_prefetch", None)
-        if prefetched is not None and self._speco_rollout_idle_worker_enabled():
+        if prefetched is not None and (
+            self._speco_rollout_idle_worker_enabled()
+            or prefetched.get("sync_cpu_only", False)
+        ):
             if int(prefetched["source_step"]) != int(self.global_steps):
                 raise RuntimeError(
-                    "Bubble publish snapshot prefetch crossed its source version"
+                    "Publish snapshot prefetch crossed its source version"
                 )
             waited = time.perf_counter()
             published = self._ray_get_if_needed(prefetched["refs"]) or []
@@ -7291,15 +7302,32 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 "bubble/publish_snapshot_prefetch_consumed": int(payload is not None),
                 "bubble/publish_snapshot_source_step": int(prefetched["source_step"]),
             }
-            logger.warning(
-                "[BubbleTime] publish_snapshot_prefetch_consumed: source_step=%s "
-                "cached=%s wait_s=%.4f",
-                prefetched["source_step"],
-                payload is not None,
-                self._speco_publish_snapshot_prefetch_metrics[
-                    "timing_s/drafter_publish_snapshot_prefetch_wait"
-                ],
-            )
+            if prefetched.get("sync_cpu_only", False):
+                self._speco_publish_snapshot_prefetch_metrics = {
+                    "drafter/sync_snapshot_prefetch_hit": int(payload is not None),
+                    "timing_s/drafter_sync_snapshot_prefetch_wait": time.perf_counter()
+                    - waited,
+                    "timing_s/drafter_sync_snapshot_prefetch_submit": prefetched[
+                        "submit_sec"
+                    ],
+                    "timing_s/drafter_sync_snapshot_prefetch_window": max(
+                        waited - prefetched["submitted_at"], 0.0
+                    ),
+                }
+                logger.warning(
+                    "[SPECO Sync snapshot prefetch] source_step=%s hit=%s metrics=%s",
+                    prefetched["source_step"],
+                    payload is not None,
+                    self._speco_publish_snapshot_prefetch_metrics,
+                )
+            if not prefetched.get("sync_cpu_only", False):
+                logger.warning(
+                    "[BubbleTime] publish_snapshot_prefetch_consumed: source_step=%s "
+                    "cached=%s wait_s=%.4f",
+                    prefetched["source_step"],
+                    payload is not None,
+                    time.perf_counter() - waited,
+                )
             if payload is not None:
                 return payload
             if getattr(self, "_speco_publish_cached_snapshot_only", False):
