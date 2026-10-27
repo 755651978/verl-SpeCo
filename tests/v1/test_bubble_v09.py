@@ -334,7 +334,9 @@ def test_explicit_topup_preserves_bounded_and_final_completion_policy(mode, fina
     trainer.timing_raw = {}
     trainer._speco_v1_admission = lambda method: None
     trainer._speco_wait_target_lm_head_prefetch = lambda: None
-    trainer._speco_v1_prepare_hot_writer_head = lambda: {}
+    trainer._speco_prepare_hot_writer_head_at_safe_point = lambda: pytest.fail(
+        "V1 top-up must not prepare head outside training preflight"
+    )
     trainer._speco_park_drafter_training_memory = lambda boundary: {}
     trainer._speco_freeze_policy = None
     manager = SimpleNamespace(

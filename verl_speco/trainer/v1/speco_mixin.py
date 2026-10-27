@@ -696,6 +696,8 @@ class SpecoV1Mixin(V1BubbleMixin):
 
     def _setup(self):
         self._speco_validate_v1_training_config(self.config)
+        if self._speco_rollout_idle_worker_enabled():
+            self._speco_v1_log_runtime_provenance()
         from verl_speco.integration.vllm_runtime import (
             configure_vllm_runtime_from_config,
         )

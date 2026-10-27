@@ -56,16 +56,20 @@ def trainer_for(mode):
 
 
 @pytest.mark.parametrize("mode", ["sync", "colocate_async"])
-def test_hot_quota_head_is_prepared_after_close_and_ack_before_target_resume(
-    monkeypatch, mode
+@pytest.mark.parametrize("requested", [None, False, True])
+def test_step_end_never_prepares_head_even_with_legacy_flag(
+    monkeypatch, mode, requested
 ):
     trainer = trainer_for(mode)
     trainer._speco_init_state()
     trainer.global_steps = 11
     trainer.total_training_steps = 50
-    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = {
-        "keep_hot_between_plans": True
-    }
+    idle = {"keep_hot_between_plans": True}
+    if requested is not None:
+        idle["v1_head_preparation_enable"] = requested
+    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = (
+        idle
+    )
     scheduler = trainer._drafter_scheduler
     group = ("2", "3")
     scheduler._idle_worker_writer_group = group
@@ -78,62 +82,74 @@ def test_hot_quota_head_is_prepared_after_close_and_ack_before_target_resume(
     events = []
     session.close = lambda boundary: events.append("close") or {}
     trainer._speco_wait_target_lm_head_prefetch = lambda: events.append("ack")
-
-    def prepare(workers, version):
-        assert workers == group and version == 8
-        events.append("prepare")
-        return [
-            {
-                "worker_id": worker,
-                "prepared": True,
-                "target_version": 8,
-                "elapsed_sec": 0.2,
-            }
-            for worker in workers
-        ]
-
-    trainer._require_speco_worker_group = lambda: SimpleNamespace(
-        prepare_hot_drafter_target_head=prepare
+    trainer._speco_prepare_hot_writer_head_at_safe_point = lambda: pytest.fail(
+        "V1 must prepare heads only at training preflight"
     )
     native = TRAINERS[mode].__bases__[1]
     monkeypatch.setattr(
         native, "on_step_end", lambda self: events.append("target_resume")
     )
     trainer.on_step_end()
-    assert events == ["close", "ack", "prepare", "target_resume"]
-    assert scheduler._idle_worker_last_target_version[group] == 8
-    assert scheduler._training_quota_data_version == 8
-    assert trainer._pending_sync_metrics["bubble/hot_writer_head_prepared"] == 1
-    assert any(key.startswith("hot_head_prepare:8:") for key in session.costs.events)
-    count = len(session.costs.events)
-    assert trainer._speco_v1_prepare_hot_writer_head() == {}
-    assert len(session.costs.events) == count
-
-
-def test_separate_pool_never_uses_shared_gpu_head_preparation():
-    trainer = trainer_for("separate_async")
-    trainer._speco_prepare_hot_writer_head_at_safe_point = lambda: pytest.fail(
-        "serving lease required"
-    )
-    assert trainer._speco_v1_prepare_hot_writer_head() == {}
-
-
-@pytest.mark.parametrize("mode", ["sync", "colocate_async"])
-def test_head_preparation_ablation_preserves_quota_and_costs(mode):
-    trainer = trainer_for(mode)
-    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = {
-        "v1_head_preparation_enable": False
-    }
-    scheduler = trainer._drafter_scheduler
-    scheduler._training_quota_debt_steps = 20
-    scheduler._training_quota_data_version = 8
-    trainer._speco_prepare_hot_writer_head_at_safe_point = lambda: pytest.fail(
-        "head preparation disabled"
-    )
-    assert trainer._speco_v1_prepare_hot_writer_head() == {}
+    assert events == ["close", "ack", "target_resume"]
+    assert group not in scheduler._idle_worker_last_target_version
     assert scheduler._training_quota_debt_steps == 20
     assert scheduler._training_quota_data_version == 8
-    assert not trainer._speco_bubble_session().costs.events
+    assert not session.costs.events
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+@pytest.mark.parametrize("git_available", [False, True])
+def test_runtime_provenance_survives_logger_filters(
+    monkeypatch, capsys, mode, git_available
+):
+    import hashlib
+    import subprocess
+    from verl_speco.trainer.v1 import bubble_mixin
+
+    trainer = trainer_for(mode)
+    trainer.config.actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker = {
+        "v1_head_preparation_enable": True,
+        "boundary_diagnostics_enable": True,
+    }
+
+    def revision(*args, **kwargs):
+        assert kwargs["timeout"] == 2
+        if not git_available:
+            raise FileNotFoundError("git unavailable")
+        return SimpleNamespace(returncode=0, stdout="revision\n")
+
+    monkeypatch.setattr(subprocess, "run", revision)
+    monkeypatch.setattr(bubble_mixin.logger, "disabled", True)
+    trainer._speco_v1_log_runtime_provenance()
+    record = capsys.readouterr().out
+    report = json.loads(record.split("v1_runtime: ", 1)[1])
+    assert report["commit"] == ("revision" if git_available else "unavailable")
+    assert report["mode"] == mode
+    assert report["head_preparation_requested"] is True
+    assert report["head_preparation_effective"] is False
+    assert report["boundary_diagnostics_enable"] is True
+    assert len(report["source_sha256"]) == 3
+    for filename, digest in report["source_sha256"].items():
+        path = Path(filename)
+        assert path.is_absolute()
+        assert digest == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("mode", ["sync", "colocate_async", "separate_async"])
+def test_runtime_provenance_precedes_worker_setup(mode):
+    trainer = trainer_for(mode)
+    events = []
+    trainer._speco_validate_v1_training_config = lambda config: None
+    trainer._speco_v1_log_runtime_provenance = lambda: events.append("provenance")
+
+    def install():
+        events.append("worker_setup")
+        raise RuntimeError("stop before worker creation")
+
+    trainer._speco_install_v1_standalone_publish_worker = install
+    with pytest.raises(RuntimeError, match="stop before worker creation"):
+        trainer._setup()
+    assert events == ["provenance", "worker_setup"]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -145,7 +161,14 @@ def test_boundary_diagnostics_preserve_actor_order_and_failure(caplog, enabled, 
     }
     trainer._pending_target_lm_head_sync = None
     trainer._speco_rollout_idle_generation_open = True
-    trainer._speco_stop_rollout_idle_event_loop = lambda *args: None
+    event_thread = object()
+    trainer._speco_bubble_session().thread = event_thread
+
+    def stop(*args):
+        assert trainer._speco_rollout_idle_generation_open is False
+        assert args[1] is event_thread
+
+    trainer._speco_stop_rollout_idle_event_loop = stop
     trainer._speco_service_rollout_idle_events = lambda **kwargs: {}
     trainer._speco_emit_rollout_generation_completed = lambda *args: {}
     events = []
@@ -177,6 +200,7 @@ def test_boundary_diagnostics_preserve_actor_order_and_failure(caplog, enabled, 
         assert all(
             f"event={event} " in record for event, record in zip(expected, records)
         )
+        assert "event_thread_active=False generation_open=False" in records[0]
         assert "event_thread_active=False generation_open=False" in records[1]
 
 

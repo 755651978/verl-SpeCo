@@ -1,6 +1,6 @@
 # Bubble Time 与 V1
 
-Last updated: 2026-10-26
+Last updated: 2026-10-27
 
 适配基线为上游 `release/v0.9.0`。PPO 主循环仍由上游 V1 trainer 执行；
 本仓库仅提供生命周期 hook、独立池 worker、数据采集和发布协议。
@@ -8,22 +8,31 @@ V1 rollout 后端仍限于 vLLM。
 
 ## 配置
 
-性能定位时可以独立关闭 V1 共享池的安全边界 head 预热：
+V1 已移除 step-end 的提前准备 head 路径。训练 preflight 仍选择并应用 quota
+绑定的 head；保留控制步同步、版本检查、quota、writer、资源租约及发布规则。
+`v1_head_preparation_enable` 仅为兼容旧启动命令而保留，默认 false；即使设置
+为 true，也不会启用提前准备。legacy trainer 的原有路径不受此调整影响。
+
+默认关闭边界诊断：
 
 ```text
-actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.v1_head_preparation_enable=false
-actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.boundary_diagnostics_enable=true
+actor_rollout_ref.rollout.drafter.training.scheduler.idle_worker.boundary_diagnostics_enable=false
 ```
 
-head 预热默认开启，关闭只取消提前准备，训练前仍会加载并校验 quota 对应的 head；
-不改变 quota、writer、资源租约或发布规则。该预热路径仅用于 sync 和 colocate_async，
-separate_async 不走共享池的安全边界预热。
-诊断默认关闭，开启后输出 `v1_boundary` 的回收开始、回收完成、Actor 开始、
-正常结束或失败时间。结合已有 worker `training_cleanup_boundary` 的 plan/rank 时间
-检查生命周期顺序；驱动回收完成日志不是 GPU 硬件同步或带宽无竞争的证明。
-separate_async 的 Actor 与独立 rollout 池可以合法重叠。
-对照实验应从同一恢复点分别启动，仅改变预热开关，并比较实际 token、训练总步数、
-发布次数、剩余 quota 和端到端耗时。修改配置不能改变已经运行的任务。
+必要时设置 true，记录回收与 Actor 边界。回收开始日志在关闭训练启动入口、
+停止事件线程之后输出，避免日志等待期间启动新训练。结合已有 worker
+`training_cleanup_boundary` 的 plan/rank 时间检查顺序；这些日志不是 GPU
+硬件同步或带宽无竞争的证明。separate_async 的独立池训练与 Actor 可以合法重叠。
+
+Bubble V1 在创建 rollout worker 前输出一次 `[BubbleTime] v1_runtime:` JSON，
+包括驱动实际模块的绝对路径及 SHA256、Git 提交号、运行模式、预热请求值、
+预热实际值（固定 false）和诊断开关。未安装 Git 时提交号为 unavailable，
+源码指纹仍会输出。记录使用标准输出，不依赖模块日志过滤；它只标识驱动源码，
+不代替各远程 worker 的部署一致性检查。修改过但未提交的源码应以 SHA256 为准。
+
+对照实验应从同一有效恢复点分别启动，先跑 20 步并比较实际 token、训练总步数、
+发布次数、剩余 quota、接收长度与端到端耗时。保持 GPU、数据、窗口阈值、
+训练额度、学习率和 hard sample 配置一致。修改文件不会更新已运行进程中的代码。
 
 使用 `--config-name=speco_v1_trainer`，沿用以下配置：
 

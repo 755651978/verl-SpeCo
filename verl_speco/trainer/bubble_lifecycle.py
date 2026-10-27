@@ -160,13 +160,13 @@ class BubbleLifecycle:
 
     def close(self, boundary: str) -> dict[str, Any]:
         owner = self.trainer
-        diagnostic = getattr(owner, "_speco_v1_boundary_diagnostic", None)
-        if diagnostic is not None:
-            diagnostic("reclaim_begin", boundary)
         generation_was_open = owner._speco_rollout_idle_generation_open
         owner._speco_rollout_idle_generation_open = False
         owner._speco_stop_rollout_idle_event_loop(self.stop_event, self.thread)
         self.stop_event = self.thread = None
+        diagnostic = getattr(owner, "_speco_v1_boundary_diagnostic", None)
+        if diagnostic is not None:
+            diagnostic("reclaim_begin", boundary)
         # A failed join raises before scheduler mutation or PPO can continue.
         with owner._speco_bubble_training_lock():
             metrics = owner._speco_service_rollout_idle_events(allow_launch=False)

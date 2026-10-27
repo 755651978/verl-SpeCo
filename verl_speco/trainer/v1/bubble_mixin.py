@@ -636,7 +636,6 @@ class V1BubbleMixin:
             # Native target synchronization already coordinates its own pool.
             # A plain actor update does not need a global Bubble probe drain.
             self._speco_wait_target_lm_head_prefetch()
-            metrics.update(self._speco_v1_prepare_hot_writer_head())
             result = parent()
             metrics.update(scheduler.training_work_metrics())
             self._pending_sync_metrics = {
@@ -710,7 +709,6 @@ class V1BubbleMixin:
                     raise RuntimeError("Final V1 Bubble quota remains incomplete")
             if topup_plan is not None or final_debt:
                 metrics.update(self._speco_park_drafter_training_memory("v1_topup"))
-            metrics.update(self._speco_v1_prepare_hot_writer_head())
             # The native mode owns actor target synchronization. Admission is
             # closed across both probe arms, even if native code resumes engines.
             result = parent()
@@ -777,25 +775,55 @@ class V1BubbleMixin:
             getattr(self, "_speco_rollout_idle_generation_open", False),
         )
 
-    def _speco_v1_prepare_hot_writer_head(self):
-        # The actor has finished/offloaded and the event loop has been joined.
-        # Separate mode keeps actor and rollout on independent pools and needs
-        # a lease on its serving pool; never use this shared-GPU safe point there.
-        if self._speco_v1_separate_bubble():
-            return {}
-        if not self._speco_v1_idle_option("v1_head_preparation_enable", True):
-            return {}
-        scheduler = self._speco_get_drafter_scheduler()
-        if scheduler._training_quota_debt_steps <= 0:
-            return {}
-        target = scheduler._training_quota_data_version
-        started = time.time()
-        metrics = self._speco_prepare_hot_writer_head_at_safe_point()
-        if metrics:
-            self._speco_bubble_session().costs.record_interval(
-                f"hot_head_prepare:{target}:{started}", started, time.time()
+    def _speco_v1_log_runtime_provenance(self):
+        """Identify this driver's sources once, before creating rollout workers."""
+        import hashlib
+        import json
+        import subprocess
+        from pathlib import Path
+
+        from verl_speco.trainer import bubble_lifecycle
+        from verl_speco.trainer.v1 import speco_mixin
+
+        sources = {}
+        for filename in (__file__, bubble_lifecycle.__file__, speco_mixin.__file__):
+            path = Path(filename).resolve()
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                digest = "unavailable"
+            sources[str(path)] = digest
+        try:
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=Path(__file__).resolve().parents[3],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
             )
-        return metrics
+            commit = (
+                revision.stdout.strip() if revision.returncode == 0 else "unavailable"
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            commit = "unavailable"
+        report = {
+            "commit": commit,
+            "source_sha256": sources,
+            "mode": str(self.config.trainer.v1.get("trainer_mode", "sync")),
+            "head_preparation_requested": bool(
+                self._speco_v1_idle_option("v1_head_preparation_enable", False)
+            ),
+            "head_preparation_effective": False,
+            "boundary_diagnostics_enable": bool(
+                self._speco_v1_idle_option("boundary_diagnostics_enable", False)
+            ),
+        }
+        # A single startup record must survive module logger filters. No RPC,
+        # device read, or per-step subprocess is added by this diagnostic.
+        print(
+            "[BubbleTime] v1_runtime: " + json.dumps(report, sort_keys=True), flush=True
+        )
 
     def _speco_v1_bubble_update_actor(self, batch, metrics, update):
         started = time.perf_counter()
