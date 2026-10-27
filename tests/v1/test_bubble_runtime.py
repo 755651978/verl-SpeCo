@@ -77,6 +77,38 @@ def test_invalid_resource_ownership_fails_before_training(replicas):
         )
 
 
+def test_distinct_training_ranks_cannot_share_one_physical_device():
+    records = [
+        {
+            "available": True,
+            "worker_id": str(rank),
+            "node_id": "node",
+            "device_ids": ["0"],
+            "training_group_ranks": [0, 1],
+        }
+        for rank in range(2)
+    ]
+    with pytest.raises(RuntimeError, match="overlap physical"):
+        map_training_replicas(
+            records,
+            {7: [{"node_id": "node", "device_ids": ["0", "1"]}]},
+        )
+
+
+def test_same_device_number_on_different_nodes_is_independent():
+    records = [
+        {
+            "available": True,
+            "worker_id": str(rank),
+            "node_id": f"node-{rank}",
+            "device_ids": ["0"],
+            "training_group_ranks": [0, 1],
+        }
+        for rank in range(2)
+    ]
+    assert len(map_training_replicas(records, {7: records})) == 2
+
+
 def test_publish_rank_domains_do_not_alias():
     ack = {"worker_id": "0", "published": True, "published_version": 9}
     assert normalize_publish_ack(ack, "hybrid", 0)["worker_id"] == "hybrid:0"

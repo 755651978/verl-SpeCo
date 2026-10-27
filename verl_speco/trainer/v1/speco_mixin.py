@@ -662,6 +662,19 @@ class SpecoV1Mixin(V1BubbleMixin):
             DrafterScheduleConfig.from_mapping(training).execution_strategy.value
             == "rollout_idle_worker"
         )
+        mode = str(config.trainer.v1.get("trainer_mode", "sync"))
+        local_updates = int(
+            (config.trainer.v1.get(mode, {}) or {}).get("parameter_sync_step", 1)
+        )
+        if bubble and mode in {"sync", "colocate_async"} and local_updates > 1:
+            # These native modes update pi after each local batch. Unlike
+            # separate_async, they do not restore a stable pi_old for capture.
+            # A global-step head key would alias distinct policy snapshots.
+            raise ValueError(
+                f"V1 Bubble {mode} requires parameter_sync_step=1: multiple local "
+                "actor updates would mix policy/head snapshots under one quota "
+                "version; separate_async retains its fixed old-policy context"
+            )
         if bool(training.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
                 "verl V1 online SPECO training currently requires "

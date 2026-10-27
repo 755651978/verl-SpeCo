@@ -43,6 +43,13 @@ actor_rollout_ref.rollout.drafter.training.scheduler.training_quota.enable=true
 actor_rollout_ref.rollout.drafter.training.scheduler.training_quota.allow_critical_path_fallback=false
 ```
 
+Bubble 的 `sync` 和 `colocate_async` 当前要求各自模式配置中的
+`parameter_sync_step=1`。上游这两种模式在每个 local batch 后更新 Actor，
+因此多个 local update 的特征不能共用一个 global-step head/quota 版本。
+在独立 policy snapshot 标识接入前，启动时拒绝大于 1 的配置，避免静默混用 head。
+`separate_async` 使用上游固定旧策略快照，可继续配置多个 local update。
+普通非 Bubble 训练不受此限制；不通过额外恢复 Actor 权重来改变 PPO 行为。
+
 启用 ROI 时，设置
 `actor_rollout_ref.rollout.drafter.training.drafter_convergence_freeze` 下的
 `enabled=true`、`economics.enabled=true` 和 `probe.enabled=true`。

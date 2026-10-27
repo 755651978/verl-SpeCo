@@ -35,6 +35,7 @@ def map_training_replicas(records, replicas):
                 ownership[key] = int(replica_rank)
     mapped = []
     owners = {}
+    training_devices = set()
     for record in records:
         if not record.get("available"):
             if record.get("reason") == "not_in_training_group":
@@ -50,6 +51,10 @@ def map_training_replicas(records, replicas):
         owner = next(iter(assigned))
         if str(record["worker_id"]) in owners:
             raise RuntimeError("Duplicate Bubble training worker identity")
+        devices = {(record["node_id"], str(device)) for device in record["device_ids"]}
+        if devices & training_devices:
+            raise RuntimeError("Bubble training workers overlap physical accelerators")
+        training_devices.update(devices)
         owners[str(record["worker_id"])] = owner
         mapped.append({**record, "replica_rank": owner})
     for record in mapped:
