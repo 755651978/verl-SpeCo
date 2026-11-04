@@ -1535,6 +1535,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             raise RuntimeError(f"Drafter checkpoint wait failed: {incomplete}")
         return len(pending_refs)
 
+    def _speco_rollout_collection_source(self):
+        training = self._speco_drafter_training_config()
+        return (
+            DrafterCollectionSource.VLLM
+            if training.get("collect_hidden_states_from_vllm", False)
+            else DrafterCollectionSource.SGLANG
+        )
+
     def _speco_plan_drafter_collection(
         self,
         source: DrafterCollectionSource,
@@ -1545,7 +1553,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         training_cfg = self._speco_drafter_training_config()
         source_enabled = bool(
             training_cfg.get(
-                "collect_hidden_states_from_sgl"
+                "collect_hidden_states_from_vllm"
+                if source is DrafterCollectionSource.VLLM
+                else "collect_hidden_states_from_sgl"
                 if source is DrafterCollectionSource.SGLANG
                 else "collect_hidden_states_from_old_logprob",
                 False,
@@ -1591,7 +1601,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         target_batches = config.idle_worker_collection_target_batches
         known_batches = getattr(self, "_speco_last_known_trainable_batches", None)
         if (
-            source is DrafterCollectionSource.SGLANG
+            source in {DrafterCollectionSource.SGLANG, DrafterCollectionSource.VLLM}
             and self._speco_rollout_idle_worker_enabled()
             and plan.collect
             and target_batches is not None
@@ -2900,7 +2910,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return metrics
         with self._speco_bubble_training_lock():
             collection_plan = self._speco_plan_drafter_collection(
-                DrafterCollectionSource.SGLANG
+                self._speco_rollout_collection_source()
             )
             if not collection_plan.collect:
                 metrics["bubble/direct_sample_not_planned"] = len(samples)
@@ -2911,7 +2921,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 else None
             )
             payload = self._speco_get_drafter_scheduler().prepare_collection_payload(
-                source=DrafterCollectionSource.SGLANG,
+                source=self._speco_rollout_collection_source(),
                 samples=samples,
                 owners=routed_owners,
                 owner_count=self._speco_sglang_collection_owner_count(
@@ -5877,7 +5887,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             int(self.global_steps) if direct_collected > 0 else None
         )
         collection_plan = self._speco_plan_drafter_collection(
-            DrafterCollectionSource.SGLANG
+            self._speco_rollout_collection_source()
         )
         self._speco_log_drafter_collection_plan(collection_plan)
         self._speco_last_collect_interval_matched = int(
@@ -5925,7 +5935,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     ),
                 )
         payload = self._speco_get_drafter_scheduler().prepare_collection_payload(
-            source=DrafterCollectionSource.SGLANG,
+            source=self._speco_rollout_collection_source(),
             samples=samples,
             owners=routed_owners,
             owner_count=self._speco_sglang_collection_owner_count(

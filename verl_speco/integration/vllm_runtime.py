@@ -4172,6 +4172,10 @@ async def _speco_generate_with_request_stats_unblocked(
     positional_params = "sampling_params" not in kwargs and len(args) >= 2
     if positional_params:
         sampling_params = args[1]
+    capture_skip = bool(
+        isinstance(sampling_params, dict)
+        and sampling_params.get("_verl_skip_drafter_collection", False)
+    )
     if isinstance(sampling_params, dict):
         clean_params = dict(sampling_params)
         clean_params.pop("_verl_global_steps", None)
@@ -4180,6 +4184,25 @@ async def _speco_generate_with_request_stats_unblocked(
             args = (args[0], clean_params, *args[2:])
         else:
             kwargs = {**kwargs, "sampling_params": clean_params}
+    from verl_speco.integration.vllm_rollout_capture import (
+        enabled,
+        generate_with_capture,
+    )
+
+    capture_config = _load_env_drafter_config()
+    if enabled(capture_config):
+        original_generate = generate
+
+        async def generate(*call_args, **call_kwargs):
+            return await generate_with_capture(
+                self,
+                original_generate,
+                call_args,
+                call_kwargs,
+                capture_config,
+                skip=capture_skip,
+            )
+
     revision_before = int(getattr(self, "_speco_serving_drafter_revision", 0))
     if not bool(getattr(self, "_speco_vllm_generate_entered", False)):
         logger.warning(
@@ -4778,6 +4801,9 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     engine_kwargs = _ensure_nested_mapping(
         config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm")
     )
+    from verl_speco.integration.vllm_rollout_capture import validate_config
+
+    validate_config(drafter_cfg, _rollout_config_from_config(config), engine_kwargs)
     additional_config = _get_nested(engine_kwargs, ("additional_config",), {}) or {}
     additional_config = dict(additional_config)
     # Keep private transport metadata out of platform additional_config: some
@@ -5285,6 +5311,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         # WorkerDict-side installer runs in a different process and is too
         # early only for the frontend, not for this model-worker process.
         patch_vllm_dspark_draft_load_config()
+        from verl_speco.integration.vllm_rollout_capture import (
+            enabled,
+            install_runner_capture,
+        )
+
+        if enabled(_load_env_drafter_config()):
+            install_runner_capture()
         try:
             instance = super().__new__(cls, **kwargs)
         except TypeError:

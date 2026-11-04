@@ -614,6 +614,10 @@ class SpecoV1Mixin:
                 "the rollout idle event bus lifecycle is not integrated; "
                 "use scheduler.execution.strategy=sync or the legacy trainer"
             )
+        if bool(training.get("collect_hidden_states_from_vllm", False)):
+            raise ValueError(
+                "vLLM rollout capture currently requires the legacy trainer"
+            )
         if bool(training.get("collect_hidden_states_from_sgl", False)):
             raise ValueError(
                 "verl V1 online SPECO training currently requires "

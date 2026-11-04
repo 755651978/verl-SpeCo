@@ -173,6 +173,8 @@ actor_rollout_ref:
         # Consumed by the standalone DFlash/DSpark producer only.
         # Cotrain collection keeps its existing behavior.
         preserve_prompt_hidden_states: false
+        # vLLM 0.22.0 V1, text-only TP1/PP1, sync scheduling and no prefix cache.
+        collect_hidden_states_from_vllm: false
         collect_hidden_states_from_sgl: false
         collect_hidden_states_from_old_logprob: false
         # SGLang does not apply the target final norm to captured aux states.

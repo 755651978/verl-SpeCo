@@ -33,6 +33,10 @@ training, and hot-update logic through `verl_speco`.
 
 ## Architecture
 
+For experimental direct feature collection with vLLM 0.22.0, see
+[vLLM rollout hidden-state collection](docs/vllm_rollout_capture.md), including
+the supported configuration and CUDA validation procedure.
+
 ![verl-SpeCo architecture](docs/assets/speco-architecture.svg)
 
 For the online drafter collection, training, and publish scheduling boundary,

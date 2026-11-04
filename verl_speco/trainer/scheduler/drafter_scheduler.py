@@ -86,6 +86,7 @@ from verl_speco.trainer.scheduler.collection_adapter import (
     DrafterCollectionAdapter,
     OldLogProbCollectionAdapter,
     SGLangCollectionAdapter,
+    VLLMCollectionAdapter,
 )
 from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
 from verl_speco.trainer.scheduler.drafter_runtime_state import (
@@ -256,6 +257,7 @@ class DrafterScheduler:
             DrafterCollectionSource, DrafterCollectionAdapter
         ] = {
             DrafterCollectionSource.SGLANG: SGLangCollectionAdapter(),
+            DrafterCollectionSource.VLLM: VLLMCollectionAdapter(),
             DrafterCollectionSource.OLD_LOGPROB: OldLogProbCollectionAdapter(),
         }
         self.rollout_idle_execution_strategy = RolloutIdleWorkerExecutionStrategy()

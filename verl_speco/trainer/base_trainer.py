@@ -669,15 +669,21 @@ class DrafterBaseTrainer:
             self.config.rollout.drafter.training.get("data_buffer_max_size", 10000)
         )
         # Only store hidden states in buffer if we're collecting them during generation
-        collect_hidden_states_from_sgl = bool(
-            self.config.rollout.drafter.training.get(
-                "collect_hidden_states_from_sgl", False
+        collect_hidden_states_from_rollout = bool(
+            (
+                self.config.rollout.drafter.training.get(
+                    "collect_hidden_states_from_vllm", False
+                )
+                or self.config.rollout.drafter.training.get(
+                    "collect_hidden_states_from_sgl", False
+                )
             )
         )
 
         # DataBuffer define
         self.data_buffer = DataBuffer(
-            max_size=buffer_max_size, store_hidden_states=collect_hidden_states_from_sgl
+            max_size=buffer_max_size,
+            store_hidden_states=collect_hidden_states_from_rollout,
         )
 
         self.criterion = SmoothL1Loss(reduction="none")
@@ -3934,17 +3940,22 @@ class DrafterBaseTrainer:
                 batch.get("hidden_position_start"), i
             )
             uses_hidden_positions = hidden_positions_item is not None
-            require_sglang_positions = bool(
-                self.config.rollout.drafter.training.get(
-                    "collect_hidden_states_from_sgl", False
+            require_rollout_positions = bool(
+                (
+                    self.config.rollout.drafter.training.get(
+                        "collect_hidden_states_from_vllm", False
+                    )
+                    or self.config.rollout.drafter.training.get(
+                        "collect_hidden_states_from_sgl", False
+                    )
                 )
             )
-            if require_sglang_positions and (
+            if require_rollout_positions and (
                 hidden_positions_item is None
                 or int(hidden_positions_item.numel()) != hidden_seq_length
             ):
                 logger.warning(
-                    "[Rank %s] Drop drafter sample: missing or mismatched SGLang hidden positions "
+                    "[Rank %s] Drop drafter sample: missing or mismatched rollout hidden positions "
                     "sample=%s hidden_rows=%s positions=%s",
                     self.rank,
                     i,
@@ -6435,13 +6446,16 @@ class DrafterBaseTrainer:
             )
             if (
                 getattr(self, "_bubble_time_enabled", False)
-                and str(getattr(rollout_cfg, "name", "")).lower() == "sglang"
+                and (
+                    str(getattr(rollout_cfg, "name", "")).lower() == "sglang"
+                    or training_cfg.get("collect_hidden_states_from_vllm", False)
+                )
                 and not training_cfg.get(
                     "collect_hidden_states_from_old_logprob", False
                 )
                 and getattr(self, "_active_training_reservation_id", None) is None
             ):
-                # SGLang can commit more same-version samples while another
+                # Rollout engines can commit more same-version samples while another
                 # replica is still generating. Expand only at a plan boundary;
                 # never change an in-flight reservation or restart its sampler.
                 known_items = {id(item) for item in session["items"]}
@@ -7077,7 +7091,9 @@ class DrafterBaseTrainer:
             training_cfg.get("collect_hidden_states_from_old_logprob", False)
         )
         if not (
-            collect_hidden_states_from_sgl or collect_hidden_states_from_old_logprob
+            collect_hidden_states_from_sgl
+            or collect_hidden_states_from_old_logprob
+            or training_cfg.get("collect_hidden_states_from_vllm", False)
         ):
             logger.debug(
                 f"[DrafterTrainer rank {self.rank}] Skipping training step {step} "
