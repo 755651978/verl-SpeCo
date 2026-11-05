@@ -20,7 +20,10 @@ from verl_speco.trainer.scheduler import (
 @pytest.fixture
 def directory(tmp_path, monkeypatch):
     monkeypatch.setattr(capture, "capture_root", lambda: tmp_path)
-    return tmp_path
+    yield tmp_path
+    if capture._EXPORT_QUEUE is not None:
+        capture._EXPORT_QUEUE.close()
+        capture._EXPORT_QUEUE = None
 
 
 def plan(**overrides):
@@ -174,6 +177,84 @@ def test_window_minimum_and_determinism():
     assert a["sample_id"] != b["sample_id"]
 
 
+def test_inactive_window_does_not_access_sampler_or_hidden(directory):
+    p = plan(start=100, end=104)
+    runner, state = runner_and_state([p], [2], [[3, 4]], [1])
+    state.aux_hidden_states = None
+    capture.capture_sampled_rows(runner, state, object())
+    assert list(directory.iterdir()) == []
+
+
+def test_capacity_exhaustion_discards_whole_sample(directory):
+    from verl_speco.producer.feature_export import FeatureExportQueue
+
+    capture._EXPORT_QUEUE = FeatureExportQueue(max_bytes=1)
+    p = plan(end=4)
+    open_plan(p)
+    runner, state = runner_and_state([p], [2], [[3, 4]], [1])
+    capture.capture_sampled_rows(
+        runner, state, NS(sampled_token_ids=torch.tensor([[4, 5]]))
+    )
+    assert (capture.plan_directory(p) / "skipped").exists()
+    assert capture.load_sample(p, [1, 2, 3], [4, 5]) is None
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        {"speculative_config": {"method": "extract_hidden_states"}},
+        {"kv_transfer_config": {"kv_connector": "ExampleHiddenStatesConnector"}},
+    ],
+)
+def test_connector_extractor_conflicts_are_rejected(engine):
+    with pytest.raises(ValueError, match="cannot use"):
+        capture.validate_config({"training": {capture.CAPTURE_FLAG: True}}, {}, engine)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_async_cuda_copy_survives_immediate_graph_buffer_reuse(directory):
+    import threading
+    from verl_speco.producer.feature_export import FeatureExportQueue
+
+    gate = threading.Event()
+
+    class GatedQueue(FeatureExportQueue):
+        def submit_reserved(self, directory, payload, *, size, wait, owners):
+            def delayed():
+                assert gate.wait(10)
+                wait()
+
+            super().submit_reserved(
+                directory, payload, size=size, wait=delayed, owners=owners
+            )
+
+    capture._EXPORT_QUEUE = GatedQueue()
+    p = plan(end=4)
+    open_plan(p)
+    runner, state = runner_and_state([p], [2], [[3, 4, 99]], [2])
+    expected = torch.cat(
+        [h[:2] for h in state.aux_hidden_states] + [state.hidden_states[:2]], -1
+    )
+    state.hidden_states = state.hidden_states.cuda()
+    state.aux_hidden_states = [h.cuda() for h in state.aux_hidden_states]
+    runner.input_ids.gpu = runner.input_ids.gpu.cuda()
+    try:
+        capture.capture_sampled_rows(
+            runner,
+            state,
+            NS(sampled_token_ids=torch.tensor([[4, 5, -1]], device="cuda")),
+        )
+        # No synchronize before overwrite: this reproduces graph/proposer reuse.
+        for h in state.aux_hidden_states + [state.hidden_states]:
+            h.fill_(-999)
+        assert list(capture.plan_directory(p).glob("*.pending"))
+        assert not list(capture.plan_directory(p).glob("*.pt"))
+    finally:
+        gate.set()
+    sample = capture.load_sample(p, [1, 2, 3], [4, 5])
+    assert torch.equal(sample["hidden_states"][0], expected)
+
+
 def test_configuration_is_explicit_and_exclusive():
     drafter = {
         "enable": True,
@@ -287,6 +368,7 @@ def test_real_hook_order_preserves_sampler_and_proposer(directory, monkeypatch):
             self.supports_mm_inputs = False
             self.use_aux_hidden_state_outputs = True
             self.vllm_config = NS(
+                speculative_config=NS(method="eagle3"),
                 model_config=NS(hf_config=NS(model_type="qwen3")),
                 parallel_config=NS(
                     tensor_parallel_size=1,

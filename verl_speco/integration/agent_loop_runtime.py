@@ -38,6 +38,8 @@ _DEFAULT_EXTRA_KEYS = {
     "max_global_steps",
     "extras",
     "drafter_sample",
+    "_speco_capture_skipped_capacity",
+    "_speco_capture_rows",
     SPECO_STUDENT_DECODE_TIME_KEY,
     SPECO_TEACHER_PREFILL_TIME_KEY,
 }

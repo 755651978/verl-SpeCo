@@ -1,10 +1,10 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""Opt-in, synchronous V1 rollout feature capture (vLLM 0.22.0).
+"""Opt-in V1 rollout feature capture with bounded async export (vLLM 0.22.0).
 
 The sampler hook runs before the proposer can reuse target output buffers.
 Only confirmed input rows in a bounded response window are copied to CPU.
-The same-node file bridge deliberately favors correctness over copy overlap.
+Owned GPU snapshots protect graph outputs while D2H/export overlap execution.
 """
 
 from __future__ import annotations
@@ -22,6 +22,16 @@ from typing import Any
 CAPTURE_KEY = "speco_rollout_capture"
 CAPTURE_FLAG = "collect_hidden_states_from_vllm"
 logger = logging.getLogger(__name__)
+_EXPORT_QUEUE: Any = None
+
+
+def export_queue():
+    global _EXPORT_QUEUE
+    if _EXPORT_QUEUE is None:
+        from verl_speco.producer.feature_export import FeatureExportQueue
+
+        _EXPORT_QUEUE = FeatureExportQueue()
+    return _EXPORT_QUEUE
 
 
 def enabled(config: Any) -> bool:
@@ -32,6 +42,16 @@ def validate_config(drafter: Any, rollout: Any, engine: Any) -> None:
     if not enabled(drafter):
         return
     training = drafter.get("training") or {}
+    spec = engine.get("speculative_config") or {}
+    if spec.get("method") == "extract_hidden_states":
+        raise ValueError(
+            "Direct rollout capture cannot use method=extract_hidden_states (#62411)"
+        )
+    connector = engine.get("kv_transfer_config") or {}
+    if connector.get("kv_connector") == "ExampleHiddenStatesConnector":
+        raise ValueError(
+            "Direct rollout capture cannot use ExampleHiddenStatesConnector"
+        )
     if not drafter.get("enable") or not drafter.get("enable_drafter_training"):
         raise ValueError("vLLM rollout capture requires drafter training enabled")
     if any(
@@ -89,6 +109,10 @@ def valid_row_count(scheduled: int, drafts: int, sampled: list[int], vocab: int)
     predicts the first sampled token and must be kept even on total rejection.
     """
     count = sum(0 <= token < vocab for token in sampled)
+    return confirmed_row_count(scheduled, drafts, count)
+
+
+def confirmed_row_count(scheduled: int, drafts: int, count: int) -> int:
     if drafts:
         return max(0, min(scheduled, scheduled - drafts + max(count - 1, 0)))
     return scheduled
@@ -150,7 +174,15 @@ def capture_sampled_rows(runner: Any, state: Any, sampler_output: Any) -> None:
     for index, request_id in enumerate(batch.req_ids):
         params = runner.requests[request_id].sampling_params
         plan = (getattr(params, "extra_args", None) or {}).get(CAPTURE_KEY)
-        if plan:
+        if not plan:
+            continue
+        start = int(batch.num_computed_tokens_cpu[index])
+        scheduled = int(state.scheduler_output.num_scheduled_tokens.get(request_id, 0))
+        if (
+            scheduled > 0
+            and start < int(plan["end"])
+            and start + scheduled > int(plan["start"])
+        ):
             selected.append((index, request_id, plan))
     if not selected:
         return
@@ -171,47 +203,125 @@ def capture_sampled_rows(runner: Any, state: Any, sampler_output: Any) -> None:
         raise ValueError(
             "Capture aux layers must exclude the pre-norm final-layer output"
         )
-    sampled = sampler_output.sampled_token_ids.detach().cpu().tolist()
     for index, request_id, plan in selected:
         directory = plan_directory(plan)
         # The frontend owns this directory. Cancellation removes the live marker.
-        if not (directory / "live").exists() or (directory / "error").exists():
+        if (
+            not (directory / "live").exists()
+            or (directory / "error").exists()
+            or (directory / "skipped").exists()
+        ):
             continue
         begin = int(runner.query_start_loc.np[index])
         scheduled = int(state.scheduler_output.num_scheduled_tokens[request_id])
         drafts = len(
             state.scheduler_output.scheduled_spec_decode_tokens.get(request_id, [])
         )
-        keep = valid_row_count(scheduled, drafts, sampled[index], batch.vocab_size)
         start = int(batch.num_computed_tokens_cpu[index])
-        lo, hi = max(start, int(plan["start"])), min(start + keep, int(plan["end"]))
+        lo, hi = (
+            max(start, int(plan["start"])),
+            min(start + scheduled, int(plan["end"])),
+        )
         if lo >= hi:
             continue
         selection = slice(begin + lo - start, begin + hi - start)
         parts = [h[selection] for h in state.aux_hidden_states]
         if plan["layout"].endswith("plus_last"):
             parts.append(state.hidden_states[selection])
-        # Blocking copy completes before graph/proposer buffer reuse. Each file
-        # owns its storage; no CUDA Tensor survives this hook.
-        hidden = torch.cat(parts, dim=-1).detach().to(device="cpu").clone()
-        ids = runner.input_ids.gpu[selection].detach().cpu().clone()
-        payload = {
-            "hidden_states": hidden,
-            "token_ids": ids,
-            "layer_ids": layer_ids,
-            "layout": plan["layout"],
-            "last_hidden_norm": "post_norm",
-            "positions": torch.arange(lo, hi),
-            "sample_id": plan["sample_id"],
-        }
-        temporary = directory / f"{uuid.uuid4().hex}.tmp"
+        # Reserve before allocating snapshots/pinned destinations. Admission is
+        # nonblocking; an overloaded sample is explicitly discarded as a whole.
+        # Include the GPU snapshot, pinned destination and writer-side compact
+        # accepted-row payload, which can coexist during serialization.
+        size = sum(h.numel() * h.element_size() for h in parts) * 3
+        size += (hi - lo) * (runner.input_ids.gpu.element_size() + 8) * 3
+        size += 16  # owned device/host acceptance-count scalar
+        queue = export_queue()
+        if not queue.reserve(size):
+            (directory / "skipped").touch()
+            logger.warning(
+                "Skipped capture sample %s: export capacity exhausted",
+                plan["sample_id"],
+            )
+            continue
+        done = None
+        stream = None
         try:
-            torch.save(payload, temporary)
-            os.replace(temporary, directory / f"{lo}-{hi}.pt")
-        except FileNotFoundError:
-            # Request cancellation can race the synchronous worker hook.
+            # cat and clone run on the forward stream, so next graph execution
+            # cannot overwrite their source before these snapshots are complete.
+            snapshot = torch.cat(parts, dim=-1).detach()
+            token_snapshot = runner.input_ids.gpu[selection].detach().clone()
+            sampled = sampler_output.sampled_token_ids[index]
+            count_snapshot = ((sampled >= 0) & (sampled < batch.vocab_size)).sum()
+            if snapshot.is_cuda:
+                ready = torch.cuda.Event()
+                ready.record(torch.cuda.current_stream(snapshot.device))
+                stream = getattr(runner, "_speco_capture_copy_stream", None)
+                if stream is None:
+                    stream = runner._speco_capture_copy_stream = torch.cuda.Stream(
+                        device=snapshot.device
+                    )
+                hidden = torch.empty_like(snapshot, device="cpu", pin_memory=True)
+                ids = torch.empty_like(token_snapshot, device="cpu", pin_memory=True)
+                count = torch.empty_like(count_snapshot, device="cpu", pin_memory=True)
+                stream.wait_event(ready)
+                with torch.cuda.stream(stream):
+                    hidden.copy_(snapshot, non_blocking=True)
+                    ids.copy_(token_snapshot, non_blocking=True)
+                    count.copy_(count_snapshot, non_blocking=True)
+                    done = torch.cuda.Event()
+                    done.record(stream)
+                snapshot.record_stream(stream)
+                token_snapshot.record_stream(stream)
+                count_snapshot.record_stream(stream)
+            else:
+                hidden, ids = snapshot, token_snapshot
+                count = count_snapshot
+            payload = {
+                "hidden_states": hidden,
+                "token_ids": ids,
+                "layer_ids": layer_ids,
+                "layout": plan["layout"],
+                "last_hidden_norm": "post_norm",
+                "positions": torch.arange(lo, hi),
+                "sample_id": plan["sample_id"],
+            }
+
+            def finish_copy(
+                event=done,
+                data=payload,
+                accepted=count,
+                offset=start,
+                total=scheduled,
+                draft_count=drafts,
+            ):
+                if event is not None:
+                    event.synchronize()
+                # Read the scalar only after D2H completes, outside the runner.
+                keep = confirmed_row_count(total, draft_count, int(accepted))
+                valid = data["positions"] < offset + keep
+                for field in ("hidden_states", "token_ids", "positions"):
+                    data[field] = data[field][valid]
+
+            queue.submit_reserved(
+                directory,
+                payload,
+                size=size,
+                wait=finish_copy,
+                owners=(snapshot, token_snapshot, count_snapshot, hidden, ids, count),
+            )
+        except BaseException:
+            # Copies may have been launched before a submission error. Wait
+            # before dropping pinned buffers and releasing their reservation.
+            try:
+                if done is not None:
+                    done.synchronize()
+                elif stream is not None:
+                    stream.synchronize()
+            finally:
+                queue.release(size)
             if (directory / "live").exists():
                 raise
+            continue
 
 
 def install_runner_capture() -> None:
@@ -233,6 +343,13 @@ def install_runner_capture() -> None:
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         config = self.vllm_config
+        if getattr(config.speculative_config, "method", None) not in {
+            "eagle3",
+            "dflash",
+        }:
+            raise ValueError(
+                "Direct capture requires a real EAGLE3/DFlash drafter; extractor mode conflicts"
+            )
         model_type = getattr(config.model_config.hf_config, "model_type", "")
         if model_type not in {"llama", "qwen2", "qwen3"}:
             raise ValueError(
@@ -297,6 +414,14 @@ def load_sample(
     import torch
 
     directory = plan_directory(plan)
+    from verl_speco.producer.feature_export import (
+        wait_for_exports,
+        rollout_feature_fields,
+    )
+
+    wait_for_exports(directory)
+    if (directory / "skipped").exists():
+        return None
     if (directory / "error").exists():
         raise RuntimeError("vLLM worker reported a hidden-state export failure")
     end = min(int(plan["end"]), len(prompt) + len(response) - 1)
@@ -338,11 +463,12 @@ def load_sample(
             "vLLM rollout capture missing rows or token alignment mismatch"
         )
     return {
-        "input_ids": torch.tensor(tokens).unsqueeze(0),
-        "prompts": torch.tensor(prompt).unsqueeze(0),
-        "responses": torch.tensor(response).unsqueeze(0),
-        "hidden_states": torch.stack([rows[p][0] for p in positions]).unsqueeze(0),
-        "hidden_positions": torch.tensor(positions).unsqueeze(0),
+        **rollout_feature_fields(
+            torch.tensor(prompt),
+            torch.tensor(response),
+            torch.stack([rows[p][0] for p in positions]),
+            torch.tensor(positions),
+        ),
         "hidden_position_start": start,
         "hidden_position_end": end,
         "hidden_states_layout": plan["layout"],
@@ -356,7 +482,9 @@ def load_sample(
 
 
 def cleanup(plan: dict[str, Any]) -> None:
-    shutil.rmtree(plan_directory(plan), ignore_errors=True)
+    directory = plan_directory(plan)
+    (directory / "live").unlink(missing_ok=True)
+    shutil.rmtree(directory, ignore_errors=True)
 
 
 async def generate_with_capture(
@@ -469,6 +597,12 @@ async def generate_with_capture(
 
         sample = await asyncio.to_thread(
             load_sample, plan, prompt, list(output.token_ids)
+        )
+        output.extra_fields["_speco_capture_skipped_capacity"] = int(
+            (directory / "skipped").exists()
+        )
+        output.extra_fields["_speco_capture_rows"] = (
+            int(sample["hidden_states"].shape[1]) if sample is not None else 0
         )
         if sample is not None:
             from verl_speco.integration.rollout_idle_events import (

@@ -1,6 +1,6 @@
 # vLLM rollout hidden-state collection
 
-Last updated: 2026-11-04
+Last updated: 2026-11-05
 
 This experimental path captures target features during the existing RL rollout
 forward. It does not replay the target model and does not replace the real
@@ -55,6 +55,12 @@ uses position `prompt_length - 1`. The last eligible position is
 `prompt_length + final_response_length - 2`; the final generated token's hidden
 is not required. EOS/stop truncation is applied again at frontend assembly.
 
+The bridge snapshots only intersecting windows. Acceptance counts stay on the
+device and are copied asynchronously with features; the writer removes rejected
+rows after its completion event. This avoids a capture-induced sampler
+`cpu().tolist()` synchronization. A few rejected candidate rows inside the
+window can cross D2H, but are never published as training rows.
+
 The bridge saves CPU-only, windowed chunks under the same-node temporary
 directory `verl-speco-rollout-capture/<sample-id>/`. Files are committed by
 atomic rename. The frontend checks identity, coverage, token IDs, layer metadata,
@@ -70,13 +76,41 @@ producer model calls are not used.
 
 ## Performance and validation limits
 
-This first implementation uses **blocking D2H copies and file writes** to ensure
-that graph output buffers cannot be overwritten before capture completes. It
-avoids an additional target forward, but can slow rollout; it makes no throughput
-claim. Asynchronous bounded staging and multi-rank transport are future work.
+CUDA capture uses owned snapshots on the forward stream, pinned host buffers,
+and a dedicated copy stream. A shared `FeatureExportQueue` waits on completion
+events and writes files on background threads; the runner does not wait for
+those copies or writes. The frontend waits for pending exports before assembling
+a sample. SGLang and vLLM share `rollout_feature_fields` for the base sample
+contract. Neither helper executes a model or invokes the independent producer.
+
+Each worker limits retained export buffers to 256 MiB and 16 outstanding chunks,
+with two writer threads. Reservations include device snapshots, pinned buffers
+and compact writer payloads. Capacity exhaustion explicitly skips the whole
+sample; partial samples are not trained. The output fields
+`_speco_capture_skipped_capacity` and `_speco_capture_rows` expose this behavior.
+The writer retains ownership until export completes, and failed exports are
+reported to the frontend. No fallback reruns the target forward.
+
+This avoids an additional target forward but is not a throughput guarantee:
+GPU snapshot copies, CPU assembly, metadata filesystem operations and feature
+files still cost time. CUDA performance and the new asynchronous lifetime
+handling require hardware validation. Multi-rank transport remains future work.
 Request completion/failure removes its capture directory. A hard process kill
 can leave files in the temporary directory; remove abandoned run files only
 after all engines using them have stopped.
+
+## Relationship to vLLM PR #62411
+
+[#62411](https://github.com/vllm-project/vllm/pull/62411) adds windowed file export
+to `ExampleHiddenStatesConnector` with `method=extract_hidden_states`. It cannot
+coexist with a real speculative drafter in that engine. SpeCo's direct path keeps
+EAGLE3/DFlash active and does not enable that connector. Configuration explicitly
+rejects mixing either extractor option into direct capture.
+
+The two designs can be used by separate engines, but this implementation does
+not require that PR. Applying its changes to a patched vLLM installation still
+requires version-specific integration testing; clean patch application or runtime
+compatibility has not been established here.
 
 CPU tests exercise acceptance filtering, mixed-request offsets, buffer ownership,
 window/stop clipping, token validation, cancellation, frontend lifecycle and
