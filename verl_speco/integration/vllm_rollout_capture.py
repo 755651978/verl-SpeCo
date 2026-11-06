@@ -3,7 +3,7 @@
 """Opt-in V1 rollout feature capture with bounded async export (vLLM 0.22.0).
 
 The sampler hook runs before the proposer can reuse target output buffers.
-Only confirmed input rows in a bounded response window are copied to CPU.
+Only intersecting window rows are copied to CPU and filtered before export.
 Owned GPU snapshots protect graph outputs while D2H/export overlap execution.
 """
 
@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,18 @@ def validate_config(drafter: Any, rollout: Any, engine: Any) -> None:
         raise ValueError("vLLM rollout capture supports front/random windows")
     if int(training.get("hidden_state_window_tokens_per_sample", 512)) <= 0:
         raise ValueError("vLLM capture window must be positive and bounded")
+    if (
+        not 1
+        <= int(training.get("hidden_state_window_min_rows", 1))
+        <= int(training.get("hidden_state_window_tokens_per_sample", 512))
+    ):
+        raise ValueError(
+            "vLLM capture min_rows must be positive and fit within the window"
+        )
+    if training.get("hidden_state_max_tokens_per_sample") is not None:
+        logger.warning(
+            "vLLM capture ignores hidden_state_max_tokens_per_sample; use hidden_state_window_tokens_per_sample"
+        )
     if training.get("preserve_prompt_hidden_states"):
         raise ValueError(
             "vLLM rollout capture currently collects response prediction rows only"
@@ -309,6 +322,19 @@ def capture_sampled_rows(runner: Any, state: Any, sampler_output: Any) -> None:
                 wait=finish_copy,
                 owners=(snapshot, token_snapshot, count_snapshot, hidden, ids, count),
             )
+            if logger.isEnabledFor(logging.DEBUG):
+                d2h_bytes = (
+                    sum(t.numel() * t.element_size() for t in (hidden, ids, count))
+                    if done is not None
+                    else 0
+                )
+                logger.debug(
+                    "vLLM capture chunk sample=%s window=[%s,%s) d2h_bytes=%s",
+                    plan["sample_id"],
+                    lo,
+                    hi,
+                    d2h_bytes,
+                )
         except BaseException:
             # Copies may have been launched before a submission error. Wait
             # before dropping pinned buffers and releasing their reservation.
@@ -419,15 +445,23 @@ def load_sample(
         rollout_feature_fields,
     )
 
-    wait_for_exports(directory)
-    if (directory / "skipped").exists():
-        return None
     if (directory / "error").exists():
         raise RuntimeError("vLLM worker reported a hidden-state export failure")
     end = min(int(plan["end"]), len(prompt) + len(response) - 1)
     start = int(plan["start"])
     if end - start < int(plan["min_rows"]) or end <= start:
         return None
+    wait_started = time.perf_counter()
+    wait_for_exports(directory)
+    logger.debug(
+        "vLLM capture export wait sample=%s seconds=%.6f",
+        plan["sample_id"],
+        time.perf_counter() - wait_started,
+    )
+    if (directory / "skipped").exists():
+        return None
+    if (directory / "error").exists():
+        raise RuntimeError("vLLM worker reported a hidden-state export failure")
     chunks = [
         torch.load(path, map_location="cpu", weights_only=True)
         for path in sorted(directory.glob("*.pt"))
@@ -497,7 +531,14 @@ async def generate_with_capture(
     skip: bool = False,
 ) -> Any:
     """Frontend adapter; expensive imports and file allocation are opt-in."""
-    if not enabled(drafter) or skip:
+    if not enabled(drafter):
+        return await generate(*args, **kwargs)
+    if skip:
+        logger.debug(
+            "vLLM capture skipped reason=request_skip step=%s replica=%s",
+            server.global_steps,
+            server.replica_rank,
+        )
         return await generate(*args, **kwargs)
     import inspect
     from verl_speco.trainer.scheduler import (
@@ -524,6 +565,12 @@ async def generate_with_capture(
         DrafterScheduleConfig.from_mapping(training),
     )
     if not decision.collect:
+        logger.debug(
+            "vLLM capture skipped reason=%s step=%s replica=%s",
+            decision.reason,
+            step,
+            server.replica_rank,
+        )
         return await generate(*args, **kwargs)
     bound = inspect.signature(generate).bind(*args, **kwargs)
     values = bound.arguments
@@ -552,6 +599,13 @@ async def generate_with_capture(
         replica_rank=int(server.replica_rank),
     )
     if plan["end"] - plan["start"] < plan["min_rows"]:
+        logger.debug(
+            "vLLM capture skipped reason=window_too_short request=%s step=%s planned_rows=%s min_rows=%s",
+            request_id,
+            step,
+            plan["end"] - plan["start"],
+            plan["min_rows"],
+        )
         return await generate(*args, **kwargs)
     # Replica-local admission happens before any await, so concurrent requests
     # cannot exceed the configured per-step sample/token budgets.
@@ -567,11 +621,21 @@ async def generate_with_capture(
         )
         / 2**64
     )
-    if (
-        (sample_limit > 0 and budget[1] >= sample_limit)
-        or (token_limit > 0 and budget[2] + rows > token_limit)
-        or fraction >= float(training.get("collection_sample_rate", 1.0))
-    ):
+    reason = None
+    if sample_limit > 0 and budget[1] >= sample_limit:
+        reason = "sample_budget"
+    elif token_limit > 0 and budget[2] + rows > token_limit:
+        reason = "token_budget"
+    elif fraction >= float(training.get("collection_sample_rate", 1.0)):
+        reason = "sample_rate"
+    if reason:
+        logger.debug(
+            "vLLM capture skipped reason=%s request=%s step=%s replica=%s",
+            reason,
+            request_id,
+            step,
+            server.replica_rank,
+        )
         return await generate(*args, **kwargs)
     budget[1] += 1
     budget[2] += rows
@@ -579,22 +643,38 @@ async def generate_with_capture(
         drafter["speculative_algorithm"], training
     )
     directory = plan_directory(plan)
-    directory.mkdir(parents=True, exist_ok=False)
-    (directory / "live").touch()
     extra = dict(params.get("extra_args") or {})
     if CAPTURE_KEY in extra:
-        cleanup(plan)
         raise ValueError("speco_rollout_capture is reserved for the rollout adapter")
     extra[CAPTURE_KEY] = plan
     values["sampling_params"] = {**params, "extra_args": extra}
+    directory.mkdir(parents=True, exist_ok=False)
     try:
+        (directory / "live").touch()
+        logger.debug(
+            "vLLM capture admitted request=%s sample=%s step=%s replica=%s window=[%s,%s) min_rows=%s layout=%s",
+            request_id,
+            plan["sample_id"],
+            step,
+            server.replica_rank,
+            plan["start"],
+            plan["end"],
+            plan["min_rows"],
+            plan["layout"],
+        )
         output = await generate(*bound.args, **bound.kwargs)
         if getattr(output, "stop_reason", None) == "aborted":
+            logger.debug(
+                "vLLM capture skipped reason=aborted request=%s sample=%s",
+                request_id,
+                plan["sample_id"],
+            )
             return output
         if int(server.global_steps) != step:
             raise RuntimeError("Target serving version changed during capture")
         import asyncio
 
+        load_started = time.perf_counter()
         sample = await asyncio.to_thread(
             load_sample, plan, prompt, list(output.token_ids)
         )
@@ -603,6 +683,23 @@ async def generate_with_capture(
         )
         output.extra_fields["_speco_capture_rows"] = (
             int(sample["hidden_states"].shape[1]) if sample is not None else 0
+        )
+        logger.debug(
+            "vLLM capture result request=%s sample=%s step=%s replica=%s reason=%s rows=%s response_tokens=%s load_seconds=%.6f",
+            request_id,
+            plan["sample_id"],
+            step,
+            server.replica_rank,
+            "collected"
+            if sample is not None
+            else (
+                "capacity"
+                if output.extra_fields["_speco_capture_skipped_capacity"]
+                else "short_response"
+            ),
+            output.extra_fields["_speco_capture_rows"],
+            len(output.token_ids),
+            time.perf_counter() - load_started,
         )
         if sample is not None:
             from verl_speco.integration.rollout_idle_events import (
@@ -622,5 +719,14 @@ async def generate_with_capture(
             sample["_speco_direct_event_emitted"] = emitted
             output.extra_fields["drafter_sample"] = sample
         return output
+    except Exception:
+        logger.exception(
+            "vLLM capture failed request=%s sample=%s step=%s replica=%s",
+            request_id,
+            plan["sample_id"],
+            step,
+            server.replica_rank,
+        )
+        raise
     finally:
         cleanup(plan)

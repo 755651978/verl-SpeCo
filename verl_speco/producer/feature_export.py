@@ -56,24 +56,39 @@ class FeatureExportQueue:
         marker = Path(directory) / f"{uuid.uuid4().hex}.pending"
         marker.touch()
         try:
-            self._executor.submit(self._write, marker, payload, size, wait, owners)
+            self._executor.submit(
+                self._write, marker, payload, size, wait, owners, time.perf_counter()
+            )
         except BaseException:
             marker.unlink(missing_ok=True)
             raise
 
-    def _write(self, marker, payload, size, wait, owners):
+    def _write(self, marker, payload, size, wait, owners, submitted):
         temporary = marker.with_suffix(".tmp")
         try:
             import torch
 
+            started = time.perf_counter()
             wait()
+            ready = time.perf_counter()
             if not (marker.parent / "live").exists():
                 return
             torch.save(payload, temporary)
             if (marker.parent / "live").exists():
                 os.replace(temporary, marker.with_suffix(".pt"))
+                logger.debug(
+                    "Feature export complete sample=%s reserved_bytes=%s queue_seconds=%.6f "
+                    "wait_and_filter_seconds=%.6f write_seconds=%.6f",
+                    payload.get("sample_id"),
+                    size,
+                    started - submitted,
+                    ready - started,
+                    time.perf_counter() - ready,
+                )
         except Exception:
-            logger.exception("Feature export failed")
+            logger.exception(
+                "Feature export failed sample=%s", payload.get("sample_id")
+            )
             try:
                 if (marker.parent / "live").exists():
                     (marker.parent / "error").touch()

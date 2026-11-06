@@ -185,6 +185,20 @@ def test_inactive_window_does_not_access_sampler_or_hidden(directory):
     assert list(directory.iterdir()) == []
 
 
+def test_short_response_skips_pending_exports(directory, monkeypatch):
+    from verl_speco.producer import feature_export
+
+    p = plan(end=6, min_rows=4)
+    open_plan(p)
+    (capture.plan_directory(p) / "unfinished.pending").touch()
+
+    def unexpected_wait(*args):
+        pytest.fail("A short response must not wait for export")
+
+    monkeypatch.setattr(feature_export, "wait_for_exports", unexpected_wait)
+    assert capture.load_sample(p, [1, 2, 3], [4, 5]) is None
+
+
 def test_capacity_exhaustion_discards_whole_sample(directory):
     from verl_speco.producer.feature_export import FeatureExportQueue
 

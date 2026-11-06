@@ -91,6 +91,15 @@ sample; partial samples are not trained. The output fields
 The writer retains ownership until export completes, and failed exports are
 reported to the frontend. No fallback reruns the target forward.
 
+Enable DEBUG for `verl_speco.integration.vllm_rollout_capture` and
+`verl_speco.producer.feature_export` in the rollout server and model worker.
+Use the sample ID to correlate admission, window bounds, final row count,
+frontend export wait and background queue/write timing. Reserved bytes are
+the memory budget charge, not measured D2H bytes. Frontend load time includes
+the export wait and sample assembly. Requests below the final minimum row
+count skip the export wait. The writer still owns any outstanding CUDA copy
+until it completes.
+
 This avoids an additional target forward but is not a throughput guarantee:
 GPU snapshot copies, CPU assembly, metadata filesystem operations and feature
 files still cost time. CUDA performance and the new asynchronous lifetime
