@@ -11,16 +11,89 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from verl_speco.integration import agent_loop_runtime
+from verl_speco.integration.partial_rollout_stats import (
+    REVISION_MAX,
+    REVISION_MIN,
+    merge_serving_segments,
+    patch_partial_rollout_client,
+    record_serving_segment,
+)
+from verl_speco.integration.rollout_admission import RolloutAdmission
+
+
+def test_agent_loop_preserves_spec_decode_metric_fields() -> None:
+    output = SimpleNamespace(extra_fields={})
+
+    agent_loop_runtime._speco_default_agent_loop_extra_fields(output)
+
+    assert output.extra_fields["_speco_vllm_spec_decode_drafts"] is None
+    assert output.extra_fields["_speco_vllm_spec_decode_accepted_tokens"] is None
+
+
+@pytest.mark.parametrize("fallback_first", [False, True])
+def test_mixed_acceptance_sources_have_concat_compatible_fields(fallback_first):
+    np = pytest.importorskip("numpy")
+
+    from verl_speco.integration.acceptance_metrics import (
+        bridge_request_acceptance_counters,
+        request_acceptance_counters,
+    )
+
+    key = "_speco_acceptance_engine_fallback"
+    outputs = [SimpleNamespace(extra_fields={}), SimpleNamespace(extra_fields={key: True})]
+    if fallback_first:
+        outputs.reverse()
+    agent_loop_runtime._speco_default_agent_loop_inputs(outputs)
+    assert outputs[0].extra_fields.keys() == outputs[1].extra_fields.keys()
+    assert [output.extra_fields[key] for output in outputs] == (
+        [True, False] if fallback_first else [False, True]
+    )
+    DataProto = pytest.importorskip("verl.protocol").DataProto
+    batches = [
+        DataProto(non_tensor_batch={k: np.array([v], dtype=object) for k, v in output.extra_fields.items()})
+        for output in outputs
+    ]
+    combined = DataProto.concat(batches)
+    assert combined.non_tensor_batch[key].tolist() == ([True, False] if fallback_first else [False, True])
+
+    fields = next(output.extra_fields for output in outputs if output.extra_fields[key])
+    fields.update(spec_num_verify_steps=100, spec_num_accepted_tokens=300)
+    assert request_acceptance_counters(fields) is None
+    fields.update(_speco_vllm_request_verify_rounds=2, _speco_vllm_request_accepted_tokens=3)
+    assert bridge_request_acceptance_counters(fields)
+    assert fields[key] is False
+    assert request_acceptance_counters(fields) == (2, 3)
 
 
 def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -> None:
     class AgentLoopWorker:
+        distillation_enabled = True
+
         async def generate_sequences(self, batch):
             return batch
 
         async def _run_agent_loop(self, sampling_params, trajectory):
-            return sampling_params, trajectory
+            output = SimpleNamespace(extra_fields={})
+            await LLMServerClient().generate(sampling_params=sampling_params)
+            await self._compute_teacher_logprobs(
+                output, [1], [2], False, {"data_source": "math"}
+            )
+            return output
+
+        async def _compute_teacher_logprobs(
+            self,
+            output,
+            prompt_ids,
+            response_ids,
+            validate,
+            sample_kwargs=None,
+        ):
+            return await LLMServerClient().generate(
+                sampling_params={"max_tokens": 1, "prompt_logprobs": 1}
+            )
 
         def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
             return inputs, input_non_tensor_batch, validate
@@ -42,7 +115,9 @@ def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -
         LLMServerClient=LLMServerClient,
     )
     monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
-    monkeypatch.setattr(agent_loop_runtime, "_load_agent_loop_module", lambda: release_v080_module)
+    monkeypatch.setattr(
+        agent_loop_runtime, "_load_agent_loop_module", lambda: release_v080_module
+    )
 
     assert agent_loop_runtime.install_agent_loop_runtime_patch() is True
     assert LLMServerClient._speco_patched_generate is True
@@ -51,7 +126,362 @@ def test_agent_loop_patch_supports_release_v080_llm_server_client(monkeypatch) -
 
     global_steps_token = agent_loop_runtime._CURRENT_GLOBAL_STEPS.set(17)
     try:
-        sampling_params = asyncio.run(LLMServerClient().generate(sampling_params={"temperature": 1.0}))
+        sampling_params = asyncio.run(
+            LLMServerClient().generate(sampling_params={"temperature": 1.0})
+        )
     finally:
         agent_loop_runtime._CURRENT_GLOBAL_STEPS.reset(global_steps_token)
     assert sampling_params["_verl_global_steps"] == 17
+
+    output = asyncio.run(
+        AgentLoopWorker()._run_agent_loop(
+            {"temperature": 1.0}, {"step": 17, "validate": False}
+        )
+    )
+    assert output.extra_fields[agent_loop_runtime.SPECO_STUDENT_DECODE_TIME_KEY] >= 0.0
+    assert output.extra_fields[agent_loop_runtime.SPECO_TEACHER_PREFILL_TIME_KEY] >= 0.0
+
+    global_steps_token = agent_loop_runtime._CURRENT_GLOBAL_STEPS.set(18)
+    skip_collection_token = agent_loop_runtime._CURRENT_SKIP_DRAFTER_COLLECTION.set(
+        True
+    )
+    try:
+        sampling_params = asyncio.run(
+            LLMServerClient().generate(sampling_params={"temperature": 1.0})
+        )
+    finally:
+        agent_loop_runtime._CURRENT_SKIP_DRAFTER_COLLECTION.reset(skip_collection_token)
+        agent_loop_runtime._CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+    assert sampling_params["_verl_global_steps"] == 18
+    assert sampling_params["_verl_skip_drafter_collection"] is True
+    assert "_verl_skip_rollout_idle_event" not in sampling_params
+
+
+@pytest.mark.parametrize("distillation_enabled", [False, True])
+@pytest.mark.parametrize("validate", [False, True])
+def test_phase_timing_survives_postprocess_defaults(
+    monkeypatch, distillation_enabled, validate
+) -> None:
+    calls = []
+
+    class AgentLoopWorker:
+        async def generate_sequences(self, batch):
+            return batch
+
+        async def _run_agent_loop(self, sampling_params, trajectory):
+            calls.append("student")
+            await LLMServerClient().generate(sampling_params=sampling_params)
+            output = SimpleNamespace(extra_fields={})
+            return await self._agent_loop_postprocess(output, trajectory["validate"])
+
+        async def _agent_loop_postprocess(self, output, validate):
+            calls.append("postprocess")
+            # The installed wrapper populates both timing fields before scoring.
+            assert (
+                output.extra_fields[agent_loop_runtime.SPECO_STUDENT_DECODE_TIME_KEY]
+                is None
+            )
+            assert (
+                output.extra_fields[agent_loop_runtime.SPECO_TEACHER_PREFILL_TIME_KEY]
+                is None
+            )
+            if self.distillation_enabled and not validate:
+                await self._compute_teacher_logprobs(output, [1], [2], validate)
+                await self._compute_teacher_logprobs(output, [1], [2], validate)
+            return output
+
+        async def _compute_teacher_logprobs(self, output, *args):
+            calls.append("teacher")
+            assert agent_loop_runtime._CURRENT_STUDENT_DECODE_TIMES.get() is None
+            await LLMServerClient().generate(sampling_params={"prompt_logprobs": 1})
+
+        def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
+            return inputs
+
+    class AgentLoopManager:
+        async def generate_sequences(self, prompts):
+            return prompts
+
+    class LLMServerClient:
+        async def generate(self, *, sampling_params):
+            return sampling_params
+
+    module = SimpleNamespace(
+        AgentLoopWorker=AgentLoopWorker,
+        AgentLoopManager=AgentLoopManager,
+        LLMServerClient=LLMServerClient,
+    )
+    monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
+    monkeypatch.setattr(agent_loop_runtime, "_load_agent_loop_module", lambda: module)
+    # Each measured operation takes one unit, independently of wall-clock noise.
+    ticks = iter(range(100))
+    monkeypatch.setattr(agent_loop_runtime.time, "perf_counter", lambda: next(ticks))
+    assert agent_loop_runtime.install_agent_loop_runtime_patch()
+    worker = AgentLoopWorker()
+    worker.distillation_enabled = distillation_enabled
+    output = asyncio.run(
+        worker._run_agent_loop({}, {"step": 1, "validate": validate})
+    )
+    assert output.extra_fields[agent_loop_runtime.SPECO_STUDENT_DECODE_TIME_KEY] == 1.0
+    teacher_time = output.extra_fields[agent_loop_runtime.SPECO_TEACHER_PREFILL_TIME_KEY]
+    if distillation_enabled and not validate:
+        assert calls == ["student", "postprocess", "teacher", "teacher"]
+        assert teacher_time == 2.0
+    else:
+        assert calls == ["student", "postprocess"]
+        assert teacher_time is None
+    assert agent_loop_runtime._CURRENT_STUDENT_DECODE_TIMES.get() is None
+
+
+def test_agent_loop_drain_waits_for_an_inflight_async_generation(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class AgentLoopWorker:
+        async def generate_sequences(self, batch):
+            started.set()
+            await release.wait()
+            return batch
+
+        async def _run_agent_loop(self, sampling_params, trajectory):
+            return sampling_params, trajectory
+
+        def _postprocess(self, inputs, input_non_tensor_batch=None, validate=False):
+            return inputs
+
+    class AgentLoopManager:
+        def __init__(self):
+            self.config = None
+
+        async def generate_sequences(self, prompts):
+            return prompts
+
+    class LLMServerClient:
+        async def generate(self, *, sampling_params):
+            return sampling_params
+
+    monkeypatch.setattr(agent_loop_runtime, "_PATCHED", False)
+    monkeypatch.setattr(
+        agent_loop_runtime,
+        "_load_agent_loop_module",
+        lambda: SimpleNamespace(
+            AgentLoopWorker=AgentLoopWorker,
+            AgentLoopManager=AgentLoopManager,
+            LLMServerClient=LLMServerClient,
+        ),
+    )
+    assert agent_loop_runtime.install_agent_loop_runtime_patch() is True
+
+    async def exercise() -> None:
+        worker = AgentLoopWorker()
+        generation = asyncio.create_task(worker.generate_sequences({}))
+        await started.wait()
+        drain = asyncio.create_task(worker.speco_drain())
+        await asyncio.sleep(0)
+        assert not drain.done()
+        release.set()
+        await generation
+        await drain
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_tq_background_tasks_settle_after_submission_rpc_returned(cancel):
+    async def exercise():
+        release = asyncio.Event()
+        worker = SimpleNamespace(background_tasks=set())
+        task = asyncio.create_task(release.wait())
+        worker.background_tasks.add(task)
+        task.add_done_callback(worker.background_tasks.discard)
+        await asyncio.sleep(0)
+        if cancel:
+            await asyncio.wait_for(
+                agent_loop_runtime._speco_worker_cancel_pending(worker), 1
+            )
+            assert task.cancelled()
+        else:
+            drain = asyncio.create_task(agent_loop_runtime._speco_worker_drain(worker))
+            await asyncio.sleep(0)
+            assert not drain.done()
+            release.set()
+            await asyncio.wait_for(drain, 1)
+        assert not worker.background_tasks
+
+    asyncio.run(exercise())
+
+
+def test_native_tq_worker_bridge_keeps_manager_and_exposes_serialized_rpcs(monkeypatch):
+    import sys
+
+    class Worker:
+        pass
+
+    class Manager:
+        pass
+
+    Manager.__module__ = "verl.trainer.ppo.v1.agent_loop_tq"
+    native = SimpleNamespace(
+        AgentLoopManagerTQ=Manager,
+        AgentLoopWorkerTQ=SimpleNamespace(__ray_actor_class__=Worker),
+    )
+    monkeypatch.setitem(
+        sys.modules, "verl.trainer.ppo.v1", SimpleNamespace(agent_loop_tq=native)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ray",
+        SimpleNamespace(remote=lambda cls: SimpleNamespace(__ray_actor_class__=cls)),
+    )
+    assert agent_loop_runtime.install_v1_agent_loop_worker_bridge(Manager)
+    bridged = native.AgentLoopWorkerTQ.__ray_actor_class__
+    assert issubclass(bridged, Worker)
+    assert bridged.speco_drain is agent_loop_runtime._speco_worker_drain
+    assert (
+        bridged.speco_cancel_pending is agent_loop_runtime._speco_worker_cancel_pending
+    )
+    assert native.AgentLoopManagerTQ is Manager
+    assert agent_loop_runtime.install_v1_agent_loop_worker_bridge(Manager)
+    assert native.AgentLoopWorkerTQ.__ray_actor_class__ is bridged
+    assert not agent_loop_runtime.install_v1_agent_loop_worker_bridge(
+        type("Custom", (), {})
+    )
+
+
+def _serving_segment(rounds, accepted, revision):
+    return {
+        "_speco_vllm_request_id": "request",
+        "_speco_vllm_request_verify_rounds": rounds,
+        "_speco_vllm_request_accepted_tokens": accepted,
+        "_speco_vllm_request_draft_tokens": rounds * 7,
+        "_speco_vllm_request_elapsed_sec": 0.25,
+        REVISION_MIN: revision,
+        REVISION_MAX: revision,
+    }
+
+
+def test_partial_acceptance_is_weighted_by_verify_rounds_not_chunk_means():
+    import json
+
+    fields = {"min_global_steps": 1, "max_global_steps": 2}
+    merge_serving_segments(
+        fields, [_serving_segment(1, 6, 0), _serving_segment(3, 3, 1)]
+    )
+    assert fields["_verl_request_mean_accept_len"] == 3.25
+    assert fields[REVISION_MIN] == 0
+    assert fields[REVISION_MAX] == 1
+    assert fields["_speco_vllm_request_elapsed_sec"] == 0.5
+    assert fields["max_global_steps"] == 2
+    projections = json.loads(fields["_speco_drafter_revision_stats"])
+    assert [
+        (row["revision"], row["verify_rounds"], row["accepted_tokens"])
+        for row in projections
+    ] == [(0, 1, 6), (1, 3, 3)]
+
+
+def test_missing_segment_provenance_or_counters_does_not_fabricate_evidence():
+    fields = {}
+    merge_serving_segments(fields, [_serving_segment(2, 4, 1), {}])
+    assert fields[REVISION_MIN] is None
+    assert fields[REVISION_MAX] is None
+    assert fields["_verl_request_mean_accept_len"] is None
+    assert fields["_speco_drafter_revision_stats"] is None
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_partial_client_context_is_per_request_and_restored_after_failure(fail):
+    class Client:
+        async def generate(self, revision):
+            record_serving_segment(
+                SimpleNamespace(
+                    token_ids=[1], extra_fields=_serving_segment(2, revision, revision)
+                )
+            )
+            await asyncio.sleep(0)
+            if fail and revision == 2:
+                raise RuntimeError("aborted client")
+            return SimpleNamespace(token_ids=[1], extra_fields={})
+
+    patch_partial_rollout_client(Client)
+    patch_partial_rollout_client(Client)
+
+    async def scenario():
+        outputs = await asyncio.gather(
+            Client().generate(1), Client().generate(2), return_exceptions=True
+        )
+        assert outputs[0].extra_fields[REVISION_MAX] == 1
+        if fail:
+            assert isinstance(outputs[1], RuntimeError)
+        else:
+            assert outputs[1].extra_fields[REVISION_MAX] == 2
+        record_serving_segment(
+            SimpleNamespace(token_ids=[99], extra_fields=_serving_segment(1, 1, 99))
+        )
+        assert (await Client().generate(1)).extra_fields[REVISION_MIN] == 1
+
+    asyncio.run(scenario())
+
+
+def test_close_blocks_new_requests_but_waits_only_for_admitted_rpc():
+    async def scenario():
+        gate = RolloutAdmission()
+        started, finish, retry_started = (
+            asyncio.Event(),
+            asyncio.Event(),
+            asyncio.Event(),
+        )
+
+        async def admitted():
+            async with gate.request():
+                started.set()
+                await finish.wait()
+
+        async def retry():
+            async with gate.request():
+                retry_started.set()
+
+        first = asyncio.create_task(admitted())
+        await started.wait()
+        gate.close()
+        queued = asyncio.create_task(retry())
+        idle = asyncio.create_task(gate.wait_idle())
+        await asyncio.sleep(0)
+        assert not idle.done()
+        assert not retry_started.is_set()
+        finish.set()
+        await first
+        await asyncio.wait_for(idle, 1)
+        assert not queued.done()  # A paused agent retry must not hold the barrier.
+        gate.resume()
+        await asyncio.wait_for(queued, 1)
+        assert retry_started.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_failed_or_cancelled_request_releases_idle_barrier(cancel):
+    async def scenario():
+        gate = RolloutAdmission()
+        started = asyncio.Event()
+
+        async def request():
+            async with gate.request():
+                started.set()
+                if cancel:
+                    await asyncio.Event().wait()
+                raise RuntimeError("serving failed")
+
+        task = asyncio.create_task(request())
+        await started.wait()
+        gate.close()
+        if cancel:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+            await task
+        await asyncio.wait_for(gate.wait_idle(), 1)
+        gate.resume()
+        async with gate.request():
+            pass
+
+    asyncio.run(scenario())

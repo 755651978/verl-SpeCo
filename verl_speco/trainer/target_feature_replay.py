@@ -31,6 +31,7 @@ import torch
 from torch import nn
 
 from verl_speco.integration.oldlogprob_layer_ids import (
+    resolve_drafter_hidden_states_layout,
     resolve_oldlogprob_aux_layer_ids,
 )
 from verl_speco.producer.hidden_states_store import (
@@ -400,8 +401,21 @@ def feature_from_vllm_payload(
     feature_config: FeatureContract,
     *,
     final_norm: nn.Module | None = None,
+    normalize_final_hidden: bool = True,
+    split_hidden_states: bool = False,
+    validate_finite: bool = True,
 ) -> DraftFeatureSample:
-    """Pure vLLM payload conversion shared by replay and standalone Producer."""
+    """Convert vLLM output; standalone CPU prefetch can retain raw final residuals.
+
+    Existing callers normalize as before. Raw output is explicitly marked and
+    must only enter a training path that applies the frozen target norm.
+    File batch assembly can request separate aux/final views, leaving flattening
+    and BF16 conversion to the write into its final batch buffer.
+    Its caller may skip the CPU finite scan when training-side sanitation owns
+    invalid rows; other paths retain the default full validation.
+    """
+    if split_hidden_states and normalize_final_hidden:
+        raise ValueError("Split file features require raw final hidden states")
 
     values = getattr(payload, "payload", payload)
     if not isinstance(values, Mapping):
@@ -434,15 +448,17 @@ def feature_from_vllm_payload(
             "vLLM hidden_states must have shape [seq, layers, hidden], "
             f"got {tuple(hidden.shape)}"
         )
-    if torch.is_floating_point(hidden) and not bool(
-        torch.isfinite(hidden).all().item()
+    if (
+        validate_finite
+        and torch.is_floating_point(hidden)
+        and not bool(torch.isfinite(hidden).all().item())
     ):
         raise HiddenStateAlignmentError(
             "vLLM hidden_states contain NaN/Inf; refusing to train on them"
         )
 
     algorithm = str(feature_config.algorithm).strip().upper()
-    if algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
+    if algorithm not in {"EAGLE3", "DFLASH", "DSPARK", "DSV4_DSPARK"}:
         raise ValueError(f"Unsupported vLLM feature algorithm {algorithm!r}")
     configured_vllm_ids = (
         feature_config.vllm_aux_hidden_state_layer_ids
@@ -521,19 +537,50 @@ def feature_from_vllm_payload(
                 f"hidden_position_offset={hidden_position_offset}"
             )
 
-    selected = hidden.index_select(0, relative_positions).to(dtype=feature_config.dtype)
+    if split_hidden_states:
+        start = int(relative_positions[0].item())
+        contiguous = torch.equal(
+            relative_positions,
+            torch.arange(
+                start,
+                start + relative_positions.numel(),
+                dtype=torch.long,
+                device=relative_positions.device,
+            ),
+        )
+        selected = (
+            hidden[start : start + relative_positions.numel()]
+            if contiguous
+            else hidden.index_select(0, relative_positions)
+        )
+        # Preserve non-BF16 intermediate rounding used by existing configurations.
+        # BF16 is the final training-buffer dtype, so that conversion can wait.
+        if feature_config.dtype != torch.bfloat16:
+            selected = selected.to(dtype=feature_config.dtype)
+    else:
+        selected = hidden.index_select(0, relative_positions).to(
+            dtype=feature_config.dtype
+        )
     # Layer-ID normalization changes which vLLM outputs are requested, not the
     # number or order of returned auxiliary tensors, so the target-side count
     # remains the correct split point here.
-    aux_hidden = selected[:, : len(vllm_aux_layer_ids), :].flatten(1)
+    aux_layers = selected[:, : len(vllm_aux_layer_ids), :]
+    aux_hidden = aux_layers if split_hidden_states else aux_layers.flatten(1)
+    final_hidden = None
     if include_final:
-        if final_norm is None:
-            raise ValueError("vLLM plus_last features require the target final norm")
-        # Auxiliary layers stay raw. Only the final supervision block goes
-        # through the frozen target norm, exactly once, before storage/transport.
-        with torch.no_grad():
-            final_hidden = final_norm(selected[:, final_source_index, :])
-        output_hidden = torch.cat([aux_hidden, final_hidden], dim=-1)
+        final_hidden = selected[:, final_source_index, :]
+        if normalize_final_hidden:
+            if final_norm is None:
+                raise ValueError(
+                    "vLLM plus_last features require the target final norm"
+                )
+            with torch.no_grad():
+                final_hidden = final_norm(final_hidden)
+        output_hidden = (
+            aux_hidden
+            if split_hidden_states
+            else torch.cat([aux_hidden, final_hidden], dim=-1)
+        )
     else:
         output_hidden = aux_hidden
     selected_input_ids = request.input_ids.index_select(0, feature_positions).long()
@@ -578,12 +625,19 @@ def feature_from_vllm_payload(
     if feature_config.vllm_aux_hidden_state_layer_ids is not None:
         metadata["vllm_aux_hidden_state_layer_ids"] = vllm_aux_layer_ids
     if include_final:
-        metadata["last_hidden_state_norm"] = "target_final_norm"
+        metadata["last_hidden_state_norm"] = (
+            "target_final_norm" if normalize_final_hidden else "raw_target_residual"
+        )
     return DraftFeatureSample(
         algorithm=algorithm,
         input_ids=selected_input_ids,
         loss_mask=selected_loss_mask,
-        hidden_states=output_hidden.cpu().contiguous(),
+        hidden_states=output_hidden.cpu()
+        if split_hidden_states
+        else output_hidden.cpu().contiguous(),
+        last_hidden_states=final_hidden.cpu()
+        if split_hidden_states and final_hidden is not None
+        else None,
         position_ids=draft_position_ids,
         metadata=metadata,
     )
@@ -637,7 +691,7 @@ class TargetFeatureReplayer:
             _config_value(self.replay_cfg, "strict_target_model_path", False)
         )
         self.algorithm = str(self.drafter_cfg.speculative_algorithm).upper()
-        if self.algorithm not in {"EAGLE3", "DFLASH", "DSPARK"}:
+        if self.algorithm not in {"EAGLE3", "DFLASH", "DSPARK", "DSV4_DSPARK"}:
             raise ValueError(
                 f"Token replay does not support drafter algorithm {self.algorithm!r}"
             )
@@ -705,16 +759,8 @@ class TargetFeatureReplayer:
                 "Token replay could not resolve target auxiliary layer ids"
             )
         self.target_layer_ids = [int(layer_id) for layer_id in layer_ids]
-        dspark_l1_enabled = (
-            self.algorithm == "DSPARK"
-            and float(self.training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
-        )
-        self.hidden_layout = (
-            "dflash_aux_plus_last"
-            if dspark_l1_enabled
-            else "dflash_aux"
-            if self.algorithm in {"DFLASH", "DSPARK"}
-            else "eagle3_aux_plus_last"
+        self.hidden_layout = resolve_drafter_hidden_states_layout(
+            self.algorithm, self.training_cfg
         )
         self.vllm_final_norm = None
         if self.backend == "vllm_file" and self.hidden_layout.endswith("_plus_last"):
@@ -1359,8 +1405,18 @@ class TargetFeatureReplayer:
                         f"replay uses the {self.vllm_hidden_states_store.backend} "
                         "hidden-state store"
                     )
+                # The Mooncake store consumes the full transfer manifest; the
+                # bare handle alone lacks the tensor layout get_sample needs.
+                load_reference: str | Mapping[str, Any]
+                if handle:
+                    params = getattr(response, "kv_transfer_params", None)
+                    if not isinstance(params, Mapping):
+                        raise ValueError("vLLM response missing kv_transfer_params")
+                    load_reference = params
+                else:
+                    load_reference = path
                 reference = handle or path
-                payload = self._load_vllm_hidden_states(reference)
+                payload = self._load_vllm_hidden_states(load_reference)
                 with self._metrics_lock:
                     self.vllm_requests += 1
                     self.vllm_request_seconds += time.perf_counter() - started
@@ -1440,7 +1496,9 @@ class TargetFeatureReplayer:
             raise ValueError("vLLM response has both hidden_states_path and handle")
         return (os.fspath(path) if path else "", str(handle) if handle else None)
 
-    def _load_vllm_hidden_states(self, reference: str) -> dict[str, Any]:
+    def _load_vllm_hidden_states(
+        self, reference: str | Mapping[str, Any]
+    ) -> dict[str, Any]:
         payload, _ = self.vllm_hidden_states_store.load(reference)
         return payload
 

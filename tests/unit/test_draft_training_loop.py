@@ -110,7 +110,7 @@ def test_tq_clear_retries_transient_failure(monkeypatch) -> None:
     loader = _TransientClearTQLoader(failures=2)
     delays = []
     monkeypatch.setattr(
-        "verl_speco.trainer.draft_training_loop.time.sleep", delays.append
+        "verl_speco.trainer.tq_retry.time.sleep", delays.append
     )
 
     _clear_tq_batch_across_ranks(
@@ -127,7 +127,7 @@ def test_tq_clear_retries_transient_failure(monkeypatch) -> None:
 def test_tq_clear_failure_is_reported_after_three_attempts(monkeypatch) -> None:
     loader = _FakeTQLoader(RuntimeError("clear failed"))
     monkeypatch.setattr(
-        "verl_speco.trainer.draft_training_loop.time.sleep", lambda _: None
+        "verl_speco.trainer.tq_retry.time.sleep", lambda _: None
     )
     with pytest.raises(RuntimeError, match="failed to clear"):
         _clear_tq_batch_across_ranks(
@@ -137,6 +137,25 @@ def test_tq_clear_failure_is_reported_after_three_attempts(monkeypatch) -> None:
             device=torch.device("cpu"),
         )
     assert loader.clear_calls == [["k0", "k1"]] * 3
+
+
+def test_tq_completion_retry_does_not_repeat_successful_clear(monkeypatch) -> None:
+    loader = _FakeTQLoader()
+    events = []
+    monkeypatch.setattr("verl_speco.trainer.tq_retry.time.sleep", lambda _: None)
+
+    def put(event):
+        events.append(event)
+        if len(events) == 1:
+            raise ConnectionError("temporary event failure")
+
+    event = {"kind": "training_completed", "plan_id": 1}
+    _clear_tq_batch_across_ranks(
+        loader, ["k0"], rank=0, device=torch.device("cpu"),
+        training_events=SimpleNamespace(put=put), completion_event=event,
+    )
+    assert loader.clear_calls == [["k0"]]
+    assert events == [event, event]
 
 
 def test_tq_store_connection_failure_is_reported() -> None:
@@ -194,6 +213,16 @@ def test_is_out_of_memory_error_matches_npu_oom_message():
     assert not _is_out_of_memory_error(RuntimeError("bad batch"))
 
 
+def test_prefetch_tracking_subtracts_foreground_wait_not_background_wait():
+    selected = _select_standalone_tracking_metrics({
+        "dspark/loss": 0.5, "perf/step_time": 0.9,
+        "perf/loader_plan_wait_time": 10.0, "perf/batch_ready_wait_time": 0.03,
+        "perf/train_time": 0.65,
+    })
+    assert selected["perf/batch_ready_wait_time"] == 0.03
+    assert selected["perf/other_time"] == pytest.approx(0.22)
+
+
 def test_contains_replay_samples_detects_draft_replay_sample():
     sample = DraftReplaySample(
         input_ids=torch.arange(4),
@@ -213,16 +242,17 @@ def test_standalone_dspark_tracking_keeps_only_core_metrics():
         "dspark/loss": 0.7, "dspark/ce_loss": 2.5, "dspark/l1_loss": 1.0,
         "dspark/top1_acc": 0.6, "dspark/mean_acceptance_length": 2.0,
         "train/lr": 1e-6, "perf/step_time": 10.0,
-        "perf/consumer_wait_time": 3.0, "perf/train_time": 5.0,
+        "perf/loader_plan_wait_time": 30.0, "perf/batch_ready_wait_time": 3.0,
+        "perf/train_time": 5.0,
         "train/ploss_0": 2.5, "dspark/valid_token_count": 42.0,
-        "perf/tq_get_time": 1.0,
+        "perf/loader_tq_get_time": 1.0,
     }
     selected = _select_standalone_tracking_metrics(metrics)
-    assert len(selected) == 10
+    assert len(selected) == 12
     assert selected["dspark/loss"] == 0.7
     assert selected["perf/other_time"] == 2.0
     assert "train/ploss_0" not in selected
-    assert "perf/tq_get_time" not in selected
+    assert selected["perf/loader_tq_get_time"] == 1.0
     assert "perf/other_time" not in metrics
 
 
@@ -246,6 +276,8 @@ def test_standalone_global_loss_and_selector_aggregation(prefix):
             f"{prefix}/selector_token_count": 15.0,
         },
         _training_metric_steps=2, optimizer_steps_total=10, optimizer=None,
+        _training_sample_draws=6,
+        _training_unique_sample_ids={1, 2, 3},
         _block_drafter_metric_prefix=lambda: prefix,
         _block_drafter_config_value=lambda name, default: 0,
     )
@@ -253,6 +285,8 @@ def test_standalone_global_loss_and_selector_aggregation(prefix):
     assert metrics[f"{prefix}/loss"] == 3.0
     assert metrics[f"{prefix}/selector_loss"] == 0.4
     assert metrics[f"{prefix}/selector_accuracy"] == 0.6
+    assert metrics["drafter/train_sample_draws"] == 6.0
+    assert metrics["drafter/train_unique_samples"] == 3.0
 
 
 @pytest.mark.parametrize("prefix", ["eagle3", "dflash", "dspark", "dflash2"])
@@ -261,7 +295,7 @@ def test_standalone_core_metrics_for_each_backend(prefix):
         f"{prefix}/loss": 1.0, f"{prefix}/top1_acc": 0.5,
         f"{prefix}/mean_acceptance_length": 2.0,
         "train/simulated_acc_len": 1.8, "train/lr": 1e-6,
-        "perf/step_time": 10.0, "perf/consumer_wait_time": 3.0,
+        "perf/step_time": 10.0, "perf/batch_ready_wait_time": 3.0,
         "perf/train_time": 5.0, "train/ploss_0": 1.0,
         f"{prefix}/count_per_position/0": 100.0,
         "dflash2/selector_loss": 0.4, "dflash2/selector_accuracy": 0.6,
@@ -416,6 +450,7 @@ def test_standalone_base_writer_defers_completion_marker(monkeypatch, tmp_path) 
         _is_checkpoint_leader=lambda: True,
         _get_pretrained_export_model=lambda: (_ExportModel(), None),
         _get_pretrained_export_state_dict=lambda: {"weight": torch.ones(1)},
+        _speco_checkpoint_buffer_state=lambda: None,
         _infer_pretrained_save_kwargs=lambda: {},
         _clear_existing_pretrained_weight_files=lambda path: None,
         _copy_drafter_auxiliary_files=lambda path: None,
@@ -745,18 +780,19 @@ def test_standalone_dflash_checkpoint_preserves_source_runtime_config(tmp_path):
     assert saved_training_config == training_config
 
 
-def test_standalone_block_checkpoint_uses_target_model_type_without_source_config(
-    tmp_path,
+@pytest.mark.parametrize("source_model_type", [None, "dspark", "qwen3"])
+def test_standalone_dspark_checkpoint_normalizes_identity_only_without_source(
+    tmp_path, source_model_type
 ):
     checkpoint_dir = tmp_path / "draft_step_5"
     checkpoint_dir.mkdir()
-    target_dir = tmp_path / "target_qwen3"
+    target_dir = tmp_path / "target_glm"
     target_dir.mkdir()
-    missing_source_dir = tmp_path / "missing_source_dspark"
+    source_dir = tmp_path / "source_dspark"
     (target_dir / "config.json").write_text(
         json.dumps(
             {
-                "model_type": "qwen3",
+                "model_type": "glm_moe_dsa",
                 "head_dim": 128,
                 "rope_theta": 1000000.0,
                 "max_position_embeddings": 40960,
@@ -775,12 +811,24 @@ def test_standalone_block_checkpoint_uses_target_model_type_without_source_confi
     (checkpoint_dir / "config.json").write_text(
         json.dumps(training_config), encoding="utf-8"
     )
+    if source_model_type is not None:
+        source_dir.mkdir()
+        source_config = dict(
+            training_config,
+            model_type=source_model_type,
+            architectures=[
+                "Qwen3DSparkModel" if source_model_type == "qwen3" else "DSparkDraftModel"
+            ],
+        )
+        (source_dir / "config.json").write_text(
+            json.dumps(source_config), encoding="utf-8"
+        )
     trainer = SimpleNamespace(
         backend=SimpleNamespace(model_type="dspark"),
         config=SimpleNamespace(
             model=SimpleNamespace(path=str(target_dir)),
             rollout=SimpleNamespace(
-                drafter=SimpleNamespace(model_path=str(missing_source_dir))
+                drafter=SimpleNamespace(model_path=str(source_dir))
             ),
         ),
     )
@@ -793,13 +841,20 @@ def test_standalone_block_checkpoint_uses_target_model_type_without_source_confi
     saved_training_config = json.loads(
         (checkpoint_dir / "speco_training_config.json").read_text(encoding="utf-8")
     )
-    assert runtime_config["model_type"] == "dspark"
-    assert runtime_config["architectures"] == ["DSparkDraftModel"]
+    assert runtime_config["model_type"] == (source_model_type or "qwen3")
+    assert runtime_config["architectures"] == [
+        "DSparkDraftModel" if source_model_type == "dspark" else "Qwen3DSparkModel"
+    ]
     assert runtime_config["speco_training_model_type"] == "dspark"
     assert runtime_config["dspark_config"]["markov_head_type"] == "vanilla"
     assert runtime_config["head_dim"] == 80
     assert runtime_config["rope_theta"] == 10000.0
     assert saved_training_config == training_config
+    if source_model_type is not None:
+        saved_source_config = json.loads(
+            (source_dir / "config.json").read_text(encoding="utf-8")
+        )
+        assert saved_source_config == source_config
 
 
 def test_standalone_eagle3_checkpoint_exports_vllm_llama_runtime_config(tmp_path):

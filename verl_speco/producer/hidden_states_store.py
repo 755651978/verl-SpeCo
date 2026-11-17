@@ -172,8 +172,14 @@ class HiddenStatesStore:
 
     backend: str = FILE_BACKEND
 
-    def load(self, reference: str) -> tuple[dict[str, torch.Tensor], int]:
-        """Return ``(payload, byte_size)`` for a response reference."""
+    def load(
+        self, reference: str | Mapping[str, Any], *, timeout: float = 120.0
+    ) -> tuple[dict[str, torch.Tensor], int]:
+        """Return ``(payload, byte_size)`` for a response reference.
+
+        The Mooncake backend takes the full transfer manifest (a mapping);
+        the file backend takes a path string.
+        """
         raise NotImplementedError
 
     def release(self, reference: str) -> None:
@@ -193,13 +199,17 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
     backend = FILE_BACKEND
 
-    def load(self, reference: str) -> tuple[dict[str, torch.Tensor], int]:
+    def load(
+        self, reference: str | Mapping[str, Any], *, timeout: float = 30.0
+    ) -> tuple[dict[str, torch.Tensor], int]:
+        if not isinstance(reference, str):
+            raise TypeError("The file hidden-state store loads path strings")
         try:
             from safetensors.torch import load_file
         except ImportError as exc:  # pragma: no cover - dependency issue
             raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
         path = Path(reference)
-        _wait_for_lock(Path(f"{path}.lock"))
+        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         payload = dict(load_file(str(path), device="cpu"))
@@ -212,7 +222,12 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
 
 class MooncakeHiddenStatesStore(HiddenStatesStore):
-    """Handle-based Mooncake store backend (``handle``)."""
+    """Handle-based Mooncake store backend (``handle``).
+
+    The load reference is the full transfer manifest vLLM returns in
+    ``kv_transfer_params`` (handle plus packed tensor layout); the release
+    reference is the bare handle string.
+    """
 
     backend = MOONCAKE_BACKEND
 
@@ -241,9 +256,17 @@ class MooncakeHiddenStatesStore(HiddenStatesStore):
             self._store = store
             return store
 
-    def load(self, reference: str) -> tuple[dict[str, torch.Tensor], int]:
+    def load(
+        self, reference: str | Mapping[str, Any], *, timeout: float = 120.0
+    ) -> tuple[dict[str, torch.Tensor], int]:
+        if not isinstance(reference, Mapping):
+            raise TypeError(
+                "The Mooncake hidden-state store requires the full transfer "
+                "manifest from kv_transfer_params (a mapping); the bare handle "
+                "alone lacks the tensor layout get_sample decodes payloads with"
+            )
         store = self._ensure_store()
-        payload = dict(store.get_sample(reference))
+        payload = dict(store.get_sample(dict(reference), timeout=timeout))
         byte_size = sum(
             int(tensor.numel()) * int(tensor.element_size())
             for tensor in payload.values()
@@ -252,12 +275,11 @@ class MooncakeHiddenStatesStore(HiddenStatesStore):
         return payload, byte_size
 
     def release(self, reference: str) -> None:
-        if self._store is None:
-            return
+        store = self._ensure_store()
         # Deletion errors deliberately propagate so callers with a retry policy
         # (the Producer cleanup loop) can retry transient store failures. Callers
         # for which cleanup is strictly best-effort wrap this in their own guard.
-        self._store.delete_sample(reference)
+        store.delete_sample(reference)
 
     def close(self) -> None:
         # hs_connectors exposes no explicit teardown; dropping the reference

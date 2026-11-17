@@ -20,9 +20,11 @@ import inspect
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
+
+from verl_speco.producer.metrics import ProducerDiagnostics
 
 from verl_speco.producer.hidden_states_store import (
     FILE_BACKEND,
@@ -57,6 +59,9 @@ class VllmResponse:
     endpoint_url: str
     generated_token_ids: tuple[int, ...] = ()
     handle: str | None = None
+    timings: dict[str, float] = field(default_factory=dict, compare=False)
+    transfer_params: dict[str, Any] = field(default_factory=dict)
+    store: HiddenStatesStore | None = field(default=None, compare=False, repr=False)
 
     @property
     def reference(self) -> str:
@@ -76,6 +81,7 @@ class RawVllmFeature:
     generated_token_ids: tuple[int, ...] = ()
     store: HiddenStatesStore | None = field(default=None, compare=False, repr=False)
     is_handle: bool = False
+    timings: dict[str, float] = field(default_factory=dict, compare=False)
 
 
 @dataclass
@@ -110,19 +116,24 @@ async def request_prefill(
     model: str,
     timeout: float,
 ) -> VllmResponse:
-    response = await client.completions.create(
-        model=model,
-        prompt=prompt_token_ids,
-        max_tokens=1,
-        extra_body={"return_token_ids": True},
+    result = await client.post(
+        "completions",
+        json={
+            "model": model,
+            "prompt": prompt_token_ids,
+            "max_tokens": 1,
+            "return_token_ids": True,
+        },
         timeout=timeout,
     )
-    choices = getattr(response, "choices", None) or []
+    result.raise_for_status()
+    response = result.json()
+    choices = response.get("choices") or []
     if choices:
-        actual = getattr(choices[0], "prompt_token_ids", None)
+        actual = choices[0].get("prompt_token_ids")
         if actual is not None and list(actual) != prompt_token_ids:
             raise ValueError("vLLM prompt_token_ids mismatch")
-    params = getattr(response, "kv_transfer_params", None)
+    params = response.get("kv_transfer_params")
     if not isinstance(params, Mapping):
         raise ValueError("vLLM response missing kv_transfer_params")
     path, handle = _parse_transfer_reference(params, operation="prefill")
@@ -130,6 +141,7 @@ async def request_prefill(
         hidden_states_path=path,
         endpoint_url=endpoint.base_url,
         handle=handle,
+        transfer_params=dict(params),
     )
 
 
@@ -144,25 +156,30 @@ async def request_generate(
 ) -> VllmResponse:
     """Generate response tokens; hidden states are collected by a later prefill."""
 
-    response = await client.completions.create(
-        model=model,
-        prompt=prompt_token_ids,
-        max_tokens=max_tokens,
-        extra_body={"return_token_ids": True},
+    result = await client.post(
+        "completions",
+        json={
+            "model": model,
+            "prompt": prompt_token_ids,
+            "max_tokens": max_tokens,
+            "return_token_ids": True,
+        },
         timeout=timeout,
     )
-    choices = getattr(response, "choices", None) or []
+    result.raise_for_status()
+    response = result.json()
+    choices = response.get("choices") or []
     if not choices:
         raise ValueError("vLLM generation response has no choices")
-    actual_prompt = getattr(choices[0], "prompt_token_ids", None)
+    actual_prompt = choices[0].get("prompt_token_ids")
     if actual_prompt is not None and list(actual_prompt) != prompt_token_ids:
         raise ValueError("vLLM generation prompt_token_ids mismatch")
-    generated = getattr(choices[0], "token_ids", None)
+    generated = choices[0].get("token_ids")
     if not isinstance(generated, (list, tuple)) or not generated:
         raise ValueError(
             "vLLM generation response missing token_ids; enable return_token_ids support"
         )
-    params = getattr(response, "kv_transfer_params", None)
+    params = response.get("kv_transfer_params")
     if not isinstance(params, Mapping):
         raise ValueError("vLLM generation response missing kv_transfer_params")
     path, handle = _parse_transfer_reference(params, operation="generation")
@@ -171,6 +188,7 @@ async def request_generate(
         endpoint_url=endpoint.base_url,
         generated_token_ids=tuple(int(token_id) for token_id in generated),
         handle=handle,
+        transfer_params=dict(params),
     )
 
 
@@ -190,11 +208,20 @@ def load_hidden_state_result(
             f"vLLM returned a {expected_backend} reference but the consumer is "
             f"configured for the {resolved.backend} hidden-state store"
         )
-    reference = response.reference
+    reference: str | Mapping[str, Any]
+    cleanup_reference: str
+    if response.is_handle:
+        # The Mooncake store consumes the full transfer manifest; the bare
+        # handle alone lacks the tensor layout get_sample decodes with.
+        reference = response.transfer_params
+        cleanup_reference = response.handle or ""
+    else:
+        reference = response.reference
+        cleanup_reference = response.reference
     payload, byte_size = resolved.load(reference)
     return RawVllmFeature(
         payload=payload,
-        temporary_path=reference,
+        temporary_path=cleanup_reference,
         endpoint_url=response.endpoint_url,
         byte_size=byte_size,
         generated_token_ids=response.generated_token_ids,
@@ -203,7 +230,15 @@ def load_hidden_state_result(
     )
 
 
-def delete_temporary_result(raw: RawVllmFeature) -> None:
+def delete_temporary_result(raw: RawVllmFeature | VllmResponse) -> None:
+    if isinstance(raw, VllmResponse):
+        if raw.store is not None:
+            raw.store.release(raw.reference)
+        elif raw.is_handle:
+            raise ValueError("Handle cleanup requires its owning hidden-state store")
+        else:
+            FileHiddenStatesStore().release(raw.reference)
+        return
     if raw.store is not None:
         raw.store.release(raw.temporary_path)
         return
@@ -246,6 +281,7 @@ class VllmFeatureClientPool:
         self.hidden_states_store = hidden_states_store or build_hidden_states_store(
             {"backend": FILE_BACKEND}
         )
+        self.diagnostics = ProducerDiagnostics()
         self._global_semaphore = asyncio.Semaphore(max_inflight_requests)
         self._states: list[_EndpointState] = []
 
@@ -253,20 +289,23 @@ class VllmFeatureClientPool:
         if self._states:
             return
         try:
-            from openai import AsyncOpenAI
+            import httpx
         except ImportError as exc:
-            raise RuntimeError("vLLM Producer requires the openai package") from exc
-        # Suppress the SDK transport's one-line INFO message for every 2xx.
+            raise RuntimeError("vLLM Producer requires the httpx package") from exc
+        # Suppress the HTTP transport's one-line INFO message for every 2xx.
         # This pool emits endpoint-aware, rate-limited success logs below.
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpx2").setLevel(logging.WARNING)
         self._states = [
             _EndpointState(
                 endpoint=endpoint,
-                client=AsyncOpenAI(
-                    base_url=endpoint.base_url,
-                    api_key="EMPTY",
-                    max_retries=0,
+                client=httpx.AsyncClient(
+                    base_url=endpoint.base_url.rstrip("/") + "/",
+                    headers={"Authorization": "Bearer EMPTY"},
+                    limits=httpx.Limits(
+                        max_connections=endpoint.max_concurrency,
+                        max_keepalive_connections=endpoint.max_concurrency,
+                    ),
                 ),
                 semaphore=asyncio.Semaphore(endpoint.max_concurrency),
             )
@@ -274,25 +313,53 @@ class VllmFeatureClientPool:
         ]
 
     async def prefill(self, request: Any) -> RawVllmFeature:
-        return await self._request(request, generate=False)
+        return cast(RawVllmFeature, await self._request(request, generate=False))
 
     async def generate(self, request: Any) -> RawVllmFeature:
-        return await self._request(request, generate=True)
+        return cast(RawVllmFeature, await self._request(request, generate=True))
 
-    async def _request(self, request: Any, *, generate: bool) -> RawVllmFeature:
+    async def prefill_reference(self, request: Any) -> VllmResponse:
+        """Transfer ownership of a hidden reference without loading its tensors.
+
+        The caller must retain the payload until consumption or explicitly release
+        it if it cannot publish the reference. Existing eager APIs are unchanged.
+        """
+        return cast(
+            VllmResponse,
+            await self._request(request, generate=False, reference_only=True),
+        )
+
+    async def generate_reference(self, request: Any) -> VllmResponse:
+        """Generate tokens without loading the unused connector output."""
+        return cast(
+            VllmResponse,
+            await self._request(request, generate=True, reference_only=True),
+        )
+
+    async def _request(
+        self, request: Any, *, generate: bool, reference_only: bool = False
+    ) -> RawVllmFeature | VllmResponse:
         if not self._states:
             raise RuntimeError("VllmFeatureClientPool.start() must be called first")
+        waiting = time.monotonic()
         async with self._global_semaphore:
-            return await self._request_with_retries(request, generate=generate)
+            global_wait = time.monotonic() - waiting
+            raw = await self._request_with_retries(
+                request, generate=generate, reference_only=reference_only
+            )
+            raw.timings["global_wait"] = global_wait
+            return raw
 
     async def _request_with_retries(
         self,
         request: Any,
         *,
         generate: bool,
-    ) -> RawVllmFeature:
+        reference_only: bool = False,
+    ) -> RawVllmFeature | VllmResponse:
         total_attempts = _DEFAULT_MAX_RETRIES + 1
         failed_in_round: set[str] = set()
+        timings = {"endpoint_wait": 0.0, "http": 0.0, "retry_backoff": 0.0}
         for attempt in range(1, total_attempts + 1):
             candidates = [
                 state
@@ -306,32 +373,51 @@ class VllmFeatureClientPool:
             state.inflight += 1
             request_started = time.monotonic()
             response: VllmResponse | None = None
-            loaded = False
+            accepted = False
             try:
                 async with state.semaphore:
-                    if generate:
-                        response = await request_generate(
-                            state.endpoint,
-                            state.client,
-                            list(request.prompt_token_ids),
-                            model=self.model,
-                            max_tokens=int(request.max_tokens),
-                            timeout=self.request_timeout,
+                    timings["endpoint_wait"] += time.monotonic() - request_started
+                    http_started = time.monotonic()
+                    self.diagnostics.http_start()
+                    try:
+                        if generate:
+                            response = await request_generate(
+                                state.endpoint,
+                                state.client,
+                                list(request.prompt_token_ids),
+                                model=self.model,
+                                max_tokens=int(request.max_tokens),
+                                timeout=self.request_timeout,
+                            )
+                        else:
+                            response = await request_prefill(
+                                state.endpoint,
+                                state.client,
+                                list(request.prompt_token_ids),
+                                model=self.model,
+                                timeout=self.request_timeout,
+                            )
+                    finally:
+                        timings["http"] += time.monotonic() - http_started
+                        self.diagnostics.http_finish()
+                    if reference_only:
+                        expected = (
+                            MOONCAKE_BACKEND if response.is_handle else FILE_BACKEND
+                        )
+                        if self.hidden_states_store.backend != expected:
+                            raise ValueError(
+                                "vLLM reference backend does not match configured store"
+                            )
+                        raw: RawVllmFeature | VllmResponse = replace(
+                            response, store=self.hidden_states_store
                         )
                     else:
-                        response = await request_prefill(
-                            state.endpoint,
-                            state.client,
-                            list(request.prompt_token_ids),
-                            model=self.model,
-                            timeout=self.request_timeout,
+                        raw = await asyncio.to_thread(
+                            load_hidden_state_result,
+                            response,
+                            self.hidden_states_store,
                         )
-                    raw = await asyncio.to_thread(
-                        load_hidden_state_result,
-                        response,
-                        self.hidden_states_store,
-                    )
-                    loaded = True
+                raw = replace(raw, timings=timings)
                 state.requests += 1
                 if self._should_log_success(state.requests):
                     logger.info(
@@ -344,6 +430,7 @@ class VllmFeatureClientPool:
                         state.inflight,
                         time.monotonic() - request_started,
                     )
+                accepted = True
                 return raw
             except ValueError:
                 # Response validation failures are deterministic protocol/data
@@ -383,13 +470,15 @@ class VllmFeatureClientPool:
                     exc,
                     backoff,
                 )
+                backoff_started = time.monotonic()
                 await asyncio.sleep(backoff)
+                timings["retry_backoff"] += time.monotonic() - backoff_started
             finally:
                 # The server has already published the hidden states, so a
-                # reference fetched but not loaded must be released; otherwise
+                # reference not handed to the caller must be released; otherwise
                 # retries (and cancellation) leak a file or leave an object in
                 # the bounded Mooncake store.
-                if response is not None and not loaded:
+                if response is not None and not accepted:
                     await self._release_unconsumed(response)
                 state.inflight = max(state.inflight - 1, 0)
         raise RuntimeError(
@@ -397,7 +486,7 @@ class VllmFeatureClientPool:
         )
 
     async def _release_unconsumed(self, response: VllmResponse) -> None:
-        """Best-effort release of a fetched reference whose load failed.
+        """Best-effort release of a response not handed to the caller.
 
         Only release when the response matches the configured store; a backend
         mismatch is a deterministic protocol error that must not trigger a
@@ -423,7 +512,7 @@ class VllmFeatureClientPool:
     async def close(self) -> None:
         states, self._states = self._states, []
         for state in states:
-            close = getattr(state.client, "close", None)
+            close = getattr(state.client, "aclose", None)
             if not callable(close):
                 continue
             result = close()

@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import os
 import random
 import tempfile
@@ -25,6 +27,8 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol, cast
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA_VERSION = 1
@@ -49,7 +53,10 @@ class DraftFeatureSample:
     last_hidden_states: torch.Tensor | None = None
     target: torch.Tensor | None = None
     target_logprobs: torch.Tensor | None = None
+    target_logz: torch.Tensor | None = None
     position_ids: torch.Tensor | None = None
+    next_token_ids: torch.Tensor | None = None
+    next_token_loss_mask: torch.Tensor | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -69,7 +76,10 @@ class DraftFeatureSample:
             last_hidden_states=payload.get("last_hidden_states", payload.get("target")),
             target=payload.get("target"),
             target_logprobs=payload.get("target_logprobs"),
+            target_logz=payload.get("target_logz"),
             position_ids=payload.get("position_ids"),
+            next_token_ids=payload.get("next_token_ids"),
+            next_token_loss_mask=payload.get("next_token_loss_mask"),
             metadata=dict(payload.get("metadata") or {}),
         )
         sample.validate(strict=strict)
@@ -95,6 +105,10 @@ class DraftFeatureSample:
             self.input_ids = self.input_ids.reshape(-1)
         if self.loss_mask.dim() > 1:
             self.loss_mask = self.loss_mask.reshape(-1)
+        for field_name in ("next_token_ids", "next_token_loss_mask"):
+            value = getattr(self, field_name)
+            if torch.is_tensor(value) and value.dim() > 1:
+                setattr(self, field_name, value.reshape(-1))
         position_ids = self.position_ids
         if torch.is_tensor(position_ids):
             position_ids_tensor = cast(Any, position_ids)
@@ -108,11 +122,29 @@ class DraftFeatureSample:
             ):
                 target_logprobs_tensor = target_logprobs_tensor.squeeze(0)
             self.target_logprobs = target_logprobs_tensor
+        target_logz = self.target_logz
+        if torch.is_tensor(target_logz):
+            target_logz_tensor = cast(Any, target_logz)
+            while target_logz_tensor.dim() > 1 and target_logz_tensor.size(0) == 1:
+                target_logz_tensor = target_logz_tensor.squeeze(0)
+            self.target_logz = target_logz_tensor.float().reshape(-1)
         if self.input_ids.size(0) != self.loss_mask.size(0) and strict:
             raise ValueError(
                 "DraftFeatureSample input_ids/loss_mask length mismatch: "
                 f"{self.input_ids.size(0)} vs {self.loss_mask.size(0)}"
             )
+        if strict:
+            for field_name in ("next_token_ids", "next_token_loss_mask"):
+                value = getattr(self, field_name)
+                if value is not None and not torch.is_tensor(value):
+                    raise TypeError(
+                        f"DraftFeatureSample.{field_name} must be a torch.Tensor when provided"
+                    )
+                if torch.is_tensor(value) and value.size(0) != self.input_ids.size(0):
+                    raise ValueError(
+                        f"DraftFeatureSample input_ids/{field_name} length mismatch: "
+                        f"{self.input_ids.size(0)} vs {value.size(0)}"
+                    )
         if (
             torch.is_tensor(self.position_ids)
             and cast(Any, self.position_ids).size(0) != self.input_ids.size(0)
@@ -168,6 +200,19 @@ class DraftFeatureSample:
                 "DraftFeatureSample.target_logprobs must have shape [rows, topk, 2], "
                 f"got {tuple(cast(Any, self.target_logprobs).shape)}"
             )
+        if self.target_logz is not None and not torch.is_tensor(self.target_logz):
+            raise TypeError(
+                "DraftFeatureSample.target_logz must be a tensor when provided"
+            )
+        if (
+            torch.is_tensor(self.target_logz)
+            and cast(Any, self.target_logz).dim() != 1
+            and strict
+        ):
+            raise ValueError(
+                "DraftFeatureSample.target_logz must have shape [rows], "
+                f"got {tuple(cast(Any, self.target_logz).shape)}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         self.validate(strict=False)
@@ -189,9 +234,21 @@ class DraftFeatureSample:
             payload["target_logprobs"] = (
                 self.target_logprobs.detach().cpu().contiguous()
             )
+        if self.target_logz is not None:
+            payload["target_logz"] = (
+                self.target_logz.detach().cpu().float().contiguous()
+            )
         if self.position_ids is not None:
             payload["position_ids"] = (
                 self.position_ids.detach().cpu().long().contiguous()
+            )
+        if self.next_token_ids is not None:
+            payload["next_token_ids"] = (
+                self.next_token_ids.detach().cpu().long().contiguous()
+            )
+        if self.next_token_loss_mask is not None:
+            payload["next_token_loss_mask"] = (
+                self.next_token_loss_mask.detach().cpu().float().contiguous()
             )
         return payload
 
@@ -212,8 +269,14 @@ class DraftFeatureSample:
             item["last_hidden_states"] = payload["target"]
         if "target_logprobs" in payload:
             item["target_logprobs"] = payload["target_logprobs"]
+        if "target_logz" in payload:
+            item["target_logz"] = payload["target_logz"]
         if "position_ids" in payload:
             item["position_ids"] = payload["position_ids"]
+        if "next_token_ids" in payload:
+            item["next_token_ids"] = payload["next_token_ids"]
+        if "next_token_loss_mask" in payload:
+            item["next_token_loss_mask"] = payload["next_token_loss_mask"]
         for key, value in metadata.items():
             item.setdefault(key, value)
         _populate_verl_alignment_fields(item, metadata)
@@ -351,6 +414,10 @@ class DraftFeatureStore(Protocol):
 
     def get_metadata(self) -> dict[str, Any]: ...
 
+    def checkpoint_state(self) -> dict[str, Any]: ...
+
+    def restore_checkpoint_state(self, state: dict[str, Any]) -> dict[str, Any]: ...
+
     def close(self) -> None: ...
 
 
@@ -425,8 +492,23 @@ class TorchShardFeatureStore:
         self._manifest = self._load_manifest()
         self._pending: list[dict[str, Any]] = []
         self._next_shard_index = self._infer_next_shard_index()
+        # Read-side shard cache: shards are multi-GB and reads arrive in shuffled
+        # key order, so without a cache every sample read would re-load a whole
+        # shard from (possibly remote) storage.
+        self._shard_cache: dict[str, dict[str, Any]] = {}
+        self._shard_cache_max = max(
+            1, int(os.environ.get("FEATURE_STORE_SHARD_CACHE_MAX", "2") or 2)
+        )
+        self._shards_loaded = 0
+        self._shards_total = len(self._manifest)
+        self._shard_load_started = time.time()
         if not self.read_only:
             self._write_metadata()
+
+        # A checkpoint cursor is a durable manifest prefix, rather than a
+        # mutable in-memory iterator position.  Writers can append after a
+        # checkpoint without invalidating the resumed prefix.
+        self._checkpoint_cursor: dict[str, Any] | None = None
 
     def write_many(
         self, samples: list[DraftStoredSample | dict[str, Any]]
@@ -489,14 +571,22 @@ class TorchShardFeatureStore:
 
     def iter_keys(self, *, shuffle: bool = False, seed: int = 0) -> Iterator[str]:
         self.flush()
-        keys: list[str] = []
-        for entry in self._load_manifest():
-            shard_name = entry["path"]
-            for idx in range(int(entry.get("num_samples", 0))):
-                keys.append(f"{shard_name}:{idx}")
+        entries = self._load_manifest()
+        # Shard-major iteration: emit a whole shard's samples together (shard order
+        # and within-shard order both shuffled) so the read-side shard cache only
+        # ever holds one shard at a time. A globally shuffled key order would touch
+        # every multi-GB shard on almost every read and thrash / OOM.
+        order = list(range(len(entries)))
         if shuffle:
-            random.Random(int(seed)).shuffle(keys)
-        yield from keys
+            random.Random(int(seed)).shuffle(order)
+        for pos, i in enumerate(order):
+            entry = entries[i]
+            shard_name = entry["path"]
+            idxs = list(range(int(entry.get("num_samples", 0))))
+            if shuffle:
+                random.Random(int(seed) * 131 + pos).shuffle(idxs)
+            for idx in idxs:
+                yield f"{shard_name}:{idx}"
 
     def get_metadata(self) -> dict[str, Any]:
         metadata = dict(self.metadata)
@@ -511,6 +601,87 @@ class TorchShardFeatureStore:
             int(entry.get("num_samples", 0)) for entry in self._load_manifest()
         )
         return metadata
+
+    @staticmethod
+    def _manifest_prefix_sha256(entries: list[dict[str, Any]]) -> str:
+        digest = hashlib.sha256()
+        for entry in entries:
+            digest.update(
+                json.dumps(
+                    entry, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Flush and return a resumable, append-safe manifest cursor.
+
+        The state deliberately describes the checkpoint's manifest *prefix*.
+        A later collection may append shards before restart; restoring accepts
+        that suffix but rejects a rewritten or truncated prefix, preventing a
+        silent replay against a different feature set.
+        """
+
+        if not self.read_only:
+            self.flush()
+        entries = self._load_manifest()
+        state = {
+            "format": "torch_shard_feature_store_cursor",
+            "version": 1,
+            "path": str(self.path.resolve()),
+            "manifest": self.manifest_path.name,
+            "num_shards": len(entries),
+            "num_samples": sum(int(entry.get("num_samples", 0)) for entry in entries),
+            "manifest_prefix_sha256": self._manifest_prefix_sha256(entries),
+            "next_shard_index": int(self._next_shard_index),
+        }
+        self._checkpoint_cursor = dict(state)
+        return state
+
+    def restore_checkpoint_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Validate and restore a previously checkpointed manifest cursor."""
+
+        if not isinstance(state, dict):
+            raise TypeError("Feature-store checkpoint state must be a mapping")
+        if (
+            state.get("format") != "torch_shard_feature_store_cursor"
+            or int(state.get("version", 0)) != 1
+        ):
+            raise ValueError("Unsupported feature-store checkpoint cursor format")
+        expected_path = str(Path(str(state.get("path", ""))).resolve())
+        if expected_path != str(self.path.resolve()):
+            raise ValueError(
+                "Feature-store checkpoint path does not match configured path: "
+                f"checkpoint={expected_path!r} configured={str(self.path.resolve())!r}"
+            )
+        try:
+            expected_shards = int(state["num_shards"])
+            expected_samples = int(state["num_samples"])
+            expected_digest = str(state["manifest_prefix_sha256"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Invalid feature-store checkpoint cursor") from exc
+        if expected_shards < 0 or expected_samples < 0:
+            raise ValueError("Feature-store checkpoint cursor has negative counts")
+
+        entries = self._load_manifest()
+        if len(entries) < expected_shards:
+            raise RuntimeError(
+                "Feature-store manifest was truncated after checkpoint: "
+                f"expected at least {expected_shards} shards, found {len(entries)}"
+            )
+        prefix = entries[:expected_shards]
+        prefix_samples = sum(int(entry.get("num_samples", 0)) for entry in prefix)
+        if (
+            prefix_samples != expected_samples
+            or self._manifest_prefix_sha256(prefix) != expected_digest
+        ):
+            raise RuntimeError(
+                "Feature-store checkpoint cursor does not match manifest prefix; "
+                "refusing to resume with rewritten samples"
+            )
+        self._checkpoint_cursor = dict(state)
+        return dict(state)
 
     def close(self) -> None:
         if not self.read_only:
@@ -563,11 +734,34 @@ class TorchShardFeatureStore:
         return max_index + 1
 
     def _load_shard(self, shard_name: str) -> dict[str, Any]:
+        cached = self._shard_cache.get(shard_name)
+        if cached is not None:
+            return cached
+        load_started = time.time()
         path = self.path / shard_name
         try:
-            return torch.load(path, map_location="cpu", weights_only=False)
+            shard = torch.load(path, map_location="cpu", weights_only=False)
         except TypeError:
-            return torch.load(path, map_location="cpu")
+            shard = torch.load(path, map_location="cpu")
+        self._shard_cache[shard_name] = shard
+        if len(self._shard_cache) > self._shard_cache_max:
+            for k in list(self._shard_cache.keys()):
+                if k != shard_name:
+                    del self._shard_cache[k]
+                    break
+        self._shards_loaded += 1
+        size_gb = path.stat().st_size / (1024**3)
+        logger.info(
+            "[FeatureStore] loaded shard %s/%s name=%s size=%.2fGB "
+            "elapsed=%.1fs total_elapsed=%.1fs",
+            self._shards_loaded,
+            self._shards_total,
+            shard_name,
+            size_gb,
+            time.time() - load_started,
+            time.time() - self._shard_load_started,
+        )
+        return shard
 
 
 class TokenReplayFeatureStore(TorchShardFeatureStore):
@@ -1068,26 +1262,38 @@ def build_feature_store_from_config(
     metadata: dict[str, Any] | None = None,
     shard_prefix: str = "shard",
     transfer_queue_cfg: Any | None = None,
+    hidden_states_store_cfg: Any | None = None,
 ) -> Any:
     store_type = (
         str(feature_store_cfg.get("type", "torch_shard") or "torch_shard")
         .strip()
         .lower()
     )
-    if store_type == "tq":
+    if store_type in {"tq", "ray_reference"}:
         if not read_only:
             raise ValueError(
-                "feature_store.type=tq is a read-only Consumer data source"
+                f"feature_store.type={store_type} is a read-only Consumer data source"
             )
-        from verl_speco.trainer.tq_feature_store import TQFeatureStore
+        from verl_speco.trainer.tq_feature_store import (
+            ReferenceFeatureStore,
+            TQFeatureStore,
+        )
 
         tq_cfg = transfer_queue_cfg
         if tq_cfg is None:
             tq_cfg = feature_store_cfg.get("tq")
         if tq_cfg is None:
             raise ValueError(
-                "feature_store.type=tq requires the sibling training.transfer_queue configuration"
+                f"feature_store.type={store_type} requires the sibling training.transfer_queue configuration"
             )
+        if store_type == "ray_reference":
+            from verl_speco.trainer.tq_feature_store import _plain_dict
+
+            tq_cfg = {
+                **_plain_dict(tq_cfg),
+                "hidden_states_store": _plain_dict(hidden_states_store_cfg),
+            }
+            return ReferenceFeatureStore.from_config(tq_cfg)
         return TQFeatureStore.from_config(tq_cfg)
     if store_type == "torch_shard":
         store_cls: type[TorchShardFeatureStore] = TorchShardFeatureStore

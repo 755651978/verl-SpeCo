@@ -52,6 +52,23 @@ def test_partial_window_uses_actual_sample_count():
     assert metrics["producer/samples_per_second"] == pytest.approx(3.7)
 
 
+def test_metadata_metrics_report_per_sample_latency_and_real_batch_size():
+    rows = [{"timing": {
+        "e2e": 6.0, "publish_queue": 2.0, "publish_queue_wait": 0.5,
+        "publish_transport": 1.0, "publish_retry_wait": 0.2,
+        "metadata_batch_size": 4, "metadata_submit": 1.2,
+    }}] * 4
+    metrics = producer_window_metrics(rows, elapsed=3)
+    assert metrics["producer/samples_per_second"] == pytest.approx(4 / 3)
+    assert metrics["producer/publish_queue_time"] == 2.0
+    assert metrics["producer/publish_queue_wait_time"] == 0.5
+    assert metrics["producer/publish_transport_time"] == 1.0
+    assert metrics["producer/publish_retry_wait_time"] == 0.2
+    assert metrics["producer/metadata_batch_size"] == 4
+    assert metrics["producer/metadata_submit_time"] == 1.2
+    assert not any("tq" in key for key in metrics)
+
+
 def test_producer_logging_uses_published_count_and_independent_step_backends():
     calls = []
     class Tracker:
@@ -97,3 +114,47 @@ def test_single_tracker_accepts_both_streams_and_records_safe_config(monkeypatch
     assert tracker.config["standalone_training"] == {"lr": 1e-6, "algorithm": "DSPARK"}
     assert tracker.config["trainer"]["project_name"] == "test"
     assert [call["step"] for call in tracker.calls] == [100, 3]
+
+
+def test_http_occupancy_is_time_weighted_and_survives_window_reset(monkeypatch):
+    import verl_speco.producer.metrics as module
+    clock = [0.0]
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    stats = module.ProducerDiagnostics()
+    clock[0] = 1
+    stats.http_start()
+    clock[0] = 3
+    stats.http_start()
+    clock[0] = 4
+    stats.http_finish()
+    stats.loop_lag(0.2)
+    stats.loop_lag(0.4)
+    clock[0] = 5
+    first = stats.snapshot()
+    assert first["http_inflight_avg"] == 1.0
+    assert first["http_inflight_peak"] == 2
+    assert first["http_inflight_now"] == 1
+    assert first["http_calls"] == 2
+    assert first["loop_lag_avg"] == pytest.approx(0.3)
+    assert first["loop_lag_max"] == 0.4
+    clock[0] = 7
+    stats.http_finish()
+    clock[0] = 8
+    second = stats.snapshot()
+    assert second["http_inflight_avg"] == pytest.approx(2 / 3)
+    assert second["http_inflight_peak"] == 1
+    assert second["http_inflight_now"] == second["http_calls"] == 0
+    assert second["loop_lag_max"] == 0
+
+
+@pytest.mark.parametrize("initialized,node_id,expected", [
+    (True, "node-a", "node-a"), (False, "node-a", None), (True, "", None),
+])
+def test_clock_identity_requires_initialized_ray(monkeypatch, initialized, node_id, expected):
+    from verl_speco.producer.metrics import current_ray_node_id
+
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(
+        is_initialized=lambda: initialized,
+        get_runtime_context=lambda: SimpleNamespace(get_node_id=lambda: node_id),
+    ))
+    assert current_ray_node_id() == expected

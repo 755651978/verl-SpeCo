@@ -36,12 +36,14 @@ def _sample(index: int = 0):
     loss_mask = torch.tensor([0, 1, 1, 0], dtype=torch.float32)
     hidden_states = torch.randn(4, 8, dtype=torch.float32)
     last_hidden_states = torch.randn(4, 4, dtype=torch.float32)
+    target_logz = torch.arange(4, dtype=torch.float32) + index
     return DraftFeatureSample(
         algorithm="EAGLE3",
         input_ids=input_ids,
         loss_mask=loss_mask,
         hidden_states=hidden_states,
         last_hidden_states=last_hidden_states,
+        target_logz=target_logz,
         metadata={
             "source": "unit",
             "global_step": index,
@@ -70,10 +72,40 @@ def test_torch_shard_feature_store_roundtrip(tmp_path):
     loaded = reader.read(keys[0])
     assert loaded.algorithm == "EAGLE3"
     assert torch.equal(loaded.input_ids, torch.tensor([1, 2, 3, 4]))
+    torch.testing.assert_close(loaded.target_logz, _sample(0).target_logz)
     assert loaded.metadata["hidden_states_layout"] == "eagle3_aux_plus_last"
     assert reader.get_metadata()["num_samples"] == 2
 
 
+def test_feature_store_checkpoint_cursor_accepts_appended_shards(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=2)
+    store.write_many([_sample(0), _sample(1)])
+    cursor = store.checkpoint_state()
+    store.write_many([_sample(2), _sample(3)])
+    store.close()
+
+    resumed = TorchShardFeatureStore(tmp_path)
+    restored = resumed.restore_checkpoint_state(cursor)
+
+    assert restored["num_shards"] == 1
+    assert restored["num_samples"] == 2
+    assert resumed.get_metadata()["num_samples"] == 4
+
+
+def test_feature_store_checkpoint_cursor_rejects_rewritten_manifest_prefix(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=2)
+    store.write_many([_sample(0), _sample(1)])
+    cursor = store.checkpoint_state()
+    store.close()
+
+    manifest = tmp_path / "manifest.jsonl"
+    manifest.write_text(
+        '{"num_samples": 2, "path": "rewritten.pt"}\n', encoding="utf-8"
+    )
+    resumed = TorchShardFeatureStore(tmp_path)
+
+    with pytest.raises(RuntimeError, match="does not match manifest prefix"):
+        resumed.restore_checkpoint_state(cursor)
 def test_token_replay_feature_store_roundtrip(tmp_path):
     sample = DraftReplaySample(
         algorithm="DSPARK",
@@ -402,6 +434,9 @@ def test_feature_sample_restores_online_alignment_metadata():
 
 
 def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
+    # Shard-level data parallelism: ranks split the shard-major key list into
+    # CONTIGUOUS slices (each rank owns whole shards) instead of striding, to
+    # avoid ~world_size read amplification when a sample read loads a whole shard.
     store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=4)
     store.write_many([_sample(i) for i in range(4)])
     store.close()
@@ -421,8 +456,8 @@ def test_draft_feature_dataloader_slices_keys_by_rank(tmp_path):
 
     rank0_ids = [int(sample.input_ids[0].item()) for batch in rank0 for sample in batch]
     rank1_ids = [int(sample.input_ids[0].item()) for batch in rank1 for sample in batch]
-    assert rank0_ids == [1, 3]
-    assert rank1_ids == [2, 4]
+    assert rank0_ids == [1, 2]
+    assert rank1_ids == [3, 4]
 
 
 def test_draft_feature_dataloader_balances_uneven_distributed_shards(tmp_path):

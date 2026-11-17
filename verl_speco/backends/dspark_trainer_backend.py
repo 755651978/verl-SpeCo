@@ -31,6 +31,11 @@ from verl_speco.backends.dflash_trainer_backend import (
     build_dflash_attention_masks,
     _document_boundary_validity,
 )
+from verl_speco.backends.lk_loss import (
+    adaptive_hybrid_loss_components,
+    negative_log_acceptance_loss,
+)
+from verl_speco.backends.target_hidden import gather_aligned_target_hidden
 from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.ops.dspark_fused_loss import (
@@ -43,6 +48,24 @@ from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+_CE_TARGET_SOURCE_LABELS = "labels"
+_CE_TARGET_SOURCE_TARGET_ARGMAX = "target_argmax"
+_CE_TARGET_SOURCES = {_CE_TARGET_SOURCE_LABELS, _CE_TARGET_SOURCE_TARGET_ARGMAX}
+
+
+def _nested_get(config: Any, path: tuple[str, ...], default: Any = None) -> Any:
+    """Read a nested config value from a mapping or attribute chain."""
+
+    current = config
+    for key in path:
+        if current is None:
+            return default
+        if hasattr(current, "get"):
+            current = current.get(key, default)
+        else:
+            current = getattr(current, key, default)
+    return current
 
 
 class DSparkTrainingModel(DFlashTrainingModel):
@@ -67,14 +90,24 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_decay_gamma: float = 7.0,
         loss_mode: str = "full_vocab",
         sampled_ce_negatives: int = 0,
+        per_position_loss_weight: str = "fixed_exp_decay",
+        dpace_alpha: float = 0.5,
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
+        lk_loss_alpha: float = 0.0,
+        lk_temperature: float = 1.0,
+        lk_loss_type: str = "alpha",
+        lk_hybrid_eta: float = 3.0,
         confidence_head_alpha: float = 0.0,
         l1_chunk_size: int = 0,
         distribution_loss_impl: str = "auto",
+        ce_target_source: str = _CE_TARGET_SOURCE_LABELS,
+        confidence_target_mode: str = "greedy",
         debug_log: bool = False,
         debug_log_first_n: int = 2,
         debug_log_interval: int = 100,
+        verifier_norm: Optional[torch.nn.Module] = None,
+        target_hidden_clip_value: Optional[float] = None,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -85,9 +118,21 @@ class DSparkTrainingModel(DFlashTrainingModel):
             front_position_count=0,
             loss_mode=loss_mode,
             sampled_ce_negatives=sampled_ce_negatives,
+            per_position_loss_weight=per_position_loss_weight,
+            dpace_alpha=dpace_alpha,
+            lk_temperature=lk_temperature,
+            lk_loss_type=lk_loss_type,
+            lk_hybrid_eta=lk_hybrid_eta,
         )
         self.ce_loss_alpha = float(ce_loss_alpha)
+        self.verifier_norm = (
+            verifier_norm.eval().requires_grad_(False)
+            if verifier_norm is not None
+            else None
+        )
+        self.target_hidden_clip_value = target_hidden_clip_value
         self.l1_loss_alpha = float(l1_loss_alpha)
+        self.lk_loss_alpha = float(lk_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
         self.l1_chunk_size = int(l1_chunk_size or 0)
         self.distribution_loss_impl = str(distribution_loss_impl).lower()
@@ -95,15 +140,36 @@ class DSparkTrainingModel(DFlashTrainingModel):
             raise ValueError(
                 "distribution_loss_impl must be one of: auto, fused, eager"
             )
+        self.ce_target_source = str(
+            ce_target_source or _CE_TARGET_SOURCE_LABELS
+        ).lower()
+        if self.ce_target_source not in _CE_TARGET_SOURCES:
+            raise ValueError(
+                "ce_target_source must be one of: "
+                f"{', '.join(sorted(_CE_TARGET_SOURCES))}"
+            )
+        self.confidence_target_mode = str(confidence_target_mode or "greedy").lower()
+        if self.confidence_target_mode not in {"greedy", "probabilistic"}:
+            raise ValueError(
+                "dspark_confidence_target_mode must be one of: greedy, probabilistic"
+            )
         self._logged_distribution_loss_backend: Optional[str] = None
         self._distribution_loss_by_device: dict[str, bool] = {}
-        if self.confidence_head_alpha > 0:
-            raise NotImplementedError(
-                "DSpark confidence loss needs target acceptance targets from target logits; "
-                "set dspark_confidence_loss_alpha=0 for the current CE-only trainer path."
-            )
         confidence_head = getattr(self.draft_model, "confidence_head", None)
-        if confidence_head is not None:
+        self.confidence_loss_enabled = self.confidence_head_alpha > 0
+        if self.confidence_loss_enabled:
+            if confidence_head is None:
+                raise ValueError(
+                    "DSpark confidence loss is enabled but the draft model has no "
+                    "confidence head; set dspark_confidence_head_alpha>0 or load a "
+                    "checkpoint that carries one."
+                )
+            confidence_head.requires_grad_(True)
+            logger.info(
+                "[dspark-trainer] confidence head is trainable (alpha=%.4f)",
+                self.confidence_head_alpha,
+            )
+        elif confidence_head is not None:
             confidence_head.requires_grad_(False)
             logger.info(
                 "[dspark-trainer] confidence head is loaded but frozen because confidence loss is disabled"
@@ -142,9 +208,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         device: torch.device,
         document_ids: Optional[torch.Tensor] = None,
+        next_token_loss_mask: Optional[torch.Tensor] = None,
     ):
         bsz = loss_mask.shape[0]
-        num_candidates = max(seq_len - 1, 0)
+        uses_aligned_next_tokens = next_token_loss_mask is not None
+        num_candidates = max(seq_len if uses_aligned_next_tokens else seq_len - 1, 0)
         if num_candidates <= 0:
             anchors = torch.zeros(
                 bsz, self.num_anchors, dtype=torch.long, device=device
@@ -154,9 +222,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
             )
             return anchors, keep_mask
 
-        valid = (loss_mask[:, :num_candidates] > 0.5) & (
-            loss_mask[:, 1 : num_candidates + 1] > 0.5
-        )
+        if uses_aligned_next_tokens:
+            aligned_next_mask = cast(torch.Tensor, next_token_loss_mask)
+            valid = (loss_mask[:, :num_candidates] > 0.5) & (
+                aligned_next_mask[:, :num_candidates] > 0.5
+            )
+        else:
+            valid = (loss_mask[:, :num_candidates] > 0.5) & (
+                loss_mask[:, 1 : num_candidates + 1] > 0.5
+            )
         indices = (
             self._cached_arange("dspark_anchor_indices", num_candidates, device)
             .unsqueeze(0)
@@ -171,7 +245,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 document_ids=document_ids,
                 block_size=self.block_size,
                 seq_len=seq_len,
-                label_shift=1,
+                label_shift=0 if uses_aligned_next_tokens else 1,
             )
         valid_counts = valid.sum(dim=1)
         masked_indices = torch.where(valid, indices, seq_len + 1)
@@ -204,6 +278,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         anchor_positions: torch.Tensor,
         block_keep_mask: torch.Tensor,
+        next_token_ids: Optional[torch.Tensor] = None,
+        next_token_loss_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -215,18 +291,38 @@ class DSparkTrainingModel(DFlashTrainingModel):
             + 1
         )
         label_indices = anchor_positions.unsqueeze(-1) + label_offsets
-        valid_label_mask = label_indices < seq_len
-        safe_label_indices = label_indices.clamp(max=max(seq_len - 1, 0))
+        label_source = input_ids
+        label_mask_source = loss_mask
+        gather_indices = label_indices
+        if next_token_ids is not None:
+            if next_token_loss_mask is None:
+                raise ValueError("DSpark next_token_ids requires next_token_loss_mask")
+            if (
+                next_token_ids.shape != input_ids.shape
+                or next_token_loss_mask.shape != loss_mask.shape
+            ):
+                raise ValueError(
+                    "DSpark next-token labels must align with context rows: "
+                    f"input={tuple(input_ids.shape)} next_ids={tuple(next_token_ids.shape)} "
+                    f"mask={tuple(loss_mask.shape)} next_mask={tuple(next_token_loss_mask.shape)}"
+                )
+            label_source = next_token_ids
+            label_mask_source = next_token_loss_mask
+            gather_indices = label_indices - 1
+        valid_label_mask = gather_indices < label_source.size(1)
+        safe_label_indices = gather_indices.clamp(max=max(label_source.size(1) - 1, 0))
         safe_label_indices = torch.where(
             block_keep_mask.unsqueeze(-1),
             safe_label_indices,
             torch.zeros_like(safe_label_indices),
         )
         target_ids = torch.gather(
-            input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+            label_source.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
         )
         target_loss_mask = torch.gather(
-            loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+            label_mask_source.unsqueeze(1).expand(-1, n_blocks, -1),
+            2,
+            safe_label_indices,
         )
         eval_mask = (
             valid_label_mask & (target_loss_mask > 0.5) & block_keep_mask.unsqueeze(-1)
@@ -279,50 +375,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
         label_indices: torch.Tensor,
         block_keep_mask: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        if target_last_hidden_states is None:
-            return None
-        if target_last_hidden_states.dim() != 3:
-            raise ValueError(
-                "DSpark target_last_hidden_states must have shape [batch, seq, hidden], "
-                f"got {tuple(target_last_hidden_states.shape)}"
-            )
-        seq_len = int(target_last_hidden_states.size(1))
-        if seq_len <= 0:
-            return None
-        target_pred_indices = (label_indices - 1).clamp(min=0, max=seq_len - 1)
-        target_pred_indices = torch.where(
-            block_keep_mask.unsqueeze(-1),
-            target_pred_indices,
-            torch.zeros_like(target_pred_indices),
-        )
-        batch_size, _, hidden_size = target_last_hidden_states.shape
-        if target_pred_indices.size(0) != batch_size:
-            raise ValueError(
-                "DSpark label_indices batch size must match target_last_hidden_states: "
-                f"{target_pred_indices.size(0)} != {batch_size}"
-            )
-
-        # Convert each per-batch token index into a row index of a flattened
-        # [batch * seq, hidden] tensor.  The previous gather input was an
-        # expanded [batch, anchors, seq, hidden] view; Ascend may materialize
-        # that view and allocate tens of GiB before gather executes.
-        batch_offsets = (
-            torch.arange(
-                batch_size,
-                device=target_pred_indices.device,
-                dtype=target_pred_indices.dtype,
-            ).view(batch_size, 1, 1)
-            * seq_len
-        )
-        flat_indices = (target_pred_indices + batch_offsets).reshape(-1)
-        flat_target_hidden = target_last_hidden_states.reshape(
-            batch_size * seq_len, hidden_size
-        )
-        return flat_target_hidden.index_select(0, flat_indices).view(
-            *target_pred_indices.shape, hidden_size
+        return gather_aligned_target_hidden(
+            target_last_hidden_states, label_indices, block_keep_mask
         )
 
-    def _compute_l1_loss_for_active(
+    def _compute_distribution_losses_for_active(
         self,
         *,
         active_hidden: torch.Tensor,
@@ -330,22 +387,95 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_target_hidden: torch.Tensor,
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
+        use_fused: bool = False,
+        active_draft_logits: Optional[torch.Tensor] = None,
         active_draft_log_probs: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        active_target_logits: Optional[torch.Tensor] = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
+        """Compute the DSpark distribution losses for the active (valid) rows.
+
+        Returns ``(l1_sum, l1_den, confidence_sum, confidence_den,
+        acceptance_sum, confidence_pred_sum, lk_sum, lk_den, lk_diagnostics)``.
+
+        The confidence head learns the analytical rejection-sampling acceptance
+        rate ``alpha = sum_v min(p_v, q_v) = 1 - d_TV`` between the target
+        (verifier) and draft distributions, mirroring ``speculators``. The
+        acceptance target is built from the frozen full-vocab distributions and
+        is detached; the confidence term itself flows into the head and, through
+        the shared draft hidden/Markov features, the draft backbone. Both losses
+        share the same per-chunk draft/target distributions, so the draft
+        full-vocab forward is not repeated when both are enabled.
+
+        ``active_target_logits`` may carry the verifier logits already computed
+        for target-argmax CE, avoiding a second target LM-head projection.
+        """
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
-            return zero, zero
+            return (
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                {
+                    "count": zero,
+                    "acceptance_sum": zero,
+                    "kl_weight_sum": zero,
+                    "forward_kl_sum": zero,
+                    "tv_sum": zero,
+                },
+            )
+
+        l1_enabled = self.l1_loss_alpha > 0
+        confidence_enabled = self.confidence_loss_enabled
 
         l1_sum = active_weights.new_zeros((), dtype=torch.float32)
-        l1_den = active_weights.float().sum()
+        l1_den = active_weights.new_zeros((), dtype=torch.float32)
+        if l1_enabled:
+            l1_den = active_weights.float().sum()
+        conf_sum = active_weights.new_zeros((), dtype=torch.float32)
+        conf_den = active_weights.new_zeros((), dtype=torch.float32)
+        accept_sum = active_weights.new_zeros((), dtype=torch.float32)
+        pred_sum = active_weights.new_zeros((), dtype=torch.float32)
+
+        lk_sum = active_weights.new_zeros((), dtype=torch.float32)
+        loss_den = (
+            active_weights.float().sum()
+            if self.lk_loss_alpha > 0
+            else active_weights.new_zeros((), dtype=torch.float32)
+        )
+        diagnostic_count = active_weights.new_zeros((), dtype=torch.float32)
+        acceptance_sum = active_weights.new_zeros((), dtype=torch.float32)
+        forward_kl_sum = active_weights.new_zeros((), dtype=torch.float32)
+        tv_sum = active_weights.new_zeros((), dtype=torch.float32)
+        weighted_forward_kl_sum = active_weights.new_zeros((), dtype=torch.float32)
+        weighted_tv_sum = active_weights.new_zeros((), dtype=torch.float32)
         active_count = int(active_hidden.size(0))
-        if active_draft_log_probs is not None:
-            expected_shape = (active_count, int(lm_head_weight.size(0)))
-            if tuple(active_draft_log_probs.shape) != expected_shape:
+        expected_shape = (active_count, int(lm_head_weight.size(0)))
+        for name, tensor in (
+            ("draft log probabilities", active_draft_log_probs),
+            ("draft logits", active_draft_logits),
+            ("target logits", active_target_logits),
+        ):
+            if tensor is not None and tuple(tensor.shape) != expected_shape:
                 raise ValueError(
-                    "DSpark precomputed draft log probabilities must have shape "
-                    f"{expected_shape}, got {tuple(active_draft_log_probs.shape)}"
+                    f"DSpark precomputed {name} must have shape "
+                    f"{expected_shape}, got {tuple(tensor.shape)}"
                 )
+
         chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else active_count
         for start in range(0, active_count, chunk_size):
             end = min(start + chunk_size, active_count)
@@ -354,54 +484,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
             target_hidden_chunk = active_target_hidden[start:end]
             weights_chunk = active_weights[start:end].float()
 
-            if active_draft_log_probs is None:
-                draft_logits = F.linear(hidden_chunk, lm_head_weight)
-                markov_bias = self._markov_bias_for_active(
-                    active_hidden=hidden_chunk,
-                    active_prev_tokens=prev_chunk,
-                    restricted_vocab=None,
-                )
-                if markov_bias is not None:
-                    draft_logits = draft_logits + markov_bias
-                draft_probs = torch.softmax(draft_logits.float(), dim=-1)
-            else:
+            draft_logits: torch.Tensor | None = None
+            draft_probs: torch.Tensor | None
+            target_probs: torch.Tensor | None = None
+            if not use_fused and active_draft_log_probs is not None:
                 draft_probs = active_draft_log_probs[start:end].exp()
-            target_logits = F.linear(target_hidden_chunk, lm_head_weight)
-            target_probs = torch.softmax(target_logits.float(), dim=-1)
-            l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
-            l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
-        return l1_sum, l1_den
-
-    def _compute_fused_l1_loss_for_active(
-        self,
-        *,
-        active_hidden: torch.Tensor,
-        active_prev_tokens: torch.Tensor,
-        active_target_hidden: torch.Tensor,
-        active_weights: torch.Tensor,
-        lm_head_weight: torch.Tensor,
-        active_draft_logits: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if active_hidden.numel() == 0:
-            zero = active_weights.new_zeros((), dtype=torch.float32)
-            return zero, zero
-        active_count = int(active_hidden.size(0))
-        if active_draft_logits is not None:
-            expected_shape = (active_count, int(lm_head_weight.size(0)))
-            if tuple(active_draft_logits.shape) != expected_shape:
-                raise ValueError(
-                    "DSpark precomputed draft logits must have shape "
-                    f"{expected_shape}, got {tuple(active_draft_logits.shape)}"
-                )
-
-        l1_sum = active_weights.new_zeros((), dtype=torch.float32)
-        l1_den = active_weights.float().sum()
-        chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else active_count
-        for start in range(0, active_count, chunk_size):
-            end = min(start + chunk_size, active_count)
-            hidden_chunk = active_hidden[start:end]
-            prev_chunk = active_prev_tokens[start:end]
-            if active_draft_logits is None:
+            elif use_fused and active_draft_logits is not None:
+                draft_logits = active_draft_logits[start:end]
+                draft_probs = None
+            else:
                 draft_logits = F.linear(hidden_chunk, lm_head_weight)
                 markov_bias = self._markov_bias_for_active(
                     active_hidden=hidden_chunk,
@@ -410,16 +501,176 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     draft_logits = draft_logits + markov_bias
-            else:
-                draft_logits = active_draft_logits[start:end]
-            with torch.no_grad():
-                target_logits = F.linear(
-                    active_target_hidden[start:end], lm_head_weight
+                draft_probs = (
+                    None if use_fused else torch.softmax(draft_logits.float(), dim=-1)
                 )
-            l1_per_token = 2.0 * fused_total_variation(draft_logits, target_logits)
-            weights_chunk = active_weights[start:end].float()
-            l1_sum = l1_sum + (l1_per_token * weights_chunk).sum()
-        return l1_sum, l1_den
+
+            with torch.no_grad():
+                target_logits = (
+                    active_target_logits[start:end]
+                    if active_target_logits is not None
+                    else F.linear(target_hidden_chunk, lm_head_weight)
+                )
+                if not use_fused:
+                    target_probs = torch.softmax(target_logits.float(), dim=-1)
+
+            if use_fused:
+                if draft_logits is None:
+                    raise RuntimeError(
+                        "DSpark fused distribution loss requires draft logits"
+                    )
+                if l1_enabled:
+                    tv = fused_total_variation(draft_logits, target_logits)
+                else:
+                    # Confidence-only: the varying part is discarded, so skip
+                    # building an autograd graph for the fused TV.
+                    with torch.no_grad():
+                        tv = fused_total_variation(draft_logits, target_logits)
+                l1_dist = 2.0 * tv
+                probabilistic_target = (1.0 - tv).clamp(0.0, 1.0)
+            else:
+                if draft_probs is None:
+                    if draft_logits is None:
+                        raise RuntimeError(
+                            "DSpark distribution loss requires draft logits or "
+                            "probabilities"
+                        )
+                    draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+                if l1_enabled:
+                    l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
+                else:
+                    # Confidence-only: the varying part is discarded, so skip
+                    # building an autograd graph for the eager L1 distance.
+                    with torch.no_grad():
+                        l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
+                probabilistic_target = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0)
+
+            if l1_enabled:
+                l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
+
+            if self.lk_loss_alpha > 0:
+                if active_draft_log_probs is not None:
+                    draft_logit_proxy = active_draft_log_probs[start:end].float()
+                elif draft_logits is not None:
+                    draft_logit_proxy = draft_logits.float()
+                else:
+                    raise RuntimeError(
+                        "DSpark LK loss requires draft logits or log probabilities"
+                    )
+                temperature = self.lk_temperature
+                draft_lk_probs = torch.softmax(draft_logit_proxy / temperature, dim=-1)
+                target_lk_probs = torch.softmax(
+                    target_logits.float() / temperature, dim=-1
+                )
+                if self.lk_loss_type == "adaptive_hybrid":
+                    acceptance, forward_kl, tv = adaptive_hybrid_loss_components(
+                        draft_lk_probs,
+                        target_lk_probs,
+                        target_lk_probs,
+                    )
+                    diagnostic_count = diagnostic_count + float(end - start)
+                    acceptance_sum = acceptance_sum + acceptance.sum()
+                    forward_kl_sum = forward_kl_sum + forward_kl.sum()
+                    tv_sum = tv_sum + tv.sum()
+                    weighted_forward_kl_sum = (
+                        weighted_forward_kl_sum + (forward_kl * weights_chunk).sum()
+                    )
+                    weighted_tv_sum = weighted_tv_sum + (tv * weights_chunk).sum()
+                else:
+                    lk_loss = negative_log_acceptance_loss(
+                        draft_lk_probs,
+                        target_lk_probs,
+                    )
+                    lk_sum = lk_sum + (lk_loss * weights_chunk).sum()
+
+            if confidence_enabled:
+                # The head must predict the acceptance the *served* proposal
+                # mode yields. 'probabilistic' drafting samples the draft
+                # softmax, so acceptance = sum_v min(p_draft, p_target) = 1-TV.
+                # 'greedy' drafting (the serving default) proposes
+                # argmax(p_draft) and the rejection sampler treats the draft as
+                # one-hot, so acceptance collapses to p_target[argmax(p_draft)].
+                if self.confidence_target_mode == "greedy":
+                    # argmax is invariant to the softmax, so reuse draft_probs
+                    # when present (eager) and fall back to the logits (fused).
+                    draft_source = (
+                        draft_probs if draft_probs is not None else draft_logits
+                    )
+                    if draft_source is None:
+                        raise RuntimeError(
+                            "DSpark greedy confidence target requires draft logits"
+                        )
+                    if target_probs is None:
+                        target_probs = torch.softmax(target_logits.float(), dim=-1)
+                    draft_argmax = draft_source.argmax(dim=-1, keepdim=True)
+                    acceptance_target = (
+                        target_probs.gather(-1, draft_argmax).squeeze(-1).detach()
+                    )
+                else:
+                    acceptance_target = probabilistic_target.detach()
+                confidence_logits = self.draft_model.predict_confidence(
+                    hidden_chunk, prev_token_ids=prev_chunk
+                )
+                if confidence_logits is None:
+                    raise ValueError(
+                        "DSpark confidence loss requires draft_model.confidence_head"
+                    )
+                if confidence_logits.shape != l1_dist.shape:
+                    raise ValueError(
+                        "DSpark confidence logits must match the active-token shape: "
+                        f"expected={tuple(l1_dist.shape)} got={tuple(confidence_logits.shape)}"
+                    )
+                bce = F.binary_cross_entropy_with_logits(
+                    confidence_logits.float(), acceptance_target, reduction="none"
+                )
+                finite_confidence = torch.isfinite(bce)
+                confidence_weights = weights_chunk * finite_confidence.to(
+                    dtype=weights_chunk.dtype
+                )
+                conf_sum = (
+                    conf_sum
+                    + (
+                        torch.where(finite_confidence, bce, torch.zeros_like(bce))
+                        * confidence_weights
+                    ).sum()
+                )
+                conf_den = conf_den + confidence_weights.sum()
+                # Weight the acceptance and prediction diagnostics by the same
+                # finite-token mask as the loss so ``accept_sum / conf_den`` and
+                # ``pred_sum / conf_den`` stay valid weighted means.
+                accept_sum = accept_sum + (acceptance_target * confidence_weights).sum()
+                pred_sum = (
+                    pred_sum
+                    + (
+                        confidence_logits.detach().float().sigmoid()
+                        * confidence_weights
+                    ).sum()
+                )
+        kl_weight = diagnostic_count.new_zeros(())
+        if self.lk_loss_alpha > 0 and self.lk_loss_type == "adaptive_hybrid":
+            mean_acceptance = acceptance_sum / diagnostic_count.clamp_min(1.0)
+            kl_weight = torch.exp(-self.lk_hybrid_eta * mean_acceptance.detach())
+            lk_sum = (
+                kl_weight * weighted_forward_kl_sum
+                + (1.0 - kl_weight) * weighted_tv_sum
+            )
+        return (
+            l1_sum,
+            l1_den,
+            conf_sum,
+            conf_den,
+            accept_sum,
+            pred_sum,
+            lk_sum,
+            loss_den,
+            {
+                "count": diagnostic_count,
+                "acceptance_sum": acceptance_sum,
+                "kl_weight_sum": kl_weight * diagnostic_count,
+                "forward_kl_sum": forward_kl_sum,
+                "tv_sum": tv_sum,
+            },
+        )
 
     def _should_debug_log(self) -> bool:
         if not self.debug_log:
@@ -486,10 +737,14 @@ class DSparkTrainingModel(DFlashTrainingModel):
         hidden_states_list: list[torch.Tensor],
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
+        target_last_hidden_states: Optional[torch.Tensor] = None,
         document_ids: Optional[torch.Tensor] = None,
         label_ids: Optional[torch.Tensor] = None,
         label_mask: Optional[torch.Tensor] = None,
-        target_last_hidden_states: Optional[torch.Tensor] = None,
+        target_hidden_is_raw: bool = False,
+        hidden_source: Optional[str] = None,
+        next_token_ids: Optional[torch.Tensor] = None,
+        next_token_loss_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -500,8 +755,13 @@ class DSparkTrainingModel(DFlashTrainingModel):
             label_mask = loss_mask
         label_len = label_ids.shape[1]
         context_feature = self.draft_model.extract_context_feature(hidden_states_list)
+        uses_aligned_next_tokens = next_token_loss_mask is not None
         anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            label_len, label_mask, device, document_ids=document_ids
+            seq_len if uses_aligned_next_tokens else label_len,
+            loss_mask if uses_aligned_next_tokens else label_mask,
+            device,
+            document_ids=document_ids,
+            next_token_loss_mask=next_token_loss_mask,
         )
         # Anchors must point at a real context row (the hidden states may be one
         # row shorter than the label sequence when a trailing label token exists).
@@ -533,12 +793,16 @@ class DSparkTrainingModel(DFlashTrainingModel):
             noise_embedding=noise_embedding,
         ).view(bsz, n_blocks, self.block_size, -1)
 
+        label_source_ids = input_ids if uses_aligned_next_tokens else label_ids
+        label_source_mask = loss_mask if uses_aligned_next_tokens else label_mask
         target_ids, prev_token_ids, eval_mask, label_indices = (
             self._build_label_tensors(
-                input_ids=label_ids,
-                loss_mask=label_mask,
+                input_ids=label_source_ids,
+                loss_mask=label_source_mask,
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
+                next_token_ids=next_token_ids,
+                next_token_loss_mask=next_token_loss_mask,
             )
         )
         aligned_target_hidden = self._gather_aligned_target_hidden(
@@ -546,8 +810,41 @@ class DSparkTrainingModel(DFlashTrainingModel):
             label_indices=label_indices,
             block_keep_mask=block_keep_mask,
         )
+        if target_hidden_is_raw:
+            if (
+                hidden_source != "standalone_vllm_reference"
+                or self.verifier_norm is None
+            ):
+                raise ValueError(
+                    "Raw DSpark targets require the standalone vLLM file model path"
+                )
+            if aligned_target_hidden is None:
+                raise ValueError("Target final norm requires target_last_hidden_states")
+            # Like speculators: select supervision positions first, then apply
+            # the frozen verifier norm in forward before projecting targets.
+            with (
+                torch.no_grad(),
+                torch.autocast(device_type=device.type, enabled=False),
+            ):
+                self.verifier_norm.eval()
+                aligned_target_hidden = self.verifier_norm(aligned_target_hidden)
+                bad_target_rows = ~torch.isfinite(aligned_target_hidden).all(dim=-1)
+                clip = self.target_hidden_clip_value
+                if clip is not None:
+                    bad_target_rows |= (
+                        aligned_target_hidden.float().abs().amax(dim=-1) > clip
+                    )
+                aligned_target_hidden = torch.nan_to_num(
+                    aligned_target_hidden, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                if clip is not None:
+                    aligned_target_hidden = aligned_target_hidden.clamp(-clip, clip)
+            eval_mask = eval_mask & ~bad_target_rows
 
-        weight_mask = eval_mask.float()
+        base_loss_mask = eval_mask.float()
+        # DSpark's auxiliary distribution losses retain the fixed exponential
+        # position weights even when CE uses dynamic D-PACE weights.
+        weight_mask = base_loss_mask
         if self.loss_decay_gamma is not None and self.loss_decay_gamma > 0:
             positions = self._cached_arange(
                 "dspark_decay_positions", self.block_size, device, view_shape=(1, 1, -1)
@@ -579,6 +876,19 @@ class DSparkTrainingModel(DFlashTrainingModel):
         local_ce_den = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_sum = torch.zeros((), dtype=torch.float32, device=device)
         local_l1_den = torch.zeros((), dtype=torch.float32, device=device)
+        local_lk_sum = torch.zeros((), dtype=torch.float32, device=device)
+        local_lk_den = torch.zeros((), dtype=torch.float32, device=device)
+        lk_diagnostics = {
+            "count": torch.zeros((), dtype=torch.float32, device=device),
+            "acceptance_sum": torch.zeros((), dtype=torch.float32, device=device),
+            "kl_weight_sum": torch.zeros((), dtype=torch.float32, device=device),
+            "forward_kl_sum": torch.zeros((), dtype=torch.float32, device=device),
+            "tv_sum": torch.zeros((), dtype=torch.float32, device=device),
+        }
+        local_conf_sum = torch.zeros((), dtype=torch.float32, device=device)
+        local_conf_den = torch.zeros((), dtype=torch.float32, device=device)
+        confidence_accept_sum = torch.zeros((), dtype=torch.float32, device=device)
+        confidence_pred_sum = torch.zeros((), dtype=torch.float32, device=device)
         active_logits = None
         active_log_probs = None
         restricted_vocab = None
@@ -586,9 +896,37 @@ class DSparkTrainingModel(DFlashTrainingModel):
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
         else:
+            ce_targets = active_targets
+            active_target_logits = None
+            if self.ce_target_source == _CE_TARGET_SOURCE_TARGET_ARGMAX:
+                if self.loss_mode != "full_vocab":
+                    raise ValueError(
+                        "DSpark target_argmax CE currently requires "
+                        "dspark_loss_mode='full_vocab'"
+                    )
+                if self.l1_chunk_size > 0:
+                    raise ValueError(
+                        "DSpark target_argmax CE currently requires "
+                        "dspark_l1_chunk_size=0"
+                    )
+                if active_target_hidden is None:
+                    raise ValueError(
+                        "DSpark target_argmax CE requires target_last_hidden_states"
+                    )
+                with torch.no_grad():
+                    active_target_logits = F.linear(
+                        active_target_hidden, lm_head_weight
+                    )
+                    ce_targets = active_target_logits.argmax(dim=-1)
+                    # Align the accuracy/acceptance diagnostics with the training
+                    # objective: measure draft argmax against the TARGET model's
+                    # argmax (the real speculative acceptance reference) rather
+                    # than the dataset label. This makes `sim_acc_len` the same
+                    # quantity that serving measures.
+                    active_targets = ce_targets
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 restricted_vocab = self._build_restricted_vocab(
-                    input_ids, active_targets, int(lm_head_weight.shape[0])
+                    input_ids, ce_targets, int(lm_head_weight.shape[0])
                 )
                 restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
                 active_logits = F.linear(active_hidden, restricted_weight)
@@ -599,7 +937,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
-                active_ce_targets = torch.searchsorted(restricted_vocab, active_targets)
+                active_ce_targets = torch.searchsorted(restricted_vocab, ce_targets)
                 active_loss = (
                     fused_label_cross_entropy(active_logits, active_ce_targets)
                     if use_fused_loss
@@ -617,13 +955,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 if markov_bias is not None:
                     active_logits = active_logits + markov_bias
                 if use_fused_loss:
-                    active_loss = fused_label_cross_entropy(
-                        active_logits, active_targets
-                    )
+                    active_loss = fused_label_cross_entropy(active_logits, ce_targets)
                 else:
                     active_log_probs = F.log_softmax(active_logits.float(), dim=-1)
                     active_loss = F.nll_loss(
-                        active_log_probs, active_targets, reduction="none"
+                        active_log_probs, ce_targets, reduction="none"
                     )
 
             finite_loss = torch.isfinite(active_loss)
@@ -631,7 +967,19 @@ class DSparkTrainingModel(DFlashTrainingModel):
             active_loss = torch.where(
                 finite_loss, active_loss, torch.zeros_like(active_loss)
             )
-            active_loss_weights = active_weights * finite_loss.to(
+            ce_active_weights = active_weights
+            if self.per_position_loss_weight == "dpace":
+                ce_weight_mask = self._dpace_weight_mask(
+                    per_token_ce=active_loss,
+                    finite_loss=finite_loss,
+                    active_mask=active_mask,
+                    base_loss_mask=base_loss_mask,
+                )
+                ce_active_weights = ce_weight_mask.reshape(-1)[active_mask]
+            active_loss_weights = ce_active_weights * finite_loss.to(
+                dtype=ce_active_weights.dtype
+            )
+            distribution_loss_weights = active_weights * finite_loss.to(
                 dtype=active_weights.dtype
             )
             loss_per_token[active_mask] = active_loss
@@ -639,72 +987,102 @@ class DSparkTrainingModel(DFlashTrainingModel):
             valid_token_count = local_ce_den.clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             ce_loss = local_ploss_sum / valid_token_count
-            if self.l1_loss_alpha > 0:
+            needs_target_distribution = (
+                self.l1_loss_alpha > 0
+                or self.lk_loss_alpha > 0
+                or self.confidence_loss_enabled
+            )
+            if needs_target_distribution:
                 if active_target_hidden is None:
                     raise ValueError(
-                        "DSpark L1 loss requires target_last_hidden_states. "
-                        "Enable old-logprob dflash_aux_plus_last collection or set dspark_l1_loss_alpha=0."
+                        "DSpark L1/LK/confidence losses require target_last_hidden_states. "
+                        "Enable old-logprob dflash_aux_plus_last collection or disable "
+                        "dspark_l1_loss_alpha, dspark_lk_loss_alpha and dspark_confidence_loss_alpha."
                     )
                 finite_target_hidden = torch.isfinite(active_target_hidden).all(dim=-1)
-                l1_mask = finite_loss & finite_target_hidden
-                if l1_mask.any():
-                    all_l1_rows = bool(l1_mask.all())
-                    l1_hidden = active_hidden if all_l1_rows else active_hidden[l1_mask]
-                    l1_prev = (
-                        active_prev_tokens
-                        if all_l1_rows
-                        else active_prev_tokens[l1_mask]
-                    )
-                    l1_target_hidden = (
-                        active_target_hidden
-                        if all_l1_rows
-                        else active_target_hidden[l1_mask]
-                    )
-                    l1_weights = (
-                        active_loss_weights
-                        if all_l1_rows
-                        else active_loss_weights[l1_mask]
-                    )
-                    if use_fused_loss:
-                        reusable_draft_logits = None
-                        if restricted_vocab is None:
+                distribution_mask = finite_loss & finite_target_hidden
+                if distribution_mask.any():
+                    all_rows = bool(distribution_mask.all())
+                    reusable_draft_logits = None
+                    reusable_draft_log_probs = None
+                    # Full-vocab CE already normalizes the complete LM head and Markov
+                    # bias. Restricted/sampled CE must rebuild full-vocab probabilities
+                    # for the L1 and confidence targets inside the loss helper.
+                    if restricted_vocab is None:
+                        if use_fused_loss:
                             reusable_draft_logits = (
-                                active_logits if all_l1_rows else active_logits[l1_mask]
+                                active_logits
+                                if all_rows
+                                else active_logits[distribution_mask]
                             )
-                        local_l1_sum, local_l1_den = (
-                            self._compute_fused_l1_loss_for_active(
-                                active_hidden=l1_hidden,
-                                active_prev_tokens=l1_prev,
-                                active_target_hidden=l1_target_hidden,
-                                active_weights=l1_weights,
-                                lm_head_weight=lm_head_weight,
-                                active_draft_logits=reusable_draft_logits,
-                            )
-                        )
-                    else:
-                        reusable_draft_log_probs = None
-                        if restricted_vocab is None:
+                        else:
                             if active_log_probs is None:
                                 raise ValueError(
-                                    "DSpark L1 loss requires active_log_probs"
+                                    "DSpark distribution losses require active_log_probs"
                                 )
                             reusable_draft_log_probs = (
                                 active_log_probs
-                                if all_l1_rows
-                                else active_log_probs[l1_mask]
+                                if all_rows
+                                else active_log_probs[distribution_mask]
                             )
-                        local_l1_sum, local_l1_den = self._compute_l1_loss_for_active(
-                            active_hidden=l1_hidden,
-                            active_prev_tokens=l1_prev,
-                            active_target_hidden=l1_target_hidden,
-                            active_weights=l1_weights,
-                            lm_head_weight=lm_head_weight,
-                            active_draft_log_probs=reusable_draft_log_probs,
-                        )
+                    (
+                        local_l1_sum,
+                        local_l1_den,
+                        local_conf_sum,
+                        local_conf_den,
+                        confidence_accept_sum,
+                        confidence_pred_sum,
+                        local_lk_sum,
+                        local_lk_den,
+                        lk_diagnostics,
+                    ) = self._compute_distribution_losses_for_active(
+                        active_hidden=(
+                            active_hidden
+                            if all_rows
+                            else active_hidden[distribution_mask]
+                        ),
+                        active_prev_tokens=(
+                            active_prev_tokens
+                            if all_rows
+                            else active_prev_tokens[distribution_mask]
+                        ),
+                        active_target_hidden=(
+                            active_target_hidden
+                            if all_rows
+                            else active_target_hidden[distribution_mask]
+                        ),
+                        active_weights=(
+                            distribution_loss_weights
+                            if all_rows
+                            else distribution_loss_weights[distribution_mask]
+                        ),
+                        lm_head_weight=lm_head_weight,
+                        use_fused=use_fused_loss,
+                        active_draft_logits=reusable_draft_logits,
+                        active_draft_log_probs=reusable_draft_log_probs,
+                        active_target_logits=(
+                            active_target_logits
+                            if all_rows
+                            else (
+                                active_target_logits[distribution_mask]
+                                if active_target_logits is not None
+                                else None
+                            )
+                        ),
+                    )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
+                lk_loss = local_lk_sum / local_lk_den.clamp(min=1e-6)
+                confidence_loss = local_conf_sum / local_conf_den.clamp(min=1e-6)
             else:
                 l1_loss = local_ploss_sum.new_zeros(())
-            loss = (ce_loss * self.ce_loss_alpha) + (l1_loss * self.l1_loss_alpha)
+                lk_loss = local_ploss_sum.new_zeros(())
+                confidence_loss = local_ploss_sum.new_zeros(())
+            loss = (
+                (ce_loss * self.ce_loss_alpha)
+                + (l1_loss * self.l1_loss_alpha)
+                + (lk_loss * self.lk_loss_alpha)
+                + (confidence_loss * self.confidence_head_alpha)
+            )
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
@@ -794,6 +1172,17 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "ce_weighted_token_count": local_ce_den.detach(),
             "l1_loss_sum": local_l1_sum.detach(),
             "l1_weighted_token_count": local_l1_den.detach(),
+            "lk_loss_sum": local_lk_sum.detach(),
+            "lk_weighted_token_count": local_lk_den.detach(),
+            "lk_diagnostic_token_count": lk_diagnostics["count"].detach(),
+            "lk_acceptance_sum": lk_diagnostics["acceptance_sum"].detach(),
+            "lk_kl_weight_sum": lk_diagnostics["kl_weight_sum"].detach(),
+            "lk_forward_kl_sum": lk_diagnostics["forward_kl_sum"].detach(),
+            "lk_tv_sum": lk_diagnostics["tv_sum"].detach(),
+            "confidence_loss_sum": local_conf_sum.detach(),
+            "confidence_weighted_token_count": local_conf_den.detach(),
+            "confidence_accept_rate_sum": confidence_accept_sum.detach(),
+            "confidence_pred_mean_sum": confidence_pred_sum.detach(),
             "sanitized_rows": sanitized_rows.detach(),
             "masked_rows": (~binary_eval_mask & flat_eval_mask).float().sum().detach(),
             "sampled_vocab_size": sampled_vocab_size.detach(),
@@ -875,12 +1264,189 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 drafter_config.num_context_layers = int(
                     training_cfg["dspark_num_target_layers"]
                 )
-        return super()._normalize_dflash_config(
+        drafter_config = super()._normalize_dflash_config(
             drafter_config,
             target_hf_config,
             normalized_state,
             spec_model_path,
         )
+        return self._normalize_dspark_confidence_config(
+            drafter_config, normalized_state, spec_model_path, training_cfg
+        )
+
+    def _normalize_dspark_confidence_config(
+        self, drafter_config, normalized_state, spec_model_path, training_cfg
+    ):
+        """Resolve the confidence-head topology from config, checkpoint and training.
+
+        Whether the head exists, and whether its input includes the Markov
+        previous-token embedding, follows what is actually present. Training
+        knobs may only align with the checkpoint topology; a mismatch fails
+        closed instead of silently loading an incompatible head through
+        ``strict=False``. A markov-less head with ``markov_rank>0`` is only
+        valid for offline training because the served vLLM head is Markov-fused.
+        """
+        training_head_alpha = float(
+            training_cfg.get("dspark_confidence_head_alpha", 0.0) or 0.0
+        )
+        training_loss_alpha = float(
+            training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0
+        )
+        if training_head_alpha < 0 or training_loss_alpha < 0:
+            raise ValueError(
+                "DSpark confidence-head and loss alphas must be non-negative"
+            )
+
+        state = normalized_state or {}
+        confidence_weight = state.get("confidence_head.proj.weight")
+        confidence_bias = state.get("confidence_head.proj.bias")
+        if (confidence_weight is None) != (confidence_bias is None):
+            raise ValueError(
+                "DSpark checkpoint must contain both confidence_head.proj.weight "
+                f"and confidence_head.proj.bias: model_path={spec_model_path}"
+            )
+
+        training_requests_head = training_head_alpha > 0 or training_loss_alpha > 0
+        config_enables_head = bool(
+            getattr(drafter_config, "enable_confidence_head", False)
+        )
+        checkpoint_has_head = confidence_weight is not None
+        enable_confidence_head = (
+            training_requests_head or config_enables_head or checkpoint_has_head
+        )
+        confidence_with_markov = bool(
+            getattr(drafter_config, "confidence_head_with_markov", True)
+        )
+        if training_requests_head:
+            confidence_with_markov = bool(
+                training_cfg.get("dspark_confidence_head_with_markov", True)
+            )
+
+        if checkpoint_has_head:
+            if confidence_weight.ndim != 2 or int(confidence_weight.shape[0]) != 1:
+                raise ValueError(
+                    "DSpark confidence_head.proj.weight must have shape [1, input_dim], "
+                    f"got {tuple(confidence_weight.shape)} in {spec_model_path}"
+                )
+            if confidence_bias.ndim != 1 or tuple(confidence_bias.shape) != (1,):
+                raise ValueError(
+                    "DSpark confidence_head.proj.bias must have shape [1], "
+                    f"got {tuple(confidence_bias.shape)} in {spec_model_path}"
+                )
+            hidden_size = int(drafter_config.hidden_size)
+            markov_rank = int(getattr(drafter_config, "markov_rank", 0))
+            confidence_input_dim = int(confidence_weight.shape[1])
+            if confidence_input_dim == hidden_size:
+                checkpoint_with_markov = False
+            elif confidence_input_dim == hidden_size + markov_rank and markov_rank > 0:
+                checkpoint_with_markov = True
+            else:
+                raise ValueError(
+                    "DSpark confidence-head input dim is incompatible with the draft "
+                    f"hidden/Markov dimensions: checkpoint={confidence_input_dim} "
+                    f"hidden_size={hidden_size} markov_rank={markov_rank} "
+                    f"model_path={spec_model_path}"
+                )
+            source_config = getattr(drafter_config, "_source_checkpoint_config", None)
+            topology_is_explicit = training_requests_head or (
+                isinstance(source_config, dict)
+                and "confidence_head_with_markov" in source_config
+            )
+            if (
+                topology_is_explicit
+                and confidence_with_markov != checkpoint_with_markov
+            ):
+                raise ValueError(
+                    "DSpark confidence-head topology disagrees with its checkpoint: "
+                    f"configured_with_markov={confidence_with_markov} "
+                    f"checkpoint_with_markov={checkpoint_with_markov} "
+                    f"model_path={spec_model_path}"
+                )
+            confidence_with_markov = checkpoint_with_markov
+
+        if enable_confidence_head:
+            markov_rank = int(getattr(drafter_config, "markov_rank", 0))
+            if confidence_with_markov and markov_rank <= 0:
+                raise ValueError(
+                    "DSpark confidence_head_with_markov requires dspark_markov_rank > 0"
+                )
+            training_mode = (
+                str(training_cfg.get("mode", "online") or "online").strip().lower()
+            )
+            if (
+                training_mode not in {"offline", "collect_only"}
+                and training_requests_head
+                and not checkpoint_has_head
+                and not config_enables_head
+            ):
+                # A fresh head is created from a checkpoint that does not declare
+                # one. The running engine was built without it, so it will skip
+                # the published weights until it is restarted from a checkpoint
+                # whose config.json declares the head.
+                logger.warning(
+                    "[dspark-trainer] training a fresh confidence head from a "
+                    "checkpoint that does not declare one; a rollout engine "
+                    "started from this checkpoint will not register the head and "
+                    "will skip its published weights. Restart the engine from a "
+                    "checkpoint whose config.json declares "
+                    "enable_confidence_head=true to serve the trained head."
+                )
+            dynamic_spec_config = _nested_get(
+                self.config,
+                (
+                    "rollout",
+                    "engine_kwargs",
+                    "vllm",
+                    "additional_config",
+                    "dynamic_spec_config",
+                ),
+                None,
+            )
+            dynamic_method = (
+                dynamic_spec_config.get("method")
+                if hasattr(dynamic_spec_config, "get")
+                else getattr(dynamic_spec_config, "method", None)
+            )
+            dynamic_serving = (
+                dynamic_method is not None
+                and str(dynamic_method).strip().lower() == "dspark"
+            )
+            if dynamic_serving and not confidence_with_markov and markov_rank > 0:
+                # The vLLM-Ascend confidence-thresholded dynamic verify budget
+                # assumes a Markov-fused confidence head. The engine itself
+                # follows the checkpoint topology, so this only restricts the
+                # dynamic path; static serving and offline export may be
+                # markov-less.
+                raise ValueError(
+                    "DSpark dynamic_spec_config.method=dspark requires "
+                    "dspark_confidence_head_with_markov=True because the "
+                    "vLLM-Ascend dynamic verify-budget consumer assumes a "
+                    "Markov-fused head. Set dspark_confidence_head_with_markov=True, "
+                    "or drop rollout.engine_kwargs.vllm.additional_config."
+                    "dynamic_spec_config (static serving and offline training may "
+                    "be markov-less)."
+                )
+            drafter_config.enable_confidence_head = True
+            drafter_config.confidence_head_with_markov = confidence_with_markov
+            drafter_config.confidence_detach_backbone = bool(
+                training_cfg.get("dspark_confidence_detach_backbone", False)
+            )
+            drafter_config.confidence_head_alpha = max(
+                float(getattr(drafter_config, "confidence_head_alpha", 0.0)),
+                training_head_alpha,
+                training_loss_alpha,
+            )
+            logger.info(
+                "[dspark-trainer] confidence head enabled "
+                "(with_markov=%s detach_backbone=%s head_alpha=%.4f loss_alpha=%.4f "
+                "checkpoint_has_head=%s)",
+                confidence_with_markov,
+                drafter_config.confidence_detach_backbone,
+                training_head_alpha,
+                training_loss_alpha,
+                checkpoint_has_head,
+            )
+        return drafter_config
 
     def _build_fallback_config(self, target_hf_config):
         training_cfg = self.config.rollout.drafter.training
@@ -919,6 +1485,13 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_layer_ids = build_target_layer_ids(
                 num_context_layers, target_num_hidden_layers
             )
+        confidence_head_alpha = max(
+            float(training_cfg.get("dspark_confidence_head_alpha", 0.0) or 0.0),
+            float(training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0),
+        )
+        confidence_loss_alpha = float(
+            training_cfg.get("dspark_confidence_loss_alpha", 0.0)
+        )
         intermediate_size_cfg = self._training_value(
             training_cfg, "dspark_intermediate_size", "dflash_intermediate_size", None
         )
@@ -969,8 +1542,9 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             markov_head_type=str(
                 training_cfg.get("dspark_markov_head_type", "vanilla")
             ),
-            confidence_head_alpha=float(
-                training_cfg.get("dspark_confidence_head_alpha", 0.0)
+            confidence_head_alpha=confidence_head_alpha,
+            enable_confidence_head=bool(
+                confidence_head_alpha > 0.0 or confidence_loss_alpha > 0.0
             ),
             confidence_head_with_markov=bool(
                 training_cfg.get("dspark_confidence_head_with_markov", True)
@@ -1025,8 +1599,39 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             target_model_path, target_hf_config
         )
         training_cfg = self.config.rollout.drafter.training
+        l1_loss_alpha = float(
+            training_cfg.get(
+                "dspark_l1_loss_alpha",
+                getattr(drafter_config, "l1_loss_alpha", 0.9),
+            )
+        )
+        lk_loss_alpha = float(training_cfg.get("dspark_lk_loss_alpha", 0.0))
+        verifier_norm = None
+        tq_expected = training_cfg.get("transfer_queue", {}).get("expected_feature", {})
+        if (
+            training_cfg.get("mode") == "offline"
+            and training_cfg.get("feature_store", {}).get("type")
+            in {"tq", "ray_reference"}
+            and not training_cfg.get("use_logits", False)
+            and tq_expected.get("payload_kind") == "vllm_reference"
+            and tq_expected.get("hidden_states_layout") == "dflash_aux_plus_last"
+        ):
+            from verl_speco.trainer.target_feature_replay import load_vllm_final_norm
+
+            verifier_norm = load_vllm_final_norm(
+                target_model_path,
+                dtype=torch.bfloat16,
+                trust_remote_code=bool(
+                    self.config.model.get("trust_remote_code", False)
+                ),
+            )
+        clip = training_cfg.get("hidden_state_clip_value", 1.0e4)
         return DSparkTrainingModel(
             draft_model=draft_model,
+            verifier_norm=verifier_norm,
+            target_hidden_clip_value=float(clip)
+            if clip is not None and float(clip) > 0
+            else None,
             block_size=int(
                 training_cfg.get(
                     "dspark_block_size", getattr(drafter_config, "block_size", 7)
@@ -1047,18 +1652,21 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             sampled_ce_negatives=int(
                 training_cfg.get("dspark_sampled_ce_negatives", 0)
             ),
+            per_position_loss_weight=str(
+                training_cfg.get("dspark_per_position_loss_weight", "fixed_exp_decay")
+            ),
+            dpace_alpha=float(training_cfg.get("dspark_dpace_alpha", 0.5)),
             ce_loss_alpha=float(
                 training_cfg.get(
                     "dspark_ce_loss_alpha",
                     getattr(drafter_config, "ce_loss_alpha", 0.1),
                 )
             ),
-            l1_loss_alpha=float(
-                training_cfg.get(
-                    "dspark_l1_loss_alpha",
-                    getattr(drafter_config, "l1_loss_alpha", 0.9),
-                )
-            ),
+            l1_loss_alpha=l1_loss_alpha,
+            lk_loss_alpha=lk_loss_alpha,
+            lk_temperature=float(training_cfg.get("lk_temperature", 1.0)),
+            lk_loss_type=str(training_cfg.get("dspark_lk_loss_type", "alpha")),
+            lk_hybrid_eta=float(training_cfg.get("dspark_lk_hybrid_eta", 3.0)),
             confidence_head_alpha=float(
                 training_cfg.get("dspark_confidence_loss_alpha", 0.0)
             ),
@@ -1066,21 +1674,62 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             distribution_loss_impl=str(
                 training_cfg.get("dspark_distribution_loss_impl", "auto")
             ),
+            ce_target_source=str(training_cfg.get("ce_target_source", "labels")),
+            confidence_target_mode=str(
+                training_cfg.get("dspark_confidence_target_mode", "greedy")
+            ),
             debug_log=bool(training_cfg.get("dspark_debug_log", False)),
             debug_log_first_n=int(training_cfg.get("dspark_debug_log_first_n", 2)),
             debug_log_interval=int(training_cfg.get("dspark_debug_log_interval", 100)),
         ), drafter_config
 
+    def _preprocess_label(self) -> str:
+        """Backend name used in preprocessing error messages."""
+        return "DSpark"
+
+    def _preprocess_window_key(self) -> str:
+        """Training-config key holding the optional preprocessing crop."""
+        return "dspark_max_window"
+
+    def _preprocess_default_num_target_layers(self) -> int:
+        """Fallback context-layer count when the model config does not set one."""
+        return 5
+
+    def _preprocess_requires_target_hidden(self, training_cfg) -> bool:
+        """Whether the configured losses need the final target hidden state.
+
+        When True, items carrying the aux-only layout are rejected up front: the
+        l1/confidence/target-argmax losses cannot be computed without
+        ``target_last_hidden_states``. Mirrors the DSpark build defaults
+        (``dspark_l1_loss_alpha`` defaults to 0.9, matching the hidden-states
+        layout resolver).
+        """
+        return (
+            float(training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0) > 0
+            or float(training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0) > 0
+            or str(training_cfg.get("ce_target_source", "labels") or "labels").lower()
+            == "target_argmax"
+        )
+
     def preprocess_individual_items(self, items, device, model_config):
-        res = {"ids": [], "h_states": [], "masks": [], "target_last_h_states": []}
-        raw_max_window = self.config.rollout.drafter.training.get("dspark_max_window")
+        label = self._preprocess_label()
+        window_key = self._preprocess_window_key()
+        res = {
+            "ids": [],
+            "h_states": [],
+            "masks": [],
+            "target_last_h_states": [],
+            "next_token_ids": [],
+            "next_token_masks": [],
+        }
+        raw_max_window = self.config.rollout.drafter.training.get(window_key)
         max_window = (
             None
             if raw_max_window is None or str(raw_max_window).strip() == ""
             else int(raw_max_window)
         )
         if max_window is not None and max_window < 0:
-            raise ValueError("dspark_max_window must be non-negative")
+            raise ValueError(f"{window_key} must be non-negative")
         if max_window == 0:
             max_window = None
         pad_id = int(getattr(model_config, "pad_token_id", 0) or 0)
@@ -1091,17 +1740,31 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             getattr(
                 model_config,
                 "num_context_layers",
-                getattr(model_config, "num_target_layers", 5),
+                getattr(
+                    model_config,
+                    "num_target_layers",
+                    self._preprocess_default_num_target_layers(),
+                ),
             )
         )
         expected_hidden_dim = h_dim * num_context_layers
+        requires_target_hidden = self._preprocess_requires_target_hidden(
+            self.config.rollout.drafter.training
+        )
 
         for item in items:
             layout = item.get("hidden_states_layout")
             if layout not in (None, "dflash_aux", "dflash_aux_plus_last"):
                 raise ValueError(
-                    f"DSpark expected hidden_states_layout='dflash_aux' or 'dflash_aux_plus_last', got {layout!r}. "
-                    "This usually means EAGLE3 aux+last hidden states were routed into DSpark training."
+                    f"{label} expected hidden_states_layout='dflash_aux' or 'dflash_aux_plus_last', got {layout!r}. "
+                    f"This usually means EAGLE3 aux+last hidden states were routed into {label} training."
+                )
+            if requires_target_hidden and layout == "dflash_aux":
+                raise ValueError(
+                    f"{label} target-hidden losses are enabled (l1/tv/"
+                    "confidence/target-argmax) but the feature item layout is "
+                    "'dflash_aux'; expected 'dflash_aux_plus_last' with the final "
+                    "target hidden states."
                 )
             ids = item["input_ids"].to(device, non_blocking=True)
             raw_h = item["hidden_states"]
@@ -1111,7 +1774,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             full_h = full_h.to(device, dtype=torch.bfloat16)
             if full_h.size(-1) < expected_hidden_dim:
                 raise ValueError(
-                    f"DSpark expected at least {expected_hidden_dim} hidden dims "
+                    f"{label} expected at least {expected_hidden_dim} hidden dims "
                     f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
                 )
             target_last_h = None
@@ -1119,7 +1782,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 expected_with_last = expected_hidden_dim + h_dim
                 if full_h.size(-1) != expected_with_last:
                     raise ValueError(
-                        "DSpark hidden_states_layout='dflash_aux_plus_last' expected exactly "
+                        f"{label} hidden_states_layout='dflash_aux_plus_last' expected exactly "
                         f"{expected_with_last} hidden dims ({num_context_layers} context layers plus final hidden), "
                         f"got {full_h.size(-1)}"
                     )
@@ -1127,7 +1790,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 full_h = full_h[..., :expected_hidden_dim]
             elif layout == "dflash_aux" and full_h.size(-1) != expected_hidden_dim:
                 raise ValueError(
-                    f"DSpark hidden_states_layout='dflash_aux' expected exactly {expected_hidden_dim} hidden dims "
+                    f"{label} hidden_states_layout='dflash_aux' expected exactly {expected_hidden_dim} hidden dims "
                     f"({num_context_layers} context layers of size {h_dim}), got {full_h.size(-1)}"
                 )
 
@@ -1146,11 +1809,31 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 item_loss_mask = torch.zeros_like(ids, dtype=torch.float32)
                 item_loss_mask[:] = 1.0
 
+            next_token_ids = item.get("next_token_ids")
+            next_token_mask = item.get("next_token_loss_mask")
+            if next_token_ids is not None or next_token_mask is not None:
+                if next_token_ids is None or next_token_mask is None:
+                    raise ValueError(
+                        "DSpark requires both next_token_ids and next_token_loss_mask"
+                    )
+                next_token_ids = next_token_ids.to(device, non_blocking=True)
+                next_token_mask = next_token_mask.to(
+                    device, dtype=torch.float32, non_blocking=True
+                )
+                if next_token_ids.size(0) != ids.size(0) or next_token_mask.size(
+                    0
+                ) != ids.size(0):
+                    raise ValueError(
+                        "DSpark next-token labels must match input rows: "
+                        f"input_rows={ids.size(0)}, next_ids={next_token_ids.size(0)}, "
+                        f"next_mask={next_token_mask.size(0)}"
+                    )
+
             _check_block_drafter_rows(
                 int(ids.size(0)),
                 int(full_h.size(0)),
                 int(item_loss_mask.size(0)),
-                "DSpark",
+                label,
             )
             if max_window is None:
                 start, end = 0, ids.size(0)
@@ -1173,6 +1856,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             res["ids"].append(ids[start:end])
             res["h_states"].append(full_h[start:hidden_end, :expected_hidden_dim])
             res["masks"].append(item_loss_mask[start:end])
+            res["next_token_ids"].append(
+                next_token_ids[start:end] if next_token_ids is not None else None
+            )
+            res["next_token_masks"].append(
+                next_token_mask[start:end] if next_token_mask is not None else None
+            )
             if target_last_h is not None:
                 res["target_last_h_states"].append(target_last_h[start:hidden_end])
             else:
@@ -1193,6 +1882,33 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         per_layer_dim = hidden_states.shape[-1] // num_context_layers
         hidden_states_list = list(hidden_states.split(per_layer_dim, dim=-1))
 
+        target_norm_kwargs = {}
+        if batch.get("last_hidden_state_norm") not in {
+            None,
+            "target_final_norm",
+            "raw_target_residual",
+        }:
+            raise ValueError("Unknown DSpark final hidden state")
+        if batch.get("last_hidden_state_norm") == "raw_target_residual":
+            training = self.config.rollout.drafter.training
+            if (
+                batch.get("hidden_source") != "standalone_vllm_reference"
+                or training.get("mode") != "offline"
+                or training.get("feature_store", {}).get("type")
+                not in {"tq", "ray_reference"}
+                or training.get("use_logits", False)
+                or training.get("transfer_queue", {})
+                .get("expected_feature", {})
+                .get("payload_kind")
+                != "vllm_reference"
+            ):
+                raise ValueError(
+                    "Raw DSpark targets are restricted to standalone vLLM file input"
+                )
+            target_norm_kwargs = {
+                "target_hidden_is_raw": True,
+                "hidden_source": batch["hidden_source"],
+            }
         loss, accuracy, loss_pp, acc_pp, count_pp, diagnostics = model(
             input_ids=batch["input_ids"],
             hidden_states_list=hidden_states_list,
@@ -1200,8 +1916,11 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
             document_ids=batch.get("document_ids"),
+            next_token_ids=batch.get("next_token_ids"),
+            next_token_loss_mask=batch.get("next_token_loss_mask"),
             label_ids=batch.get("label_ids"),
             label_mask=batch.get("label_mask"),
+            **target_norm_kwargs,
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):

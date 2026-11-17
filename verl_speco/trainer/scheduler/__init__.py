@@ -11,12 +11,19 @@ Code outside this package should import scheduling contracts from here instead
 of depending on trigger, budget, or execution implementation modules.
 """
 
-from .drafter_runtime_state import DrafterRuntimeState, DrafterRuntimeStatus
+from .drafter_runtime_state import (
+    DrafterRuntimeState,
+    DrafterRuntimeStatus,
+    StandaloneQueueState,
+)
+from .adaptive_schedule import AcceptanceFeedback, AdaptiveScheduleConfig
 from .drafter_scheduler import DrafterScheduler, step_matches_interval
 from .schedule_types import (
     CollectionPlan,
     CollectionPayload,
     CollectionWorkerResult,
+    AvailableTrainingResources,
+    IdleWindowConfidence,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterExecutionStrategy,
@@ -25,6 +32,8 @@ from .schedule_types import (
     DrafterTrainingDataSource,
     ProducerAction,
     PublishPlan,
+    RolloutWorkerEvent,
+    RolloutWorkerEventType,
     QueueScheduleContext,
     QueueScheduleConfig,
     QueueStatus,
@@ -48,7 +57,11 @@ from .lifecycle import (
     BeforeActorUpdateContext,
     SchedulerEventOutcome,
 )
-from .collection_strategy import CollectionOutcome, DrafterCollectionStrategy
+from .collection_strategy import (
+    CollectionFinalizeError,
+    CollectionOutcome,
+    DrafterCollectionStrategy,
+)
 from .collection_adapter import DrafterCollectionAdapter
 from .training_outcome import TrainingOutcome
 from .standalone_executor import (
@@ -63,13 +76,18 @@ from .standalone_executor import (
 )
 
 __all__ = [
+    "AcceptanceFeedback",
+    "AdaptiveScheduleConfig",
     "AfterActorUpdateContext",
     "AfterWeightUpdateContext",
+    "AvailableTrainingResources",
+    "IdleWindowConfidence",
     "BeforeActorUpdateContext",
     "CollectionPlan",
     "CollectionPayload",
     "CollectionWorkerResult",
     "CollectionOutcome",
+    "CollectionFinalizeError",
     "ConservativeTrainingDataStatusPolicy",
     "CallbackDrafterWorkerExecutor",
     "CallbackDrafterCollectionExecutor",
@@ -81,6 +99,7 @@ __all__ = [
     "DrafterExecutionStrategy",
     "DrafterRuntimeState",
     "DrafterRuntimeStatus",
+    "StandaloneQueueState",
     "DrafterScheduleConfig",
     "DrafterScheduleContext",
     "DrafterTrainingDataSource",
@@ -91,6 +110,8 @@ __all__ = [
     "DrafterCollectionStrategy",
     "DrafterPublishExecutor",
     "PublishPlan",
+    "RolloutWorkerEvent",
+    "RolloutWorkerEventType",
     "ProducerAction",
     "QueueScheduleContext",
     "QueueScheduleConfig",

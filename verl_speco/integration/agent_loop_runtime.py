@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import inspect
 import logging
+import time
 import types
 from functools import wraps
 from typing import Any, cast
@@ -25,18 +27,55 @@ from typing import Any, cast
 logger = logging.getLogger(__file__)
 
 _PATCHED = False
+SPECO_STUDENT_DECODE_TIME_KEY = "speco_student_decode_time_s"
+SPECO_TEACHER_PREFILL_TIME_KEY = "speco_teacher_prefill_time_s"
 _DEFAULT_EXTRA_KEYS = {
-    "turn_scores",
-    "tool_rewards",
-    "min_global_steps",
-    "max_global_steps",
-    "extras",
-    "drafter_sample",
+    "_speco_vllm_spec_decode_accepted_tokens": None,
+    "_speco_vllm_spec_decode_drafts": None,
+    "turn_scores": None,
+    "tool_rewards": None,
+    "min_global_steps": None,
+    "max_global_steps": None,
+    "extras": None,
+    "drafter_sample": None,
+    "_speco_acceptance_engine_fallback": False,
+    SPECO_STUDENT_DECODE_TIME_KEY: None,
+    SPECO_TEACHER_PREFILL_TIME_KEY: None,
 }
 _CURRENT_GLOBAL_STEPS = contextvars.ContextVar(
     "speco_current_global_steps", default=None
 )
 _CURRENT_VALIDATE = contextvars.ContextVar("speco_current_validate", default=False)
+_CURRENT_SKIP_DRAFTER_COLLECTION = contextvars.ContextVar(
+    "speco_current_skip_drafter_collection", default=False
+)
+# Fixed paired-probe batches (RFC sec. 6) force greedy sampling and a length
+# cap so the two arms are comparable and cheap regardless of val_kwargs.
+_CURRENT_PROBE_MAX_TOKENS = contextvars.ContextVar(
+    "speco_current_probe_max_tokens", default=None
+)
+_CURRENT_PROBE_GREEDY = contextvars.ContextVar(
+    "speco_current_probe_greedy", default=False
+)
+
+
+def _apply_probe_sampling_overrides(sampling_params: Any) -> Any:
+    """Force greedy + max_tokens on the fixed paired-probe arm requests."""
+    if not isinstance(sampling_params, dict):
+        return sampling_params
+    if bool(_CURRENT_PROBE_GREEDY.get()):
+        sampling_params["temperature"] = 0
+        sampling_params["top_p"] = 1.0
+        sampling_params["top_k"] = -1
+    max_tokens = _CURRENT_PROBE_MAX_TOKENS.get()
+    if max_tokens:
+        sampling_params["max_tokens"] = int(max_tokens)
+    return sampling_params
+
+
+_CURRENT_STUDENT_DECODE_TIMES: contextvars.ContextVar[list[float] | None] = (
+    contextvars.ContextVar("speco_current_student_decode_times", default=None)
+)
 SPECO_AGENT_LOOP_MANAGER_CLASS = (
     "verl_speco.integration.agent_loop_runtime.SpecoAgentLoopManager"
 )
@@ -89,8 +128,10 @@ def _ensure_extra_field_defaults(result: Any) -> Any:
 
     for key in _DEFAULT_EXTRA_KEYS:
         if key not in non_tensor_batch:
-            values = np.empty(batch_len, dtype=object)
-            values[:] = [None for _ in range(batch_len)]
+            values: np.ndarray[Any, np.dtype[np.object_]] = np.empty(
+                batch_len, dtype=object
+            )
+            values[:] = [_DEFAULT_EXTRA_KEYS[key] for _ in range(batch_len)]
             non_tensor_batch[key] = values
     return result
 
@@ -102,20 +143,26 @@ def _sampling_params_with_speco_context(sampling_params: Any) -> Any:
     global_steps = _CURRENT_GLOBAL_STEPS.get()
     if global_steps is not None:
         patched.setdefault("_verl_global_steps", global_steps)
-    if bool(_CURRENT_VALIDATE.get()):
+    validate = bool(_CURRENT_VALIDATE.get())
+    skip_collection = bool(_CURRENT_SKIP_DRAFTER_COLLECTION.get())
+    if validate or skip_collection:
         patched["_verl_skip_drafter_collection"] = True
     return patched
 
 
 def _sampling_params_with_speco_step(
-    sampling_params: Any, *, global_steps: Any, validate: bool
+    sampling_params: Any,
+    *,
+    global_steps: Any,
+    validate: bool,
+    skip_drafter_collection: bool = False,
 ) -> Any:
     if not isinstance(sampling_params, dict):
         return sampling_params
     patched = dict(sampling_params)
     if global_steps is not None and global_steps != -1:
         patched["_verl_global_steps"] = global_steps
-    if validate:
+    if validate or skip_drafter_collection:
         patched["_verl_skip_drafter_collection"] = True
     return patched
 
@@ -138,7 +185,7 @@ def _speco_default_agent_loop_extra_fields(output: Any) -> Any:
     extra_fields = getattr(output, "extra_fields", None)
     if isinstance(extra_fields, dict):
         for key in _DEFAULT_EXTRA_KEYS:
-            extra_fields.setdefault(key, None)
+            extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
     return output
 
 
@@ -148,17 +195,112 @@ def _speco_default_agent_loop_inputs(inputs: Any) -> Any:
     return inputs
 
 
-def _speco_context_from_batch(batch: Any) -> tuple[Any, Any]:
+def _speco_context_from_batch(batch: Any) -> tuple[Any, ...]:
     meta_info = getattr(batch, "meta_info", None)
     meta_info = meta_info if isinstance(meta_info, dict) else {}
     global_steps_token = _CURRENT_GLOBAL_STEPS.set(meta_info.get("global_steps"))
     validate_token = _CURRENT_VALIDATE.set(bool(meta_info.get("validate", False)))
-    return global_steps_token, validate_token
+    skip_collection_token = _CURRENT_SKIP_DRAFTER_COLLECTION.set(
+        bool(meta_info.get("skip_drafter_collection", False))
+    )
+    probe_greedy_token = _CURRENT_PROBE_GREEDY.set(
+        bool(meta_info.get("_speco_freeze_probe", False))
+    )
+    probe_max_tokens_token = _CURRENT_PROBE_MAX_TOKENS.set(
+        meta_info.get("_speco_freeze_probe_max_tokens", None)
+    )
+    return (
+        global_steps_token,
+        validate_token,
+        probe_greedy_token,
+        probe_max_tokens_token,
+        skip_collection_token,
+    )
 
 
-def _speco_reset_context(global_steps_token: Any, validate_token: Any) -> None:
-    _CURRENT_VALIDATE.reset(validate_token)
-    _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+def _speco_reset_context(*tokens: Any) -> None:
+    if len(tokens) >= 5:
+        _CURRENT_SKIP_DRAFTER_COLLECTION.reset(tokens[4])
+    if len(tokens) >= 4:
+        _CURRENT_PROBE_MAX_TOKENS.reset(tokens[3])
+        _CURRENT_PROBE_GREEDY.reset(tokens[2])
+    if len(tokens) >= 2:
+        _CURRENT_VALIDATE.reset(tokens[1])
+        _CURRENT_GLOBAL_STEPS.reset(tokens[0])
+
+
+def _record_phase_time(output: Any, key: str, elapsed: float) -> None:
+    extra_fields = getattr(output, "extra_fields", None)
+    if isinstance(extra_fields, dict):
+        previous = extra_fields.get(key)
+        extra_fields[key] = (0.0 if previous is None else previous) + elapsed
+
+
+async def _compute_teacher_logprobs_with_timing(
+    worker: Any,
+    compute_teacher_logprobs: Any,
+    output: Any,
+    prompt_ids: Any,
+    response_ids: Any,
+    validate: bool,
+    sample_kwargs: Any = None,
+) -> Any:
+    """Run upstream teacher scoring and record its end-to-end prefill latency.
+
+    Latency is accumulated per output. Only installed on the vLLM agent-loop
+    worker path; the SGLang worker path does not record teacher prefill time.
+    """
+
+    measure = bool(getattr(worker, "distillation_enabled", False)) and not validate
+    started = time.perf_counter() if measure else None
+    # Teacher traffic can use the same LLMServerClient class as student rollout.
+    # Temporarily disable the student accumulator so it stays student-only.
+    student_times_token = _CURRENT_STUDENT_DECODE_TIMES.set(None)
+    try:
+        result = compute_teacher_logprobs(
+            worker,
+            output,
+            prompt_ids,
+            response_ids,
+            validate,
+            sample_kwargs,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+    finally:
+        _CURRENT_STUDENT_DECODE_TIMES.reset(student_times_token)
+    if started is not None:
+        _record_phase_time(
+            output,
+            SPECO_TEACHER_PREFILL_TIME_KEY,
+            time.perf_counter() - started,
+        )
+    return result
+
+
+async def _run_agent_loop_with_student_timing(call: Any, *args, **kwargs) -> Any:
+    """Measure student LLM request wall time across all turns of one trajectory."""
+
+    if _CURRENT_STUDENT_DECODE_TIMES.get() is not None:
+        result = call(*args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    student_decode_times: list[float] = []
+    token = _CURRENT_STUDENT_DECODE_TIMES.set(student_decode_times)
+    try:
+        result = call(*args, **kwargs)
+        if inspect.isawaitable(result):
+            result = await result
+    finally:
+        _CURRENT_STUDENT_DECODE_TIMES.reset(token)
+    _record_phase_time(
+        result,
+        SPECO_STUDENT_DECODE_TIME_KEY,
+        sum(student_decode_times),
+    )
+    return result
 
 
 def _speco_worker_init(self, *args, **kwargs):
@@ -169,8 +311,10 @@ def _speco_worker_init(self, *args, **kwargs):
 
 
 async def _speco_worker_generate_sequences(self, batch):
-    global_steps_token, validate_token = _speco_context_from_batch(batch)
+    _speco_worker_request_started(self)
+    context_tokens = None
     try:
+        context_tokens = _speco_context_from_batch(batch)
         generate_sequences = _speco_parent_method(self, "generate_sequences")
         if not callable(generate_sequences):
             raise AttributeError(
@@ -182,7 +326,9 @@ async def _speco_worker_generate_sequences(self, batch):
         result = _ensure_extra_field_defaults(result)
         return result
     finally:
-        _speco_reset_context(global_steps_token, validate_token)
+        if context_tokens is not None:
+            _speco_reset_context(*context_tokens)
+        _speco_worker_request_finished(self)
 
 
 async def _speco_worker_run_agent_loop(
@@ -193,16 +339,22 @@ async def _speco_worker_run_agent_loop(
         sampling_params,
         global_steps=trajectory.get("step"),
         validate=bool(trajectory.get("validate", False)),
+        skip_drafter_collection=bool(trajectory.get("skip_drafter_collection", False)),
     )
+    sampling_params = _apply_probe_sampling_overrides(sampling_params)
     run_agent_loop = _speco_parent_method(self, "_run_agent_loop")
     if not callable(run_agent_loop):
         raise AttributeError(
             "SPECO AgentLoop worker parent has no _run_agent_loop method"
         )
-    result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
+    return await _run_agent_loop_with_student_timing(
+        run_agent_loop,
+        self,
+        sampling_params,
+        trajectory,
+        *args,
+        **kwargs,
+    )
 
 
 async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs):
@@ -216,6 +368,81 @@ async def _speco_worker_agent_loop_postprocess(self, output, validate, **kwargs)
     if inspect.isawaitable(result):
         result = await result
     return _speco_default_agent_loop_extra_fields(result)
+
+
+async def _speco_worker_drain(self) -> None:
+    """Wait until all generation calls submitted before this barrier finish.
+
+    Agent-loop workers are async Ray actors: a later RPC can run while an
+    earlier ``generate_sequences`` call is suspended at an ``await``.  A no-op
+    RPC is therefore not a completion barrier.  The wrapper records live
+    generation calls and waits for their shared idle event instead.
+    """
+    event = _speco_worker_idle_event(self)
+    await event.wait()
+    # Native V1 TQ returns after spawning prompt tasks, before they finish.
+    # Draining only generate_sequences RPCs is not a completion barrier there.
+    while True:
+        tasks = list(getattr(self, "background_tasks", ()) or ())
+        if not tasks:
+            return
+        await asyncio.gather(*tasks)
+        await asyncio.sleep(0)  # Allow task-discard callbacks to settle.
+
+
+async def _speco_worker_cancel_pending(self):
+    tasks = list(getattr(self, "background_tasks", ()) or ())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def install_v1_agent_loop_worker_bridge(manager_cls):
+    """Keep the native TQ manager, installing serializable worker RPCs only."""
+    if manager_cls.__module__ != "verl.trainer.ppo.v1.agent_loop_tq":
+        return False
+    import ray
+    from verl.trainer.ppo.v1 import agent_loop_tq
+
+    if manager_cls is not agent_loop_tq.AgentLoopManagerTQ:
+        return False  # Never replace a caller's custom worker/manager policy.
+    actor_cls = agent_loop_tq.AgentLoopWorkerTQ
+    raw_cls = getattr(actor_cls, "__ray_actor_class__", None)
+    if raw_cls is None:
+        raise RuntimeError("Native V1 TQ worker has no inspectable Ray actor class")
+    if raw_cls.__dict__.get("_speco_explicit_worker_runtime", False):
+        return True
+    agent_loop_tq.AgentLoopWorkerTQ = ray.remote(
+        _build_speco_agent_loop_worker_class(raw_cls)
+    )
+    return True
+
+
+def _speco_worker_idle_event(worker: Any) -> asyncio.Event:
+    event = getattr(worker, "_speco_agent_loop_idle_event", None)
+    if event is None:
+        event = asyncio.Event()
+        event.set()
+        worker._speco_agent_loop_idle_event = event
+        worker._speco_agent_loop_inflight = 0
+    return event
+
+
+def _speco_worker_request_started(worker: Any) -> None:
+    event = _speco_worker_idle_event(worker)
+    worker._speco_agent_loop_inflight = (
+        int(getattr(worker, "_speco_agent_loop_inflight", 0)) + 1
+    )
+    event.clear()
+
+
+def _speco_worker_request_finished(worker: Any) -> None:
+    event = _speco_worker_idle_event(worker)
+    remaining = max(int(getattr(worker, "_speco_agent_loop_inflight", 0)) - 1, 0)
+    worker._speco_agent_loop_inflight = remaining
+    if remaining == 0:
+        event.set()
 
 
 def _speco_worker_postprocess(
@@ -278,7 +505,7 @@ except Exception:  # noqa: BLE001
 
 
 def _build_speco_agent_loop_worker_class(worker_cls):
-    speco_worker_cls = getattr(worker_cls, "_speco_remote_worker_cls", None)
+    speco_worker_cls = worker_cls.__dict__.get("_speco_remote_worker_cls")
     if speco_worker_cls is not None and getattr(
         speco_worker_cls, "_speco_explicit_worker_runtime", False
     ):
@@ -293,6 +520,8 @@ def _build_speco_agent_loop_worker_class(worker_cls):
         "__module__": __name__,
         "__doc__": "Ray-serializable AgentLoopWorker subclass carrying SPECO runtime patches.",
         "__init__": _speco_worker_init,
+        "speco_drain": _speco_worker_drain,
+        "speco_cancel_pending": _speco_worker_cancel_pending,
         "_speco_explicit_worker_runtime": True,
     }
     if callable(generate_sequences):
@@ -396,6 +625,7 @@ def install_agent_loop_runtime_patch() -> bool:
     generate_sequences = getattr(worker_cls, "generate_sequences", None)
     run_agent_loop = getattr(worker_cls, "_run_agent_loop", None)
     agent_loop_postprocess = getattr(worker_cls, "_agent_loop_postprocess", None)
+    compute_teacher_logprobs = getattr(worker_cls, "_compute_teacher_logprobs", None)
     postprocess = getattr(worker_cls, "_postprocess", None)
     manager_init = getattr(manager_cls, "__init__", None)
     manager_generate_sequences = getattr(manager_cls, "generate_sequences", None)
@@ -421,34 +651,50 @@ def install_agent_loop_runtime_patch() -> bool:
                 kwargs["sampling_params"] = _sampling_params_with_speco_context(
                     kwargs["sampling_params"]
                 )
+            student_decode_times = _CURRENT_STUDENT_DECODE_TIMES.get()
+            started = time.perf_counter() if student_decode_times is not None else None
             result = llm_server_generate(self, *args, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
+            if started is not None:
+                student_decode_times.append(time.perf_counter() - started)
+            from verl_speco.integration.partial_rollout_stats import (
+                record_serving_segment,
+            )
+
+            record_serving_segment(result)
             return result
 
         llm_server_client_cls.generate = speco_llm_server_generate
         llm_server_client_cls._speco_patched_generate = True
 
+    try:
+        from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+        from verl_speco.integration.partial_rollout_stats import (
+            patch_partial_rollout_client,
+        )
+
+        patch_partial_rollout_client(FullyAsyncLLMServerClient)
+    except ImportError:
+        # Older verl versions have no native partial-rollout client.
+        pass
+
     if not getattr(worker_cls, "_speco_patched_generate_sequences", False):
 
         @wraps(generate_sequences)
         async def speco_generate_sequences(self, batch):
-            meta_info = getattr(batch, "meta_info", None)
-            meta_info = meta_info if isinstance(meta_info, dict) else {}
-            global_steps_token = _CURRENT_GLOBAL_STEPS.set(
-                meta_info.get("global_steps")
-            )
-            validate_token = _CURRENT_VALIDATE.set(
-                bool(meta_info.get("validate", False))
-            )
+            _speco_worker_request_started(self)
+            context_tokens = None
             try:
+                context_tokens = _speco_context_from_batch(batch)
                 result = generate_sequences(self, batch)
                 if inspect.isawaitable(result):
                     result = await result
                 return _ensure_extra_field_defaults(result)
             finally:
-                _CURRENT_VALIDATE.reset(validate_token)
-                _CURRENT_GLOBAL_STEPS.reset(global_steps_token)
+                if context_tokens is not None:
+                    _speco_reset_context(*context_tokens)
+                _speco_worker_request_finished(self)
 
         worker_cls.generate_sequences = speco_generate_sequences
         worker_cls._speco_patched_generate_sequences = True
@@ -464,11 +710,19 @@ def install_agent_loop_runtime_patch() -> bool:
                 sampling_params,
                 global_steps=trajectory.get("step"),
                 validate=bool(trajectory.get("validate", False)),
+                skip_drafter_collection=bool(
+                    trajectory.get("skip_drafter_collection", False)
+                ),
             )
-            result = run_agent_loop(self, sampling_params, trajectory, *args, **kwargs)
-            if inspect.isawaitable(result):
-                result = await result
-            return result
+            sampling_params = _apply_probe_sampling_overrides(sampling_params)
+            return await _run_agent_loop_with_student_timing(
+                run_agent_loop,
+                self,
+                sampling_params,
+                trajectory,
+                *args,
+                **kwargs,
+            )
 
         worker_cls._run_agent_loop = speco_run_agent_loop
         worker_cls._speco_patched_run_agent_loop = True
@@ -482,18 +736,44 @@ def install_agent_loop_runtime_patch() -> bool:
             extra_fields = getattr(output, "extra_fields", None)
             if isinstance(extra_fields, dict):
                 for key in _DEFAULT_EXTRA_KEYS:
-                    extra_fields.setdefault(key, None)
+                    extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
             result = agent_loop_postprocess(self, output, validate, **kwargs)
             if inspect.isawaitable(result):
                 result = await result
             extra_fields = getattr(result, "extra_fields", None)
             if isinstance(extra_fields, dict):
                 for key in _DEFAULT_EXTRA_KEYS:
-                    extra_fields.setdefault(key, None)
+                    extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
             return result
 
         worker_cls._agent_loop_postprocess = speco_agent_loop_postprocess
         worker_cls._speco_patched_agent_loop_postprocess = True
+
+    if callable(compute_teacher_logprobs) and not getattr(
+        worker_cls, "_speco_patched_compute_teacher_logprobs", False
+    ):
+
+        @wraps(compute_teacher_logprobs)
+        async def speco_compute_teacher_logprobs(
+            self,
+            output,
+            prompt_ids,
+            response_ids,
+            validate,
+            sample_kwargs=None,
+        ):
+            return await _compute_teacher_logprobs_with_timing(
+                self,
+                compute_teacher_logprobs,
+                output,
+                prompt_ids,
+                response_ids,
+                validate,
+                sample_kwargs,
+            )
+
+        worker_cls._compute_teacher_logprobs = speco_compute_teacher_logprobs
+        worker_cls._speco_patched_compute_teacher_logprobs = True
 
     if not getattr(worker_cls, "_speco_patched_postprocess", False):
 
@@ -505,7 +785,7 @@ def install_agent_loop_runtime_patch() -> bool:
                 extra_fields = getattr(input_item, "extra_fields", None)
                 if isinstance(extra_fields, dict):
                     for key in _DEFAULT_EXTRA_KEYS:
-                        extra_fields.setdefault(key, None)
+                        extra_fields.setdefault(key, _DEFAULT_EXTRA_KEYS[key])
             signature = inspect.signature(postprocess)
             kwargs = {}
             if "input_non_tensor_batch" in signature.parameters:
@@ -517,6 +797,10 @@ def install_agent_loop_runtime_patch() -> bool:
 
         worker_cls._postprocess = speco_postprocess
         worker_cls._speco_patched_postprocess = True
+
+    if not getattr(worker_cls, "_speco_patched_drain", False):
+        worker_cls.speco_drain = _speco_worker_drain
+        worker_cls._speco_patched_drain = True
 
     if not getattr(manager_cls, "_speco_patched_init", False):
 

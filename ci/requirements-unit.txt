@@ -1,0 +1,24 @@
+# CPU unit-suite dependencies; torch is installed from the CPU wheel index.
+ray
+peft
+tensordict
+transformers
+numpy
+pydantic
+datasets
+pyarrow
+safetensors
+pillow
+scipy
+psutil
+torchdata
+# Native V1 trainer import chain: profiler, tracking, and tensor reshaping.
+codetiming
+orjson
+einops
+cachetools
+fastapi
+uvicorn
+httpx
+# Upstream verl's reward loop imports this when loading main_ppo.
+aiohttp
